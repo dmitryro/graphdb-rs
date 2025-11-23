@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque,  BTreeMap};
 use std::sync::Arc;
 use derivative::Derivative;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc };
@@ -30,8 +30,10 @@ pub use crate::storage_engine::sled_client::{ZmqSocketWrapper};
 pub use crate::storage_engine::sled_wal_manager::{ SledWalManager };
 pub use crate::storage_engine::rocksdb_client::{ZmqSocketWrapper as RocksdDBZmqSocketWrapper};
 pub use crate::storage_engine::rocksdb_wal_manager::{ RocksDBWalManager };
+pub use crate::indexing::{ IndexingService, backend::Document };
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
 use models::errors::{GraphError, GraphResult};
+use models::properties::PropertyValue;
 use openraft_memstore::MemStore;
 use openraft::{
     self, BasicNode, Entry, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot,
@@ -43,8 +45,9 @@ use openraft::{
     error::InstallSnapshotError,
 };
 use std::error::Error; 
+use bincode::{Encode, Decode};
 
-
+pub type Service = Arc<TokioMutex<IndexingService>>; 
 
 use rocksdb::{BoundColumnFamily, ColumnFamily, ColumnFamilyDescriptor, DB, Options, WriteOptions};
 
@@ -95,6 +98,64 @@ pub enum RaftResponse {
     DeleteResponse,
 }
 
+/// A unified representation for objects stored in the graph (Vertices or Edges).
+/// This is used to pass objects polymorphically to services like the Indexer.
+#[derive(Clone, Debug, Serialize, Deserialize, Encode, Decode)]
+pub enum GraphObject {
+    Vertex(Vertex),
+    Edge(Edge),
+}
+
+impl GraphObject {
+    /// Helper to get the ID string for indexing purposes.
+    pub fn id_string(&self) -> String {
+        match self {
+            GraphObject::Vertex(v) => v.id.0.to_string(),
+            GraphObject::Edge(e) => e.id.0.to_string(),
+        }
+    }
+}
+
+/// Implements the conversion from GraphObject (Vertex or Edge) into the 
+/// Document structure required by the indexing backend.
+impl From<GraphObject> for Document {
+    fn from(obj: GraphObject) -> Self {
+        let (id_string, label_str, properties_map) = match obj {
+            GraphObject::Vertex(v) => {
+                // Assuming v.label is convertible to String (e.g., Identifier)
+                let label_str = v.label.to_string(); 
+                // Assuming v.properties is a HashMap<String, PropertyValue> and converting to BTreeMap
+                let props: BTreeMap<String, PropertyValue> = v.properties.into_iter().collect();
+                (v.id.0.to_string(), label_str, props)
+            },
+            GraphObject::Edge(e) => {
+                // Assuming Edge already holds String label and BTreeMap properties
+                (e.id.0.to_string(), e.label, e.properties)
+            },
+        };
+        
+        let mut fields: HashMap<String, String> = HashMap::new();
+
+        // 1. Add the graph element label to the HashMap under a known key
+        // This is CRITICAL for being able to query by node/edge type
+        fields.insert("_label".to_string(), label_str); 
+
+        // 2. Iterate and flatten all properties into the fields map
+        for (key, value) in properties_map.into_iter() {
+            // Flatten the complex PropertyValue enum into a simple String for indexing.
+            // Using `format!("{:?}", value)` is a common way to serialize complex 
+            // values into a searchable string representation if JSON serialization is not desired.
+            let serialized_value = format!("{:?}", value); 
+            fields.insert(key, serialized_value);
+        }
+
+        // 3. Construct the final Document structure using the correct fields
+        Document {
+            id: id_string,
+            fields, // This matches the `pub fields: HashMap<String, String>` definition
+        }
+    }
+}
 
 /// Custom network implementation for Raft using TCP.
 ///
@@ -317,6 +378,8 @@ pub struct SledDaemon {
     pub wal_manager: Arc<SledWalManager>,  // Add WAL manager
     pub running: Arc<TokioMutex<bool>>,
     pub zmq_thread: Option<std::thread::JoinHandle<()>>,  // Changed to store thread handle
+    // ADDED: The initialized indexing service instance
+    pub indexing_service: Service, 
     #[cfg(feature = "with-openraft-sled")]
     pub raft_storage: Arc<openraft_sled::SledRaftStorage<TypeConfig>>,
     #[cfg(feature = "with-openraft-sled")]
@@ -357,6 +420,7 @@ impl Clone for SledDaemonPool {
 #[derive(Debug, Clone)]
 pub struct SledStorage {
     pub pool: Arc<TokioMutex<SledDaemonPool>>,
+    pub db: Arc<sled::Db>, // <-- Add this field
 }
 
 /// Struct to hold rocksdb::DB and its path
@@ -526,6 +590,8 @@ pub struct RocksDBDaemon<'a> {
     pub zmq_context: Arc<ZmqContext>,
     //pub zmq_thread: Arc<TokioMutex<Option<JoinHandle<Result<(), GraphError>>>>>,
     pub zmq_thread: Arc<TokioMutex<Option<std::thread::JoinHandle<Result<(), GraphError>>>>>,
+    // ADDED: The initialized indexing service instance
+    pub indexing_service: Service, 
     #[cfg(feature = "with-openraft-rocksdb")]
     pub raft: Option<Arc<Raft<TypeConfig>>>,
     #[cfg(feature = "with-openraft-rocksdb")]
@@ -586,6 +652,8 @@ pub struct RocksDBStorage {
     pub pool: Arc<TokioMutex<RocksDBDaemonPool>>,
     #[cfg(feature = "with-openraft-rocksdb")]
     pub raft: Option<openraft::Raft<TypeConfig>>,
+    // Add the actual RocksDB instance
+    pub db: Arc<DB>,
 }
 
 /// Engine type configuration

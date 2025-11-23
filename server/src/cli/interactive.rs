@@ -17,6 +17,8 @@ use lib::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
     ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
     ConfigAction, parse_kv_operation, parse_storage_engine, KvAction, MigrateAction,
+    // NEW: Graph & Index domain actions
+    GraphAction, IndexAction, SearchOrder,
 };
 use crate::cli::handlers;
 use crate::cli::help_display::{
@@ -148,6 +150,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "start", "stop", "status", "auth", "authenticate", "register", "version", "health",
         "reload", "restart", "clear", "help", "exit", "daemon", "rest", "storage", "use",
         "quit", "q", "clean", "save", "show", "kv", "query", "exec", "migrate",
+        // NEW: Add graph and index for tab-completion & fuzzy help
+        "graph", "index",
     ];
     const FUZZY_MATCH_THRESHOLD: usize = 2;
 
@@ -1547,6 +1551,263 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 })
             }
         }
+        // === NEW: Graph Domain Commands ===
+        "graph" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: graph <insert-person|medical|delete|load> [args...]");
+                CommandType::Unknown
+            } else {
+                match remaining_args[0].to_lowercase().as_str() {
+                    "insert-person" => {
+                        let mut name = None;
+                        let mut age = None;
+                        let mut city = None;
+                        let mut i = 1;
+                        while i < remaining_args.len() {
+                            match remaining_args[i].as_str() {
+                                "name" | "name=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        name = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "age" | "age=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        age = val.parse::<i32>().ok();
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "city" | "city=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        city = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                _ => i += 1,
+                            }
+                        }
+                        CommandType::Graph(GraphAction::InsertPerson { name, age, city })
+                    }
+                    "medical" => {
+                        let mut patient_name = None;
+                        let mut patient_age = None;
+                        let mut diagnosis_code = None;
+                        let mut i = 1;
+                        while i < remaining_args.len() {
+                            match remaining_args[i].as_str() {
+                                "patient_name" | "patient_name=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        patient_name = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "patient_age" | "patient_age=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        patient_age = val.parse::<i32>().ok();
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "diagnosis_code" | "diagnosis_code=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        diagnosis_code = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                _ => i += 1,
+                            }
+                        }
+                        CommandType::Graph(GraphAction::MedicalRecord { patient_name, patient_age, diagnosis_code })
+                    }
+                    "delete" => {
+                        if remaining_args.len() > 1 {
+                            CommandType::Graph(GraphAction::DeleteNode { id: remaining_args[1].clone() })
+                        } else {
+                            eprintln!("Usage: graph delete <node_id>");
+                            CommandType::Unknown
+                        }
+                    }
+                    "load" => {
+                        if remaining_args.len() > 1 {
+                            CommandType::Graph(GraphAction::LoadData { path: remaining_args[1].clone().into() })
+                        } else {
+                            eprintln!("Usage: graph load <path/to/data.json>");
+                            CommandType::Unknown
+                        }
+                    }
+                    _ => {
+                        eprintln!("Unknown graph action: {}. Use insert-person, medical, delete, load", remaining_args[0]);
+                        CommandType::Unknown
+                    }
+                }
+            }
+        }
+        // === NEW: Index & Full-Text Search Commands ===
+        "index" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: index <create|drop|search|rebuild|list|stats|create-fulltext-index|drop-fulltext> [args...]");
+                CommandType::Unknown
+            } else {
+                match remaining_args[0].to_lowercase().as_str() {
+
+                    // 1. Standard Index Creation: index create <L> <P> OR index create FULLTEXT <L> <P>
+                    "create" => {
+                        // Needs at least two arguments: <arg1> <arg2>
+                        if remaining_args.len() < 3 {
+                            eprintln!("Usage: index create <Label> <property> (Standard B-Tree)");
+                            eprintln!("Usage: index create FULLTEXT <Label> <property> (Single-field Fulltext)");
+                            CommandType::Unknown
+                        } else {
+                            // Map the arguments directly to the flexible IndexAction::Create variant
+                            CommandType::Index(IndexAction::Create {
+                                arg1: remaining_args[1].clone(),
+                                arg2: remaining_args[2].clone(),
+                                arg3_property: remaining_args.get(3).cloned(),
+                            })
+                        }
+                    }
+
+                    // 2. Dedicated Multi-field Fulltext Creation: index createfulltext <name> --labels <L1,L2> --properties <P1,P2>
+                    "createfulltext" | "create-fulltext-index" => { // Support both styles
+                        // Check for index name presence
+                        let index_name = remaining_args.get(1).cloned();
+
+                        // Use the original flag parsing logic for labels/properties
+                        let mut labels = Vec::new();
+                        let mut properties = Vec::new();
+
+                        let mut i = 2; // Start after "index createfulltext <name>"
+                        while i < remaining_args.len() {
+                            let current_arg_lower = remaining_args[i].to_lowercase();
+
+                            if current_arg_lower == "--labels" && i + 1 < remaining_args.len() {
+                                labels = remaining_args[i + 1]
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                i += 2;
+                            // --- FIX: Change --props to --properties ---
+                            } else if current_arg_lower == "--properties" && i + 1 < remaining_args.len() {
+                                properties = remaining_args[i + 1]
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                i += 2;
+                            // ------------------------------------------
+                            } else {
+                                i += 1;
+                            }
+                        }
+
+                        if let Some(name) = index_name {
+                            if labels.is_empty() || properties.is_empty() {
+                                eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --properties <P1,P2>");
+                                CommandType::Unknown
+                            } else {
+                                // --- FIX: Use the correct new variant name ---
+                                CommandType::Index(IndexAction::CreateFulltext {
+                                    index_name: name,
+                                    labels,
+                                    properties,
+                                })
+                                // --------------------------------------------
+                            }
+                        } else {
+                            eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --properties <P1,P2>");
+                            CommandType::Unknown
+                        }
+                    }
+
+                    // 3. Drop Index Logic: index drop <L> <P> OR index drop fulltext <N>
+                    "drop" => {
+                        if remaining_args.len() < 3 {
+                            eprintln!("Usage: index drop <Label> <property> OR index drop fulltext <name>");
+                            CommandType::Unknown
+                        } else {
+                            let arg1 = remaining_args[1].to_lowercase();
+                            if arg1 == "fulltext" {
+                                // Fulltext drop: index drop fulltext <name>
+                                CommandType::Index(IndexAction::DropFulltext {
+                                    index_name: remaining_args[2].clone(),
+                                })
+                            } else {
+                                // Standard drop: index drop <Label> <property>
+                                CommandType::Index(IndexAction::Drop {
+                                    label: remaining_args[1].clone(),
+                                    property: remaining_args[2].clone(),
+                                })
+                            }
+                        }
+                    }
+                    
+                    // 4. Dedicated Drop Fulltext: index dropfulltext <name>
+                    "dropfulltext" | "drop-fulltext" => {
+                        if remaining_args.len() < 2 {
+                            eprintln!("Usage: index dropfulltext <name>");
+                            CommandType::Unknown
+                        } else {
+                            CommandType::Index(IndexAction::DropFulltext {
+                                index_name: remaining_args[1].clone(),
+                            })
+                        }
+                    }
+
+                    // 5. Search Logic: index search "query" [top|bottom N]
+                    "search" => {
+                        if remaining_args.len() < 2 {
+                            eprintln!("Usage: index search \"query\" [top|bottom|head|tail <N>]");
+                            return (CommandType::Unknown, Vec::new());
+                        }
+
+                        let term = remaining_args[1].clone();
+                        let mut order = None;
+
+                        // Check for order specification: <order_type> <N> (4 args total)
+                        if remaining_args.len() >= 4 {
+                            let order_type = remaining_args[2].to_lowercase();
+                            if let Ok(n) = remaining_args[3].parse::<usize>() {
+                                match order_type.as_str() {
+                                    "top" | "--top" | "head" | "--head" => order = Some(SearchOrder::Top { count: n }),
+                                    "bottom" | "--bottom" | "tail" | "--tail" => order = Some(SearchOrder::Bottom { count: n }),
+                                    _ => {
+                                        eprintln!("Invalid order type: {}. Use: top, bottom, head, or tail.", remaining_args[2]);
+                                        return (CommandType::Unknown, Vec::new());
+                                    }
+                                }
+                            } else {
+                                eprintln!("Invalid count provided for search order.");
+                                return (CommandType::Unknown, Vec::new());
+                            }
+                        } else if remaining_args.len() == 3 {
+                            // Check for single-arg flag style like "--top=5"
+                            let arg = remaining_args[2].to_lowercase();
+                            if let Some(stripped) = arg.strip_prefix("top=").or_else(|| arg.strip_prefix("--top=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Top { count: n });
+                            } else if let Some(stripped) = arg.strip_prefix("head=").or_else(|| arg.strip_prefix("--head=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Head { count: n });
+                            } else if let Some(stripped) = arg.strip_prefix("bottom=").or_else(|| arg.strip_prefix("--bottom=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Bottom { count: n });
+                            } else if let Some(stripped) = arg.strip_prefix("tail=").or_else(|| arg.strip_prefix("--tail=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Tail { count: n });
+                            }
+                        }
+
+                        CommandType::Index(IndexAction::Search { term, order })
+                    }
+                    
+                    // 6. Simple Actions
+                    "rebuild" => CommandType::Index(IndexAction::Rebuild),
+                    "list" => CommandType::Index(IndexAction::List),
+                    "stats" => CommandType::Index(IndexAction::Stats),
+                    
+                    _ => {
+                        eprintln!("Unknown index action. Use: create, drop, search, rebuild, list, stats, createfulltext, dropfulltext");
+                        CommandType::Unknown
+                    }
+                }
+            }
+        }
         _ => CommandType::Unknown,
     };
 
@@ -2097,6 +2358,16 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
             ).await?;
+            Ok(())
+        }
+        CommandType::Graph(action) => {
+            let engine = ensure_query_engine(state).await?;
+            crate::cli::handlers_graph::handle_graph_command(engine, action).await?;
+            Ok(())
+        }
+        CommandType::Index(action) => {
+            let engine = ensure_query_engine(state).await?;
+            crate::cli::handlers_index::handle_index_command(action).await?;
             Ok(())
         }
     }
