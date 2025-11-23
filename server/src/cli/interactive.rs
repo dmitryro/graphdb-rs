@@ -1644,7 +1644,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         // === NEW: Index & Full-Text Search Commands ===
         "index" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: index <create|drop|search|rebuild|list|stats|createfulltext|dropfulltext> [args...]");
+                eprintln!("Usage: index <create|drop|search|rebuild|list|stats|create-fulltext-index|drop-fulltext> [args...]");
                 CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
@@ -1666,8 +1666,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         }
                     }
 
-                    // 2. Dedicated Multi-field Fulltext Creation: index createfulltext <name> --labels <L1,L2> --props <P1,P2>
-                    "createfulltext" => {
+                    // 2. Dedicated Multi-field Fulltext Creation: index createfulltext <name> --labels <L1,L2> --properties <P1,P2>
+                    "createfulltext" | "create-fulltext-index" => { // Support both styles
                         // Check for index name presence
                         let index_name = remaining_args.get(1).cloned();
 
@@ -1686,13 +1686,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                     .filter(|s| !s.is_empty())
                                     .collect();
                                 i += 2;
-                            } else if current_arg_lower == "--props" && i + 1 < remaining_args.len() {
+                            // --- FIX: Change --props to --properties ---
+                            } else if current_arg_lower == "--properties" && i + 1 < remaining_args.len() {
                                 properties = remaining_args[i + 1]
                                     .split(',')
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty())
                                     .collect();
                                 i += 2;
+                            // ------------------------------------------
                             } else {
                                 i += 1;
                             }
@@ -1700,17 +1702,19 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
 
                         if let Some(name) = index_name {
                             if labels.is_empty() || properties.is_empty() {
-                                eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --props <P1,P2>");
+                                eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --properties <P1,P2>");
                                 CommandType::Unknown
                             } else {
+                                // --- FIX: Use the correct new variant name ---
                                 CommandType::Index(IndexAction::CreateFulltext {
                                     index_name: name,
                                     labels,
                                     properties,
                                 })
+                                // --------------------------------------------
                             }
                         } else {
-                            eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --props <P1,P2>");
+                            eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --properties <P1,P2>");
                             CommandType::Unknown
                         }
                     }
@@ -1738,7 +1742,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     
                     // 4. Dedicated Drop Fulltext: index dropfulltext <name>
-                    "dropfulltext" => {
+                    "dropfulltext" | "drop-fulltext" => {
                         if remaining_args.len() < 2 {
                             eprintln!("Usage: index dropfulltext <name>");
                             CommandType::Unknown

@@ -197,6 +197,7 @@ pub enum GraphAction {
     },
 }
 
+
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum IndexAction {
     #[command(about = "Create a standard B-Tree index or a single-field FULLTEXT index")]
@@ -240,24 +241,30 @@ pub enum IndexAction {
         property: String,
     },
 
-    #[command(about = "Create a new fulltext index (for multi-field/multi-label indices)")]
+    #[command(name = "create-fulltext-index", about = "Create a new fulltext index (for multi-field/multi-label indices)")]
     CreateFulltext {
         #[arg(help = "The name for the new index (e.g., people_fulltext_index)")]
         index_name: String,
 
-        #[arg(required = true, help = "List of Labels to include (e.g., Person Movie)", num_args = 1..)]
+        // FIX: Added `long` to allow the --labels flag.
+        // Use `value_delimiter = ','` to allow comma separation when using the flag.
+        // We must rely on the flags to unambiguously separate the two lists.
+        #[arg(required = true, long, help = "Comma-separated list of Labels (e.g., Person,Movie)", value_delimiter = ',', num_args = 1..)]
         labels: Vec<String>,
 
-        #[arg(required = true, help = "List of Properties to index (e.g., name title)", num_args = 1..)]
+        // FIX: Added `long` to allow the --properties flag.
+        // Use `value_delimiter = ','` to allow comma separation when using the flag.
+        #[arg(required = true, long, help = "Comma-separated list of Properties (e.g., name,title,summary)", value_delimiter = ',', num_args = 1..)]
         properties: Vec<String>
     },
 
-    #[command(about = "Drop a fulltext index")]
+    #[command(name = "drop-fulltext-index", about = "Drop a fulltext index")]
     DropFulltext {
         #[arg(help = "The name of the index to drop")]
         index_name: String
     }
 }
+
 
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum SearchOrder {

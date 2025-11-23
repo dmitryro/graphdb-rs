@@ -41,8 +41,6 @@ const MAX_ZMQ_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY_MS: u64 = 500;
 
 // Helper function to check if an index type string matches "FULLTEXT" case-insensitively.
-// This logic would be used if IndexAction was a single generic CREATE variant.
-// Currently, IndexAction variants separate the types, so this is illustrative.
 fn is_fulltext_type(index_type: &str) -> bool {
     index_type.to_lowercase() == "fulltext"
 }
@@ -136,7 +134,6 @@ async fn send_raw_zmq_request(port: u16, command: &str, params: Value) -> Result
     Err(anyhow!("Exhausted ZMQ retries without success."))
 }
 
-
 /// Initializes the Storage Daemon and ensures it is running and accessible via ZMQ.
 ///
 /// Returns the working ZMQ port of the running storage daemon.
@@ -156,27 +153,51 @@ pub async fn initialize_storage_for_index() -> Result<u16, anyhow::Error> {
 
     // Retrieve function pointers from the global singletons
     let start_storage_interactive = get_start_storage_fn();
-    let _stop_storage_interactive = get_stop_storage_fn(); 
+    let _stop_storage_interactive = get_stop_storage_fn();
 
     // 1. Load config
     let cwd = std::env::current_dir().context("cwd")?;
     let cfg_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
     let config = StorageConfig::load(&cfg_path).await?;
-    
+
     // 2. Look for ANY running storage daemon of the correct engine type
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    let engine_type_lower = config.storage_engine_type.to_string().to_lowercase();
     
+    // FIX: Convert the StorageEngineType to a String *once* for efficient, case-insensitive comparison
+    let target_engine_type = config.storage_engine_type.to_string();
+
     let running_daemons = daemon_registry
         .get_all_daemon_metadata()
         .await
         .unwrap_or_default()
         .into_iter()
         .filter(|m| {
-            m.service_type == "storage"
-                && m.engine_type.as_deref().map(|e| e.to_lowercase()) == Some(engine_type_lower.clone())
-                && m.pid > 0
-                && check_pid_validity_sync(m.pid)
+            // 1. Must be a storage service
+            let is_storage = m.service_type == "storage";
+            
+            // 2. Must match the engine type (case insensitive)
+            // Explicitly convert the target String into a &str for the comparison method.
+            let is_correct_engine = m.engine_type.as_deref()
+                .map(|e| e.eq_ignore_ascii_case(target_engine_type.as_str()))
+                .unwrap_or(false);
+
+            // 3. Must be a valid running process (this check often fails if the registry is non-persistent)
+            let is_running = m.pid > 0 && check_pid_validity_sync(m.pid);
+            
+            // === DEBUG LOGGING ADDED HERE ===
+            // This log will show which daemon metadata is being considered and why the filter fails.
+            println!(
+                "=================> Filtering daemon PID={} Port={} Type={:?}. Storage={} EngineMatch={} Running={}",
+                m.pid, 
+                m.port, 
+                m.engine_type,
+                is_storage, 
+                is_correct_engine, 
+                is_running
+            );
+            // ================================
+
+            is_storage && is_correct_engine && is_running
         })
         .collect::<Vec<_>>();
 
@@ -315,20 +336,41 @@ pub async fn handle_index_command(action: IndexAction) -> Result<()> {
     
     // 2. Determine command, parameters, and expected output message
     let (command, params, success_msg_prefix) = match action {
-        // FIX: Update pattern to match new field names (arg1, arg2, arg3_property)
-        IndexAction::Create { arg1: label, arg2: property, arg3_property: _ } => {
-            // NOTE: Command names use the daemon handler's expected 'index_' prefix.
-            (
-                "index_create".to_string(),
-                json!({ "label": label, "property": property }),
-                format!("B-Tree index created successfully on {}.{}", label, property),
-            )
+        // --- UPDATED LOGIC FOR IndexAction::Create ---
+        IndexAction::Create { arg1, arg2, arg3_property } => {
+            let (command_name, params, success_msg) = if let Some(property_name) = arg3_property {
+                // Case 1: Three arguments (e.g., create FULLTEXT Person name)
+                let index_type = &arg1; // Should be "FULLTEXT"
+                let label = &arg2;
+                let property = property_name;
+
+                if is_fulltext_type(index_type) {
+                    (
+                        "index_create".to_string(),
+                        // Pass type as FULLTEXT
+                        json!({ "type": "FULLTEXT", "label": label, "property": property }),
+                        format!("Single-field FULLTEXT index created successfully on {}.{}", label, property),
+                    )
+                } else {
+                    return Err(anyhow!("Invalid index type '{}' provided for 3-argument creation. Expected 'FULLTEXT'.", index_type));
+                }
+            } else {
+                // Case 2: Two arguments (e.g., create Person name)
+                let label = &arg1;
+                let property = &arg2;
+
+                (
+                    "index_create".to_string(),
+                    // Pass type as BTREE (default index)
+                    json!({ "type": "BTREE", "label": label, "property": property }),
+                    format!("B-Tree index created successfully on {}.{}", label, property),
+                )
+            };
+            (command_name, params, success_msg)
         },
+        // --- END UPDATED LOGIC FOR IndexAction::Create ---
+        
         IndexAction::CreateFulltext { index_name, labels, properties } => {
-            // This action already correctly routes to the full-text command.
-            // If the index type name (e.g., "FULLTEXT") were passed here as a string argument
-            // instead of being a separate enum variant, the case-insensitive logic (like
-            // checking is_fulltext_type) would be applied before routing the command.
             (
                 "index_create_fulltext".to_string(),
                 json!({ 

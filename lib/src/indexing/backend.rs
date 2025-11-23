@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use crate::config::{ StorageEngineType };
 use serde::{Serialize, Deserialize}; // <-- ADDED: Necessary traits for JSON operations
+use models::{Edge, Identifier, Vertex, };
+use models::errors::{GraphError, GraphResult};
+use models::identifiers::{SerializableUuid};
 
 // Result type for all indexing operations
 pub type IndexResult<T> = Result<T, IndexingError>;
@@ -91,6 +94,9 @@ pub trait IndexingBackend: Send + Sync + 'static {
     /// Returns a status or result string (placeholder for database `Value`).
     async fn rebuild_indexes(&self) -> IndexResult<String>;
 
+    /// Triggers a full rebuild of all indexes, which can be an expensive operation.
+    /// Returns a status or result string (placeholder for database `Value`).
+    async fn rebuild_indexes_with_data(&self, all_vertices: Vec<Vertex>) -> IndexResult<String>;
     /// Retrieves statistics and metrics about the current state of the indexes.
     /// Returns a result string (placeholder for database `Value`).
     async fn index_stats(&self) -> IndexResult<String>;
