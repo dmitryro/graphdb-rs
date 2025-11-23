@@ -21,7 +21,7 @@ use std::future::Future;
 use lib::commands::{
     parse_kv_operation, ConfigAction, DaemonCliCommand, HelpArgs, ReloadAction, RestartAction,
     RestCliCommand, SaveAction, ShowAction, StartAction, StatusAction, StopAction, StorageAction,
-    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction, MigrateAction,
+    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction, MigrateAction, GraphAction, IndexAction,
 };
 use lib::config::{
     self, load_storage_config_from_yaml, SelectedStorageConfig, StorageConfig,
@@ -33,10 +33,21 @@ use lib::config::{
     load_cli_config
 };
 use lib::config as config_mod;
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::cli::daemon_management;
 use crate::cli::handlers as handlers_mod;
 use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive };
-use crate::cli::handlers_utils::{ parse_storage_engine, handle_internal_daemon_run };
+use crate::cli::handlers_utils::{
+    START_STORAGE_FN_SINGLETON,
+    STOP_STORAGE_FN_SINGLETON,
+    parse_storage_engine, 
+    handle_internal_daemon_run,
+    StartStorageFn,
+    StopStorageFn,
+    adapt_start_storage,
+    adapt_stop_storage,
+};
+
 use crate::cli::help_display as help_display_mod;
 use crate::cli::interactive as interactive_mod;
 use crate::cli::handlers_queries::{
@@ -45,6 +56,9 @@ use crate::cli::handlers_queries::{
     handle_sql_query,
     handle_graphql_query,
 };
+
+pub use crate::cli::handlers_graph::handle_graph_command;
+pub use crate::cli::handlers_index::{ self, handle_index_command, initialize_storage_for_index };
 use lib::database::Database;
 use lib::query_parser::config::KeyValueStore;
 use lib::query_parser::{parse_query_from_string, QueryType};
@@ -269,6 +283,15 @@ pub enum Commands {
         key: String,
     },
     Migrate(MigrateAction),
+    
+    /// Graph domain actions: insert person, medical records, delete, load
+    #[clap(subcommand)]
+    Graph(GraphAction),
+
+    /// Full-text search and index management
+    #[clap(subcommand)]
+    Index(IndexAction),
+
 }
 
 // Use a TokioMutex to manage the singleton instance of the QueryExecEngine.
@@ -891,6 +914,34 @@ pub async fn run_single_command(
                 storage_daemon_port_arc.clone(),
             ).await?;
         }
+        // === NEW: Graph Domain Commands ===
+        Commands::Graph(action) => {
+            info!("Executing graph domain command: {:?}", action);
+            println!("===> Executing graph domain command: {:?}", action);
+            let engine = get_query_engine_singleton().await?;
+            handle_graph_command(engine, action).await?;
+        }
+
+        // === NEW: Index & Full-Text Search Commands ===
+        // === NEW: Index & Full-Text Search Commands ===
+        // === Index & Full-Text Search Commands ===
+        // === Index & Full-Text Search Commands ===
+        Commands::Index(action) => {
+            info!("Executing index command: {:?}", action);
+            println!("===> Executing index command: {:?}", action);
+
+            // 1. Ensure a Storage Daemon is running, initializing the client internally.
+            // NOTE: The function is called without arguments, keeping the cli.rs contract intact.
+            let daemon_port = handlers_index::initialize_storage_for_index()
+                .await
+                .context("Indexing command requires a running and healthy storage daemon.")?;
+            
+            // 2. Execute the command handler.
+            handlers_index::handle_index_command(action).await?;
+
+            info!("Index command executed successfully on port {}", daemon_port);
+            println!("===> Index command completed successfully.");
+        }
     }
     if env_var_set {
         info!("Removing GRAPHDB_CLI_INTERACTIVE after command execution");
@@ -904,6 +955,18 @@ pub async fn run_single_command(
 
 /// Main entry point for CLI command handling.
 pub async fn start_cli() -> Result<()> {
+    // --- REQUIRED INITIALIZATION STEP ---
+    // Set the global function pointers before running any command.
+    START_STORAGE_FN_SINGLETON
+        // FIX: Use the adapter function which returns the correct Pin<Box<dyn Future>> type
+        .set(adapt_start_storage as StartStorageFn)
+        .expect("Failed to set StartStorageFn singleton.");
+        
+    STOP_STORAGE_FN_SINGLETON
+        // FIX: Use the adapter function which returns the correct Pin<Box<dyn Future>> type
+        .set(adapt_stop_storage as StopStorageFn)
+        .expect("Failed to set StopStorageFn singleton.");
+
     let args_vec: Vec<String> = env::args().collect();
     if args_vec.len() > 1 && args_vec[1].to_lowercase() == "help" {
         let help_command_args: Vec<String> = args_vec.into_iter().skip(2).collect();

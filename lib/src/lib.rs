@@ -6,6 +6,7 @@ pub mod durability;
 pub mod query_parser;
 pub mod graph_engine;
 pub mod graph_evolution;
+pub mod graph_indexing;
 pub mod network_interfaces;
 pub mod plugin_system;
 pub mod database;
@@ -14,6 +15,7 @@ pub mod errors;
 pub mod query_exec_engine;
 pub mod storage_engine; // This declares the directory `storage_engine`
 pub mod transact_indexing;
+pub mod indexing;
 pub mod indexing_caching;
 pub mod daemon;
 pub mod util;
@@ -32,6 +34,9 @@ pub use models::queries::{Query, QueryOutputValue};
 pub use models::medical::{Login, User};
 pub use commands::*;
 pub use daemon::*;
+pub use graph_indexing::*;
+pub use graph_engine::*;
+pub use indexing::*;
 
 #[cfg(feature = "bench-suite")]
 extern crate test;

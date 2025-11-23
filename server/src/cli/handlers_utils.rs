@@ -1,15 +1,16 @@
 use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::sync::{oneshot, Mutex as TokioMutex, OnceCell};
 use tokio::task::JoinHandle;
 use tokio::fs as tokio_fs;
+use std::pin::Pin;
 use std::path::{PathBuf, Path};
 use std::io::{self, Write};
 use std::collections::HashMap;
 use std::fs;
 use std::process;
 use log::{info, error, warn, debug};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration as TokioDuration};
 use serde_json::{self, Value};
 use sysinfo::{System, Pid, ProcessesToUpdate};
 use zmq::{Context as ZmqContext, SocketType};
@@ -30,7 +31,87 @@ use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use crossterm::execute;
 use crossterm::cursor::MoveTo;
-use lib::daemon::daemon_registry::{DaemonMetadata};
+use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive };
+
+pub type StartStorageFn = fn(
+    Option<u16>,
+    Option<PathBuf>,
+    Option<StorageConfig>,
+    Option<String>,
+    Arc<TokioMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
+    Arc<TokioMutex<Option<u16>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send>>;
+
+pub type StopStorageFn = fn(
+    Option<u16>,
+    Arc<TokioMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
+    Arc<TokioMutex<Option<u16>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send>>;
+
+
+// Global OnceCell to hold the required function pointers
+// These must be set once by main.rs before any command execution.
+
+pub static START_STORAGE_FN_SINGLETON: OnceCell<StartStorageFn> = OnceCell::const_new();
+pub static STOP_STORAGE_FN_SINGLETON: OnceCell<StopStorageFn> = OnceCell::const_new();
+
+/// Helper function to retrieve StartStorageFn, panics if not initialized.
+pub fn get_start_storage_fn() -> StartStorageFn {
+    *START_STORAGE_FN_SINGLETON
+        .get()
+        .expect("StartStorageFn must be initialized before command execution.")
+}
+
+/// Helper function to retrieve StopStorageFn, panics if not initialized.
+pub fn get_stop_storage_fn() -> StopStorageFn {
+    *STOP_STORAGE_FN_SINGLETON
+        .get()
+        .expect("StopStorageFn must be initialized before command execution.")
+}
+
+
+// Assuming the original functions (not shown here) have signatures like:
+// pub async fn start_storage_interactive(...) -> Result<()> { ... }
+
+/// Adapter function to wrap start_storage_interactive's returned future in Pin<Box<...>>.
+#[allow(clippy::too_many_arguments)] // This signature is required by the StartStorageFn type
+pub fn adapt_start_storage(
+    port: Option<u16>,
+    config_path: Option<PathBuf>,
+    config: Option<StorageConfig>,
+    command_name: Option<String>,
+    shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
+    Box::pin(start_storage_interactive(
+        port,
+        config_path,
+        config,
+        command_name,
+        shutdown_tx,
+        handle,
+        port_arc,
+    ))
+}
+
+/// Adapter function to wrap stop_storage_interactive's returned future in Pin<Box<...>>.
+pub fn adapt_stop_storage(
+    port: Option<u16>,
+    shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
+    Box::pin(stop_storage_interactive(
+        port,
+        shutdown_tx,
+        handle,
+        port_arc,
+    ))
+}
 
 
 /// Helper to get the path to the current executable.
@@ -70,7 +151,7 @@ where
                 if attempt + 1 >= max_attempts {
                     return Err(e).context(format!("Failed to {} after {} attempts", desc, max_attempts));
                 }
-                sleep(Duration::from_millis(500)).await;
+                sleep(TokioDuration::from_millis(500)).await;
             }
         }
     }
@@ -488,4 +569,95 @@ pub fn map_engine_type_str(engine_str: &str) -> StorageEngineType {
             StorageEngineType::Sled
         }
     }
+}
+
+/// Returns the current active storage daemon port from the registry.
+/// Prioritizes healthy (zmq_ready + engine_synced) storage daemons.
+/// Falls back gracefully if nothing is perfect.
+pub async fn get_current_storage_port() -> u16 {
+    // GLOBAL_DAEMON_REGISTRY.get().await returns &AsyncRegistryWrapper
+    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    
+    let all_daemons = match registry.get_all_daemon_metadata().await {
+        Ok(daemons) => daemons,
+        Err(e) => {
+            warn!("Failed to read daemon metadata: {} — using fallback port 8052", e);
+            return 8052;
+        }
+    };
+    
+    // 1. Prefer fully healthy storage daemon
+    for meta in &all_daemons {
+        if meta.service_type == "storage" && meta.zmq_ready && meta.engine_synced {
+            info!("Using healthy storage daemon on port {} (ZMQ+sync ready)", meta.port);
+            return meta.port;
+        }
+    }
+    
+    // 2. Fallback: any running storage daemon
+    for meta in &all_daemons {
+        if meta.service_type == "storage" && meta.pid > 0 {
+            info!("Using running storage daemon on port {} (fallback)", meta.port);
+            return meta.port;
+        }
+    }
+    
+    // 3. Ultimate fallback
+    warn!("No storage daemon found in registry — defaulting to port 8052");
+    8052
+}
+
+/// Sync version for Lazy — safe, no block_on on current runtime
+/// Sync version — safe to call from Lazy, no nested runtime
+pub fn get_current_storage_port_sync() -> u16 {
+    use std::sync::OnceLock;
+    static CACHED_PORT: OnceLock<u16> = OnceLock::new();
+    
+    // Fast path — return cached value
+    if let Some(port) = CACHED_PORT.get() {
+        return *port;
+    }
+    
+    // Slow path — spawn a temporary runtime
+    let port = std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+                
+                let all = match registry.get_all_daemon_metadata().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Failed to get daemon metadata: {} — using fallback port 8052", e);
+                        return 8052;
+                    }
+                };
+                
+                // Prefer healthy storage daemon
+                for meta in &all {
+                    if meta.service_type == "storage" && meta.zmq_ready && meta.engine_synced {
+                        info!("Using healthy storage daemon on port {}", meta.port);
+                        return meta.port;
+                    }
+                }
+                
+                // Fallback to any storage daemon
+                for meta in &all {
+                    if meta.service_type == "storage" {
+                        info!("Using storage daemon on port {} (fallback)", meta.port);
+                        return meta.port;
+                    }
+                }
+                
+                warn!("No storage daemon found — using default port 8052");
+                8052
+            })
+    })
+    .join()
+    .unwrap_or(8052);
+    
+    let _ = CACHED_PORT.set(port);
+    port
 }

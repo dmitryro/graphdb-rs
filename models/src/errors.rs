@@ -23,6 +23,8 @@ pub enum GraphError {
     StorageError(String), // General storage operation error
     #[error("ZMQ error: {0}")]
     ZmqError(String), // General ZMQ error
+    #[error("Invalid Request: {0}")]
+    InvalidRequest(String),
     #[error("Timeout error: {0}")]
     TimeoutError(String),
     #[error("Daemon error: {0}")]
@@ -85,6 +87,12 @@ pub enum GraphError {
     Storage(String),
 }
 
+// Implement the From trait for &str
+impl From<&str> for GraphError {
+    fn from(error: &str) -> Self {
+        GraphError::InvalidRequest(error.to_string())
+    }
+}
 
 impl From<tokio::time::error::Elapsed> for GraphError {
     fn from(_: tokio::time::error::Elapsed) -> Self {

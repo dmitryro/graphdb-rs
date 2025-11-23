@@ -7,8 +7,9 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// In-memory graph structure used by the query / traversal engine.
+/// 
 pub struct Graph {
-    /// `Vertex.id` is a `SerializableUuid`.  We store the raw `Uuid` for fast
+    /// `Vertex.id` is a `SerializableUuid`. We store the raw `Uuid` for fast
     /// look-ups (the wrapper is just `pub struct SerializableUuid(pub Uuid)`).
     pub vertices: HashMap<Uuid, Vertex>,
 
@@ -16,8 +17,8 @@ pub struct Graph {
     pub edges: HashMap<Uuid, Edge>,
 
     // Fast adjacency look-ups
-    pub adjacency_list: HashMap<Uuid, HashSet<Uuid>>, // from vertex id → set of edge ids
-    pub inbound_list:   HashMap<Uuid, HashSet<Uuid>>, // to   vertex id → set of edge ids
+    pub adjacency_list: HashMap<Uuid, HashSet<Uuid>>, // from vertex id → set of edge ids (Outbound)
+    pub inbound_list:   HashMap<Uuid, HashSet<Uuid>>, // to   vertex id → set of edge ids (Inbound)
 }
 
 impl Graph {
@@ -31,17 +32,17 @@ impl Graph {
         }
     }
 
-    /// Insert a vertex.  The vertex already carries its own `id`.
+    /// Insert a vertex. The vertex already carries its own `id`.
     pub fn add_vertex(&mut self, vertex: Vertex) {
-        let id = vertex.id.0;               // `SerializableUuid` → `Uuid`
+        let id = vertex.id.0; // `SerializableUuid` → `Uuid`
         self.vertices.insert(id, vertex);
     }
 
     /// Insert an edge and update the adjacency lists.
     pub fn add_edge(&mut self, edge: Edge) {
-        let from = edge.outbound_id.0;      // ✅ Convert SerializableUuid → Uuid
-        let to   = edge.inbound_id.0;       // ✅ Convert SerializableUuid → Uuid
-        let edge_id = edge.id.0;            // ✅ Convert SerializableUuid → Uuid
+        let from = edge.outbound_id.0; // ✅ Convert SerializableUuid → Uuid
+        let to   = edge.inbound_id.0;  // ✅ Convert SerializableUuid → Uuid
+        let edge_id = edge.id.0;       // ✅ Convert SerializableUuid → Uuid
 
         self.edges.insert(edge_id, edge);
         self.adjacency_list.entry(from).or_default().insert(edge_id);
@@ -64,7 +65,76 @@ impl Graph {
     }
 
     // -----------------------------------------------------------------
-    // Add more engine-level helpers here (remove_vertex, remove_edge,
-    // BFS/DFS, pattern-match integration, etc.)
+    // NEW MUTATION HELPERS
     // -----------------------------------------------------------------
+
+    /// Remove a vertex and all its associated edges.
+    pub fn remove_vertex(&mut self, vertex_id: &Uuid) -> Option<Vertex> {
+        // 1. Remove the vertex itself
+        let removed_vertex = self.vertices.remove(vertex_id)?;
+
+        // 2. Collect all edge IDs to be removed (both incoming and outgoing)
+        let outgoing_edges = self.adjacency_list.remove(vertex_id).unwrap_or_default();
+        let incoming_edges = self.inbound_list.remove(vertex_id).unwrap_or_default();
+
+        // 3. Process outgoing edges: remove from `edges` and destination's `inbound_list`
+        for edge_id in outgoing_edges {
+            if let Some(edge) = self.edges.remove(&edge_id) {
+                let to_id = edge.inbound_id.0;
+                if let Some(edge_set) = self.inbound_list.get_mut(&to_id) {
+                    edge_set.remove(&edge_id);
+                    // Cleanup: remove the entry if the set is empty
+                    if edge_set.is_empty() {
+                        self.inbound_list.remove(&to_id);
+                    }
+                }
+            }
+        }
+
+        // 4. Process incoming edges: remove from `edges` and source's `adjacency_list`
+        // Note: The edge is already removed from `self.edges` if it was in `outgoing_edges`, but this is cheap.
+        for edge_id in incoming_edges {
+            if let Some(edge) = self.edges.remove(&edge_id) {
+                let from_id = edge.outbound_id.0;
+                if let Some(edge_set) = self.adjacency_list.get_mut(&from_id) {
+                    edge_set.remove(&edge_id);
+                    // Cleanup: remove the entry if the set is empty
+                    if edge_set.is_empty() {
+                        self.adjacency_list.remove(&from_id);
+                    }
+                }
+            }
+        }
+        
+        Some(removed_vertex)
+    }
+
+    /// Remove a single edge by its `Uuid`.
+    pub fn remove_edge(&mut self, edge_id: &Uuid) -> Option<Edge> {
+        // 1. Remove the edge itself
+        let removed_edge = self.edges.remove(edge_id)?;
+        
+        let from_id = removed_edge.outbound_id.0;
+        let to_id = removed_edge.inbound_id.0;
+
+        // 2. Remove the edge from the source vertex's adjacency list
+        if let Some(edge_set) = self.adjacency_list.get_mut(&from_id) {
+            edge_set.remove(edge_id);
+            // Cleanup: remove the entry if the set is empty
+            if edge_set.is_empty() {
+                self.adjacency_list.remove(&from_id);
+            }
+        }
+
+        // 3. Remove the edge from the destination vertex's inbound list
+        if let Some(edge_set) = self.inbound_list.get_mut(&to_id) {
+            edge_set.remove(edge_id);
+            // Cleanup: remove the entry if the set is empty
+            if edge_set.is_empty() {
+                self.inbound_list.remove(&to_id);
+            }
+        }
+
+        Some(removed_edge)
+    }
 }
