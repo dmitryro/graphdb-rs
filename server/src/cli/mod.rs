@@ -14,6 +14,8 @@ pub mod handlers_storage;
 pub mod handlers_rest;
 pub mod handlers_all;
 pub mod handlers_queries;
+pub mod handlers_index;
+pub mod handlers_graph;
 pub mod query_classifier;
 /*
 pub mod serializers;
@@ -81,7 +83,18 @@ pub use handlers_utils::{
     storage_engine_type_to_str,
     parse_show_command,
     parse_storage_engine,
+    StartStorageFn,
+    StopStorageFn,
+    START_STORAGE_FN_SINGLETON,
+    STOP_STORAGE_FN_SINGLETON,
+    get_start_storage_fn,
+    get_stop_storage_fn,
+    convert_hashmap_to_selected_config,
+    adapt_start_storage,
+    adapt_stop_storage,
 };
+
+
 pub use handlers_queries::{
     handle_interactive_query,
     handle_kv_command,
@@ -89,6 +102,16 @@ pub use handlers_queries::{
     handle_exec_command,
     handle_query_command,
 };
+
+pub use handlers_index::{
+    handle_index_command,
+    initialize_storage_for_index,
+};
+
+pub use handlers_graph::{
+    handle_graph_command,
+};
+
 pub use handlers_main::{
     DaemonArgs,
     display_daemon_status,
@@ -99,7 +122,8 @@ pub use handlers_main::{
     stop_daemon_instance_interactive,
     reload_daemon_interactive,
     handle_show_main_config_command,
-};  
+}; 
+
 pub use handlers_storage::{
     storage,
     show_storage,
@@ -120,6 +144,7 @@ pub use handlers_storage::{
     handle_show_storage_command_interactive,
     handle_show_storage_config_command,
 };
+
 pub use handlers_rest::{
     RestArgs,
     rest,
@@ -159,6 +184,7 @@ pub use handlers::{
 pub use interactive::{
     run_cli_interactive,
 };
+
 pub use help_display::{
     print_help_clap_generated,
     print_filtered_help_clap_generated,
@@ -166,6 +192,7 @@ pub use help_display::{
     print_interactive_help,
     print_interactive_filtered_help,
 };
+
 pub use daemon_management::{
     start_daemon_process,
     stop_daemon_api_call,

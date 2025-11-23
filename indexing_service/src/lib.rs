@@ -1,14 +1,17 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+// indexing_service/src/lib.rs
+pub mod index;
+pub mod fulltext;
+pub mod query;
+pub mod adapters;
+pub mod errors;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub use index::*;
+pub use fulltext::*;
+pub use query::*;
+pub use adapters::*;
+pub use errors::*;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// Re-export the main service
+pub use index::IndexingService;
+pub use index::indexing_service;
+pub use index::init_indexing_service;

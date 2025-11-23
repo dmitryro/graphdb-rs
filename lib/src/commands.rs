@@ -16,6 +16,20 @@ use uuid::Uuid;
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
 
+// Helper structs for variants that need Args implementation
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct PortArgs {
+    /// Port number
+    #[arg(short, long)]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, PartialEq, Clone, Args)]
+pub struct HelpArgs {
+    pub filter_command: Option<String>,
+    pub command_path: Vec<String>,
+}
+
 /// Custom parser for storage engine to accept many aliases (rocksdb, rocks-db, postgres, postgresql, postgre-sql, mysql, my-sql, inmemory, in-memory).
 pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     match engine.to_lowercase().as_str() {
@@ -50,7 +64,6 @@ pub struct UnifiedQuery {
     pub query: String,
     pub language: Option<String>, // None → infer
 }
-
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CommandType {
@@ -93,7 +106,6 @@ pub enum CommandType {
     StatusStorage(Option<u16>),
     StatusCluster,
     StatusRaft(Option<u16>),
-    //ShowStorage,
     // Authentication and User Management
     Auth { username: String, password: String },
     Authenticate { username: String, password: String },
@@ -135,12 +147,150 @@ pub enum CommandType {
     Migrate(MigrateAction),
     /// Unified query command (used by `query`, `exec`, `-q`, `-c`, and bare strings)
     Query { query: String, language: Option<String> },
+    // Graph and Index commands - plain variants, no attributes
+    Graph(GraphAction),
+    Index(IndexAction),
 }
 
-#[derive(Debug, PartialEq, Clone, Args)]
-pub struct HelpArgs {
-    pub filter_command: Option<String>,
-    pub command_path: Vec<String>,
+// lib/src/commands.rs
+
+// BEFORE (your current code):
+// pub enum GraphAction { ... }
+
+// AFTER — this is the ONLY change you need:
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum GraphAction {
+    #[command(about = "Insert a new Person node")]
+    InsertPerson {
+        #[arg(long, help = "Name of the person")]
+        name: Option<String>,
+
+        #[arg(long, help = "Age of the person")]
+        age: Option<i32>,
+
+        #[arg(long, help = "City of residence")]
+        city: Option<String>,
+    },
+
+    #[command(about = "Create a medical record (patient + diagnosis)")]
+    MedicalRecord {
+        #[arg(long, help = "Patient name")]
+        patient_name: Option<String>,
+
+        #[arg(long, help = "Patient age")]
+        patient_age: Option<i32>,
+
+        #[arg(long, help = "ICD diagnosis code")]
+        diagnosis_code: Option<String>,
+    },
+
+    #[command(about = "Delete node by ID")]
+    DeleteNode {
+        #[arg(help = "Node ID (UUID)")]
+        id: String,
+    },
+
+    #[command(about = "Bulk load data from JSON/CSV")]
+    LoadData {
+        #[arg(help = "Path to data file")]
+        path: std::path::PathBuf,
+    },
+}
+
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum IndexAction {
+    #[command(about = "Create a standard B-Tree index or a single-field FULLTEXT index")]
+    Create {
+        // This will capture either "FULLTEXT" (in 3-arg usage) or the Label (in 2-arg usage)
+        #[arg(help = "The index type (e.g., FULLTEXT) or the Label (e.g., Person)")]
+        arg1: String,
+        
+        // This will capture either the Label (in 3-arg usage) or the Property (in 2-arg usage)
+        #[arg(help = "The Label (e.g., Person) or the Property (e.g., name)")]
+        arg2: String,
+        
+        // This makes the third argument optional, allowing both `create <A> <B>` and `create <A> <B> <C>`
+        #[arg(help = "The Property (e.g., name). Required if index type is provided.")]
+        arg3_property: Option<String>,
+    },
+
+    #[command(about = "Search the index")]
+    Search {
+        #[arg(help = "The term to search for (e.g., \"Oliver Stone\")")]
+        term: String,
+        
+        #[clap(subcommand)]
+        order: Option<SearchOrder>,
+    },
+
+    #[command(about = "Rebuild all existing indexes")]
+    Rebuild,
+
+    #[command(about = "List all existing indexes")]
+    List,
+
+    #[command(about = "Show statistics about all indexes")]
+    Stats,
+
+    #[command(about = "Drop a standard index")]
+    Drop {
+        #[arg(help = "The Label (e.g., Person)")]
+        label: String,
+        #[arg(help = "The Property (e.g., name)")]
+        property: String,
+    },
+
+    #[command(name = "create-fulltext-index", about = "Create a new fulltext index (for multi-field/multi-label indices)")]
+    CreateFulltext {
+        #[arg(help = "The name for the new index (e.g., people_fulltext_index)")]
+        index_name: String,
+
+        // FIX: Added `long` to allow the --labels flag.
+        // Use `value_delimiter = ','` to allow comma separation when using the flag.
+        // We must rely on the flags to unambiguously separate the two lists.
+        #[arg(required = true, long, help = "Comma-separated list of Labels (e.g., Person,Movie)", value_delimiter = ',', num_args = 1..)]
+        labels: Vec<String>,
+
+        // FIX: Added `long` to allow the --properties flag.
+        // Use `value_delimiter = ','` to allow comma separation when using the flag.
+        #[arg(required = true, long, help = "Comma-separated list of Properties (e.g., name,title,summary)", value_delimiter = ',', num_args = 1..)]
+        properties: Vec<String>
+    },
+
+    #[command(name = "drop-fulltext-index", about = "Drop a fulltext index")]
+    DropFulltext {
+        #[arg(help = "The name of the index to drop")]
+        index_name: String
+    }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum SearchOrder {
+    #[command(about = "Get top N results (highest scores first)")]
+    Top {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
+    
+    #[command(about = "Get top N results (alias for 'top')")]
+    Head {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
+    
+    #[command(about = "Get bottom N results (lowest scores first)")]
+    Bottom {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
+    
+    #[command(about = "Get bottom N results (alias for 'bottom')")]
+    Tail {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
 }
 
 /// Arguments for the unified query command.
@@ -287,6 +437,14 @@ pub enum Commands {
     /// Migrates one store to another.
     #[clap(alias = "m")]
     Migrate(MigrateAction),
+
+    /// Graph engine domain-specific operations (insert, medical, delete, load)
+    #[clap(subcommand)]
+    Graph(GraphAction),
+
+    /// Full-text and indexing operations
+    #[clap(subcommand)]
+    Index(IndexAction),
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
