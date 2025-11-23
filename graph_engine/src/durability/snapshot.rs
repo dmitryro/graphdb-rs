@@ -1,6 +1,6 @@
 // lib/src/durability/snapshot.rs
-use crate::graph_engine::Graph;
-use crate::graph_engine::{Vertex, Edge};
+use crate::graph::Graph;
+use models::{Vertex, Edge};
 use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::{Path, PathBuf};

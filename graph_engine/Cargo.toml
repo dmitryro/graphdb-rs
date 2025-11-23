@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-indexing_service = { path = "../indexing_service" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
 lib = { path = "../lib" }
 models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] }
 caching = { path = "../caching" }
 uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] }
+argon2 = "0.5.3"
+base64 = "0.22.1"
+bincode = { version = "2.0.1", features = ["serde", "derive"] }
+log = "0.4.27"
+chrono = { version = "0.4.39", features = ["serde"] }
