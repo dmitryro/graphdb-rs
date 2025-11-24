@@ -757,6 +757,32 @@ pub struct PostgreSQLConfig {
     pub port: Option<u16>,
 }
 
+/// Generic DB configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenericConfig {
+    #[serde(with = "storage_engine_type_serde")]
+    pub storage_engine_type: StorageEngineType,
+    #[serde(with = "option_path_buf_serde", default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub current: Option<bool>,
+     #[serde(default)]
+   pub active: Option<bool>,
+}
+
+
 /// Raw storage configuration from YAML
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case")]
