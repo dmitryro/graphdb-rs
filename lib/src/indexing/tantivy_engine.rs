@@ -15,6 +15,7 @@ use crate::indexing::backend::{IndexingBackend, Document, IndexingError};
 use crate::config::config_structs::StorageEngineType;
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
 use crate::storage_engine::storage_engine::{ GraphStorageEngine, get_global_storage_registry};
+use crate::storage_engine::storage_utils::{create_edge_key, deserialize_edge, deserialize_vertex, serialize_edge, serialize_vertex};
 use models::{Edge, Identifier, Vertex, };
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::{SerializableUuid};
@@ -52,32 +53,33 @@ struct TantivyManager {
 impl TantivyManager {
     pub fn new(storage_path: &Path) -> Result<Self> {
         let mut schema_builder = Schema::builder();
-
+        
+        // Revert back to i64
         let node_id_field = schema_builder.add_i64_field("node_id", INDEXED | STORED);
         let fulltext_content_field = schema_builder.add_text_field("fulltext_content", TEXT | STORED);
-
+        
         let schema = schema_builder.build();
-
+        
         // Use persistent path instead of temp directory
         let index_path = storage_path.join("tantivy_index");
         println!("===========> Creating Tantivy index at: {:?}", index_path);
         
         std::fs::create_dir_all(&index_path)
             .context(format!("Failed to create index directory at {:?}", index_path))?;
-
+        
         let directory = MmapDirectory::open(&index_path)
             .context(format!("Failed to open MmapDirectory at {:?}", index_path))?;
-
+        
         let index = Index::open_or_create(directory, schema.clone())
             .context("Failed to create or open Tantivy index")?;
-
+        
         let writer = index.writer(50_000_000)
             .context("Failed to create Tantivy IndexWriter")?;
-
+        
         let reader = index.reader()
             .context("Failed to create Tantivy IndexReader")?;
         let searcher = reader.searcher();
-
+        
         Ok(TantivyManager {
             index,
             schema,
@@ -400,29 +402,61 @@ impl IndexingBackend for TantivyIndexingEngine {
         Ok(format!("Full-text index dropped: {}", name))
     }
 
-
     async fn fulltext_search(&self, query: &str, limit: usize) -> IndexResult<String> {
+        // Commit first
         self.manager.commit().await
             .map_err(|e| IndexingError::Other(e.to_string()))?;
 
-        let searcher = self.manager.searcher.read().unwrap();
-        let query_parser = QueryParser::for_index(&self.manager.index, vec![self.manager.fulltext_content_field]);
-        let tantivy_query = query_parser.parse_query(query)
-            .map_err(|e| IndexingError::Other(format!("Query parse error: {}", e)))?;
+        // Drop searcher guard before any .await
+        let top_docs = {
+            let searcher = self.manager.searcher.read().unwrap();
+            let query_parser = QueryParser::for_index(&self.manager.index, vec![self.manager.fulltext_content_field]);
+            let tantivy_query = query_parser.parse_query(query)
+                .map_err(|e| IndexingError::Other(format!("Query parse error: {}", e)))?;
 
-        let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(limit))?;
+            searcher.search(&tantivy_query, &TopDocs::with_limit(limit))
+                .map_err(|e| IndexingError::TantivyError(e))?
+        };
 
-        let results: Vec<JsonValue> = top_docs.into_iter()
-            .filter_map(|(score, doc_address)| {
-                let retrieved_doc: TantivyDocument = searcher.doc(doc_address).ok()?;
-                let node_id = retrieved_doc.get_first(self.manager.node_id_field)?
-                    .as_i64()?;
-                Some(json!({
-                    "node_id": node_id,
-                    "score": score,
-                }))
-            })
-            .collect();
+        // Now safe to .await
+        let registry = crate::storage_engine::storage_engine::get_global_storage_registry().await;
+        let guard = registry.read().await;
+        let storage = guard.values().next()
+            .ok_or_else(|| IndexingError::Other("No storage engine available".into()))?
+            .clone();
+
+        let all_vertices = storage.get_all_vertices().await
+            .map_err(|e| IndexingError::Other(format!("Failed to fetch vertices: {}", e)))?;
+
+        let mut vertex_map: HashMap<i64, Vertex> = HashMap::new();
+        for vertex in all_vertices {
+            let node_id = vertex.id.0.as_u128() as i64;
+            vertex_map.insert(node_id, vertex);
+        }
+
+        let mut results = Vec::new();
+
+        for (score, doc_address) in top_docs {
+            let searcher = self.manager.searcher.read().unwrap();
+            let retrieved_doc: TantivyDocument = searcher.doc(doc_address)
+                .map_err(|e| IndexingError::TantivyError(e))?;
+
+            if let Some(node_id_val) = retrieved_doc.get_first(self.manager.node_id_field) {
+                if let Some(node_id) = node_id_val.as_i64() {
+                    if let Some(vertex) = vertex_map.get(&node_id) {
+                        let vertex_json = json!({
+                            "id": vertex.id.to_string(),
+                            "label": vertex.label.to_string(),
+                            "properties": vertex.properties,
+                        });
+                        results.push(json!({
+                            "score": score,
+                            "vertex": vertex_json
+                        }));
+                    }
+                }
+            }
+        }
 
         Ok(json!({
             "status": "success",
@@ -453,17 +487,17 @@ impl IndexingBackend for TantivyIndexingEngine {
         for (i, meta) in fulltext_indexes.iter().enumerate() {
             println!("===========> Index {}: labels={:?}, properties={:?}", i, meta.labels, meta.properties);
         }
-
+        
         // 6. Index Vertices
         let mut writer = self.manager.writer.lock().await;
         
         for vertex in all_vertices {
+            // Revert back to i64
             let node_id = vertex.id.0.as_u128() as i64;
             let vertex_label = &vertex.label;
             let mut content = String::new();
             
             for meta in &fulltext_indexes {
-                // Fix: Use explicit string comparison
                 let matches = meta.labels.is_empty() || 
                     meta.labels.iter().any(|l| l.as_ref() as &str == vertex_label.as_ref() as &str);
                 
@@ -481,6 +515,7 @@ impl IndexingBackend for TantivyIndexingEngine {
             
             if !content.is_empty() {
                 let mut doc = TantivyDocument::new();
+                // Revert back to i64
                 doc.add_i64(self.manager.node_id_field, node_id);
                 doc.add_text(self.manager.fulltext_content_field, content.trim());
                 writer.add_document(doc).map_err(|e| IndexingError::TantivyError(e))?;
@@ -839,4 +874,3 @@ mod tests {
         Ok(())
     }
 }
-

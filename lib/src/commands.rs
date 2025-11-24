@@ -147,6 +147,8 @@ pub enum CommandType {
     Migrate(MigrateAction),
     /// Unified query command (used by `query`, `exec`, `-q`, `-c`, and bare strings)
     Query { query: String, language: Option<String> },
+    /// Unified query command (used by `visualize`, `-q`, `-c`, and bare strings)
+    Visualize { query: String, language: Option<String> },
     // Graph and Index commands - plain variants, no attributes
     Graph(GraphAction),
     Index(IndexAction),

@@ -1,0 +1,15 @@
+[package]
+name = "graph_visualizing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+graph_engine = { path = "../graph_engine", version = "0.1.0"}
+lib = { path = "../lib", version = "0.1.0"}
+models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] }
+caching = { path = "../caching" }
+uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] }
+plotters-backend = "0.3.7"
+plotters = "0.3.7"
+ratatui = "0.29.0"
+crossterm = "0.29.0"

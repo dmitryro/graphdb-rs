@@ -57,6 +57,12 @@ use crate::cli::handlers_queries::{
     handle_graphql_query,
 };
 
+use crate::cli::handlers_visualizing::{
+    handle_cypher_query_visualizing,
+    handle_sql_query_visualizing,
+    handle_graphql_query_visualizing,
+};
+
 pub use crate::cli::handlers_graph::handle_graph_command;
 pub use crate::cli::handlers_index::{ self, handle_index_command, initialize_storage_for_index };
 use lib::database::Database;
@@ -256,6 +262,12 @@ pub enum Commands {
     #[clap(name = "query", alias = "q", alias = "e", alias = "exec", alias = "unified")]
     Query {
         #[arg(value_name = "QUERY")]
+        query: String,
+        #[arg(long, short = 'l', value_name = "LANG", help = "Query language: sql, cypher, graphql (auto-detected if omitted)")]
+        language: Option<String>,
+    },
+    Visualize {
+        #[arg(value_name = "VISUALIZE")]
         query: String,
         #[arg(long, short = 'l', value_name = "LANG", help = "Query language: sql, cypher, graphql (auto-detected if omitted)")]
         language: Option<String>,
@@ -820,6 +832,54 @@ pub async fn run_single_command(
                 "cypher" => handle_cypher_query(query_engine, query_to_execute).await?,
                 "sql" => handle_sql_query(query_engine, query_to_execute).await?,
                 "graphql" => handle_graphql_query(query_engine, query_to_execute).await?,
+                "unknown" | "" => {
+                    return Err(anyhow!(
+                        "Could not detect query language. Use --language sql|cypher|graphql"
+                    ));
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Unsupported query language: '{}'. Use sql, cypher, or graphql",
+                        effective_lang
+                    ));
+                }
+            }
+        }
+        Commands::Visualize { query, language } => {
+            let raw_query = query.trim().to_string();
+            let detected_lang = if language.is_none() {
+                detect_query_language(&raw_query)
+            } else {
+                ""
+            };
+
+            let effective_lang = language
+                .as_deref()
+                .unwrap_or(detected_lang)
+                .trim()
+                .to_lowercase();
+
+            let query_to_execute = if effective_lang == "cypher" {
+                sanitize_cypher_query(&raw_query)
+            } else {
+                raw_query.clone()
+            };
+
+            info!(
+                "Executing query: '{}', language: {} (detected: {}, explicit: {:?})",
+                query_to_execute, effective_lang, detected_lang, language
+            );
+            println!(
+                "===> Executing query: '{}', language: {}",
+                query_to_execute, effective_lang
+            );
+
+            let query_engine = get_query_engine_singleton().await?;
+
+            match effective_lang.as_str() {
+                "cypher" => handle_cypher_query_visualizing(query_engine, query_to_execute).await?,
+                "sql" => handle_sql_query_visualizing(query_engine, query_to_execute).await?,
+                "graphql" => handle_graphql_query_visualizing(query_engine, query_to_execute).await?,
                 "unknown" | "" => {
                     return Err(anyhow!(
                         "Could not detect query language. Use --language sql|cypher|graphql"
