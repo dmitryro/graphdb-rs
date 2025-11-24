@@ -16,6 +16,7 @@ pub mod handlers_all;
 pub mod handlers_queries;
 pub mod handlers_index;
 pub mod handlers_graph;
+pub mod handlers_visualizing;
 pub mod query_classifier;
 /*
 pub mod serializers;
@@ -101,6 +102,9 @@ pub use handlers_queries::{
     handle_unified_query,
     handle_exec_command,
     handle_query_command,
+    handle_cypher_query,
+    handle_sql_query,
+    handle_graphql_query,
 };
 
 pub use handlers_index::{
@@ -110,6 +114,14 @@ pub use handlers_index::{
 
 pub use handlers_graph::{
     handle_graph_command,
+};
+
+pub use handlers_visualizing:: {
+    handle_cypher_query_visualizing,
+    handle_sql_query_visualizing,
+    handle_graphql_query_visualizing,
+    handle_unified_query_visualizing,
+    handle_interactive_query_visualizing,
 };
 
 pub use handlers_main::{

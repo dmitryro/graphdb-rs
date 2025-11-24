@@ -2,9 +2,7 @@
 // Updated: 2025-07-04 - Refactored to use new storage engine names and removed obsolete imports.
 
 #![cfg_attr(feature = "bench-suite", feature(test))]
-pub mod durability;
 pub mod query_parser;
-pub mod graph_engine;
 pub mod graph_evolution;
 pub mod graph_indexing;
 pub mod network_interfaces;
@@ -35,7 +33,6 @@ pub use models::medical::{Login, User};
 pub use commands::*;
 pub use daemon::*;
 pub use graph_indexing::*;
-pub use graph_engine::*;
 pub use indexing::*;
 
 #[cfg(feature = "bench-suite")]
@@ -81,12 +78,6 @@ pub use crate::config::RocksDBStorage; // Re-export the new RocksDB storage
 // Do NOT glob-import engine and models together to avoid ambiguity
 // Instead, re-export them under namespaces
 pub mod api {
-    pub use crate::graph_engine::{
-        Graph,
-        Edge as EngineEdge,
-        Vertex as EngineVertex,
-        properties::PropertyValue as EnginePropertyValue
-    };
     pub use models::{
         Edge as ModelEdge,
         Vertex as ModelVertex,

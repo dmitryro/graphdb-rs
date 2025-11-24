@@ -1,0 +1,1 @@
+// connectors/src/adapters.rs

@@ -29,7 +29,7 @@ use lib::storage_engine::storage_engine::{
     GLOBAL_STORAGE_ENGINE_MANAGER,
 };
 use lib::commands::parse_kv_operation;
-use lib::graph_engine::graph::Graph;
+use graph_engine::graph::Graph;
 use lib::storage_engine::rocksdb_storage::{ROCKSDB_DB, ROCKSDB_POOL_MAP};
 use lib::storage_engine::sled_storage::{SLED_DB, SLED_POOL_MAP};
 use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, 
@@ -45,7 +45,7 @@ use lib::storage_engine::rocksdb_client::RocksDBClient;
 use zmq::{Context as ZmqContext, Message};
 use base64::Engine;
 
-async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) -> Result<()> {
+pub async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) -> Result<()> {
     match engine.execute(query_string).await {
         Ok(result) => {
             println!("Query Result:\n{}", serde_json::to_string_pretty(&result)?);
@@ -206,7 +206,7 @@ pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -
     Ok(())
 }
 
-fn do_zmq_request(addr: &str, request_data: &[u8]) -> Result<Value> {
+pub fn do_zmq_request(addr: &str, request_data: &[u8]) -> Result<Value> {
     let zmq_context = zmq::Context::new();
     let client = zmq_context
         .socket(zmq::REQ)
@@ -1342,7 +1342,7 @@ pub async fn execute_query(
 }
 
 // Use this instead of format_result
-fn format_json_result(result: &serde_json::Value) -> String {
+pub fn format_json_result(result: &serde_json::Value) -> String {
     serde_json::to_string_pretty(result)
         .unwrap_or_else(|_| result.to_string())
 }
