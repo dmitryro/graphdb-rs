@@ -3,14 +3,15 @@ pub mod wal;
 pub mod snapshot;
 pub mod recovery;
 
-use crate::graph_engine::{Vertex, Edge};
+use models::{Vertex, Edge, properties};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
+use crate::graph::{ Graph };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GraphOp {
     InsertVertex(Vertex),
-    UpdateVertex(Uuid, Vec<(String, crate::graph_engine::properties::PropertyValue)>),
+    UpdateVertex(Uuid, Vec<(String, properties::PropertyValue)>),
     DeleteVertex(Uuid),
     InsertEdge(Edge),
     DeleteEdge(Uuid),
@@ -33,8 +34,8 @@ impl DurabilityManager {
         self.wal.append(op)
     }
 
-    pub async fn create_snapshot(&mut self, graph: &crate::graph_engine::Graph) -> Result<(), Box<dyn std::error::Error>> {
-        self.snapshot.create(graph, self.wal.current_offset()).await
+    pub async fn create_snapshot(&mut self, graph: Graph) -> Result<(), Box<dyn std::error::Error>> {
+        self.snapshot.create(&graph, self.wal.current_offset()).await
     }
 
     pub fn latest_snapshot(&self) -> Option<snapshot::Snapshot> {
