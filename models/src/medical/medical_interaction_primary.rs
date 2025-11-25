@@ -27,3 +27,15 @@ impl ToVertex for MedicalInteractionPrimary {
     }
 }
 
+impl MedicalInteractionPrimary {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "MedicalInteractionPrimary" { return None; }
+        Some(MedicalInteractionPrimary {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            medication_id: vertex.properties.get("medication_id")?.as_str()?.parse().ok()?,
+            interaction_name: vertex.properties.get("interaction_name")?.as_str()?.to_string(),
+            interaction_class: vertex.properties.get("interaction_class")?.as_str()?.to_string(),
+            description: vertex.properties.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        })
+    }
+}

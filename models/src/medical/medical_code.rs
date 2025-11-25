@@ -25,3 +25,20 @@ impl ToVertex for MedicalCode {
     }
 }
 
+impl MedicalCode {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "MedicalCode" { return None; }
+        Some(MedicalCode {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            code: vertex.properties.get("code")?.as_str()?.to_string(),
+            description: vertex.properties.get("description")?.as_str()?.to_string(),
+            code_type: vertex.properties.get("code_type")?.as_str()?.to_string(),
+            created_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("created_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("updated_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+        })
+    }
+}

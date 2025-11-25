@@ -24,3 +24,16 @@ impl ToVertex for Pharmacy {
     }
 }
 
+impl Pharmacy {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Pharmacy" { return None; }
+        Some(Pharmacy {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            name: vertex.properties.get("name")?.as_str()?.to_string(),
+            address: vertex.properties.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            contact_number: vertex.properties.get("contact_number").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email: vertex.properties.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            pharmacy_type: vertex.properties.get("pharmacy_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        })
+    }
+}

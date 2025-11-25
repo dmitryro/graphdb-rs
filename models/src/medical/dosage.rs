@@ -28,3 +28,20 @@ impl ToVertex for Dosage {
     }
 }
 
+impl Dosage {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Dosage" { return None; }
+        Some(Dosage {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            medication_id: vertex.properties.get("medication_id")?.as_str()?.parse().ok()?,
+            dosage_amount: vertex.properties.get("dosage_amount")?.as_str()?.to_string(),
+            dosage_frequency: vertex.properties.get("dosage_frequency")?.as_str()?.to_string(),
+            created_at: chrono::DateTime::parse_from_rfc3339(vertex.properties.get("created_at")?.as_str()?)
+                .ok()?.with_timezone(&chrono::Utc),
+            updated_at: vertex.properties.get("updated_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+        })
+    }
+}
