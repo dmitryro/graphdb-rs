@@ -27,3 +27,20 @@ impl ToVertex for ClinicalNote {
     }
 }
 
+impl ClinicalNote {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "ClinicalNote" { return None; }
+        Some(ClinicalNote {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            patient_id: vertex.properties.get("patient_id")?.as_str()?.parse().ok()?,
+            doctor_id: vertex.properties.get("doctor_id")?.as_str()?.parse().ok()?,
+            note_text: vertex.properties.get("note_text")?.as_str()?.to_string(),
+            created_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("created_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("updated_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+        })
+    }
+}

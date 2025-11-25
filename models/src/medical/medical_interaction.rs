@@ -21,3 +21,13 @@ impl ToVertex for MedicalInteraction {
     }
 }
 
+impl MedicalInteraction {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "MedicalInteraction" { return None; }
+        Some(MedicalInteraction {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            primary_medication_id: vertex.properties.get("primary_medication_id")?.as_str()?.parse().ok()?,
+            secondary_medication_id: vertex.properties.get("secondary_medication_id")?.as_str()?.parse().ok()?,
+        })
+    }
+}

@@ -39,3 +39,25 @@ impl ToVertex for Disposition {
         v
     }
 }
+
+impl Disposition {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Disposition" {
+            return None;
+        }
+
+        Some(Disposition {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            encounter_id: vertex.properties.get("encounter_id")?.as_str()?.parse().ok()?,
+            patient_id: vertex.properties.get("patient_id")?.as_str()?.parse().ok()?,
+            disposition_type: vertex.properties.get("disposition_type")?.as_str()?.to_string(),
+            admitting_service: vertex.properties.get("admitting_service").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            admitting_doctor_id: vertex.properties.get("admitting_doctor_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            transfer_facility_id: vertex.properties.get("transfer_facility_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            discharge_instructions: vertex.properties.get("discharge_instructions").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            disposed_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("disposed_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+        })
+    }
+}

@@ -30,3 +30,17 @@ impl ToVertex for Immunization {
     }
 }
 
+impl Immunization {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Immunization" { return None; }
+        Some(Immunization {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            patient_id: vertex.properties.get("patient_id")?.as_str()?.parse().ok()?,
+            vaccine_name: vertex.properties.get("vaccine_name")?.as_str()?.to_string(),
+            administration_date: chrono::DateTime::parse_from_rfc3339(vertex.properties.get("administration_date")?.as_str()?)
+                .ok()?.with_timezone(&chrono::Utc),
+            administered_by: vertex.properties.get("administered_by").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            notes: vertex.properties.get("notes").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        })
+    }
+}

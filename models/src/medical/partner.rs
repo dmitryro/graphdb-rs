@@ -39,3 +39,22 @@ impl ToVertex for Partner {
         vertex
     }
 }
+
+impl Partner {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Partner" { return None; }
+        Some(Partner {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            partner_type: vertex.properties.get("partner_type")?.as_str()?.to_string(),
+            name: vertex.properties.get("name")?.as_str()?.to_string(),
+            contact_person_user_id: vertex.properties.get("contact_person_user_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            phone: vertex.properties.get("phone").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email: vertex.properties.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            address: vertex.properties.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            created_at: chrono::DateTime::parse_from_rfc3339(vertex.properties.get("created_at")?.as_str()?)
+                .ok()?.with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(vertex.properties.get("updated_at")?.as_str()?)
+                .ok()?.with_timezone(&chrono::Utc),
+        })
+    }
+}

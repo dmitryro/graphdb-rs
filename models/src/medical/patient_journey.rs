@@ -22,8 +22,23 @@ impl ToVertex for PatientJourney {
         if let Some(p) = self.prescription_id { vertex.add_property("prescription_id", &p.to_string()); }
         if let Some(v) = self.vitals_id { vertex.add_property("vitals_id", &v.to_string()); }
         vertex.add_property("timestamp", &self.timestamp.to_rfc3339());
-
         vertex
     }
 }
 
+impl PatientJourney {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "PatientJourney" { return None; }
+        Some(PatientJourney {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            patient_id: vertex.properties.get("patient_id")?.as_str()?.parse().ok()?,
+            encounter_id: vertex.properties.get("encounter_id")?.as_str()?.parse().ok()?,
+            diagnosis_id: vertex.properties.get("diagnosis_id")?.as_str()?.parse().ok()?,
+            prescription_id: vertex.properties.get("prescription_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            vitals_id: vertex.properties.get("vitals_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            timestamp: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("timestamp")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+        })
+    }
+}

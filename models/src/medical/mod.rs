@@ -41,7 +41,7 @@ pub mod ed_event;
 pub mod ed_procedure;
 pub mod disposition;
 pub mod observation;
-
+pub mod referral;
 // New models for Hospital Onboarding
 pub mod hospital;
 pub mod department;
@@ -84,6 +84,7 @@ pub use vitals::Vitals;
 pub use x12edi_message::X12EDIMessage;
 pub use master_patient_index::MasterPatientIndex;
 pub use user::{User, Login, NewUser}; 
+pub use referral::Referral;
 
 // New models for Emergency Care Chart Management
 pub use triage::Triage;
