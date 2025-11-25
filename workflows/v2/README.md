@@ -48,39 +48,53 @@ This documentation provides comprehensive workflows for clinical staff, develope
 
 ## Quick Start Guide
 
-### Installation
+### 📋 Installation Prerequisites
 
-```bash
-# Install the graphdb-cli CLI tool
-npm install -g @graphplatform/cli
+Before building GraphDB, ensure the following are installed:
+* **Rust**: Version 1.72 or higher (`rustup install 1.72`).
+* **Cargo**: Included with Rust for building and managing dependencies.
+* **Git**: For cloning the repository.
+* **Optional Backends** (if used):
+  * Postgres: For relational storage.
+  * Redis: For caching.
+  * RocksDB/Sled: For embedded key-value storage.
 
-# Verify installation
-graphdb-cli --version
+### 🛠️  Building GraphDB
 
-# Configure credentials
-graphdb-cli configure --api-key YOUR_API_KEY --endpoint https://api.graphplatform.health
-```
+1. Clone the repository:
+   ```bash
+   git clone [https://github.com/dmitryro/graphdb.git](https://github.com/dmitryro/graphdb.git)
+   cd graphdb
+   ```
+
+2. Build the CLI executable:
+   ```bash
+   cargo build --workspace --release --bin graphdb-cli
+   ```
+
+   The compiled binary will be located at `./target/release/graphdb-cli`.
+
 
 ### Basic Commands
 
 ```bash
 # Start an encounter
-graphdb-cli encounter start --patient 12345 --type ED_TRIAGE --location "Triage Room 1"
+graphdb encounter start --patient 12345 --type ED_TRIAGE --location "Triage Room 1"
 
 # Add vital signs
-graphdb-cli vitals add --encounter e1f2abc --bp "180/100" --hr 110 --temp 38.5
+graphdb vitals add --encounter e1f2abc --bp "180/100" --hr 110 --temp 38.5
 
 # Check drug interactions
-graphdb-cli drug check 12345 --proposed-medication "Aspirin"
+graphdb drug check 12345 --proposed-medication "Aspirin"
 
 # Add clinical note
-graphdb-cli note add --patient 12345 --type PROGRESS --text "Patient improving, pain 3/10"
+graphdb note add --patient 12345 --type PROGRESS --text "Patient improving, pain 3/10"
 
 # Query population for care gaps
-graphdb-cli population screening-due MAMMOGRAPHY --age-min 50
+graphdb population screening-due MAMMOGRAPHY --age-min 50
 
 # Export patient data for AI
-graphdb-cli export patient 12345 --format FHIR --include-timeline
+graphdb export patient 12345 --format FHIR --include-timeline
 ```
 
 ---
@@ -130,14 +144,14 @@ graphdb-cli export patient 12345 --format FHIR --include-timeline
 
 ```bash
 # Initialize encounter
-graphdb-cli encounter start \
+graphdb encounter start \
   --patient 12345 \
   --type ED_TRIAGE \
   --location "Triage Room 1" \
   --arrived-via "Ambulance"
 
 # Perform triage assessment
-graphdb-cli triage assess \
+graphdb triage assess \
   --encounter e1f2abc \
   --level ESI2 \
   --complaint "Chest pain radiating to left arm" \
@@ -145,7 +159,7 @@ graphdb-cli triage assess \
   --severity "8/10"
 
 # Capture vital signs
-graphdb-cli vitals add \
+graphdb vitals add \
   --encounter e1f2abc \
   --bp "180/100" \
   --hr 110 \
@@ -165,7 +179,7 @@ graphdb-cli vitals add \
 
 ```bash
 # Document allergy
-graphdb-cli allergy add \
+graphdb allergy add \
   --patient 12345 \
   --allergen "Penicillin" \
   --reaction "Anaphylaxis" \
@@ -173,13 +187,13 @@ graphdb-cli allergy add \
   --verified-by "Nurse Smith"
 
 # Add clinical note
-graphdb-cli note add \
+graphdb note add \
   --patient 12345 \
   --type TRIAGE \
   --text "Patient presents with acute onset chest pain, diaphoretic, anxious. EKG ordered STAT."
 
 # Flag critical value
-graphdb-cli alert add \
+graphdb alert add \
   --patient 12345 \
   --type CRITICAL_BP \
   --value "BP 180/100" \
@@ -197,27 +211,27 @@ graphdb-cli alert add \
 
 ```bash
 # View complete patient summary
-graphdb-cli patient view 12345 \
+graphdb patient view 12345 \
   --include-history \
   --include-vitals \
   --include-medications \
   --include-allergies
 
 # Add working diagnosis
-graphdb-cli diagnosis add \
+graphdb diagnosis add \
   --encounter e1f2abc \
   --description "Acute coronary syndrome, rule out MI" \
   --icd10 I21.9 \
   --type WORKING
 
 # Order diagnostic tests
-graphdb-cli order add \
+graphdb order add \
   --encounter e1f2abc \
   --type LAB \
   --test "Troponin, CBC, BMP, PT/INR" \
   --priority STAT
 
-graphdb-cli order add \
+graphdb order add \
   --encounter e1f2abc \
   --type IMAGING \
   --test "Chest X-ray" \
@@ -234,7 +248,7 @@ graphdb-cli order add \
 
 ```bash
 # Check for drug interactions before prescribing
-graphdb-cli drug check 12345 \
+graphdb drug check 12345 \
   --proposed-medication "Aspirin 325mg" \
   --proposed-medication "Clopidogrel 300mg" \
   --proposed-medication "Heparin 5000 units"
@@ -246,7 +260,7 @@ graphdb-cli drug check 12345 \
 # ✓  No allergy conflicts detected
 
 # Prescribe medications with acknowledgment
-graphdb-cli prescription add \
+graphdb prescription add \
   --encounter e1f2abc \
   --medication "Aspirin" \
   --dose "325mg" \
@@ -255,7 +269,7 @@ graphdb-cli prescription add \
   --indication "ACS" \
   --interaction-acknowledged
 
-graphdb-cli prescription add \
+graphdb prescription add \
   --encounter e1f2abc \
   --medication "Clopidogrel" \
   --dose "300mg" \
@@ -274,7 +288,7 @@ graphdb-cli prescription add \
 
 ```bash
 # Document procedure
-graphdb-cli procedure add \
+graphdb procedure add \
   --encounter e1f2abc \
   --procedure "12-lead EKG" \
   --status COMPLETED \
@@ -282,14 +296,14 @@ graphdb-cli procedure add \
   --performed-by "Dr. Johnson"
 
 # Add final diagnosis
-graphdb-cli diagnosis update \
+graphdb diagnosis update \
   --encounter e1f2abc \
   --description "Inferior wall ST-elevation myocardial infarction (STEMI)" \
   --icd10 I21.19 \
   --type FINAL
 
 # Create disposition
-graphdb-cli disposition add \
+graphdb disposition add \
   --encounter e1f2abc \
   --type ADMIT \
   --destination "CCU" \
@@ -313,14 +327,14 @@ graphdb-cli disposition add \
 
 ```bash
 # Create admission
-graphdb-cli encounter start \
+graphdb encounter start \
   --patient 12345 \
   --type INPATIENT_ADMISSION \
   --location "4 West, Room 412" \
   --admitting-diagnosis "Community-acquired pneumonia"
 
 # Admission orders
-graphdb-cli orders admit \
+graphdb orders admit \
   --encounter e3g4def \
   --diet "Regular" \
   --activity "Bedrest with bathroom privileges" \
@@ -335,7 +349,7 @@ graphdb-cli orders admit \
 
 ```bash
 # Add progress note
-graphdb-cli note add \
+graphdb note add \
   --patient 12345 \
   --type PROGRESS \
   --template SOAP \
@@ -345,7 +359,7 @@ graphdb-cli note add \
   --plan "Continue antibiotics, advance activity, d/c planning if stable 24h"
 
 # Update problem list
-graphdb-cli problem update \
+graphdb problem update \
   --patient 12345 \
   --problem "Community-acquired pneumonia" \
   --status IMPROVING
@@ -355,20 +369,20 @@ graphdb-cli problem update \
 
 ```bash
 # Initiate discharge planning
-graphdb-cli discharge plan \
+graphdb discharge plan \
   --encounter e3g4def \
   --estimated-date "2025-11-28" \
   --disposition HOME \
   --services-needed "Home health for IV antibiotics"
 
 # Add discharge medications
-graphdb-cli prescription discharge \
+graphdb prescription discharge \
   --encounter e3g4def \
   --medication "Amoxicillin 500mg PO TID x 7 days" \
   --patient-education "antibiotic-completion"
 
 # Schedule follow-up
-graphdb-cli appointment schedule \
+graphdb appointment schedule \
   --patient 12345 \
   --type FOLLOW_UP \
   --provider "Dr. Johnson PCP" \
@@ -384,13 +398,13 @@ graphdb-cli appointment schedule \
 
 ```bash
 # Comprehensive medication review
-graphdb-cli medication review 12345 \
+graphdb medication review 12345 \
   --include-home-meds \
   --include-otc \
   --include-herbals
 
 # Check all interactions
-graphdb-cli drug check 12345 \
+graphdb drug check 12345 \
   --comprehensive \
   --include-lab-values \
   --include-allergies \
@@ -411,7 +425,7 @@ graphdb-cli drug check 12345 \
 
 ```bash
 # Verify renal dosing
-graphdb-cli dosing verify 12345 \
+graphdb dosing verify 12345 \
   --medication "Vancomycin" \
   --dose "1000mg IV Q12H" \
   --indication "MRSA bacteremia" \
@@ -426,7 +440,7 @@ graphdb-cli dosing verify 12345 \
 #    Order trough before 4th dose
 
 # Pharmacokinetic calculation
-graphdb-cli pk calculate \
+graphdb pk calculate \
   --drug "Vancomycin" \
   --loading-dose 25mg/kg \
   --maintenance-dose 15mg/kg \
@@ -439,7 +453,7 @@ graphdb-cli pk calculate \
 
 ```bash
 # Document medication counseling
-graphdb-cli note add \
+graphdb note add \
   --patient 12345 \
   --type PHARMACY \
   --text "Counseled patient on: 
@@ -450,7 +464,7 @@ graphdb-cli note add \
     Patient verbalizes understanding, no questions."
 
 # Dispense medication
-graphdb-cli prescription dispense \
+graphdb prescription dispense \
   --prescription-id rx789 \
   --quantity 30 \
   --refills 5 \
@@ -458,7 +472,7 @@ graphdb-cli prescription dispense \
   --patient-education-provided
 
 # Add monitoring plan
-graphdb-cli monitoring add \
+graphdb monitoring add \
   --patient 12345 \
   --medication "Warfarin" \
   --parameter INR \
@@ -476,14 +490,14 @@ graphdb-cli monitoring add \
 
 ```bash
 # View cancer timeline
-graphdb-cli patient cancer-timeline 12345 \
+graphdb patient cancer-timeline 12345 \
   --include-staging \
   --include-treatments \
   --include-labs \
   --include-imaging
 
 # Add chemotherapy cycle
-graphdb-cli chemo cycle-add \
+graphdb chemo cycle-add \
   --patient 12345 \
   --regimen "FOLFOX" \
   --cycle-number 6 \
@@ -491,7 +505,7 @@ graphdb-cli chemo cycle-add \
   --pre-meds "Ondansetron 16mg IV, Dexamethasone 12mg IV"
 
 # Pre-chemo lab verification
-graphdb-cli chemo labs-verify \
+graphdb chemo labs-verify \
   --patient 12345 \
   --cycle 6 \
   --required-labs "CBC, CMP, CEA"
@@ -505,7 +519,7 @@ graphdb-cli chemo labs-verify \
 # ⚠️  ACTION REQUIRED: Cannot proceed with chemotherapy
 
 # Document treatment decision
-graphdb-cli chemo cycle-modify \
+graphdb chemo cycle-modify \
   --patient 12345 \
   --cycle 6 \
   --action HOLD \
@@ -518,7 +532,7 @@ graphdb-cli chemo cycle-modify \
 
 ```bash
 # Create radiation plan
-graphdb-cli radiation plan \
+graphdb radiation plan \
   --patient 12345 \
   --site "Lung, right upper lobe" \
   --technique "IMRT" \
@@ -527,7 +541,7 @@ graphdb-cli radiation plan \
   --start-date "2025-12-05"
 
 # Daily treatment verification
-graphdb-cli radiation treatment \
+graphdb radiation treatment \
   --patient 12345 \
   --fraction 15 \
   --dose-delivered "2 Gy" \
@@ -535,7 +549,7 @@ graphdb-cli radiation treatment \
   --toxicity "Grade 1 esophagitis"
 
 # Toxicity monitoring
-graphdb-cli toxicity assess \
+graphdb toxicity assess \
   --patient 12345 \
   --type "Radiation esophagitis" \
   --grade 1 \
@@ -548,7 +562,7 @@ graphdb-cli toxicity assess \
 
 ```bash
 # Assess HF pathway compliance
-graphdb-cli patient hf-pathway 12345
+graphdb patient hf-pathway 12345
 
 # System response:
 # ═══ Heart Failure Pathway Status ═══
@@ -569,7 +583,7 @@ graphdb-cli patient hf-pathway 12345
 #   • Daily weights: Compliant 6/7 days
 
 # Address care gap
-graphdb-cli prescription add \
+graphdb prescription add \
   --patient 12345 \
   --medication "Empagliflozin" \
   --dose "10mg" \
@@ -579,7 +593,7 @@ graphdb-cli prescription add \
   --pathway "Heart Failure"
 
 # Order monitoring labs
-graphdb-cli order add \
+graphdb order add \
   --patient 12345 \
   --type LAB \
   --test "BNP" \
@@ -590,7 +604,7 @@ graphdb-cli order add \
 
 ```bash
 # Add device interrogation
-graphdb-cli device interrogation \
+graphdb device interrogation \
   --patient 12345 \
   --device-type ICD \
   --manufacturer "Medtronic" \
@@ -601,7 +615,7 @@ graphdb-cli device interrogation \
   --therapy-needed "Antiarrhythmic optimization"
 
 # Create alert for arrhythmia burden
-graphdb-cli alert add \
+graphdb alert add \
   --patient 12345 \
   --type DEVICE_ALERT \
   --severity HIGH \
@@ -614,7 +628,7 @@ graphdb-cli alert add \
 
 ```bash
 # Calculate and stage CKD
-graphdb-cli patient ckd-stage 12345
+graphdb patient ckd-stage 12345
 
 # System response:
 # ═══ CKD Staging Results ═══
@@ -634,7 +648,7 @@ graphdb-cli patient ckd-stage 12345
 #   ✓ Lisinopril 20mg - Appropriate dose
 
 # Manage medication adjustments
-graphdb-cli prescription modify \
+graphdb prescription modify \
   --patient 12345 \
   --medication "Metformin" \
   --new-dose "500mg" \
@@ -646,7 +660,7 @@ graphdb-cli prescription modify \
 
 ```bash
 # Document access assessment
-graphdb-cli access assessment \
+graphdb access assessment \
   --patient 12345 \
   --access-type "AV fistula, left upper arm" \
   --creation-date "2025-06-15" \
@@ -662,7 +676,7 @@ graphdb-cli access assessment \
 #    TREND: Declining from 1200 → 1050 → 850 over 3 months
 
 # Create referral
-graphdb-cli referral create \
+graphdb referral create \
   --patient 12345 \
   --specialty "Interventional Radiology" \
   --procedure "Fistulogram" \
@@ -676,7 +690,7 @@ graphdb-cli referral create \
 
 ```bash
 # Create surgical case
-graphdb-cli surgery case-create \
+graphdb surgery case-create \
   --patient 12345 \
   --procedure "Laparoscopic cholecystectomy" \
   --surgeon "Dr. Williams" \
@@ -685,7 +699,7 @@ graphdb-cli surgery case-create \
   --location "OR 3"
 
 # Pre-op checklist
-graphdb-cli surgery preop-checklist \
+graphdb surgery preop-checklist \
   --patient 12345 \
   --case case456 \
   --consent SIGNED \
@@ -697,7 +711,7 @@ graphdb-cli surgery preop-checklist \
   --antibiotic-timing "Cefazolin to be given 30 min pre-incision"
 
 # Risk stratification
-graphdb-cli surgery risk-calculate \
+graphdb surgery risk-calculate \
   --patient 12345 \
   --procedure "Cholecystectomy" \
   --asa-class 2 \
@@ -717,25 +731,25 @@ graphdb-cli surgery risk-calculate \
 
 ```bash
 # Start case
-graphdb-cli surgery case-start \
+graphdb surgery case-start \
   --case case456 \
   --anesthesia-start "08:15" \
   --incision-time "08:35" \
   --antibiotic-given "Cefazolin 2g IV @ 08:05"
 
 # Document key events
-graphdb-cli surgery event-add \
+graphdb surgery event-add \
   --case case456 \
   --time "08:45" \
   --event "Gallbladder successfully mobilized, no bile leak"
 
-graphdb-cli surgery event-add \
+graphdb surgery event-add \
   --case case456 \
   --time "09:10" \
   --event "Specimen removed intact, field irrigated"
 
 # Close case
-graphdb-cli surgery case-close \
+graphdb surgery case-close \
   --case case456 \
   --closure-time "09:30" \
   --ebl "50 mL" \
@@ -753,7 +767,7 @@ graphdb-cli surgery case-close \
 
 ```bash
 # Create office visit
-graphdb-cli encounter start \
+graphdb encounter start \
   --patient 12345 \
   --type OFFICE_VISIT \
   --location "Primary Care Clinic, Exam Room 3" \
@@ -761,7 +775,7 @@ graphdb-cli encounter start \
   --provider "Dr. Martinez"
 
 # Document visit
-graphdb-cli note add \
+graphdb note add \
   --patient 12345 \
   --type OFFICE_VISIT \
   --template "Annual Physical" \
@@ -775,13 +789,13 @@ graphdb-cli note add \
                       4. Health maintenance - Due for colonoscopy, flu shot given"
 
 # Order preventive screenings
-graphdb-cli orders preventive \
+graphdb orders preventive \
   --patient 12345 \
   --screening "Colonoscopy" \
   --indication "Age-appropriate CRC screening, last scope 2015" \
   --priority ROUTINE
 
-graphdb-cli orders preventive \
+graphdb orders preventive \
   --patient 12345 \
   --vaccination "Influenza 2025-2026" \
   --administered "2025-11-25" \
@@ -793,7 +807,7 @@ graphdb-cli orders preventive \
 
 ```bash
 # Review diabetes metrics
-graphdb-cli patient diabetes-dashboard 12345
+graphdb patient diabetes-dashboard 12345
 
 # System response:
 # ═══ Diabetes Management Dashboard ═══
@@ -813,19 +827,19 @@ graphdb-cli patient diabetes-dashboard 12345
 #   ✓ Pneumococcal vaccine current
 
 # Address care gaps
-graphdb-cli orders add \
+graphdb orders add \
   --patient 12345 \
   --type LAB \
   --test "Microalbumin/Creatinine ratio" \
   --indication "Annual DM screening"
 
-graphdb-cli referral create \
+graphdb referral create \
   --patient 12345 \
   --specialty "Ophthalmology" \
   --indication "Diabetic retinopathy screening - overdue"
 
 # Consider GLP-1 agonist
-graphdb-cli prescription add \
+graphdb prescription add \
   --patient 12345 \
   --medication "Semaglutide (Ozempic)" \
   --dose "0.25mg SC weekly x 4 weeks, then increase to 0.5mg" \
@@ -837,7 +851,7 @@ graphdb-cli prescription add \
 
 ```bash
 # Start telehealth encounter
-graphdb-cli encounter start \
+graphdb encounter start \
   --patient 12345 \
   --type TELEHEALTH \
   --platform "Zoom Health" \
@@ -845,7 +859,7 @@ graphdb-cli encounter start \
   --chief-complaint "Medication refill and blood pressure check"
 
 # Document virtual visit
-graphdb-cli note add \
+graphdb note add \
   --patient 12345 \
   --type TELEHEALTH \
   --text "Patient contacted via secure video visit. Discussed:
@@ -856,7 +870,7 @@ graphdb-cli note add \
     Plan: Continue current medications, recheck BP in 3 months"
 
 # E-prescribe during visit
-graphdb-cli prescription refill \
+graphdb prescription refill \
   --patient 12345 \
   --medication "Lisinopril 20mg daily" \
   --quantity 90 \
@@ -874,9 +888,9 @@ graphdb-cli prescription refill \
 
 **Commands**:
 ```bash
-graphdb-cli nursing assessment --patient 12345 --shift DAY --pain-level 3 --mobility AMBULATORY
-graphdb-cli nursing safety-check --patient 12345 --fall-risk LOW --pressure-ulcer-risk MODERATE
-graphdb-cli nursing intake-output --patient 12345 --intake-ml 1500 --output-ml 1200
+graphdb nursing assessment --patient 12345 --shift DAY --pain-level 3 --mobility AMBULATORY
+graphdb nursing safety-check --patient 12345 --fall-risk LOW --pressure-ulcer-risk MODERATE
+graphdb nursing intake-output --patient 12345 --intake-ml 1500 --output-ml 1200
 ```
 
 **Real-Time Effects**: Updates flowsheet, triggers alerts for abnormal values, notifies care team of status changes
@@ -887,9 +901,9 @@ graphdb-cli nursing intake-output --patient 12345 --intake-ml 1500 --output-ml 1
 
 **Commands**:
 ```bash
-graphdb-cli nursing care-plan add --patient 12345 --goal "Pain < 3/10" --interventions "Q4H pain assessment"
-graphdb-cli nursing care-plan update --patient 12345 --goal-id g789 --status ACHIEVED
-graphdb-cli nursing patient-education --patient 12345 --topic "Diabetes self-management" --method TEACH_BACK
+graphdb nursing care-plan add --patient 12345 --goal "Pain < 3/10" --interventions "Q4H pain assessment"
+graphdb nursing care-plan update --patient 12345 --goal-id g789 --status ACHIEVED
+graphdb nursing patient-education --patient 12345 --topic "Diabetes self-management" --method TEACH_BACK
 ```
 
 **Real-Time Effects**: Care plan visible to entire team, education documented for regulatory compliance
@@ -900,9 +914,9 @@ graphdb-cli nursing patient-education --patient 12345 --topic "Diabetes self-man
 
 **Commands**:
 ```bash
-graphdb-cli nursing med-administration verify --order-id o456 --patient 12345 --barcode-scan
-graphdb-cli nursing med-administration give --order-id o456 --time-given "2025-11-25T14:00:00" --route PO
-graphdb-cli nursing med-administration refuse --order-id o456 --reason "Patient nauseated"
+graphdb nursing med-administration verify --order-id o456 --patient 12345 --barcode-scan
+graphdb nursing med-administration give --order-id o456 --time-given "2025-11-25T14:00:00" --route PO
+graphdb nursing med-administration refuse --order-id o456 --reason "Patient nauseated"
 ```
 
 **Real-Time Effects**: Real-time MAR update, allergy/interaction alerts, automatic documentation
@@ -913,10 +927,10 @@ graphdb-cli nursing med-administration refuse --order-id o456 --reason "Patient 
 
 **Commands**:
 ```bash
-graphdb-cli discharge-planning assess --patient 12345 --barriers "No transportation, lives alone"
-graphdb-cli discharge-planning dme-order --patient 12345 --equipment "Walker, shower chair"
-graphdb-cli discharge-planning follow-up schedule --patient 12345 --provider-id 999 --days-out 7
-graphdb-cli discharge-planning education document --patient 12345 --topic "Wound care instructions"
+graphdb discharge-planning assess --patient 12345 --barriers "No transportation, lives alone"
+graphdb discharge-planning dme-order --patient 12345 --equipment "Walker, shower chair"
+graphdb discharge-planning follow-up schedule --patient 12345 --provider-id 999 --days-out 7
+graphdb discharge-planning education document --patient 12345 --topic "Wound care instructions"
 ```
 
 **Real-Time Effects**: Triggers social work consult, coordinates equipment delivery, schedules follow-up appointments
@@ -931,9 +945,9 @@ graphdb-cli discharge-planning education document --patient 12345 --topic "Wound
 
 **Commands**:
 ```bash
-graphdb-cli population high-risk-screening --conditions "CHF,COPD,Diabetes" --er-visits-threshold 3 --timeframe "last-6-months"
-graphdb-cli population comorbidity-analysis --min-conditions 3 --age-min 65
-graphdb-cli population social-risk-screening --domains "housing,food,transportation" --screening-overdue
+graphdb population high-risk-screening --conditions "CHF,COPD,Diabetes" --er-visits-threshold 3 --timeframe "last-6-months"
+graphdb population comorbidity-analysis --min-conditions 3 --age-min 65
+graphdb population social-risk-screening --domains "housing,food,transportation" --screening-overdue
 ```
 
 **Real-Time Effects**: Generates prioritized outreach lists, triggers care manager assignment, identifies SDOH needs
@@ -946,10 +960,10 @@ graphdb-cli population social-risk-screening --domains "housing,food,transportat
 
 **Commands**:
 ```bash
-graphdb-cli population screening-due MAMMOGRAPHY --age-min 50 --age-max 74 --overdue-by-months 6
-graphdb-cli population screening-due COLONOSCOPY --age-min 45 --never-screened
-graphdb-cli population diabetes-monitoring --hba1c-overdue --last-test-months 6
-graphdb-cli population immunization-due INFLUENZA --age-min 65 --current-season
+graphdb population screening-due MAMMOGRAPHY --age-min 50 --age-max 74 --overdue-by-months 6
+graphdb population screening-due COLONOSCOPY --age-min 45 --never-screened
+graphdb population diabetes-monitoring --hba1c-overdue --last-test-months 6
+graphdb population immunization-due INFLUENZA --age-min 65 --current-season
 ```
 
 **Real-Time Effects**: Exports patient lists for outreach, generates patient reminder letters, updates quality dashboards
@@ -962,10 +976,10 @@ graphdb-cli population immunization-due INFLUENZA --age-min 65 --current-season
 
 **Commands**:
 ```bash
-graphdb-cli population chronic-program enrollment --program CHF --criteria "EF<40% OR recent-admission"
-graphdb-cli population chronic-program monitoring CHF --weight-gain-threshold 3lbs --days 2
-graphdb-cli population chronic-program engagement --program DIABETES --no-contact-days 30
-graphdb-cli population chronic-program outcomes --program CHF --metric readmission-rate --timeframe "last-quarter"
+graphdb population chronic-program enrollment --program CHF --criteria "EF<40% OR recent-admission"
+graphdb population chronic-program monitoring CHF --weight-gain-threshold 3lbs --days 2
+graphdb population chronic-program engagement --program DIABETES --no-contact-days 30
+graphdb population chronic-program outcomes --program CHF --metric readmission-rate --timeframe "last-quarter"
 ```
 
 **Real-Time Effects**: Auto-enrolls eligible patients, triggers nurse outreach for concerning trends, measures program effectiveness
@@ -976,10 +990,10 @@ graphdb-cli population chronic-program outcomes --program CHF --metric readmissi
 
 **Commands**:
 ```bash
-graphdb-cli quality measure calculate MIPS_2025 --measures "DM_HBA1C,BP_CONTROL,STATIN_THERAPY"
-graphdb-cli quality measure performance --measure HEDIS_BCS --denominator-analysis
-graphdb-cli quality measure gap-report --payer MEDICARE --measures "ALL_HEDIS"
-graphdb-cli quality measure attestation --measure CMS_PREVENTIVE --quarter Q3_2025
+graphdb quality measure calculate MIPS_2025 --measures "DM_HBA1C,BP_CONTROL,STATIN_THERAPY"
+graphdb quality measure performance --measure HEDIS_BCS --denominator-analysis
+graphdb quality measure gap-report --payer MEDICARE --measures "ALL_HEDIS"
+graphdb quality measure attestation --measure CMS_PREVENTIVE --quarter Q3_2025
 ```
 
 **Real-Time Effects**: Real-time quality scores, identifies improvable gaps, generates regulatory reports
@@ -996,10 +1010,10 @@ graphdb-cli quality measure attestation --measure CMS_PREVENTIVE --quarter Q3_20
 
 **Commands**:
 ```bash
-graphdb-cli lab order --patient 12345 --tests "CBC,BMP,Troponin" --priority STAT --clinical-indication "Chest pain"
-graphdb-cli lab result receive --order-id L789 --test TROPONIN --value 2.3 --critical-flag
-graphdb-cli lab result acknowledge --order-id L789 --provider-id 888 --action "Cardiology consult ordered"
-graphdb-cli lab trending view --patient 12345 --test CREATININE --days-back 30
+graphdb lab order --patient 12345 --tests "CBC,BMP,Troponin" --priority STAT --clinical-indication "Chest pain"
+graphdb lab result receive --order-id L789 --test TROPONIN --value 2.3 --critical-flag
+graphdb lab result acknowledge --order-id L789 --provider-id 888 --action "Cardiology consult ordered"
+graphdb lab trending view --patient 12345 --test CREATININE --days-back 30
 ```
 
 **Real-Time Effects**: Instant critical value alerts to ordering provider, automatic notifications, trending analysis
@@ -1010,10 +1024,10 @@ graphdb-cli lab trending view --patient 12345 --test CREATININE --days-back 30
 
 **Commands**:
 ```bash
-graphdb-cli imaging order --patient 12345 --study "CT-CHEST-PE-PROTOCOL" --priority STAT --clinical-info "SOB, chest pain"
-graphdb-cli imaging result preliminary --study-id I456 --finding "No PE identified" --follow-up-recommended
-graphdb-cli imaging result final --study-id I456 --radiologist-id 777 --critical-finding "Incidental lung nodule"
-graphdb-cli imaging compare --patient 12345 --study-type "CHEST-XRAY" --compare-to-date "2024-10-15"
+graphdb imaging order --patient 12345 --study "CT-CHEST-PE-PROTOCOL" --priority STAT --clinical-info "SOB, chest pain"
+graphdb imaging result preliminary --study-id I456 --finding "No PE identified" --follow-up-recommended
+graphdb imaging result final --study-id I456 --radiologist-id 777 --critical-finding "Incidental lung nodule"
+graphdb imaging compare --patient 12345 --study-type "CHEST-XRAY" --compare-to-date "2024-10-15"
 ```
 
 **Real-Time Effects**: Critical findings alert ordering provider, incidental findings tracked for follow-up, prior studies auto-retrieved
@@ -1024,10 +1038,10 @@ graphdb-cli imaging compare --patient 12345 --study-type "CHEST-XRAY" --compare-
 
 **Commands**:
 ```bash
-graphdb-cli pathology specimen --patient 12345 --type BIOPSY --site "Right breast" --clinical-dx "Mass"
-graphdb-cli pathology result --specimen-id P123 --diagnosis "Invasive ductal carcinoma" --grade 2 --markers "ER+,PR+,HER2-"
-graphdb-cli microbiology culture --patient 12345 --source "Blood" --preliminary "Gram positive cocci in clusters"
-graphdb-cli microbiology sensitivity --culture-id C789 --organism "MRSA" --sensitivities "Vancomycin:S,Daptomycin:S"
+graphdb pathology specimen --patient 12345 --type BIOPSY --site "Right breast" --clinical-dx "Mass"
+graphdb pathology result --specimen-id P123 --diagnosis "Invasive ductal carcinoma" --grade 2 --markers "ER+,PR+,HER2-"
+graphdb microbiology culture --patient 12345 --source "Blood" --preliminary "Gram positive cocci in clusters"
+graphdb microbiology sensitivity --culture-id C789 --organism "MRSA" --sensitivities "Vancomycin:S,Daptomycin:S"
 ```
 
 **Real-Time Effects**: Pathology results trigger oncology referral, positive cultures alert infectious disease, antibiotic stewardship notifications
@@ -1042,9 +1056,9 @@ graphdb-cli microbiology sensitivity --culture-id C789 --organism "MRSA" --sensi
 
 **Commands**:
 ```bash
-graphdb-cli audit patient 12345 --from-date "2025-01-01" --include-all
-graphdb-cli audit patient 12345 --audit-type BILLING --encounters "e1f2...,e3f4..."
-graphdb-cli audit patient 12345 --compliance-check HIPAA --access-log
+graphdb audit patient 12345 --from-date "2025-01-01" --include-all
+graphdb audit patient 12345 --audit-type BILLING --encounters "e1f2...,e3f4..."
+graphdb audit patient 12345 --compliance-check HIPAA --access-log
 ```
 
 **Real-Time Effects**: Generates complete audit trail, identifies documentation gaps, validates billing codes
@@ -1057,9 +1071,9 @@ graphdb-cli audit patient 12345 --compliance-check HIPAA --access-log
 
 **Commands**:
 ```bash
-graphdb-cli audit controlled-substances --provider-id 888 --from-date "2025-10-01"
-graphdb-cli audit controlled-substances --patient 12345 --pdmp-check
-graphdb-cli audit controlled-substances --pharmacy-id P456 --discrepancy-check
+graphdb audit controlled-substances --provider-id 888 --from-date "2025-10-01"
+graphdb audit controlled-substances --patient 12345 --pdmp-check
+graphdb audit controlled-substances --pharmacy-id P456 --discrepancy-check
 ```
 
 **Real-Time Effects**: Flags unusual prescribing patterns, identifies doctor shopping, validates DEA compliance
@@ -1072,9 +1086,9 @@ graphdb-cli audit controlled-substances --pharmacy-id P456 --discrepancy-check
 
 **Commands**:
 ```bash
-graphdb-cli incident investigate --incident-id I2025_001 --root-cause-analysis
-graphdb-cli incident timeline --incident-id I2025_001 --hours-before 24 --hours-after 4
-graphdb-cli incident similar-events --incident-type MEDICATION_ERROR --days-back 90
+graphdb incident investigate --incident-id I2025_001 --root-cause-analysis
+graphdb incident timeline --incident-id I2025_001 --hours-before 24 --hours-after 4
+graphdb incident similar-events --incident-type MEDICATION_ERROR --days-back 90
 ```
 
 **Real-Time Effects**: Reconstructs complete event timeline, identifies contributing factors, suggests preventive measures
@@ -1085,9 +1099,9 @@ graphdb-cli incident similar-events --incident-type MEDICATION_ERROR --days-back
 
 **Commands**:
 ```bash
-graphdb-cli compliance report-generate CMS_HOSPITAL_COMPARE --quarter Q3_2025
-graphdb-cli compliance report-generate JOINT_COMMISSION --measures "CORE_MEASURES"
-graphdb-cli compliance report-generate STATE_DOH --reportable-diseases --month "2025-11"
+graphdb compliance report-generate CMS_HOSPITAL_COMPARE --quarter Q3_2025
+graphdb compliance report-generate JOINT_COMMISSION --measures "CORE_MEASURES"
+graphdb compliance report-generate STATE_DOH --reportable-diseases --month "2025-11"
 ```
 
 **Real-Time Effects**: Automated regulatory report generation, validates data completeness, tracks submission status
@@ -1102,10 +1116,10 @@ graphdb-cli compliance report-generate STATE_DOH --reportable-diseases --month "
 
 **Commands**:
 ```bash
-graphdb-cli research cohort create --name "IMMUNO_2025" --criteria "diagnosis:lung-cancer AND treatment:immunotherapy AND age>18"
-graphdb-cli research cohort refine IMMUNO_2025 --exclude "prior-immunotherapy OR autoimmune-disease"
-graphdb-cli research cohort analyze IMMUNO_2025 --demographics --comorbidities --outcomes
-graphdb-cli research cohort export IMMUNO_2025 --format FHIR --de-identify --consent-verified
+graphdb research cohort create --name "IMMUNO_2025" --criteria "diagnosis:lung-cancer AND treatment:immunotherapy AND age>18"
+graphdb research cohort refine IMMUNO_2025 --exclude "prior-immunotherapy OR autoimmune-disease"
+graphdb research cohort analyze IMMUNO_2025 --demographics --comorbidities --outcomes
+graphdb research cohort export IMMUNO_2025 --format FHIR --de-identify --consent-verified
 ```
 
 **Real-Time Effects**: Instant cohort identification, real-time eligibility screening, consent tracking
@@ -1118,10 +1132,10 @@ graphdb-cli research cohort export IMMUNO_2025 --format FHIR --de-identify --con
 
 **Commands**:
 ```bash
-graphdb-cli ml dataset create SEPSIS_TRAINING --cohort ICU_PATIENTS_2024 --outcome "sepsis-within-24h" --features "vitals,labs,demographics"
-graphdb-cli ml model train SEPSIS_PREDICTOR --dataset SEPSIS_TRAINING --algorithm GRADIENT_BOOST --validation-split 0.2
-graphdb-cli ml model evaluate SEPSIS_PREDICTOR --metrics "AUC,sensitivity,specificity" --test-cohort ICU_PATIENTS_2025_Q1
-graphdb-cli ml model deploy SEPSIS_PREDICTOR --environment PRODUCTION --real-time-scoring
+graphdb ml dataset create SEPSIS_TRAINING --cohort ICU_PATIENTS_2024 --outcome "sepsis-within-24h" --features "vitals,labs,demographics"
+graphdb ml model train SEPSIS_PREDICTOR --dataset SEPSIS_TRAINING --algorithm GRADIENT_BOOST --validation-split 0.2
+graphdb ml model evaluate SEPSIS_PREDICTOR --metrics "AUC,sensitivity,specificity" --test-cohort ICU_PATIENTS_2025_Q1
+graphdb ml model deploy SEPSIS_PREDICTOR --environment PRODUCTION --real-time-scoring
 ```
 
 **Real-Time Effects**: Zero-ETL data access, automated feature engineering, production deployment with monitoring
@@ -1134,9 +1148,9 @@ graphdb-cli ml model deploy SEPSIS_PREDICTOR --environment PRODUCTION --real-tim
 
 **Commands**:
 ```bash
-graphdb-cli ml predict SEPSIS_PREDICTOR --patient 12345 --current-data "temp:38.5,hr:115,wbc:14.2"
-graphdb-cli ml predict READMISSION_RISK --patient 12345 --discharge-date "2025-11-25"
-graphdb-cli ml predict FALL_RISK --patient 12345 --mobility-status IMPAIRED --medications "sedatives"
+graphdb ml predict SEPSIS_PREDICTOR --patient 12345 --current-data "temp:38.5,hr:115,wbc:14.2"
+graphdb ml predict READMISSION_RISK --patient 12345 --discharge-date "2025-11-25"
+graphdb ml predict FALL_RISK --patient 12345 --mobility-status IMPAIRED --medications "sedatives"
 ```
 
 **Real-Time Effects**: Instant risk scoring, triggers clinical protocols, alerts care team
@@ -1149,10 +1163,10 @@ graphdb-cli ml predict FALL_RISK --patient 12345 --mobility-status IMPAIRED --me
 
 **Commands**:
 ```bash
-graphdb-cli clinical-trial screening --trial-id NCT12345 --eligibility-criteria "age>18,diagnosis:NSCLC"
-graphdb-cli clinical-trial enrollment --trial-id NCT12345 --patient 12345 --consent-date "2025-11-01"
-graphdb-cli clinical-trial protocol-compliance --trial-id NCT12345 --patient 12345 --visit-schedule
-graphdb-cli clinical-trial adverse-events --trial-id NCT12345 --severity GRADE3 --report-to-irb
+graphdb clinical-trial screening --trial-id NCT12345 --eligibility-criteria "age>18,diagnosis:NSCLC"
+graphdb clinical-trial enrollment --trial-id NCT12345 --patient 12345 --consent-date "2025-11-01"
+graphdb clinical-trial protocol-compliance --trial-id NCT12345 --patient 12345 --visit-schedule
+graphdb clinical-trial adverse-events --trial-id NCT12345 --severity GRADE3 --report-to-irb
 ```
 
 **Real-Time Effects**: Automated eligibility screening, protocol deviation alerts, regulatory reporting
@@ -1167,10 +1181,10 @@ graphdb-cli clinical-trial adverse-events --trial-id NCT12345 --severity GRADE3 
 
 **Commands**:
 ```bash
-graphdb-cli metrics operational --time-period MONTH --units "ED,ICU,OR,INPATIENT"
-graphdb-cli metrics quality --measures "MORTALITY,READMISSION,INFECTION_RATE"
-graphdb-cli metrics throughput --unit ED --metrics "DOOR_TO_PROVIDER,LOS,LWBS_RATE"
-graphdb-cli metrics capacity --real-time --predict-discharge-next-24h
+graphdb metrics operational --time-period MONTH --units "ED,ICU,OR,INPATIENT"
+graphdb metrics quality --measures "MORTALITY,READMISSION,INFECTION_RATE"
+graphdb metrics throughput --unit ED --metrics "DOOR_TO_PROVIDER,LOS,LWBS_RATE"
+graphdb metrics capacity --real-time --predict-discharge-next-24h
 ```
 
 **Real-Time Effects**: Real-time dashboard updates, predictive alerts, trend analysis
@@ -1186,10 +1200,10 @@ graphdb-cli metrics capacity --real-time --predict-discharge-next-24h
 
 **Commands**:
 ```bash
-graphdb-cli financial service-line --service "cardiology" --period Q3_2025 --metrics "revenue,cost,margin"
-graphdb-cli financial payer-mix --facility MAIN_HOSPITAL --period Q3_2025
-graphdb-cli financial denials-analysis --top-denial-reasons --recovery-opportunities
-graphdb-cli financial forecasting --service "orthopedics" --months-ahead 6
+graphdb financial service-line --service "cardiology" --period Q3_2025 --metrics "revenue,cost,margin"
+graphdb financial payer-mix --facility MAIN_HOSPITAL --period Q3_2025
+graphdb financial denials-analysis --top-denial-reasons --recovery-opportunities
+graphdb financial forecasting --service "orthopedics" --months-ahead 6
 ```
 
 **Real-Time Effects**: Financial performance tracking, denial prevention, revenue optimization
@@ -1202,10 +1216,10 @@ graphdb-cli financial forecasting --service "orthopedics" --months-ahead 6
 
 **Commands**:
 ```bash
-graphdb-cli facility beds --unit ICU --occupancy-status CURRENT
-graphdb-cli facility beds --predict-discharge --timeframe TODAY
-graphdb-cli facility beds --patient-flow-analysis --bottlenecks
-graphdb-cli facility beds --transfer-center --available-capacity REGIONAL
+graphdb facility beds --unit ICU --occupancy-status CURRENT
+graphdb facility beds --predict-discharge --timeframe TODAY
+graphdb facility beds --patient-flow-analysis --bottlenecks
+graphdb facility beds --transfer-center --available-capacity REGIONAL
 ```
 
 **Real-Time Effects**: Real-time bed availability, transfer coordination, capacity planning
@@ -1218,10 +1232,10 @@ graphdb-cli facility beds --transfer-center --available-capacity REGIONAL
 
 **Commands**:
 ```bash
-graphdb-cli analytics market-share --service "cardiovascular" --region COUNTY --trend-years 3
-graphdb-cli analytics volume-forecasting --service "joint-replacement" --years-ahead 5
-graphdb-cli analytics referral-patterns --specialty "oncology" --leakage-analysis
-graphdb-cli analytics quality-benchmarking --compare-to "CMS_NATIONAL_AVERAGE"
+graphdb analytics market-share --service "cardiovascular" --region COUNTY --trend-years 3
+graphdb analytics volume-forecasting --service "joint-replacement" --years-ahead 5
+graphdb analytics referral-patterns --specialty "oncology" --leakage-analysis
+graphdb analytics quality-benchmarking --compare-to "CMS_NATIONAL_AVERAGE"
 ```
 
 **Real-Time Effects**: Strategic insights, market intelligence, quality benchmarking
@@ -1238,12 +1252,12 @@ graphdb-cli analytics quality-benchmarking --compare-to "CMS_NATIONAL_AVERAGE"
 
 **Training**:
 ```bash
-graphdb-cli ml train SEPSIS_PREDICTOR --training-cohort "ICU_patients_2020_2024" --features "vitals,labs,demographics" --outcome "sepsis-within-6h"
+graphdb ml train SEPSIS_PREDICTOR --training-cohort "ICU_patients_2020_2024" --features "vitals,labs,demographics" --outcome "sepsis-within-6h"
 ```
 
 **Prediction**:
 ```bash
-graphdb-cli ml predict SEPSIS_PREDICTOR --patient 12345 --current-data "temp:38.5,hr:115,wbc:14.2,lactate:3.1"
+graphdb ml predict SEPSIS_PREDICTOR --patient 12345 --current-data "temp:38.5,hr:115,wbc:14.2,lactate:3.1"
 ```
 
 **Output**: SEPSIS RISK: 87% - Triggers sepsis protocol bundle, alerts rapid response team
@@ -1256,7 +1270,7 @@ graphdb-cli ml predict SEPSIS_PREDICTOR --patient 12345 --current-data "temp:38.
 
 **Commands**:
 ```bash
-graphdb-cli ml predict READMISSION_RISK --patient 12345 --discharge-date "2025-11-25" --include-social-determinants
+graphdb ml predict READMISSION_RISK --patient 12345 --discharge-date "2025-11-25" --include-social-determinants
 ```
 
 **Output**: READMISSION RISK: 42% (High) - Recommends post-discharge call day 2, home health referral
@@ -1269,9 +1283,9 @@ graphdb-cli ml predict READMISSION_RISK --patient 12345 --discharge-date "2025-1
 
 **Commands**:
 ```bash
-graphdb-cli ml predict FALL_RISK --patient 12345 --mobility IMPAIRED --medications "sedatives,antihypertensives"
-graphdb-cli ml predict PRESSURE_ULCER_RISK --patient 12345 --braden-score 14 --immobility-hours 18
-graphdb-cli ml predict CAUTI_RISK --patient 12345 --catheter-days 5 --immune-status COMPROMISED
+graphdb ml predict FALL_RISK --patient 12345 --mobility IMPAIRED --medications "sedatives,antihypertensives"
+graphdb ml predict PRESSURE_ULCER_RISK --patient 12345 --braden-score 14 --immobility-hours 18
+graphdb ml predict CAUTI_RISK --patient 12345 --catheter-days 5 --immune-status COMPROMISED
 ```
 
 **Real-Time Effects**: Hourly risk recalculation, triggers prevention protocols, nursing alerts
@@ -1286,8 +1300,8 @@ graphdb-cli ml predict CAUTI_RISK --patient 12345 --catheter-days 5 --immune-sta
 
 **Commands**:
 ```bash
-graphdb-cli ml dose recommend --patient 12345 --drug "vancomycin" --target-auc 400 --crcl 45 --weight 82
-graphdb-cli ml dose recommend --patient 12345 --drug "warfarin" --target-inr 2.5 --cyp2c9-genotype *1/*3
+graphdb ml dose recommend --patient 12345 --drug "vancomycin" --target-auc 400 --crcl 45 --weight 82
+graphdb ml dose recommend --patient 12345 --drug "warfarin" --target-inr 2.5 --cyp2c9-genotype *1/*3
 ```
 
 **Output**: Recommended vancomycin dose: 1250mg q12h, Predicted peak: 28 mcg/mL, trough: 15 mcg/mL
@@ -1300,7 +1314,7 @@ graphdb-cli ml dose recommend --patient 12345 --drug "warfarin" --target-inr 2.5
 
 **Commands**:
 ```bash
-graphdb-cli ml diagnose --patient 12345 --symptoms "chest_pain,dyspnea,diaphoresis" --vitals "BP:180/100,HR:110" --labs "troponin:0.8,d-dimer:elevated"
+graphdb ml diagnose --patient 12345 --symptoms "chest_pain,dyspnea,diaphoresis" --vitals "BP:180/100,HR:110" --labs "troponin:0.8,d-dimer:elevated"
 ```
 
 **Output**: 
@@ -1316,8 +1330,8 @@ graphdb-cli ml diagnose --patient 12345 --symptoms "chest_pain,dyspnea,diaphores
 
 **Commands**:
 ```bash
-graphdb-cli ml pathway recommend --patient 12345 --diagnosis "STEMI" --presentation-time "45min-ago"
-graphdb-cli ml pathway compliance --patient 12345 --pathway "SEPSIS_BUNDLE" --check-completion
+graphdb ml pathway recommend --patient 12345 --diagnosis "STEMI" --presentation-time "45min-ago"
+graphdb ml pathway compliance --patient 12345 --pathway "SEPSIS_BUNDLE" --check-completion
 ```
 
 **Output**: STEMI Pathway - Time to cath lab: 48 min (Target: <90 min) ✓ On track
@@ -1334,9 +1348,9 @@ graphdb-cli ml pathway compliance --patient 12345 --pathway "SEPSIS_BUNDLE" --ch
 
 **Commands**:
 ```bash
-graphdb-cli ml progression CKD --patient 12345 --baseline-egfr 45 --albuminuria 300 --comorbidities "diabetes,hypertension"
-graphdb-cli ml progression HEART_FAILURE --patient 12345 --ejection-fraction 35 --nyha-class III
-graphdb-cli ml progression DIABETES --patient 12345 --hba1c-trend "7.2,7.8,8.5" --complications "retinopathy"
+graphdb ml progression CKD --patient 12345 --baseline-egfr 45 --albuminuria 300 --comorbidities "diabetes,hypertension"
+graphdb ml progression HEART_FAILURE --patient 12345 --ejection-fraction 35 --nyha-class III
+graphdb ml progression DIABETES --patient 12345 --hba1c-trend "7.2,7.8,8.5" --complications "retinopathy"
 ```
 
 **Output**: CKD Progression - 5-year risk of ESRD: 32%, Predicted time to dialysis: 4.2 years
@@ -1349,9 +1363,9 @@ graphdb-cli ml progression DIABETES --patient 12345 --hba1c-trend "7.2,7.8,8.5" 
 
 **Commands**:
 ```bash
-graphdb-cli ml forecast ED-volume --facility MAIN_HOSPITAL --forecast-days 7 --external-factors "weather,flu-season"
-graphdb-cli ml forecast ICU-census --predict-admissions --predict-discharges --timeframe "next-48-hours"
-graphdb-cli ml forecast OR-utilization --service "orthopedics" --forecast-months 6 --seasonal-adjustment
+graphdb ml forecast ED-volume --facility MAIN_HOSPITAL --forecast-days 7 --external-factors "weather,flu-season"
+graphdb ml forecast ICU-census --predict-admissions --predict-discharges --timeframe "next-48-hours"
+graphdb ml forecast OR-utilization --service "orthopedics" --forecast-months 6 --seasonal-adjustment
 ```
 
 **Output**: ED Volume Forecast Next Week: 1,847 visits (±87), Peak: Tuesday 2pm-6pm, Recommended staffing: +3 nurses, +1 physician
