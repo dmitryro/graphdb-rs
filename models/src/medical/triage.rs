@@ -39,3 +39,26 @@ impl ToVertex for Triage {
         v
     }
 }
+
+impl Triage {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Triage" {
+            return None;
+        }
+
+        Some(Triage {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            encounter_id: vertex.properties.get("encounter_id")?.as_str()?.parse().ok()?,
+            patient_id: vertex.properties.get("patient_id")?.as_str()?.parse().ok()?,
+            triage_nurse_id: vertex.properties.get("triage_nurse_id")?.as_str()?.parse().ok()?,
+            triage_level: vertex.properties.get("triage_level")?.as_str()?.to_string(),
+            chief_complaint: vertex.properties.get("chief_complaint")?.as_str()?.to_string(),
+            presenting_symptoms: vertex.properties.get("presenting_symptoms").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            pain_score: vertex.properties.get("pain_score").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            triage_notes: vertex.properties.get("triage_notes").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            assessed_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("assessed_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+        })
+    }
+}

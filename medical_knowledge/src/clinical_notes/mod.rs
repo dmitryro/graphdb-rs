@@ -1,4 +1,7 @@
 // medical_knowledge/src/clinical_notes/mod.rs
-
 pub mod clinical_notes;
-pub use clinical_notes::ClinicalNoteService;
+
+pub use clinical_notes::{
+    ClinicalNoteService,
+    CLINICAL_NOTE_SERVICE,
+};

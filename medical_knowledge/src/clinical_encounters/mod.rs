@@ -9,6 +9,7 @@
 //!
 //! It is built on top of `graph_engine` and `models` — pure domain logic, no storage.
 
+// medical_knowledge/src/clinical_encounters/mod.rs
 pub mod clinical_encounters;
 
 pub use clinical_encounters::{
@@ -17,8 +18,8 @@ pub use clinical_encounters::{
     TimelineEntry,
     DrugAlert,
     CareGap,
+    CLINICAL_ENCOUNTER_SERVICE,
 };
-
 // Re-export key domain types for convenience
 pub use models::medical::{
     Encounter, Patient, Doctor, Diagnosis, Prescription,
