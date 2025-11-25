@@ -3,7 +3,6 @@ pub mod graph;
 pub mod traversal;
 pub mod medical;
 pub mod pattern_match;
-pub mod adapters;   // new
 pub mod durability;
 
 // Re-export the *exact* types that the rest of the engine uses

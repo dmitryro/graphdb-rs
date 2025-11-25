@@ -43,3 +43,26 @@ impl ToVertex for EdProcedure {
         v
     }
 }
+
+impl EdProcedure {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "EdProcedure" { return None; }
+        Some(EdProcedure {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            encounter_id: vertex.properties.get("encounter_id")?.as_str()?.parse().ok()?,
+            patient_id: vertex.properties.get("patient_id")?.as_str()?.parse().ok()?,
+            procedure_code_id: vertex.properties.get("procedure_code_id")?.as_str()?.parse().ok()?,
+            procedure_name: vertex.properties.get("procedure_name")?.as_str()?.to_string(),
+            performed_by_doctor_id: vertex.properties.get("performed_by_doctor_id")?.as_str()?.parse().ok()?,
+            assist_nurse_id: vertex.properties.get("assist_nurse_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            start_time: chrono::DateTime::parse_from_rfc3339(vertex.properties.get("start_time")?.as_str()?)
+                .ok()?.with_timezone(&chrono::Utc),
+            end_time: vertex.properties.get("end_time")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            outcome: vertex.properties.get("outcome").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            notes: vertex.properties.get("notes").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        })
+    }
+}

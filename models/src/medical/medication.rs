@@ -1,5 +1,3 @@
-// medication.rs
-use chrono::{DateTime, Utc};
 use crate::{Vertex, ToVertex, identifiers::Identifier};
 
 #[derive(Debug, Clone)]
@@ -24,5 +22,18 @@ impl ToVertex for Medication {
         }
         v.add_property("medication_class", &self.medication_class);
         v
+    }
+}
+
+impl Medication {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Medication" { return None; }
+        Some(Medication {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            name: vertex.properties.get("name")?.as_str()?.to_string(),
+            brand_name: vertex.properties.get("brand_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            generic_name: vertex.properties.get("generic_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            medication_class: vertex.properties.get("medication_class")?.as_str()?.to_string(),
+        })
     }
 }

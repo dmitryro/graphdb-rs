@@ -24,3 +24,16 @@ impl ToVertex for Insurance {
         v
     }
 }
+
+impl Insurance {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Insurance" { return None; }
+        Some(Insurance {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            name: vertex.properties.get("name")?.as_str()?.to_string(),
+            contact_info: vertex.properties.get("contact_info")?.as_str()?.to_string(),
+            coverage_details: vertex.properties.get("coverage_details").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            claims_integration_status: vertex.properties.get("claims_integration_status")?.as_str()?.to_string(),
+        })
+    }
+}

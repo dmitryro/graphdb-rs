@@ -4,11 +4,11 @@ use crate::{Vertex, ToVertex, identifiers::Identifier};
 #[derive(Debug, Clone)]
 pub struct Patient {
     pub id: i32,
-    pub user_id: Option<i32>, // Links to an existing User (if patient is also a user)
+    pub user_id: Option<i32>,
     pub first_name: String,
     pub last_name: String,
     pub date_of_birth: DateTime<Utc>,
-    pub gender: String, // e.g., "Male", "Female", "Other"
+    pub gender: String,
     pub address: Option<String>,
     pub phone: Option<String>,
     pub email: Option<String>,
@@ -18,9 +18,7 @@ pub struct Patient {
 
 impl ToVertex for Patient {
     fn to_vertex(&self) -> Vertex {
-        // FIX: Convert "&str" to String using .to_string()
-        let id_type = Identifier::new("Patient".to_string()).expect("Invalid Identifier");
-        let mut v = Vertex::new(id_type);
+        let mut v = Vertex::new(Identifier::new("Patient".to_string()).unwrap());
         v.add_property("id", &self.id.to_string());
         if let Some(ref val) = self.user_id {
             v.add_property("user_id", &val.to_string());
@@ -41,5 +39,30 @@ impl ToVertex for Patient {
         v.add_property("created_at", &self.created_at.to_rfc3339());
         v.add_property("updated_at", &self.updated_at.to_rfc3339());
         v
+    }
+}
+
+impl Patient {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Patient" { return None; }
+        Some(Patient {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            user_id: vertex.properties.get("user_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            first_name: vertex.properties.get("first_name")?.as_str()?.to_string(),
+            last_name: vertex.properties.get("last_name")?.as_str()?.to_string(),
+            date_of_birth: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("date_of_birth")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+            gender: vertex.properties.get("gender")?.as_str()?.to_string(),
+            address: vertex.properties.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            phone: vertex.properties.get("phone").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email: vertex.properties.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            created_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("created_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("updated_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+        })
     }
 }
