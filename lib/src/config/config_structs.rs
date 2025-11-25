@@ -782,7 +782,6 @@ pub struct GenericConfig {
    pub active: Option<bool>,
 }
 
-
 /// Raw storage configuration from YAML
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case")]
