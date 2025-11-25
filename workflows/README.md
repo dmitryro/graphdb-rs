@@ -1,5 +1,4 @@
-```markdown
-# Clinical Workflows for Real-Time Graph Platform  
+# Clinical Workflows for Real-Time GraphDB Platform  
 **Comprehensive Workflow Document v3.0**
 
 ---
@@ -29,11 +28,11 @@ Built on global singleton services (`GraphService`, `ClinicalEncounterService`, 
 
 ## III. Command Syntax
 
-All examples use the CLI wrapper `graphdb`.  
+All examples use the CLI wrapper `graphdb-cli`.  
 Commands are **ready to copy-paste** – replace IDs as needed.
 
 ```bash
-graphdb <resource> <action> [flags]
+graphdb-cli <resource> <action> [flags]
 ```
 
 ---
@@ -44,10 +43,10 @@ graphdb <resource> <action> [flags]
 
 | Workflow          | Commands (copy → run)                                                                 | Real-Time Effect                          |
 |-------------------|----------------------------------------------------------------------------------------|-------------------------------------------|
-| **Start encounter** | `graphdb encounter start --patient 12345 --type ED_TRIAGE --location "Triage-1"`      | Timeline created; ED dashboard updates    |
-| **Triage assessment** | `graphdb triage assess --encounter e1f2 --level ESI3 --complaint "Chest pain" --pain 8` | Priority alert fires if ESI 1-2          |
-| **Vitals**          | `graphdb vitals add --encounter e1f2 --bp 180/100 --hr 110 --rr 22 --spo2 96`         | Flowsheet populated instantly            |
-| **Allergy alert**   | `graphdb allergy add --patient 12345 --allergen Penicillin --reaction Anaphylaxis`     | Blocks future penicillin orders          |
+| **Start encounter** | `graphdb-cli encounter start --patient 12345 --type ED_TRIAGE --location "Triage-1"`      | Timeline created; ED dashboard updates    |
+| **Triage assessment** | `graphdb-cli triage assess --encounter e1f2 --level ESI3 --complaint "Chest pain" --pain 8` | Priority alert fires if ESI 1-2          |
+| **Vitals**          | `graphdb-cli vitals add --encounter e1f2 --bp 180/100 --hr 110 --rr 22 --spo2 96`         | Flowsheet populated instantly            |
+| **Allergy alert**   | `graphdb-cli allergy add --patient 12345 --allergen Penicillin --reaction Anaphylaxis`     | Blocks future penicillin orders          |
 
 ---
 
@@ -55,13 +54,13 @@ graphdb <resource> <action> [flags]
 
 | Workflow             | Commands                                                                                      | Real-Time Effect                          |
 |----------------------|-----------------------------------------------------------------------------------------------|-------------------------------------------|
-| **View patient**       | `graphdb patient view 12345`                                                                 | Complete graph rendered                   |
-| **Full timeline**      | `graphdb patient timeline 12345 --include-notes --include-vitals --include-medications`      | Everything up to millisecond              |
-| **Add diagnosis**      | `graphdb diagnosis add --encounter e1f2 "Chest pain, possible ACS" --icd10 R07.9`            | ICD-10 coded; triggers care-pathway check|
-| **Drug safety check**  | `graphdb drug check 12345 --proposed-medication Aspirin --dose 325mg`                        | **HIGH: Warfarin + Aspirin = Bleed Risk** |
-| **Prescribe safely**   | `graphdb prescription add --encounter e1f2 Aspirin 325mg daily 30 --check-interactions`       | Order only if no critical DDI            |
-| **Procedures**         | `graphdb procedure add --encounter e1f2 "EKG" --status COMPLETED --results "ST elevation"`  | Auto-added to timeline                   |
-| **Discharge**          | `graphdb disposition add --encounter e1f2 --type DISCHARGE --instructions "Follow-up cardiology"` | Schedules follow-up tasks                |
+| **View patient**       | `graphdb-cli patient view 12345`                                                                 | Complete graph rendered                   |
+| **Full timeline**      | `graphdb-cli patient timeline 12345 --include-notes --include-vitals --include-medications`      | Everything up to millisecond              |
+| **Add diagnosis**      | `graphdb-cli diagnosis add --encounter e1f2 "Chest pain, possible ACS" --icd10 R07.9`            | ICD-10 coded; triggers care-pathway check|
+| **Drug safety check**  | `graphdb-cli drug check 12345 --proposed-medication Aspirin --dose 325mg`                        | **HIGH: Warfarin + Aspirin = Bleed Risk** |
+| **Prescribe safely**   | `graphdb-cli prescription add --encounter e1f2 Aspirin 325mg daily 30 --check-interactions`       | Order only if no critical DDI            |
+| **Procedures**         | `graphdb-cli procedure add --encounter e1f2 "EKG" --status COMPLETED --results "ST elevation"`  | Auto-added to timeline                   |
+| **Discharge**          | `graphdb-cli disposition add --encounter e1f2 --type DISCHARGE --instructions "Follow-up cardiology"` | Schedules follow-up tasks                |
 
 ---
 
@@ -69,11 +68,11 @@ graphdb <resource> <action> [flags]
 
 | Workflow            | Commands                                                                                      | Real-Time Effect                          |
 |---------------------|-----------------------------------------------------------------------------------------------|-------------------------------------------|
-| **Medication review** | `graphdb medication review 12345 --include-inactive --include-otc`                           | Full med list + OTCs                      |
-| **Comprehensive DDI** | `graphdb drug check 12345 --comprehensive`                                                   | Returns **HIGH / MOD / LOW** list         |
-| **Allergy check**     | `graphdb drug allergy-check 12345 --proposed-medication Penicillin`                          | **CRITICAL** if match                     |
-| **Renal dosing**      | `graphdb dosing verify 12345 --medication Metformin --crcl 45`                               | **ADJUST: reduce 50 % for CKD-3**         |
-| **Audit dispense**    | `graphdb prescription dispense --rx-id rx123 --quantity 30 --lot ABC123 --exp 2025-12-31`     | Immutable audit entry                     |
+| **Medication review** | `graphdb-cli medication review 12345 --include-inactive --include-otc`                           | Full med list + OTCs                      |
+| **Comprehensive DDI** | `graphdb-cli drug check 12345 --comprehensive`                                                   | Returns **HIGH / MOD / LOW** list         |
+| **Allergy check**     | `graphdb-cli drug allergy-check 12345 --proposed-medication Penicillin`                          | **CRITICAL** if match                     |
+| **Renal dosing**      | `graphdb-cli dosing verify 12345 --medication Metformin --crcl 45`                               | **ADJUST: reduce 50 % for CKD-3**         |
+| **Audit dispense**    | `graphdb-cli prescription dispense --rx-id rx123 --quantity 30 --lot ABC123 --exp 2025-12-31`     | Immutable audit entry                     |
 
 ---
 
@@ -82,35 +81,35 @@ graphdb <resource> <action> [flags]
 #### 4.1 Oncologist
 ```bash
 # Cancer timeline
-graphdb patient cancer-timeline 12345 --include-chemo --include-radiation --include-surgeries
+graphdb-cli patient cancer-timeline 12345 --include-chemo --include-radiation --include-surgeries
 
 # Chemo cycle with labs
-graphdb chemo cycle-add --patient 12345 --regimen FOLFOX --cycle 3/12 --labs "ANC:1.2,Plt:95"
+graphdb-cli chemo cycle-add --patient 12345 --regimen FOLFOX --cycle 3/12 --labs "ANC:1.2,Plt:95"
 → **HOLD CYCLE** - ANC < 1.5 automatically fired
 
 # Tumour-board export
-graphdb tumour-board prep 12345 --export-format PPTX --include-imaging --include-pathology
+graphdb-cli tumour-board prep 12345 --export-format PPTX --include-imaging --include-pathology
 ```
 
 #### 4.2 Cardiologist
 ```bash
 # HF pathway compliance
-graphdb patient hf-pathway 12345 --include-echo --include-labs --include-medications
+graphdb-cli patient hf-pathway 12345 --include-echo --include-labs --include-medications
 → **MISSING**: BNP > 6 months, ACEi not optimised
 
 # Device interrogation due
-graphdb device interrogation --patient 12345 --device-type ICD --last-date 2025-01-15
+graphdb-cli device interrogation --patient 12345 --device-type ICD --last-date 2025-01-15
 → **OVERDUE** by 45 days - schedule immediately
 ```
 
 #### 4.3 Nephrologist
 ```bash
 # CKD stage tracking
-graphdb patient ckd-stage 12345 --calculate-egfr --track-proteinuria
+graphdb-cli patient ckd-stage 12345 --calculate-egfr --track-proteinuria
 → eGFR declined 45 → 32 in 6 months (stage 3b → 4)
 
 # Access assessment
-graphdb access assessment --patient 12345 --access-type AVF --flow-rate 800
+graphdb-cli access assessment --patient 12345 --access-type AVF --flow-rate 800
 → **ALERT** Flow < 1000 - refer for fistulagram
 ```
 
@@ -120,12 +119,12 @@ graphdb access assessment --patient 12345 --access-type AVF --flow-rate 800
 
 | Task                     | Commands                                                                                   | Output / Use                                      |
 |--------------------------|--------------------------------------------------------------------------------------------|---------------------------------------------------|
-| **Screening due**        | `graphdb population screening-due MAMMOGRAPHY --age-min 50 --age-max 74 --last-years 2`   | CSV: 1,847 patients → auto-scheduler              |
-| **High-risk meds**       | `graphdb population high-risk-meds --medications "warfarin,insulin,digoxin"`               | 312 patients → monitoring list                    |
-| **Uncontrolled diabetes**| `graphdb population chronic-conditions diabetes --hba1c-threshold 9.0 --uncontrolled-only` | 245 patients → outreach campaign                  |
-| **Social determinants**  | `graphdb population sdoh-screening --domains "housing,food,transport"`                     | 567 unmet needs → community referrals             |
-| **Readmission risk**     | `graphdb population readmission-risk --discharge-start 2025-01-01 --risk-threshold HIGH`   | 89 high-risk → call schedule                      |
-| **Quality measures**     | `graphdb quality measure MIPS_2025 --measure-type diabetes-control`                        | Performance: 78.5 % (target 80 %+) - 45 need work |
+| **Screening due**        | `graphdb-cli population screening-due MAMMOGRAPHY --age-min 50 --age-max 74 --last-years 2`   | CSV: 1,847 patients → auto-scheduler              |
+| **High-risk meds**       | `graphdb-cli population high-risk-meds --medications "warfarin,insulin,digoxin"`               | 312 patients → monitoring list                    |
+| **Uncontrolled diabetes**| `graphdb-cli population chronic-conditions diabetes --hba1c-threshold 9.0 --uncontrolled-only` | 245 patients → outreach campaign                  |
+| **Social determinants**  | `graphdb-cli population sdoh-screening --domains "housing,food,transport"`                     | 567 unmet needs → community referrals             |
+| **Readmission risk**     | `graphdb-cli population readmission-risk --discharge-start 2025-01-01 --risk-threshold HIGH`   | 89 high-risk → call schedule                      |
+| **Quality measures**     | `graphdb-cli quality measure MIPS_2025 --measure-type diabetes-control`                        | Performance: 78.5 % (target 80 %+) - 45 need work |
 
 ---
 
@@ -133,9 +132,9 @@ graphdb access assessment --patient 12345 --access-type AVF --flow-rate 800
 
 | Task                      | Commands                                                                                         | Use Case Result                                      |
 |---------------------------|--------------------------------------------------------------------------------------------------|------------------------------------------------------|
-| **Full patient audit**    | `graphdb audit patient 12345 --from-date 2025-01-01 --to-date 2025-12-31 --include-all`         | 456 notes, 12 Rx, 3 procedures, 2 referrals, 1 incident |
-| **Controlled substances** | `graphdb audit controlled-substances --provider-id 888 --date-range "2025-01-01 to 2025-12-31"` | 892 controlled Rx, 3 discrepancies flagged           |
-| **Incident investigation**| `graphdb incident investigate --incident-id I2025_001 --root-cause-analysis --include-timeline` | Complete timeline for RCA                            |
+| **Full patient audit**    | `graphdb-cli audit patient 12345 --from-date 2025-01-01 --to-date 2025-12-31 --include-all`         | 456 notes, 12 Rx, 3 procedures, 2 referrals, 1 incident |
+| **Controlled substances** | `graphdb-cli audit controlled-substances --provider-id 888 --date-range "2025-01-01 to 2025-12-31"` | 892 controlled Rx, 3 discrepancies flagged           |
+| **Incident investigation**| `graphdb-cli incident investigate --incident-id I2025_001 --root-cause-analysis --include-timeline` | Complete timeline for RCA                            |
 
 ---
 
@@ -143,10 +142,10 @@ graphdb access assessment --patient 12345 --access-type AVF --flow-rate 800
 
 | Task                     | Commands                                                                                                 | Output & Use                                       |
 |--------------------------|----------------------------------------------------------------------------------------------------------|----------------------------------------------------|
-| **Build cohort**         | `graphdb research cohort --criteria "diagnosis:lung-cancer AND treatment:immunotherapy AND stage:IIIB"`  | Named cohort ready for consent review              |
-| **Export (zero-ETL)**    | `graphdb export cohort IMMUNO_2025 --format JSON --de-identify --include-timeline --include-outcomes`   | 312 patients, 45 MB graph → direct ML input        |
-| **Real-time scoring**    | `graphdb model score SEPSIS_PREDICTOR --patient 12345 --input-data "temp:38.5,wbc:15.2,lactate:3.1"`   | RISK: 87 % → trigger sepsis protocol               |
-| **Model validation**     | `graphdb model validate READMISSION_RISK --test-cohort "discharged-last-30-days"`                        | AUC, sensitivity, specificity reported              |
+| **Build cohort**         | `graphdb-cli research cohort --criteria "diagnosis:lung-cancer AND treatment:immunotherapy AND stage:IIIB"`  | Named cohort ready for consent review              |
+| **Export (zero-ETL)**    | `graphdb-cli export cohort IMMUNO_2025 --format JSON --de-identify --include-timeline --include-outcomes`   | 312 patients, 45 MB graph → direct ML input        |
+| **Real-time scoring**    | `graphdb-cli model score SEPSIS_PREDICTOR --patient 12345 --input-data "temp:38.5,wbc:15.2,lactate:3.1"`   | RISK: 87 % → trigger sepsis protocol               |
+| **Model validation**     | `graphdb-cli model validate READMISSION_RISK --test-cohort "discharged-last-30-days"`                        | AUC, sensitivity, specificity reported              |
 
 ---
 
@@ -154,9 +153,9 @@ graphdb access assessment --patient 12345 --access-type AVF --flow-rate 800
 
 | Task                  | Commands                                                                                      | Key Metric Output                          |
 |-----------------------|-----------------------------------------------------------------------------------------------|--------------------------------------------|
-| **Operational metrics** | `graphdb metrics operational --time-period MONTH --units "ED,ICU,OR"`                       | ALOS: 4.2 d, ED wait: 18 min, OR util: 78 % |
-| **Financial performance** | `graphdb financial service-line --service cardiology --period Q3_2025 --include-costs --include-revenue` | Margin: 12.3 %, Cost/case: \$18,450        |
-| **Capacity management** | `graphdb facility beds --unit ICU --occupancy-status CURRENT --predict-discharge`            | 18/24 occupied, 3 predicted discharges today |
+| **Operational metrics** | `graphdb-cli metrics operational --time-period MONTH --units "ED,ICU,OR"`                       | ALOS: 4.2 d, ED wait: 18 min, OR util: 78 % |
+| **Financial performance** | `graphdb-cli financial service-line --service cardiology --period Q3_2025 --include-costs --include-revenue` | Margin: 12.3 %, Cost/case: \$18,450        |
+| **Capacity management** | `graphdb-cli facility beds --unit ICU --occupancy-status CURRENT --predict-discharge`            | 18/24 occupied, 3 predicted discharges today |
 
 ---
 
@@ -165,13 +164,13 @@ graphdb access assessment --patient 12345 --access-type AVF --flow-rate 800
 ### 1. Real-time Predictive Models
 ```bash
 # Train sepsis predictor on native graph
-graphdb ml train SEPSIS_PREDICTOR \
+graphdb-cli ml train SEPSIS_PREDICTOR \
   --training-cohort ICU_patients_2024 \
   --features vitals,lab_values,medications \
   --algorithm XGBOOST
 
 # Score in real time
-graphdb ml predict SEPSIS_PREDICTOR --patient 12345 \
+graphdb-cli ml predict SEPSIS_PREDICTOR --patient 12345 \
   --input-data "temp:38.5,wbc:15.2,lactate:3.1"
 → RISK: 87 % → automatic sepsis protocol activation
 ```
@@ -179,7 +178,7 @@ graphdb ml predict SEPSIS_PREDICTOR --patient 12345 \
 ### 2. Clinical Decision Support
 ```bash
 # Individualised vancomycin dosing
-graphdb ml dose recommend --patient 12345 --drug vancomycin \
+graphdb-cli ml dose recommend --patient 12345 --drug vancomycin \
   --target-auc 400 --current-levels "trough:18,creatinine:1.2"
 → Dose: 1250 mg q12h, Next level: 24 h
 ```
@@ -187,7 +186,7 @@ graphdb ml dose recommend --patient 12345 --drug vancomycin \
 ### 3. Population Forecasting
 ```bash
 # ED volume next 7 days
-graphdb ml forecast ED-volume --historical-data 2020-2024 \
+graphdb-cli ml forecast ED-volume --historical-data 2020-2024 \
   --external-factors weather,holidays,flu-season --horizon 7-days
 → Predicted: 1,847 patients (95 % CI: 1,720-1,974)
 ```
