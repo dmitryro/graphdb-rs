@@ -1,7 +1,5 @@
-// models/src/medical/vitals.rs
-// FIX: Changed `crate::models::{...}` to `crate::{...}`
-use crate::{Vertex, ToVertex, identifiers::Identifier};
 use chrono::{DateTime, Utc};
+use crate::{Vertex, ToVertex, identifiers::Identifier};
 
 #[derive(Debug, Clone)]
 pub struct Vitals {
@@ -18,12 +16,9 @@ pub struct Vitals {
 
 impl ToVertex for Vitals {
     fn to_vertex(&self) -> Vertex {
-        let id_type = Identifier::new("Vitals".to_string()).expect("Invalid Identifier");
-        let mut vertex = Vertex::new(id_type);
-
+        let mut vertex = Vertex::new(Identifier::new("Vitals".to_string()).unwrap());
         vertex.add_property("id", &self.id.to_string());
         vertex.add_property("patient_id", &self.patient_id.to_string());
-
         if let Some(weight) = self.weight {
             vertex.add_property("weight", &weight.to_string());
         }
@@ -42,9 +37,26 @@ impl ToVertex for Vitals {
         if let Some(hr) = self.heart_rate {
             vertex.add_property("heart_rate", &hr.to_string());
         }
-
         vertex.add_property("created_at", &self.created_at.to_rfc3339());
-
         vertex
+    }
+}
+
+impl Vitals {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "Vitals" { return None; }
+        Some(Vitals {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            patient_id: vertex.properties.get("patient_id")?.as_str()?.parse().ok()?,
+            weight: vertex.properties.get("weight").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            height: vertex.properties.get("height").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            blood_pressure_systolic: vertex.properties.get("blood_pressure_systolic").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            blood_pressure_diastolic: vertex.properties.get("blood_pressure_diastolic").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            temperature: vertex.properties.get("temperature").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            heart_rate: vertex.properties.get("heart_rate").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            created_at: chrono::DateTime::parse_from_rfc3339(
+                vertex.properties.get("created_at")?.as_str()?
+            ).ok()?.with_timezone(&chrono::Utc),
+        })
     }
 }

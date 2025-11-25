@@ -34,3 +34,19 @@ impl ToVertex for EdEvent {
         v
     }
 }
+
+impl EdEvent {
+    pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
+        if vertex.label.as_ref() != "EdEvent" { return None; }
+        Some(EdEvent {
+            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
+            encounter_id: vertex.properties.get("encounter_id")?.as_str()?.parse().ok()?,
+            event_type: vertex.properties.get("event_type")?.as_str()?.to_string(),
+            event_description: vertex.properties.get("event_description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            associated_entity_id: vertex.properties.get("associated_entity_id").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()),
+            occurred_at: chrono::DateTime::parse_from_rfc3339(vertex.properties.get("occurred_at")?.as_str()?)
+                .ok()?.with_timezone(&chrono::Utc),
+            recorded_by_user_id: vertex.properties.get("recorded_by_user_id")?.as_str()?.parse().ok()?,
+        })
+    }
+}

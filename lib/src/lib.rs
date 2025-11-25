@@ -2,6 +2,7 @@
 // Updated: 2025-07-04 - Refactored to use new storage engine names and removed obsolete imports.
 
 #![cfg_attr(feature = "bench-suite", feature(test))]
+pub mod connectors;
 pub mod query_parser;
 pub mod graph_evolution;
 pub mod graph_indexing;
@@ -25,6 +26,7 @@ pub mod commands;
 pub use models::{Edge, Identifier, Json, Vertex}; // Added Vertex here for convenience
 
 // Fix the imports by specifying the correct sub-modules
+pub use connectors::*;
 pub use models::bulk_insert::BulkInsertItem;
 pub use models::queries::EdgeDirection;
 pub use models::properties::{EdgeProperties, NamedProperty, PropertyValue, VertexProperties};
