@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{ json, Value};
 use uuid::Uuid;
-use models::{Edge, Identifier, Vertex};
+use models::{Edge, Graph, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use crate::config::{StorageConfig, MemStoreForTypeConfig, QueryResult, QueryPlan};
 use crate::{StorageEngine, GraphStorageEngine};
@@ -14,6 +14,7 @@ use log::info;
 use tokio::sync::{ Mutex as TokioMutex, MutexGuard, OnceCell };
 use openraft::{storage::Adaptor, RaftTypeConfig};
 use openraft_memstore::{MemStore, TypeConfig as RaftMemStoreTypeConfig};
+use crate::storage_engine::{ GraphOp };
 
 // Tantivy full-text index — async-safe OnceCell
 static FULLTEXT_INDEX: OnceCell<Arc<indexing_service::fulltext::FullTextIndex>> = OnceCell::const_new();
@@ -102,6 +103,14 @@ impl StorageEngine for RaftStorage {
     }
 
     async fn flush(&self) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
         Ok(())
     }
 }

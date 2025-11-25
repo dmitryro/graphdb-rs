@@ -10,15 +10,18 @@ use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use log::{info, debug, warn, error, trace};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options, DBCompactionStyle, WriteOptions, BoundColumnFamily, IteratorMode};
 use crate::storage_engine::rocksdb_storage_daemon_pool::{ FULLTEXT_INDEX };
+use crate::storage_engine::storage_engine::{ GraphOp };
 use serde_json::{json, Value};
 use futures::future::join_all;
 use uuid::Uuid;
+use chrono::Utc;
 use async_trait::async_trait;
 use std::any::Any;
-
+use bincode::{ config as binconfig };
 use crate::config::{
     RocksDBConfig, RocksDBStorage, RocksDBDaemonPool, StorageConfig, StorageEngineType,
     QueryResult, QueryPlan, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, RocksDBWithPath,
+    json_to_prop,
 };
 use crate::storage_engine::{StorageEngine, GraphStorageEngine, get_global_storage_registry};
 use crate::storage_engine::storage_utils::{
@@ -29,7 +32,7 @@ use crate::daemon::daemon_management::{find_pid_by_port, check_pid_validity, sto
                                        is_port_free, stop_process_by_port, get_ipc_endpoint};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, NonBlockingDaemonRegistry, DaemonMetadata};
 use crate::daemon::daemon_utils::{parse_cluster_range};
-use models::{Vertex, Edge, Identifier};
+use models::{Vertex, Edge, Identifier, Graph, PropertyValue};
 use models::errors::{GraphResult, GraphError};
 use models::identifiers::SerializableUuid;
 use super::rocksdb_client::{ RocksDBClient, ZmqSocketWrapper };
@@ -2093,6 +2096,88 @@ impl StorageEngine for RocksDBStorage {
         }
         info!("Flushed RocksDB database at {:?}", db_path);
         println!("===> FLUSHED ROCKSDB DATABASE AT {:?}", db_path);
+        Ok(())
+    }
+
+    /// Append a graph operation to the write-ahead log (WAL)
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring RocksDB pool lock".into()))?;
+        
+        // Use serde_json instead of bincode
+        let op_bytes = serde_json::to_vec(&op)
+            .map_err(|e| GraphError::StorageError(format!("Failed to serialize GraphOp: {}", e)))?;
+        
+        // Use timestamp_nanos_opt() instead of deprecated timestamp_nanos()
+        let timestamp = Utc::now().timestamp_nanos_opt()
+            .ok_or_else(|| GraphError::StorageError("Failed to get timestamp".into()))?;
+        let key = format!("wal_{}", timestamp);
+        
+        pool_guard.insert_replicated(key.as_bytes(), &op_bytes, self.use_raft_for_scale).await?;
+        info!("RocksDBStorage::append - persisted op: {:?}", op);
+        Ok(())
+    }
+
+    /// Replay all persisted operations into the in-memory graph
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+        let pool_guard = timeout(TokioDuration::from_secs(10), self.pool.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring RocksDB pool lock".into()))?;
+        
+        info!("RocksDBStorage::replay_into - starting replay from WAL");
+        
+        for daemon in pool_guard.daemons.values() {
+            // Use prefix_iterator instead of scan_prefix
+            let iter = daemon.db.prefix_iterator(b"wal_");
+            
+            for item in iter {
+                let (key, value) = item
+                    .map_err(|e| GraphError::StorageError(format!("Failed to read WAL entry: {}", e)))?;
+                
+                // Check if key still matches prefix (iterator might go beyond)
+                if !key.starts_with(b"wal_") {
+                    break;
+                }
+                
+                // Use serde_json instead of bincode
+                let op: GraphOp = serde_json::from_slice(&value)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to deserialize GraphOp: {}", e)))?;
+                
+                match op {
+                    GraphOp::InsertVertex(v) => graph.add_vertex(v),
+                    GraphOp::InsertEdge(e) => graph.add_edge(e),
+                    GraphOp::DeleteVertex(id) => {
+                        // Convert Identifier to Uuid
+                        if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                            let _ = graph.vertices.remove(&uuid);
+                        }
+                    }
+                    GraphOp::DeleteEdge(id) => {
+                        // Convert Identifier to Uuid
+                        if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                            let _ = graph.edges.remove(&uuid);
+                        }
+                    }
+                    GraphOp::UpdateVertex(id, updates) => {
+                        // Convert Identifier to Uuid via string parsing
+                        if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                            if let Some(v) = graph.vertices.get_mut(&uuid) {
+                                for (k, json_val) in updates {
+                                    v.properties.insert(k, json_to_prop(json_val)?);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!(
+            "RocksDBStorage::replay_into - completed: {} vertices, {} edges",
+            graph.vertices.len(),
+            graph.edges.len()
+        );
         Ok(())
     }
 }

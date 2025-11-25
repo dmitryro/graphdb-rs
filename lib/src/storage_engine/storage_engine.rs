@@ -4,7 +4,7 @@ use std::collections::{HashMap, BTreeSet};
 use async_trait::async_trait;
 use models::errors::{GraphError, GraphResult, ValidationError};
 use uuid::Uuid;
-use models::{Edge, Identifier, Vertex};
+use models::{Graph, Edge, Identifier, Vertex, PropertyValue};
 use tokio::sync::{OnceCell, RwLock, Mutex as TokioMutex};
 use tokio::process::Command as TokioCommand;
 use tokio::fs as tokio_fs;
@@ -22,10 +22,12 @@ use surrealdb::Surreal;
 pub use sled::Db as SledDB;
 use surrealdb::engine::any::Any as SurrealAny;
 use surrealdb::sql::Thing;
+use bincode::{Encode, Decode};
 use tokio::fs;
 use tokio::net::{TcpStream, TcpListener};
 use tokio::time::{self, sleep, timeout, Duration as TokioDuration};
 use tokio::task;
+use chrono::Utc;
 pub use rocksdb::{Options, WriteOptions};
 use reqwest::Client;
 use std::process;
@@ -141,6 +143,15 @@ async fn get_fulltext_index() -> Arc<indexing_service::fulltext::FullTextIndex> 
         std::fs::create_dir_all(&index_dir).expect("Failed to create fulltext index directory");
         Arc::new(indexing_service::fulltext::FullTextIndex::new(&index_dir).expect("Failed to initialize Tantivy index"))
     }).await.clone()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GraphOp {
+    InsertVertex(Vertex),
+    InsertEdge(Edge),
+    DeleteVertex(Identifier),
+    DeleteEdge(Identifier),
+    UpdateVertex(Identifier, HashMap<String, Value>),
 }
 
 #[derive(Debug, Default)]
@@ -467,6 +478,85 @@ impl StorageEngine for SurrealdbGraphStorage {
 
     /// SurrealDB handles flushing internally.
     async fn flush(&self) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    // append: store the operation in a dedicated `wal` table ----------------
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        let ts = Utc::now().timestamp_nanos_opt()
+            .ok_or_else(|| GraphError::StorageError("Failed to get timestamp".into()))?;
+        let key = format!("wal_{:0>20}", ts);
+
+        let data = serde_json::to_vec(&op)
+            .map_err(|e| GraphError::StorageError(format!("JSON encode failed: {}", e)))?;
+        let record = StoredValue { value: String::from_utf8_lossy(&data).into_owned() };
+
+        let created: Option<StoredValue> = self.db
+            .create(("wal", key))
+            .content(record)
+            .await
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        if created.is_none() {
+            return Err(GraphError::StorageError("Failed to create WAL record".to_string()));
+        }
+        Ok(())
+    }
+
+    // replay_into: scan the `wal` table, deserialize, apply to graph -------
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+        info!("SurrealdbGraphStorage::replay_into - starting replay");
+
+        // helper: JSON -> PropertyValue
+        fn json_to_prop(v: serde_json::Value) -> Result<PropertyValue, GraphError> {
+            serde_json::from_value(v)
+                .map_err(|e| GraphError::StorageError(format!("bad property: {}", e)))
+        }
+
+        // fetch all WAL rows already sorted by id (time)
+        let mut rows: Vec<StoredValue> = self.db
+            .query("SELECT value FROM wal ORDER BY id")
+            .await
+            .map_err(|e| GraphError::StorageError(e.to_string()))?
+            .take(0)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        // replay
+        for stored in rows {
+            let op: GraphOp = serde_json::from_str(&stored.value)
+                .map_err(|e| GraphError::StorageError(format!("deserialize GraphOp: {}", e)))?;
+
+            match op {
+                GraphOp::InsertVertex(v)  => graph.add_vertex(v),
+                GraphOp::InsertEdge(e)    => graph.add_edge(e),
+
+                GraphOp::DeleteVertex(id) => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        graph.vertices.remove(&uuid);
+                    }
+                }
+                GraphOp::DeleteEdge(id)   => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        graph.edges.remove(&uuid);
+                    }
+                }
+                GraphOp::UpdateVertex(id, updates) => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            for (k, json_val) in updates {
+                                v.properties.insert(k, json_to_prop(json_val)?);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            "SurrealdbGraphStorage::replay_into - completed: {} vertices, {} edges",
+            graph.vertices.len(),
+            graph.edges.len()
+        );
         Ok(())
     }
 }
@@ -1311,6 +1401,9 @@ pub trait StorageEngine: Send + Sync + Debug + 'static {
     async fn retrieve(&self, key: &Vec<u8>) -> Result<Option<Vec<u8>>, GraphError>;
     async fn delete(&self, key: &Vec<u8>) -> Result<(), GraphError>;
     async fn flush(&self) -> Result<(), GraphError>;
+    // Required for recovery
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError>;
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError>;
 }
 
 #[async_trait]

@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
-use models::{Edge, Identifier, Vertex};
+use chrono::Utc;
+use models::{Edge, Identifier, Vertex, Graph, PropertyValue,};
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::SerializableUuid;
-pub use crate::config::{TikvConfig, QueryResult, QueryPlan, TikvStorage};
+pub use crate::config::{TikvConfig, QueryResult, QueryPlan, TikvStorage, json_to_prop};
 use crate::storage_engine::storage_utils::{
     serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge,
 };
+use crate::storage_engine::{ GraphOp };
 use crate::{StorageEngine, GraphStorageEngine};
 use log::{info, debug, error, warn};
 use tikv_client::{Config, TransactionClient, Transaction, KvPair, Key};
@@ -220,6 +222,90 @@ impl StorageEngine for TikvStorage {
 
     async fn flush(&self) -> Result<(), GraphError> {
         info!("Flushing TiKV storage engine (handled by TiKV transactions)");
+        Ok(())
+    }
+
+    // append: write the operation to TiKV with a WAL key ------------------
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        let val = serde_json::to_vec(&op)
+            .map_err(|e| GraphError::StorageError(format!("JSON encode failed: {}", e)))?;
+
+        let ts = Utc::now().timestamp_nanos_opt()
+            .ok_or_else(|| GraphError::StorageError("Failed to get timestamp".into()))?;
+        let key = format!("wal_{:0>20}", ts);
+
+        self.insert(key.into_bytes(), val).await?;   // re-use the existing insert method
+        Ok(())
+    }
+
+    // replay_into: scan every WAL key, deserialize, apply to graph --------
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+        info!("TikvStorage::replay_into - starting replay");
+
+        let start_key = b"wal_".to_vec();
+        let end_key   = b"wal`".to_vec();             // upper bound (exclusive)
+
+        // TiKV range scan
+        let mut txn = self.client.begin_optimistic().await
+            .map_err(|e| GraphError::StorageError(format!("start txn: {}", e)))?;
+
+        let pairs = txn
+            .scan(start_key..end_key, u32::MAX)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("scan WAL: {}", e)))?;
+
+        txn.commit().await
+            .map_err(|e| GraphError::StorageError(format!("commit scan txn: {}", e)))?;
+
+        // sort by key (time order)
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = pairs
+            .into_iter()
+            .map(|p| (p.0.into(), p.1.into()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // helper: JSON -> PropertyValue
+        fn json_to_prop(v: serde_json::Value) -> Result<PropertyValue, GraphError> {
+            serde_json::from_value(v)
+                .map_err(|e| GraphError::StorageError(format!("bad property: {}", e)))
+        }
+
+        // replay
+        for (_key, value) in entries {
+            let op: GraphOp = serde_json::from_slice(&value)
+                .map_err(|e| GraphError::StorageError(format!("deserialize GraphOp: {}", e)))?;
+
+            match op {
+                GraphOp::InsertVertex(v)  => graph.add_vertex(v),
+                GraphOp::InsertEdge(e)    => graph.add_edge(e),
+
+                GraphOp::DeleteVertex(id) => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        graph.vertices.remove(&uuid);
+                    }
+                }
+                GraphOp::DeleteEdge(id)   => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        graph.edges.remove(&uuid);
+                    }
+                }
+                GraphOp::UpdateVertex(id, updates) => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            for (k, json_val) in updates {
+                                v.properties.insert(k, json_to_prop(json_val)?);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            "TikvStorage::replay_into - completed: {} vertices, {} edges",
+            graph.vertices.len(),
+            graph.edges.len()
+        );
         Ok(())
     }
 }

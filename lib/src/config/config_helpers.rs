@@ -17,6 +17,7 @@ pub use crate::config::config_serializers::*;
 use crate::daemon_utils::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range};
 use crate::query_exec_engine::query_exec_engine::{QueryExecEngine};
 use models::errors::{GraphError, GraphResult};
+use models::{ PropertyValue };
 
 pub fn deserialize_engine_config<'de, D>(deserializer: D) -> Result<Option<SelectedStorageConfig>, D::Error>
 where
@@ -1004,6 +1005,12 @@ pub fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngin
     info!("Created default config file at {:?}", yaml_path);
     trace!("Default config file written successfully");
     Ok(())
+}
+
+// Helper: JSON → PropertyValue
+pub fn json_to_prop(v: serde_json::Value) -> Result<PropertyValue, GraphError> {
+    serde_json::from_value(v)
+        .map_err(|e| GraphError::StorageError(format!("Bad property: {}", e)))
 }
 
 /// Creates a default YAML configuration file
