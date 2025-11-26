@@ -9,7 +9,7 @@
 // UPDATED: 2025-11-06 - Unified `Exec`, `Query`, `-q`, `-c` into single `Query` command with optional `--language`.
 //                     Bare strings in interactive mode are now treated as queries with inference.
 
-use clap::{Parser, Subcommand, Arg, Args, ArgAction};
+use clap::{Parser, Subcommand, Arg, Args, ArgAction, ValueEnum}; 
 use std::path::PathBuf;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
@@ -170,11 +170,51 @@ pub enum CommandType {
     Referral(ReferralCommand),
     Triage(TriageCommand),
     Disposition(DispositionCommand),
-    Vitals(VitalsCommand),
     Allergy(AllergyCommand),
     Appointment(AppointmentCommand),
     Problem(ProblemCommand),
     Order(OrderCommand),
+    Discharge(DischargeCommand),
+    Procedure(ProcedureCommand),
+    // =========================================================================
+    // DOSING
+    // =========================================================================
+    Dosing(DosingCommand),
+
+    // =========================================================================
+    // ALERT & NOTIFICATION SYSTEM
+    // =========================================================================
+    Alert(AlertCommand),
+
+    // =========================================================================
+    // PATHOLOGY
+    // =========================================================================
+    Pathology(PathologyCommand),
+
+    // =========================================================================
+    // MICROBIOLOGY
+    // =========================================================================
+    Microbiology(MicrobiologyCommand),
+
+    // =========================================================================
+    // VITAL & OBSERVATION
+    // =========================================================================
+    Vitals(VitalsCommand),
+    Observation(ObservationCommand),
+
+    // =========================================================================
+    // LAB & IMAGING
+    // =========================================================================
+    Lab(LabCommand),
+    Imaging(ImagingCommand),
+
+    // =========================================================================
+    // SPECIALTY CARE
+    // =========================================================================
+    Chemo(ChemoCommand),
+    Radiation(RadiationCommand),
+    Surgery(SurgeryCommand),
+
     // =========================================================================
     // DRUG SAFETY & INTERACTIONS
     // =========================================================================
@@ -184,14 +224,387 @@ pub enum CommandType {
     // POPULATION HEALTH & ANALYTICS
     // =========================================================================
     Population(PopulationCommand),
+    Analytics(AnalyticsCommand),
+    Metrics(MetricsCommand),
 
     // =========================================================================
     // COMPLIANCE & AUDIT
     // =========================================================================
     Audit(AuditCommand),
     Export(ExportCommand),
+
+    // =========================================================================
+    // FACILITY & ADMIN
+    // =========================================================================
+    Facility(FacilityCommand),
+    Access(AccessCommand),
+    Financial(FinancialCommand),
+
+    // =========================================================================
+    // QUALITY & COMPLIANCE
+    // =========================================================================
+    Quality(QualityCommand),
+    Incident(IncidentCommand),
+    Compliance(ComplianceCommand),
+
+    // =========================================================================
+    // RESEARCH & AI
+    // =========================================================================
+    Research(ResearchCommand),
+    Ml(MlCommand),
+    ClinicalTrial(ClinicalTrialCommand),
+    Model(ModelCommand),
+
+    // =========================================================================
+    // NURSING & CARE COORDINATION
+    // =========================================================================
+    Nursing(NursingCommand),
+    Education(EducationCommand),
+    DischargePlanning(DischargePlanningCommand),
 }
 
+
+// =========================================================================
+// CLINICAL WORKFLOW
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum DischargeCommand {
+    /// Initiate discharge planning
+    Plan {
+        patient_id: i32,
+        #[clap(long)] encounter_id: Option<Uuid>,
+        #[clap(long)] estimated_date: Option<String>,
+        #[clap(long)] target_disposition: Option<DispositionTarget>,
+        #[clap(long)] barriers: Vec<String>,
+        #[clap(long)] primary_diagnosis: Option<String>,
+    },
+
+    /// Document discharge readiness assessment
+    Readiness {
+        patient_id: i32,
+        #[clap(long)] medically_stable: bool,
+        #[clap(long)] pain_controlled: bool,
+        #[clap(long)] mobility_safe: bool,
+        #[clap(long)] barriers_resolved: Vec<String>,
+        #[clap(long)] pending_items: Vec<String>,
+        #[clap(long)] assessed_by: i32,
+    },
+
+    /// Generate discharge summary
+    Summary {
+        patient_id: i32,
+        #[clap(long)] template: Option<SummaryTemplate>,
+        #[clap(long)] include_reconciliation: bool,
+        #[clap(long)] include_followup: bool,
+        #[clap(long)] format: Option<OutputFormat>,
+    },
+
+    /// Medication reconciliation at discharge
+    MedRec {
+        patient_id: i32,
+        #[clap(value_enum)]
+        action: MedRecAction,
+        #[clap(long)]
+        medication: String,
+        #[clap(long)]
+        new_dose: Option<String>,     // for Modify
+        #[clap(long)]
+        new_frequency: Option<String>, // for Modify
+        #[clap(long)]
+        reason: Option<String>,
+        #[clap(long)]
+        reconciled_by: i32,
+    },
+
+    /// Create discharge orders
+    Orders {
+        patient_id: i32,
+        #[clap(long)] diet: Option<String>,
+        #[clap(long)] activity: Option<String>,
+        #[clap(long)] wound_care: Option<String>,
+        #[clap(long)] monitoring: Vec<String>,
+        #[clap(long)] restrictions: Vec<String>,
+    },
+
+    /// Schedule follow-up appointments
+    FollowUp {
+        patient_id: i32,
+        provider_type: String, // "PCP", "Cardiology", "Oncology"
+        #[clap(long)] days_out: Option<i64>,
+        #[clap(long)] priority: Option<FollowUpPriority>,
+        #[clap(long)] reason: Option<String>,
+        #[clap(long)] telehealth: bool,
+    },
+
+    /// Patient education & instructions
+    Education {
+        patient_id: i32,
+        topics: Vec<String>, // "medications", "diet", "warning-signs"
+        #[clap(long)] method: Option<EducationMethod>,
+        #[clap(long)] language: Option<String>,
+        #[clap(long)] literacy_level: Option<String>,
+        #[clap(long)] teach_back_verified: bool,
+    },
+
+    /// Finalize discharge
+    Finalize {
+        patient_id: i32,
+        #[clap(long)] actual_date: Option<String>,
+        #[clap(long)] disposition: DispositionTarget,
+        #[clap(long)] transportation: Option<String>,
+        #[clap(long)] accompanying_person: Option<String>,
+        #[clap(long)] final_diagnosis: Vec<String>,
+        #[clap(long)] completed_by: i32,
+    },
+
+    /// Discharge dashboard & analytics
+    Dashboard {
+        #[clap(long)] unit: Option<String>,
+        #[clap(long)] provider_id: Option<i32>,
+        #[clap(long)] timeframe: Option<String>,
+        #[clap(long)] show_pending: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum DispositionTarget {
+    Home,
+    HomeHealth,
+    SkilledNursing,
+    Rehab,
+    LTACH,
+    Hospice,
+    AgainstMedicalAdvice,
+    Expired,
+    Transfer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum SummaryTemplate {
+    Standard,
+    ComplexChronic,
+    Surgical,
+    Stroke,
+    MI,
+    Sepsis,
+    Oncology,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Html,
+    Pdf,
+    Fhir,
+    Hl7,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum MedRecActionCmd {
+    Continue,
+    Hold,
+    Modify { #[clap(long)] new_dose: String },
+    Discontinue { #[clap(long)] reason: String },
+    New {
+        #[clap(long)] medication: String,
+        #[clap(long)] dose: String,
+        #[clap(long)] frequency: String,
+    },
+}
+
+// lib/src/commands.rs — Add this enum
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum MedRecAction {
+    /// Continue medication as prescribed
+    Continue,
+
+    /// Modify dose/frequency/route
+    Modify,
+
+    /// Hold medication temporarily
+    Hold,
+
+    /// Permanently discontinue
+    Discontinue,
+
+    /// Add new medication at discharge
+    New,
+
+    /// Medication was not prescribed on admission but patient reports taking
+    Resume,
+
+    /// Medication reconciliation completed — no changes
+    NoChange,
+
+    /// Medication not reconciled (e.g., patient unable to provide info)
+    UnableToReconcile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum FollowUpPriority {
+    Urgent,    // <7 days
+    Routine,   // 7-14 days
+    Standard,  // 14-30 days
+    Extended,  // >30 days
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum EducationMethod {
+    Verbal,
+    Written,
+    Video,
+    TeachBack,
+    Interpreter,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ProcedureCommand {
+    /// Create new procedure order
+    Order {
+        encounter_id: Uuid,
+        procedure: String,
+        #[clap(long)] cpt_code: Option<String>,
+        #[clap(long)] laterality: Option<Laterality>,
+        #[clap(long)] priority: Option<ProcedurePriority>,
+        #[clap(long)] indication: Option<String>,
+        #[clap(long)] ordering_provider: Option<i32>,
+        #[clap(long)] scheduled_date: Option<String>,
+        #[clap(long)] location: Option<String>,
+    },
+
+    /// Document procedure performance
+    Perform {
+        procedure_id: Uuid,
+        #[clap(long)] performing_provider: i32,
+        #[clap(long)] start_time: Option<String>,
+        #[clap(long)] end_time: Option<String>,
+        #[clap(long)] anesthesia_type: Option<AnesthesiaType>,
+        #[clap(long)] assistants: Vec<i32>,
+        #[clap(long)] specimens: Vec<String>,
+        #[clap(long)] implants: Vec<String>,
+        #[clap(long)] ebl_ml: Option<i32>,
+        #[clap(long)] complications: Vec<String>,
+    },
+
+    /// Record procedure result/report
+    Result {
+        procedure_id: Uuid,
+        #[clap(long)] status: ProcedureStatus,
+        #[clap(long)] findings: Option<String>,
+        #[clap(long)] impression: Option<String>,
+        #[clap(long)] pathology_sent: bool,
+        #[clap(long)] report_by: i32,
+        #[clap(long)] report_date: Option<String>,
+    },
+
+    /// Cancel procedure
+    Cancel {
+        procedure_id: Uuid,
+        reason: String,
+        #[clap(long)] cancelled_by: i32,
+    },
+
+    /// List procedures
+    List {
+        #[clap(long)] patient_id: Option<i32>,
+        #[clap(long)] encounter_id: Option<Uuid>,
+        #[clap(long)] status: Option<ProcedureStatus>,
+        #[clap(long)] provider_id: Option<i32>,
+        #[clap(long)] date_range: Option<String>,
+        #[clap(long)] limit: Option<usize>,
+    },
+
+    /// Procedure timeline for patient
+    Timeline {
+        patient_id: i32,
+        #[clap(long)] procedure_type: Option<String>,
+        #[clap(long)] years: Option<i32>,
+    },
+
+    /// Quality & utilization analytics
+    Analytics {
+        #[clap(subcommand)]
+        analytics_type: ProcedureAnalyticsType,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum Laterality {
+    Left,
+    Right,
+    Bilateral,
+    Midline,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ProcedurePriority {
+    Routine,
+    Urgent,
+    Stat,
+    Elective,
+    Emergent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum AnesthesiaType {
+    General,
+    Regional,
+    Local,
+    Monitored,
+    Sedation,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ProcedureStatus {
+    Ordered,
+    Scheduled,
+    InProgress,
+    Completed,
+    Cancelled,
+    NotDone,
+    Preliminary,
+    Final,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ProcedureAnalyticsType {
+    /// Volume by procedure type
+    Volume {
+        #[clap(long)] procedure_type: Option<String>,
+        #[clap(long)] provider: Option<i32>,
+        #[clap(long)] timeframe: Option<String>,
+    },
+
+    /// Complication rates
+    Complications {
+        procedure: String,
+        #[clap(long)] risk_adjusted: bool,
+    },
+
+    /// Turnaround time (order to completion)
+    Turnaround {
+        procedure: String,
+        #[clap(long)] target_hours: Option<i64>,
+    },
+
+    /// Cancellation/no-show rate
+    Cancellations,
+
+    /// Provider procedure volume
+    ProviderVolume {
+        provider_id: i32,
+        #[clap(long)] timeframe: Option<String>,
+    },
+
+    /// Procedure-specific outcomes
+    Outcomes {
+        procedure: String,
+        #[clap(long)] outcome_metric: Option<String>,
+    },
+}
 // AppointmentCommand
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum AppointmentCommand {
@@ -422,6 +835,268 @@ pub enum ReferralCommand {
     },
 }
 
+// =========================================================================
+// LABORATORY
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum LabCommand {
+    /// Order lab tests
+    Order {
+        encounter_id: Uuid,
+        tests: Vec<String>, // "CBC", "BMP", "Troponin", "Blood Culture"
+        #[clap(long)] priority: Option<LabPriority>,
+        #[clap(long)] clinical_indication: Option<String>,
+        #[clap(long)] collect_time: Option<String>,
+    },
+
+    /// Receive and record lab result
+    Result {
+        order_id: Uuid,
+        test_name: String,
+        value: String,
+        #[clap(long)] unit: Option<String>,
+        #[clap(long)] reference_range: Option<String>,
+        #[clap(long)] flag: Option<LabFlag>,
+        #[clap(long)] critical: bool,
+    },
+
+    /// View lab trending
+    Trend {
+        patient_id: i32,
+        test_name: String,
+        #[clap(long)] days: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum LabPriority {
+    Routine,
+    Urgent,
+    Stat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum LabFlag {
+    Low,
+    High,
+    CriticalLow,
+    CriticalHigh,
+    Abnormal,
+    Normal,
+}
+
+// =========================================================================
+// IMAGING
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ImagingCommand {
+    /// Order imaging study
+    Order {
+        encounter_id: Uuid,
+        study: String, // "CT Chest with Contrast", "MRI Brain"
+        #[clap(long)] priority: Option<ImagingPriority>,
+        #[clap(long)] indication: Option<String>,
+        #[clap(long)] contrast: Option<bool>,
+        #[clap(long)] modality: Option<String>,
+    },
+
+    /// Record preliminary read
+    Preliminary {
+        study_id: Uuid,
+        finding: String,
+        #[clap(long)] impression: Option<String>,
+        #[clap(long)] radiologist: Option<i32>,
+    },
+
+    /// Record final report
+    Final {
+        study_id: Uuid,
+        report: String,
+        #[clap(long)] critical_finding: Option<bool>,
+        #[clap(long)] radiologist: Option<i32>,
+    },
+
+    /// Compare with prior
+    Compare {
+        patient_id: i32,
+        study_type: String,
+        #[clap(long)] prior_date: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ImagingPriority {
+    Routine,
+    Urgent,
+    Stat,
+}
+
+// =========================================================================
+// CHEMOTHERAPY
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ChemoCommand {
+    /// Create chemotherapy regimen
+    Regimen {
+        patient_id: i32,
+        regimen_name: String, // "FOLFOX", "R-CHOP"
+        #[clap(long)] diagnosis: String,
+        #[clap(long)] intent: Option<ChemoIntent>,
+        #[clap(long)] start_date: Option<String>,
+    },
+
+    /// Add cycle
+    CycleAdd {
+        regimen_id: Uuid,
+        cycle_number: i32,
+        #[clap(long)] planned_date: String,
+        #[clap(long)] pre_meds: Vec<String>,
+    },
+
+    /// Verify pre-chemo labs
+    LabsVerify {
+        regimen_id: Uuid,
+        cycle_number: i32,
+        #[clap(long)] required_labs: Vec<String>,
+    },
+
+    /// Modify cycle (hold, dose reduce)
+    CycleModify {
+        cycle_id: Uuid,
+        #[clap(long)] action: ChemoAction,
+        #[clap(long)] reason: Option<String>,
+        #[clap(long)] dose_reduction_pct: Option<i32>,
+    },
+
+    /// Document toxicity
+    Toxicity {
+        patient_id: i32,
+        cycle_id: Option<Uuid>,
+        term: String,
+        grade: i32,
+        #[clap(long)] management: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ChemoIntent {
+    Curative,
+    Adjuvant,
+    Neoadjuvant,
+    Palliative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ChemoAction {
+    Hold,
+    Delay,
+    Reduce,
+    Discontinue,
+}
+
+// =========================================================================
+// RADIATION THERAPY
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum RadiationCommand {
+    /// Create radiation plan
+    Plan {
+        patient_id: i32,
+        site: String,
+        technique: String, // "IMRT", "SBRT", "3D-CRT"
+        total_dose_gy: f32,
+        fractions: i32,
+        #[clap(long)] start_date: Option<String>,
+    },
+
+    /// Daily treatment
+    Treatment {
+        plan_id: Uuid,
+        fraction: i32,
+        dose_delivered: f32,
+        #[clap(long)] image_guidance: Option<String>,
+        #[clap(long)] toxicity: Option<String>,
+    },
+
+    /// Assess cumulative toxicity
+    Toxicity {
+        patient_id: i32,
+        #[clap(long)] grade: i32,
+        #[clap(long)] organ: String,
+        #[clap(long)] management: Option<String>,
+    },
+}
+
+// =========================================================================
+// SURGERY
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum SurgeryCommand {
+    /// Create surgical case
+    CaseCreate {
+        patient_id: i32,
+        procedure: String,
+        surgeon_id: i32,
+        #[clap(long)] date: String,
+        #[clap(long)] time: Option<String>,
+        #[clap(long)] location: Option<String>,
+    },
+
+    /// Pre-operative checklist
+    PreopChecklist {
+        case_id: Uuid,
+        #[clap(long)] consent: bool,
+        #[clap(long)] h_and_p: bool,
+        #[clap(long)] npo: bool,
+        #[clap(long)] antibiotics_given: Option<String>,
+    },
+
+    /// Start case
+    CaseStart {
+        case_id: Uuid,
+        #[clap(long)] anesthesia_start: Option<String>,
+        #[clap(long)] incision_time: Option<String>,
+    },
+
+    /// Document intraoperative event
+    EventAdd {
+        case_id: Uuid,
+        time: String,
+        event: String,
+    },
+
+    /// Close case
+    CaseClose {
+        case_id: Uuid,
+        #[clap(long)] ebl_ml: Option<i32>,
+        #[clap(long)] complications: Option<String>,
+        #[clap(long)] specimens: Option<String>,
+    },
+}
+
+// =========================================================================
+// OBSERVATION & VITALS
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ObservationCommand {
+    /// Record a clinical observation (pain, consciousness, etc.)
+    Add {
+        encounter_id: Uuid,
+        observation_type: String, // "PAIN", "CONSCIOUSNESS", "MOOD"
+        value: String,
+        #[clap(long)] unit: Option<String>,
+        #[clap(long)] observed_by: Option<i32>,
+        #[clap(long)] notes: Option<String>,
+    },
+
+    /// List observations for encounter
+    List {
+        encounter_id: Uuid,
+        #[clap(long)] type_filter: Option<String>,
+        #[clap(long)] limit: Option<usize>,
+    },
+}
+
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum VitalsCommand {
     /// Add vital signs for an encounter
@@ -563,8 +1238,439 @@ pub enum PopulationCommand {
     CareGapsSummary,
 }
 
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum AnalyticsCommand {
+    /// Population health & epidemiology
+    #[clap(subcommand)]
+    Population(AnalyticsPopulationCommand),
 
-#[derive(Subcommand, Debug, PartialEq, Clone)]
+    /// Clinical quality & outcomes
+    #[clap(subcommand)]
+    Quality(AnalyticsQualityCommand),
+
+    /// Utilization & efficiency
+    #[clap(subcommand)]
+    Utilization(AnalyticsUtilizationCommand),
+
+    /// Risk stratification & predictive
+    #[clap(subcommand)]
+    Risk(AnalyticsRiskCommand),
+
+    /// Care pathway & protocol adherence
+    #[clap(subcommand)]
+    Pathway(AnalyticsPathwayCommand),
+
+    /// Social determinants & equity
+    #[clap(subcommand)]
+    Equity(AnalyticsEquityCommand),
+
+    /// Custom cohort analytics
+    Cohort {
+        query: String,
+        #[clap(long)] name: Option<String>,
+        #[clap(long)] save: bool,
+    },
+}
+
+// =========================================================================
+// 1. POPULATION HEALTH & EPIDEMIOLOGY
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum AnalyticsPopulationCommand {
+    /// Disease prevalence by demographics
+    Prevalence {
+        diagnosis: String,
+        #[clap(long)] age_group: Option<String>,
+        #[clap(long)] gender: Option<String>,
+        #[clap(long)] race: Option<String>,
+    },
+
+    /// Incidence rate (new cases)
+    Incidence {
+        diagnosis: String,
+        #[clap(long)] timeframe: Option<String>, // 30d, 90d, 1y
+    },
+
+    /// Comorbidity analysis
+    Comorbidity {
+        primary_diagnosis: String,
+        #[clap(long)] top_n: Option<usize>,
+    },
+
+    /// Seasonal patterns
+    Seasonal {
+        diagnosis: String,
+        #[clap(long)] years: Option<usize>,
+    },
+
+    /// Outbreak detection
+    Outbreak {
+        #[clap(long)] pathogen: Option<String>,
+        #[clap(long)] threshold: Option<f64>,
+    },
+}
+
+// =========================================================================
+// 2. CLINICAL QUALITY & OUTCOMES
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum AnalyticsQualityCommand {
+    /// Mortality index (observed vs expected)
+    MortalityIndex {
+        #[clap(long)] service_line: Option<String>,
+    },
+
+    /// Length of stay analysis
+    Los {
+        #[clap(long)] diagnosis: Option<String>,
+        #[clap(long)] benchmark: Option<String>, // national, peer
+    },
+
+    /// Readmission analysis
+    Readmission {
+        #[clap(long)] days: Option<i32>, // 7, 30, 90
+        #[clap(long)] preventable_only: bool,
+    },
+
+    /// Complication rates
+    Complications {
+        procedure: String,
+        #[clap(long)] risk_adjusted: bool,
+    },
+
+    /// Patient experience scores
+    Experience {
+        #[clap(long)] domain: Option<String>, // communication, pain, quietness
+    },
+}
+
+// =========================================================================
+// 3. UTILIZATION & EFFICIENCY
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum AnalyticsUtilizationCommand {
+    /// ED utilization patterns
+    EdUtilization {
+        #[clap(long)] chief_complaint: Option<String>,
+        #[clap(long)] time_of_day: bool,
+    },
+
+    /// Bed turnover rate
+    BedTurnover {
+        #[clap(long)] unit: Option<String>,
+    },
+
+    /// OR case volume & efficiency
+    OrEfficiency {
+        #[clap(long)] surgeon: Option<i32>,
+        #[clap(long)] procedure_type: Option<String>,
+    },
+
+    /// Diagnostic test utilization
+    TestUtilization {
+        test_name: String,
+        #[clap(long)] ordering_provider: Option<i32>,
+    },
+
+    /// Medication utilization
+    MedicationUtilization {
+        medication: String,
+        #[clap(long)] therapeutic_class: Option<String>,
+    },
+}
+
+// =========================================================================
+// 4. RISK STRATIFICATION & PREDICTIVE
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum AnalyticsRiskCommand {
+    /// LACE+ readmission risk distribution
+    LacePlus,
+
+    /// Hospital-acquired condition risk
+    HacRisk {
+        #[clap(long)] condition: Option<String>, // fall, pressure ulcer, etc.
+    },
+
+    /// Deterioration index (modified early warning score)
+    DeteriorationIndex {
+        #[clap(long)] unit: Option<String>,
+    },
+
+    /// Sepsis risk trajectory
+    SepsisTrajectory {
+        patient_id: i32,
+        #[clap(long)] hours: Option<i32>,
+    },
+
+    /// Frailty index
+    Frailty {
+        #[clap(long)] age_min: Option<u32>,
+    },
+}
+
+// =========================================================================
+// 5. CARE PATHWAY & PROTOCOL ADHERENCE
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum AnalyticsPathwayCommand {
+    /// Pathway compliance rate
+    Compliance {
+        pathway: String, // "Stroke", "Sepsis-6", "Postoperative"
+        #[clap(long)] milestone: Option<String>,
+    },
+
+    /// Time to milestone achievement
+    MilestoneTiming {
+        pathway: String,
+        milestone: String,
+    },
+
+    /// Deviation analysis
+    Deviations {
+        pathway: String,
+        #[clap(long)] reason_filter: Option<String>,
+    },
+
+    /// Pathway outcomes comparison
+    Outcomes {
+        pathway: String,
+        #[clap(long)] variant: Option<String>,
+    },
+}
+
+// =========================================================================
+// 6. SOCIAL DETERMINANTS & HEALTH EQUITY
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum AnalyticsEquityCommand {
+    /// SDOH prevalence
+    SdohPrevalence {
+        #[clap(long)] domain: Option<String>, // housing, food, transportation
+    },
+
+    /// Outcomes by SDOH status
+    OutcomesBySdoh {
+        diagnosis: String,
+        sdoh_factor: String,
+    },
+
+    /// Access disparities
+    AccessDisparities {
+        #[clap(long)] metric: Option<String>, // ED visits, preventive screening
+        #[clap(long)] demographic: Option<String>,
+    },
+
+    /// Language barrier impact
+    LanguageImpact {
+        #[clap(long)] preferred_language: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum MetricsCommand {
+    /// Real-time clinical quality metrics
+    #[clap(subcommand)]
+    Clinical(MetricsClinicalCommand),
+
+    /// Operational & throughput metrics
+    #[clap(subcommand)]
+    Operational(MetricsOperationalCommand),
+
+    /// Financial & revenue cycle metrics
+    #[clap(subcommand)]
+    Financial(MetricsFinancialCommand),
+
+    /// Safety & adverse event metrics
+    #[clap(subcommand)]
+    Safety(MetricsSafetyCommand),
+
+    /// AI model performance metrics
+    #[clap(subcommand)]
+    Ml(MetricsMlCommand),
+
+    /// Custom dashboard — combine any metrics
+    Dashboard {
+        #[clap(long)] name: Option<String>,
+        #[clap(long)] save: bool,
+    },
+}
+
+// =========================================================================
+// 1. CLINICAL QUALITY METRICS
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum MetricsClinicalCommand {
+    /// Sepsis bundle compliance (SEP-1)
+    SepsisBundle {
+        #[clap(long)] facility: Option<String>,
+        #[clap(long)] timeframe: Option<String>, // today, 7d, 30d
+    },
+
+    /// Door-to-balloon time for STEMI
+    DoorToBalloon {
+        #[clap(long)] target_minutes: Option<i32>, // default 90
+    },
+
+    /// Stroke pathway compliance (tPA <60min)
+    StrokeTpa {
+        #[clap(long)] target_minutes: Option<i32>, // default 60
+    },
+
+    /// Antibiotic stewardship — time to appropriate therapy
+    AntibioticTiming,
+
+    /// Glycemic control — severe hypo/hyperglycemia rates
+    GlycemicControl,
+
+    /// VTE prophylaxis compliance
+    VteProphylaxis,
+
+    /// Pain reassessment within 1 hour
+    PainReassessment,
+
+    /// Fall rate per 1000 patient days
+    FallRate,
+
+    /// Pressure injury prevalence
+    PressureInjury,
+
+    /// 30-day readmission rate
+    ReadmissionRate {
+        #[clap(long)] condition: Option<String>,
+    },
+}
+
+// =========================================================================
+// 2. OPERATIONAL & THROUGHPUT METRICS
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum MetricsOperationalCommand {
+    /// ED throughput metrics
+    EdThroughput {
+        #[clap(long)] metric: Option<EdMetric>,
+    },
+
+    /// OR utilization and efficiency
+    OrUtilization,
+
+    /// Bed occupancy and turnover
+    BedOccupancy {
+        #[clap(long)] unit: Option<String>,
+        #[clap(long)] predict_hours: Option<i32>,
+    },
+
+    /// Patient flow — LWBS, AMA, elopement
+    PatientFlow,
+
+    /// Staff productivity
+    StaffProductivity {
+        #[clap(long)] role: Option<String>, // doctor, nurse, tech
+    },
+
+    /// Appointment no-show rate
+    NoShowRate,
+
+    /// Telehealth utilization
+    TelehealthUtilization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum EdMetric {
+    DoorToProvider,
+    DoorToDisposition,
+    Los, // Length of stay
+    Lwbs, // Left without being seen
+    BoardingTime,
+}
+
+// =========================================================================
+// 3. FINANCIAL METRICS
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum MetricsFinancialCommand {
+    /// Revenue per encounter by service line
+    RevenuePerEncounter {
+        #[clap(long)] service: Option<String>,
+    },
+
+    /// Cost per case
+    CostPerCase,
+
+    /// Denial rate and reasons
+    DenialRate,
+
+    /// Payer mix
+    PayerMix,
+
+    /// Point-of-service collections
+    PosCollections,
+
+    /// Charge lag days
+    ChargeLag,
+
+    /// AR days outstanding
+    ArDays,
+}
+
+// =========================================================================
+// 4. SAFETY & ADVERSE EVENT METRICS
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum MetricsSafetyCommand {
+    /// Medication errors
+    MedicationErrors {
+        #[clap(long)] type_filter: Option<String>, // wrong-dose, wrong-drug
+    },
+
+    /// Adverse drug events
+    AdverseDrugEvents,
+
+    /// Hospital-acquired infections
+    Hai {
+        #[clap(long)] infection_type: Option<String>, // CLABSI, CAUTI, SSI
+    },
+
+    /// Sentinel events
+    SentinelEvents,
+
+    /// Near misses
+    NearMisses,
+
+    /// Patient satisfaction (HCAHPS)
+    PatientSatisfaction,
+}
+
+// =========================================================================
+// 5. AI/ML MODEL METRICS
+// =========================================================================
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum MetricsMlCommand {
+    /// Model performance dashboard
+    Performance {
+        model_name: String,
+    },
+
+    /// Alert fatigue analysis
+    AlertFatigue {
+        #[clap(long)] provider_id: Option<i32>,
+    },
+
+    /// Override rate by model
+    OverrideRate,
+
+    /// Positive predictive value over time
+    PpvTrend {
+        model_name: String,
+    },
+
+    /// Model drift detection
+    Drift {
+        model_name: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum AuditCommand {
     Patient {
         patient_id: i32,
@@ -588,6 +1694,324 @@ pub enum ExportCommand {
         query: String,
         #[arg(long)] format: String,
     },
+}
+
+// =========================================================================
+// RESEARCH & AI
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ResearchCommand {
+    Cohort { query: String },
+    Export { cohort_id: String, #[clap(long)] format: String, #[clap(long)] deidentify: bool },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum MlCommand {
+    Predict { model: String, patient_id: i32 },
+    Train { name: String, dataset: String },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ClinicalTrialCommand {
+    /// List all active trials
+    List {
+        #[clap(long)] status: Option<TrialStatus>,
+        #[clap(long)] sponsor: Option<String>,
+        #[clap(long)] phase: Option<TrialPhase>,
+    },
+
+    /// Show detailed trial information
+    Show {
+        trial_id: String, // NCT ID or internal ID
+        #[clap(long)] include_sites: bool,
+        #[clap(long)] include_arms: bool,
+    },
+
+    /// Screen patients for trial eligibility
+    Screen {
+        trial_id: String,
+        #[clap(long)] patient_id: Option<i32>,
+        #[clap(long)] cohort_query: Option<String>,
+        #[clap(long)] dry_run: bool,
+    },
+
+    /// Enroll patient in trial
+    Enroll {
+        trial_id: String,
+        patient_id: i32,
+        #[clap(long)] consent_date: Option<String>,
+        #[clap(long)] arm: Option<String>,
+        #[clap(long)] site_id: Option<String>,
+    },
+
+    /// Randomize patient (when applicable)
+    Randomize {
+        trial_id: String,
+        patient_id: i32,
+        #[clap(long)] stratification_factors: Vec<String>,
+    },
+
+    /// Record trial visit
+    Visit {
+        trial_id: String,
+        patient_id: i32,
+        visit_name: String,
+        #[clap(long)] scheduled_date: Option<String>,
+        #[clap(long)] actual_date: Option<String>,
+        #[clap(long)] status: Option<VisitStatus>,
+    },
+
+    /// Record adverse event
+    AdverseEvent {
+        trial_id: String,
+        patient_id: i32,
+        #[clap(long)] term: String,
+        #[clap(long)] grade: Option<i32>,
+        #[clap(long)] seriousness: Option<Seriousness>,
+        #[clap(long)] expected: bool,
+        #[clap(long)] onset_date: String,
+    },
+
+    /// Record protocol deviation
+    Deviation {
+        trial_id: String,
+        patient_id: i32,
+        description: String,
+        #[clap(long)] category: Option<DeviationCategory>,
+        #[clap(long)] impact: Option<String>,
+    },
+
+    /// End trial participation
+    EndParticipation {
+        trial_id: String,
+        patient_id: i32,
+        #[clap(long)] reason: String,
+        #[clap(long)] date: Option<String>,
+    },
+
+    /// Generate trial reports
+    Report {
+        trial_id: String,
+        #[clap(subcommand)]
+        report_type: TrialReportType,
+    },
+
+    /// Export trial data
+    Export {
+        trial_id: String,
+        #[clap(long)] format: ExportFormat,
+        #[clap(long)] include_sae: bool,
+        #[clap(long)] deidentify: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)] 
+pub enum TrialStatus {
+    Recruiting,
+    Active,
+    Completed,
+    Terminated,
+    Withdrawn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)] 
+pub enum TrialPhase {
+    Phase1,
+    Phase2,
+    Phase3,
+    Phase4,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum TrialReportType {
+    Enrollment,
+    Safety,
+    Demographics,
+    Efficacy,
+    Compliance,
+    DataQuality,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum VisitStatus {
+    Scheduled,
+    Completed,
+    Missed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum Seriousness {
+    Serious,
+    NonSerious,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum DeviationCategory {
+    Major,
+    Minor,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    Json,
+    Fhir,
+    Csv,
+    Sdtm,
+    Redcap,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ModelCommand {
+    /// List all deployed models
+    List {
+        #[clap(long)] status: Option<ModelStatus>,
+        #[clap(long)] domain: Option<String>, // sepsis, readmission, etc.
+    },
+
+    /// Show detailed model information
+    Show {
+        model_name: String,
+        #[clap(long)] include_metrics: bool,
+        #[clap(long)] include_features: bool,
+        #[clap(long)] include_version_history: bool,
+    },
+
+    /// Deploy new model version
+    Deploy {
+        model_name: String,
+        #[clap(long)] version: String,
+        #[clap(long)] path: std::path::PathBuf,
+        #[clap(long)] format: ModelFormat,
+        #[clap(long)] description: Option<String>,
+        #[clap(long)] force: bool,
+    },
+
+    /// Run real-time prediction
+    Predict {
+        model_name: String,
+        patient_id: i32,
+        #[clap(long)] encounter_id: Option<Uuid>,
+        #[clap(long)] output_format: Option<PredictionFormat>,
+    },
+
+    /// Evaluate model performance
+    Evaluate {
+        model_name: String,
+        #[clap(long)] test_cohort: Option<String>,
+        #[clap(long)] start_date: Option<String>,
+        #[clap(long)] end_date: Option<String>,
+    },
+
+    /// Retrain model with new data
+    Retrain {
+        model_name: String,
+        #[clap(long)] cohort_query: Option<String>,
+        #[clap(long)] outcome_variable: String,
+        #[clap(long)] time_window_hours: Option<i64>,
+    },
+
+    /// Model monitoring dashboard
+    Monitor {
+        model_name: Option<String>,
+        #[clap(long)] timeframe: Option<String>, // 1h, 24h, 7d
+        #[clap(long)] alert_threshold: Option<f64>,
+    },
+
+    /// Explain prediction (XAI)
+    Explain {
+        model_name: String,
+        patient_id: i32,
+        #[clap(long)] top_features: Option<usize>,
+        #[clap(long)] format: Option<ExplainFormat>,
+    },
+
+    /// Model drift detection
+    Drift {
+        model_name: String,
+        #[clap(long)] baseline_date: Option<String>,
+    },
+
+    /// A/B test models
+    AbTest {
+        model_a: String,
+        model_b: String,
+        #[clap(long)] traffic_split: Option<String>, // "50-50", "10-90"
+        #[clap(long)] duration_days: Option<i64>,
+    },
+
+    /// Rollback to previous version
+    Rollback {
+        model_name: String,
+        #[clap(long)] version: Option<String>, // latest safe if omitted
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ModelStatus {
+    Development,
+    Staging,
+    Production,
+    Retired,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ModelFormat {
+    Pytorch,
+    Tensorflow,
+    Onnx,
+    Pkl,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum PredictionFormat {
+    Json,
+    FhirObservation,
+    ClinicalNote,
+    Alert,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ExplainFormat {
+    Text,
+    Json,
+    Html,
+    Lime,
+    Shap,
+}
+
+// =========================================================================
+// FACILITY & FINANCIAL
+// =========================================================================
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum FacilityCommand {
+    Beds { #[clap(long)] unit: Option<String> },
+    Capacity,
+}
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum FinancialCommand {
+    ServiceLine { service: String },
+    PayerMix,
+}
+
+// =========================================================================
+// COMPLIANCE & ACCESS
+// =========================================================================
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum ComplianceCommand {
+    AuditPatient { patient_id: i32, #[clap(long)] from: DateTime<Utc> },
+    AuditControlledSubstances { #[clap(long)] from: DateTime<Utc> },
+}
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum AccessCommand {
+    Login { username: String },
+    Whoami,
+    Logout,
 }
 
 // AFTER — this is the ONLY change you need:
@@ -630,6 +2054,299 @@ pub enum GraphAction {
     },
 }
 
+
+// =========================================================================
+// ALERT & NOTIFICATION SYSTEM
+// =========================================================================
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum AlertCommand {
+    /// List active alerts
+    List {
+        #[clap(long)] patient_id: Option<i32>,
+        #[clap(long)] severity: Option<AlertSeverity>,
+        #[clap(long)] type_filter: Option<String>,
+        #[clap(long)] unresolved_only: bool,
+    },
+
+    /// Create new clinical alert
+    Create {
+        patient_id: i32,
+        alert_type: String, // "CRITICAL_LAB", "DDI_HIGH", "SEPSIS_RISK"
+        message: String,
+        #[clap(long)] severity: Option<AlertSeverity>,
+        #[clap(long)] trigger_source: Option<String>,
+        #[clap(long)] expires_in_hours: Option<i64>,
+    },
+
+    /// Acknowledge/alert resolution
+    Ack {
+        alert_id: Uuid,
+        #[clap(long)] resolved_by: i32,
+        #[clap(long)] resolution_note: Option<String>,
+    },
+
+    /// Escalate alert
+    Escalate {
+        alert_id: Uuid,
+        #[clap(long)] to_role: Option<String>, // "rapid-response", "ICU-consult"
+        #[clap(long)] reason: Option<String>,
+    },
+
+    /// Alert dashboard
+    Dashboard {
+        #[clap(long)] provider_id: Option<i32>,
+        #[clap(long)] unit: Option<String>,
+        #[clap(long)] timeframe: Option<String>, // today, shift, 24h
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum AlertSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+} 
+
+// =========================================================================
+// DOSING
+// =========================================================================
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum DosingCommand {
+    /// Real-time dose calculation with adjustments
+    Calculate {
+        patient_id: i32,
+        medication: String,
+        #[clap(long)] indication: Option<String>,
+        #[clap(long)] weight_kg: Option<f64>,
+        #[clap(long)] height_cm: Option<f64>,
+        #[clap(long)] creatinine: Option<f64>,
+        #[clap(long)] age: Option<i32>,
+        #[clap(long)] hepatic_function: Option<HepaticFunction>,
+        #[clap(long)] dialysis: bool,
+    },
+
+    /// Verify current dose appropriateness
+    Verify {
+        patient_id: i32,
+        #[clap(long)] prescription_id: Option<Uuid>,
+        #[clap(long)] medication: Option<String>,
+        #[clap(long)] include_therapeutic_duplicates: bool,
+    },
+
+    /// Vancomycin pharmacokinetic dosing
+    Vancomycin {
+        patient_id: i32,
+        #[clap(long)] trough_level: Option<f64>,
+        #[clap(long)] target_auc: Option<f64>, // default 400-600
+        #[clap(long)] loading_dose: bool,
+    },
+
+    /// Warfarin dosing with INR feedback
+    Warfarin {
+        patient_id: i32,
+        current_inr: f64,
+        target_inr_range: Option<String>, // "2.0-3.0"
+        #[clap(long)] weekly_dose_mg: Option<f64>,
+        #[clap(long)] cyp2c9: Option<String>,
+        #[clap(long)] vkorc1: Option<String>,
+    },
+
+    /// Aminoglycoside (Gentamicin/Tobramycin) extended interval
+    Aminoglycoside {
+        patient_id: i32,
+        medication: String, // "Gentamicin", "Tobramycin"
+        #[clap(long)] level: Option<f64>,
+        #[clap(long)] level_timing_hours: Option<f64>,
+    },
+
+    /// Antiepileptic drug (AED) level interpretation
+    Aed {
+        patient_id: i32,
+        medication: String, // "Phenytoin", "Valproate", "Carbamazepine"
+        level: f64,
+        #[clap(long)] albumin: Option<f64>,
+        #[clap(long)] free_level: Option<bool>,
+    },
+
+    /// Immunosuppressant (Tacrolimus, Cyclosporine) monitoring
+    Immunosuppressant {
+        patient_id: i32,
+        medication: String,
+        trough_level: f64,
+        #[clap(long)] transplant_type: Option<String>,
+        #[clap(long)] post_transplant_days: Option<i32>,
+    },
+
+    /// Chemotherapy dose calculation & adjustment
+    Chemo {
+        patient_id: i32,
+        regimen: String,
+        cycle: i32,
+        #[clap(long)] bsa_m2: Option<f64>,
+        #[clap(long)] auc_target: Option<f64>, // for carboplatin
+        #[clap(long)] dose_reduction_pct: Option<i32>,
+    },
+
+    /// Pediatric weight-based dosing
+    Pediatric {
+        patient_id: i32,
+        medication: String,
+        #[clap(long)] weight_kg: Option<f64>,
+        #[clap(long)] age_months: Option<i32>,
+        #[clap(long)] max_dose: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum HepaticFunction {
+    Normal,
+    Mild,
+    Moderate,
+    Severe,
+    CirrhosisChildPughA,
+    CirrhosisChildPughB,
+    CirrhosisChildPughC,
+}
+
+// =========================================================================
+// PATHOLOGY
+// =========================================================================
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum PathologyCommand {
+    /// Register new specimen
+    Specimen {
+        patient_id: i32,
+        encounter_id: Option<Uuid>,
+        specimen_type: String, // "Biopsy", "Surgical resection"
+        collection_site: String,
+        #[clap(long)] collection_date: Option<String>,
+        #[clap(long)] collector: Option<i32>,
+    },
+
+    /// Record pathology result
+    Result {
+        specimen_id: Uuid,
+        diagnosis: String,
+        #[clap(long)] malignancy: Option<bool>,
+        #[clap(long)] grade: Option<i32>,
+        #[clap(long)] stage: Option<String>,
+        #[clap(long)] margins: Option<String>,
+        #[clap(long)] biomarkers: Vec<String>,
+        #[clap(long)] pathologist: i32,
+        #[clap(long)] report_date: Option<String>,
+    },
+
+    /// Add molecular/genomic findings
+    Molecular {
+        specimen_id: Uuid,
+        test_type: String, // "NGS", "IHC", "FISH"
+        gene: String,
+        variant: String,
+        #[clap(long)] interpretation: Option<String>,
+        #[clap(long)] therapeutic_implication: Option<String>,
+    },
+
+    /// Search pathology reports
+    Search {
+        #[clap(long)] patient_id: Option<i32>,
+        #[clap(long)] diagnosis_contains: Option<String>,
+        #[clap(long)] biomarker: Option<String>,
+        #[clap(long)] malignancy: Option<bool>,
+    },
+}
+
+// =========================================================================
+// MICROBIOLOGY
+// =========================================================================
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum MicrobiologyCommand {
+    /// Register culture specimen
+    Culture {
+        patient_id: i32,
+        encounter_id: Option<Uuid>,
+        source: String, // "Blood", "Urine", "Wound"
+        #[clap(long)] collection_date: Option<String>,
+        #[clap(long)] collected_by: Option<i32>,
+    },
+
+    /// Preliminary culture result
+    Preliminary {
+        culture_id: Uuid,
+        finding: String, // "Gram positive cocci in clusters"
+        #[clap(long)] organism_quantity: Option<String>,
+    },
+
+    /// Final identification & sensitivities
+    Final {
+        culture_id: Uuid,
+        organism: String, // "MRSA", "Pseudomonas aeruginosa"
+        #[clap(long)] sensitivities: Vec<String>, // "Vancomycin:S", "Ceftazidime:R"
+        #[clap(long)] mic_values: Vec<String>,
+        #[clap(long)] microbiologist: i32,
+    },
+
+    /// Antibiotic resistance trends
+    Resistance {
+        organism: String,
+        #[clap(long)] antibiotic: Option<String>,
+        #[clap(long)] timeframe: Option<String>,
+    },
+
+    /// Alert on resistant organisms
+    Alert {
+        organism: String, // "VRE", "CRE", "MDR-Pseudomonas"
+        #[clap(long)] auto_notify: bool,
+    },
+
+    /// Culture turnaround time
+    Turnaround {
+        #[clap(long)] source: Option<String>,
+        #[clap(long)] target_hours: Option<i64>,
+    },
+}
+
+// =========================================================================
+// NURSING & EDUCATION
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum NursingCommand {
+    Assessment { patient_id: i32, #[clap(long)] pain_level: Option<i32>, #[clap(long)] mobility: Option<String> },
+    SafetyCheck { patient_id: i32, #[clap(long)] fall_risk: Option<String> },
+    IntakeOutput { patient_id: i32, #[clap(long)] intake_ml: Option<i64>, #[clap(long)] output_ml: Option<i64> },
+    MedAdministration { order_id: Uuid, #[clap(long)] time_given: Option<String>, #[clap(long)] route: Option<String> },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum EducationCommand {
+    Document { patient_id: i32, topic: String, #[clap(long)] method: Option<String> },
+}
+
+// =========================================================================
+// DISCHARGE PLANNING
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum DischargePlanningCommand {
+    Assess { patient_id: i32, #[clap(long)] barriers: Vec<String> },
+    DmeOrder { patient_id: i32, equipment: String },
+    FollowUp { patient_id: i32, provider_id: i32, days_out: i64 },
+}
+
+// =========================================================================
+// QUALITY & INCIDENT
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum QualityCommand {
+    Measure { name: String },
+    GapReport { #[clap(long)] payer: Option<String> },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum IncidentCommand {
+    Report { patient_id: i32, incident_type: String, description: String },
+    Investigate { incident_id: Uuid },
+}
 
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum IndexAction {
@@ -910,6 +2627,59 @@ pub enum Commands {
     Problem(ProblemCommand),
     #[clap(subcommand)]
     Order(OrderCommand),
+    #[clap(subcommand)]
+    Discharge(DischargeCommand),
+    #[clap(subcommand)]
+    Procedure(ProcedureCommand),
+    // =========================================================================
+    // DOSING
+    // =========================================================================
+    #[clap(subcommand)]
+    Dosing(DosingCommand),
+
+    // =========================================================================
+    // ALERT & NOTIFICATION SYSTEM
+    // =========================================================================
+    #[clap(subcommand)]
+    Alert(AlertCommand),
+
+    // =========================================================================
+    // PATHOLOGY
+    // =========================================================================
+    #[clap(subcommand)]
+    Pathology(PathologyCommand),
+
+    // =========================================================================
+    // MICROBIOLOGY
+    // =========================================================================
+    #[clap(subcommand)]
+    Microbiology(MicrobiologyCommand),
+
+    // =========================================================================
+    // VITAL & OBSERVATION
+    // =========================================================================
+    #[clap(subcommand)]
+    Vitals(VitalsCommand),
+    #[clap(subcommand)]
+    Observation(ObservationCommand),
+
+    // =========================================================================
+    // LAB & IMAGING
+    // =========================================================================
+    #[clap(subcommand)]
+    Lab(LabCommand),
+    #[clap(subcommand)]
+    Imaging(ImagingCommand),
+
+    // =========================================================================
+    // SPECIALTY CARE
+    // =========================================================================
+    #[clap(subcommand)]
+    Chemo(ChemoCommand),
+    #[clap(subcommand)]
+    Radiation(RadiationCommand),
+    #[clap(subcommand)]
+    Surgery(SurgeryCommand),
 
     // =========================================================================
     // DRUG SAFETY & INTERACTIONS
@@ -922,6 +2692,10 @@ pub enum Commands {
     // =========================================================================
     #[clap(subcommand)]
     Population(PopulationCommand),
+    #[clap(subcommand)]
+    Analytics(AnalyticsCommand),
+    #[clap(subcommand)]
+    Metrics(MetricsCommand),
 
     // =========================================================================
     // COMPLIANCE & AUDIT
@@ -930,8 +2704,49 @@ pub enum Commands {
     Audit(AuditCommand),
     #[clap(subcommand)]
     Export(ExportCommand),
+
+    // =========================================================================
+    // FACILITY & ADMIN
+    // =========================================================================
     #[clap(subcommand)]
-    Vitals(VitalsCommand),
+    Facility(FacilityCommand),
+    #[clap(subcommand)]
+    Access(AccessCommand),
+    #[clap(subcommand)]
+    Financial(FinancialCommand),
+
+    // =========================================================================
+    // QUALITY & COMPLIANCE
+    // =========================================================================
+    #[clap(subcommand)]
+    Quality(QualityCommand),
+    #[clap(subcommand)]
+    Incident(IncidentCommand),
+    #[clap(subcommand)]
+    Compliance(ComplianceCommand),
+
+    // =========================================================================
+    // RESEARCH & AI
+    // =========================================================================
+    #[clap(subcommand)]
+    Research(ResearchCommand),
+    #[clap(subcommand)]
+    Ml(MlCommand),
+    #[clap(subcommand)]
+    ClinicalTrial(ClinicalTrialCommand),
+    #[clap(subcommand)]
+    Model(ModelCommand),
+
+    // =========================================================================
+    // NURSING & CARE COORDINATION
+    // =========================================================================
+    #[clap(subcommand)]
+    Nursing(NursingCommand),
+    #[clap(subcommand)]
+    Education(EducationCommand),
+    #[clap(subcommand)]
+    DischargePlanning(DischargePlanningCommand),
+
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]

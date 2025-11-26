@@ -2571,6 +2571,87 @@ pub async fn handle_interactive_command(
         CommandType::Problem(command) => {
             Ok(())
         }
+        CommandType::Procedure(command) => {
+            Ok(())
+        }
+        CommandType::Discharge(command) => {
+            Ok(())
+        }
+        CommandType::Dosing(command) => {
+            Ok(())
+        }
+        CommandType::Alert(command) => {
+            Ok(())
+        }
+        CommandType::Pathology(command) => {
+            Ok(())
+        }
+        CommandType::Microbiology(command) => {
+            Ok(())
+        }
+        CommandType::Observation(command) => {
+            Ok(())
+        }
+        CommandType::Lab(command) => {
+            Ok(())
+        }
+        CommandType::Imaging(command) => {
+            Ok(())
+        }
+        CommandType::Chemo(command) => {
+            Ok(())
+        }
+        CommandType::Radiation(command) => {
+            Ok(())
+        }
+        CommandType::Surgery(command) => {
+            Ok(())
+        }
+        CommandType::Analytics(command) => {
+            Ok(())
+        }
+        CommandType::Metrics(command) => {
+            Ok(())
+        }
+        CommandType::Facility(command) => {
+            Ok(())
+        }
+        CommandType::Access(command) => {
+            Ok(())
+        }
+        CommandType::Financial(command) => {
+            Ok(())
+        }
+        CommandType::Quality(command) => {
+            Ok(())
+        }
+        CommandType::Incident(command) => {
+            Ok(())
+        }
+        CommandType::Compliance(command) => {
+            Ok(())
+        }
+        CommandType::Research(command) => {
+            Ok(())
+        }
+        CommandType::Ml(command) => {
+            Ok(())
+        }
+        CommandType::ClinicalTrial(command) => {
+            Ok(())
+        }
+        CommandType::Model(command) => {
+            Ok(())
+        }
+        CommandType::Nursing(command) => {
+            Ok(())
+        }
+        CommandType::Education(command) => {
+            Ok(())
+        }
+        CommandType::DischargePlanning(command) => {
+            Ok(())
+        }
     }
 }
 
