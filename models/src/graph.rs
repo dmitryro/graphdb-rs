@@ -1,8 +1,8 @@
-// graph_engine/src/graph.rs
+// src/graph.rs
 //! Core in-memory graph with real-time observer callbacks
 //! Used by medical_knowledge for instant clinical intelligence
 
-use models::{Vertex, Edge};
+use crate::{Vertex, Edge};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

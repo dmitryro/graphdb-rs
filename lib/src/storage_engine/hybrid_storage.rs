@@ -9,15 +9,18 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
-use models::{Edge, Identifier, Vertex};
 use serde_json::Value;
 use uuid::Uuid;
+use tokio::sync::Mutex as TokioMutex;
+use chrono::Utc;
 use log::{info, debug, error, warn};
 use models::errors::{GraphError, GraphResult};
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
+use crate::storage_engine::{ GraphOp };
 use crate::storage_engine::inmemory_storage::InMemoryStorage;
 use crate::config::config::{StorageConfig, StorageEngineType, QueryResult, QueryPlan,};
-use tokio::sync::Mutex as TokioMutex;
+use models::{ Graph, Edge, Identifier, Vertex};
+
 
 #[derive(Debug)]
 pub struct HybridStorage {
@@ -87,6 +90,32 @@ impl StorageEngine for HybridStorage {
         self.inmemory.flush().await?;
         self.persistent.flush().await?;
         Ok(())
+    }
+    // ------------------------------------------------------------------ //
+    // append: mirror what SledStorage does, but write to **both** layers //
+    // ------------------------------------------------------------------ //
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        let op_bytes = serde_json::to_vec(&op)
+            .map_err(|e| GraphError::StorageError(format!("JSON encode failed: {}", e)))?;
+
+        let timestamp = Utc::now().timestamp_nanos_opt()
+            .ok_or_else(|| GraphError::StorageError("Failed to get timestamp".into()))?;
+        let key = format!("wal_{:0>20}", timestamp);
+
+        // 1.  in-memory layer
+        self.inmemory.insert(key.as_bytes().to_vec(), op_bytes.clone()).await?;
+
+        // 2.  persistent layer
+        self.persistent.insert(key.as_bytes().to_vec(), op_bytes).await?;
+
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ //
+    // replay_into: delegate to the **persistent** layer only             //
+    // ------------------------------------------------------------------ //
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+        self.persistent.replay_into(graph).await
     }
 }
 

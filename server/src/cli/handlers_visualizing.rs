@@ -30,7 +30,6 @@ use lib::storage_engine::storage_engine::{
     GLOBAL_STORAGE_ENGINE_MANAGER,
 };
 use lib::commands::parse_kv_operation;
-use graph_engine::graph::Graph;
 use lib::storage_engine::rocksdb_storage::{ROCKSDB_DB, ROCKSDB_POOL_MAP};
 use lib::storage_engine::sled_storage::{SLED_DB, SLED_POOL_MAP};
 use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, 
@@ -43,6 +42,7 @@ use crate::cli::handlers_queries::{ format_json_result,  execute_query, verify_a
                                     find_or_create_working_daemon, initialize_storage_for_query,
                                     handle_query_command, do_zmq_request, execute_and_print, 
                                   };
+use models::{ Graph, Edge, Vertex };
 use models::errors::{GraphError, GraphResult};
 use daemon_api::{start_daemon, stop_port_daemon};
 use lib::storage_engine::sled_client::SledClient;

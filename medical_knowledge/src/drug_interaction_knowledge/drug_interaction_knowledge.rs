@@ -2,10 +2,8 @@
 //! Drug Interaction Knowledge — Global singleton, real-time, high-performance
 
 use graph_engine::graph_service::GraphService;
-use graph_engine::graph::Graph;  // ← THIS WAS MISSING
+use models::{ ToVertex, Graph, Vertex, Edge };  // ← THIS WAS MISSING
 use models::medical::*;
-use models::vertices::Vertex;
-use models::ToVertex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
@@ -63,29 +61,29 @@ impl DrugInteractionKnowledgeService {
         {
             let service_clone = service.clone();
             let graph_service = GraphService::get().await;
-            let graph_ref = graph_service.inner();
 
             tokio::spawn(async move {
-                let graph = graph_ref.read().await;
-                service_clone.load_all_interactions(&graph).await;
+                // 1.  load existing interactions
+                {
+                    let graph = graph_service.get_graph().await;
+                    service_clone.load_all_interactions(&graph).await;
+                }
 
-                let mut graph_write = graph_ref.write().await;
-                let service = service_clone;
-
-                graph_write.on_vertex_added({
-                    let service = service.clone();
+                // 2.  register vertex observer
+                graph_service.add_vertex_observer({
+                    let service = service_clone.clone();
                     move |vertex| {
-                        let vertex = vertex.clone();
-                        let service = service.clone();
-                        tokio::spawn(async move {
-                            if vertex.label.as_ref() == "MedicalInteractionSecondary" {
-                                if let Some(secondary) = MedicalInteractionSecondary::from_vertex(&vertex) {
-                                    service.on_secondary_interaction_added(secondary).await;
+                        if vertex.label.as_ref() == "MedicalInteractionSecondary" {
+                            let svc = service.clone();
+                            let v   = vertex.clone();
+                            tokio::spawn(async move {
+                                if let Some(sec) = MedicalInteractionSecondary::from_vertex(&v) {
+                                    svc.on_secondary_interaction_added(sec).await;
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
-                }).await;
+                }).await.expect("register vertex observer");
             });
         }
 

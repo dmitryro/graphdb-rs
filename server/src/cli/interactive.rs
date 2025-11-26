@@ -2520,6 +2520,57 @@ pub async fn handle_interactive_command(
             crate::cli::handlers_index::handle_index_command(action).await?;
             Ok(())
         }
+        CommandType::Patient(command) => {
+            Ok(())
+        }
+        CommandType::Encounter(command) => {
+            Ok(())
+        }
+        CommandType::Diagnosis(command) => {
+            Ok(())
+        }
+        CommandType::Prescription(command) => {
+            Ok(())
+        }
+        CommandType::Note(command) => {
+            Ok(())
+        }
+        CommandType::Referral(command) => {
+            Ok(())
+        }
+        CommandType::Triage(command) => {
+            Ok(())
+        }
+        CommandType::Disposition(command) => {
+            Ok(())
+        }
+        CommandType::Drug(command) => {
+            Ok(())
+        }
+        CommandType::Population(command) => {
+            Ok(())
+        }
+        CommandType::Audit(command) => {
+            Ok(())
+        }
+        CommandType::Export(command) => {
+            Ok(())
+        }
+        CommandType::Vitals(command) => {
+            Ok(())
+        }
+        CommandType::Allergy(command) => {
+            Ok(())
+        }
+        CommandType::Appointment(command) => {
+            Ok(())
+        }
+        CommandType::Order(command) => {
+            Ok(())
+        }
+        CommandType::Problem(command) => {
+            Ok(())
+        }
     }
 }
 

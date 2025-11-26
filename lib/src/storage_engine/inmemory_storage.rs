@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngine};
-use models::{Edge, Identifier, Vertex};
+use models::{Graph, Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -11,6 +11,7 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard, OnceCell};
 use uuid::Uuid;
 use log::info;
 use crate::config::{ QueryPlan, QueryResult };
+use crate::storage_engine::{ GraphOp };
 
 // Tantivy full-text index — async-safe OnceCell
 static FULLTEXT_INDEX: OnceCell<Arc<indexing_service::fulltext::FullTextIndex>> = OnceCell::const_new();
@@ -89,6 +90,14 @@ impl StorageEngine for InMemoryStorage {
     }
 
     async fn flush(&self) -> GraphResult<()> {
+        Ok(())
+    }
+
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        Ok(())
+    }
+
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
         Ok(())
     }
 }

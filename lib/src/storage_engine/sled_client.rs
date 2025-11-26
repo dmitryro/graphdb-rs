@@ -4,13 +4,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use sled::{open, Db, Tree, IVec};
+use chrono::Utc;
 use uuid::Uuid;
 use log::{info, error, debug, warn};
 use serde_json::{json, Value};
-use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
+use models::{Graph, Vertex, Edge, Identifier, identifiers::SerializableUuid, PropertyValue};
 use models::errors::{GraphError, GraphResult};
 pub use crate::config::{QueryResult, QueryPlan, SledClient, SledClientMode, DEFAULT_STORAGE_PORT, DEFAULT_DATA_DIRECTORY};
 use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
+use crate::storage_engine::storage_engine::{ GraphOp };
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use tokio::task::spawn_blocking; // FIX: Explicitly importing spawn_blocking
@@ -1407,6 +1409,7 @@ impl SledClient {
         Ok(QueryResult::Null)
     }
 }
+
 #[async_trait]
 impl StorageEngine for SledClient {
     async fn connect(&self) -> GraphResult<()> {
@@ -1415,6 +1418,7 @@ impl StorageEngine for SledClient {
         *is_running = true;
         Ok(())
     }
+    
     async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
         let port = match &self.mode {
             Some(SledClientMode::ZMQ(port)) => *port,
@@ -1422,6 +1426,7 @@ impl StorageEngine for SledClient {
         };
         self.insert_into_cf_zmq(port, "kv_pairs", &key, &value).await
     }
+    
     async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
         let port = match &self.mode {
             Some(SledClientMode::ZMQ(port)) => *port,
@@ -1429,6 +1434,7 @@ impl StorageEngine for SledClient {
         };
         self.retrieve_from_cf_zmq(port, "kv_pairs", key).await
     }
+    
     async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
         let port = match &self.mode {
             Some(SledClientMode::ZMQ(port)) => *port,
@@ -1436,11 +1442,121 @@ impl StorageEngine for SledClient {
         };
         self.delete_from_cf_zmq(port, "kv_pairs", key).await
     }
+    
     async fn flush(&self) -> GraphResult<()> {
         self.flush().await
     }
+    
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        let port = match &self.mode {
+            Some(SledClientMode::ZMQ(port)) => *port,
+            _ => DEFAULT_STORAGE_PORT,
+        };
+        
+        // Serialize the operation
+        let op_bytes = serde_json::to_vec(&op)
+            .map_err(|e| GraphError::StorageError(format!("Failed to serialize GraphOp: {}", e)))?;
+        
+        // Create timestamped key
+        let timestamp = Utc::now().timestamp_nanos_opt()
+            .ok_or_else(|| GraphError::StorageError("Failed to get timestamp".into()))?;
+        let key = format!("wal_{}", timestamp);
+        
+        // Store in WAL
+        self.insert_into_cf_zmq(port, "wal", key.as_bytes(), &op_bytes).await?;
+        
+        info!("SledClient::append - persisted op: {:?}", op);
+        Ok(())
+    }
+    
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+        let port = match &self.mode {
+            Some(SledClientMode::ZMQ(port)) => *port,
+            _ => DEFAULT_STORAGE_PORT,
+        };
+        
+        info!("SledClient::replay_into - starting replay from WAL");
+        
+        // Send request to daemon via ZMQ to scan WAL prefix
+        let request = json!({
+            "command": "scan_prefix",
+            "params": {
+                "cf": "wal",
+                "prefix": "wal_"
+            },
+            "request_id": uuid::Uuid::new_v4().to_string()
+        });
+        
+        let response = self.send_zmq_request(port, request).await?;
+        
+        // Parse entries from response
+        let entries = response.get("entries")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| GraphError::StorageError("Invalid response: missing entries".into()))?;
+        
+        // Collect and sort entries by key
+        let mut sorted_entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in entries {
+            let key = entry.get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| GraphError::StorageError("Invalid entry: missing key".into()))?
+                .to_string();
+            
+            let value_str = entry.get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GraphError::StorageError("Invalid entry: missing value".into()))?;
+            
+            // Decode base64 value
+            let value = base64::decode(value_str)
+                .map_err(|e| GraphError::StorageError(format!("Failed to decode value: {}", e)))?;
+            
+            sorted_entries.push((key, value));
+        }
+        
+        sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        // Replay operations
+        for (_key, value) in sorted_entries {
+            let op: GraphOp = serde_json::from_slice(&value)
+                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize GraphOp: {}", e)))?;
+            
+            match op {
+                GraphOp::InsertVertex(v) => graph.add_vertex(v),
+                GraphOp::InsertEdge(e) => graph.add_edge(e),
+                GraphOp::DeleteVertex(id) => {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        let _ = graph.vertices.remove(&uuid);
+                    }
+                }
+                GraphOp::DeleteEdge(id) => {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        let _ = graph.edges.remove(&uuid);
+                    }
+                }
+                GraphOp::UpdateVertex(id, updates) => {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            for (k, val) in updates {
+                                // Convert JsonValue to PropertyValue
+                                // Skip if conversion fails
+                                if let Ok(prop_value) = serde_json::from_value(val) {
+                                    v.properties.insert(k, prop_value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!(
+            "SledClient::replay_into - completed: {} vertices, {} edges",
+            graph.vertices.len(),
+            graph.edges.len()
+        );
+        Ok(())
+    }
 }
-
 #[async_trait]
 impl GraphStorageEngine for SledClient {
     async fn start(&self) -> GraphResult<()> {
