@@ -7,6 +7,7 @@ pub mod fhir;
 pub mod hl7;
 pub mod mpi_identity_resolution;
 pub mod patient_journey;
+pub mod snomed_knowledge;
 
 pub use clinical_encounters::*;
 pub use clinical_notes::*;
@@ -15,4 +16,4 @@ pub use fhir::*;
 pub use hl7::*;
 pub use mpi_identity_resolution::*;
 pub use patient_journey::*;
-
+pub use snomed_knowledge::*;
