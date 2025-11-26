@@ -1,9 +1,7 @@
 // graph_engine/src/traversal.rs
 // Graph traversal algorithms — BFS, DFS, Dijkstra, A*, shortest path
 
-use crate::graph::Graph;
-use models::Vertex;
-use models::edges::Edge;
+use models::{Vertex, Graph, Edge};
 use uuid::Uuid;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::cmp::Ordering;
@@ -28,9 +26,18 @@ impl PartialOrd for State {
     }
 }
 
-impl Graph {
-    /// Breadth-first search
-    pub fn bfs(&self, start: Uuid, max_depth: Option<usize>) -> Vec<&Vertex> {
+/// Extension trait for all traversal algorithms.
+pub trait TraverseExt {
+    fn bfs(&self, start: Uuid, max_depth: Option<usize>) -> Vec<&Vertex>;
+    fn dfs(&self, start: Uuid) -> Vec<&Vertex>;
+    fn dijkstra(&self, start: Uuid) -> HashMap<Uuid, (i64, Option<Uuid>)>;
+    fn a_star(&self, start: Uuid, goal: Uuid) -> Option<(i64, Vec<Uuid>)>;
+    fn reachable(&self, start: Uuid) -> HashSet<Uuid>;
+    fn shortest_path(&self, start: Uuid, goal: Uuid) -> Option<Vec<Uuid>>;
+}
+
+impl TraverseExt for Graph {
+    fn bfs(&self, start: Uuid, max_depth: Option<usize>) -> Vec<&Vertex> {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut results = Vec::new();
@@ -40,15 +47,11 @@ impl Graph {
 
         while let Some((current_id, depth)) = queue.pop_front() {
             if let Some(max_d) = max_depth {
-                if depth > max_d {
-                    continue;
-                }
+                if depth > max_d { continue; }
             }
-
             if let Some(vertex) = self.get_vertex(&current_id) {
                 results.push(vertex);
             }
-
             for edge in self.outgoing_edges(&current_id) {
                 let next_id = edge.inbound_id.0;
                 if !visited.contains(&next_id) {
@@ -57,26 +60,20 @@ impl Graph {
                 }
             }
         }
-
         results
     }
 
-    /// Depth-first search
-    pub fn dfs(&self, start: Uuid) -> Vec<&Vertex> {
+    fn dfs(&self, start: Uuid) -> Vec<&Vertex> {
         let mut visited = HashSet::new();
         let mut stack = vec![start];
         let mut results = Vec::new();
 
         while let Some(current_id) = stack.pop() {
-            if visited.contains(&current_id) {
-                continue;
-            }
+            if visited.contains(&current_id) { continue; }
             visited.insert(current_id);
-
             if let Some(vertex) = self.get_vertex(&current_id) {
                 results.push(vertex);
             }
-
             for edge in self.outgoing_edges(&current_id) {
                 let next_id = edge.inbound_id.0;
                 if !visited.contains(&next_id) {
@@ -84,143 +81,116 @@ impl Graph {
                 }
             }
         }
-
         results
     }
 
-    /// Dijkstra's shortest path (weighted)
-    /// Returns map: vertex_id → (cost, previous_vertex_id)
-    pub fn dijkstra(&self, start: Uuid) -> HashMap<Uuid, (i64, Option<Uuid>)> {
-        let mut distances: HashMap<Uuid, i64> = HashMap::new();
-        let mut previous: HashMap<Uuid, Uuid> = HashMap::new();
+    fn dijkstra(&self, start: Uuid) -> HashMap<Uuid, (i64, Option<Uuid>)> {
+        let mut dist: HashMap<Uuid, i64> = HashMap::new();
+        let mut prev: HashMap<Uuid, Uuid> = HashMap::new();
         let mut heap = BinaryHeap::new();
 
-        distances.insert(start, 0);
+        dist.insert(start, 0);
         heap.push(State { cost: 0, vertex_id: start });
 
         while let Some(State { cost, vertex_id }) = heap.pop() {
-            if cost > distances.get(&vertex_id).copied().unwrap_or(i64::MAX) {
-                continue;
-            }
-
+            if cost > dist.get(&vertex_id).copied().unwrap_or(i64::MAX) { continue; }
             for edge in self.outgoing_edges(&vertex_id) {
-                let weight = edge.properties
+                let w = edge.properties
                     .get("weight")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(1);
-
-                let next_id = edge.inbound_id.0;
-                let next_cost = cost + weight;
-
-                if next_cost < distances.get(&next_id).copied().unwrap_or(i64::MAX) {
-                    distances.insert(next_id, next_cost);
-                    previous.insert(next_id, vertex_id);
-                    heap.push(State { cost: next_cost, vertex_id: next_id });
+                let next = edge.inbound_id.0;
+                let new_cost = cost + w;
+                if new_cost < dist.get(&next).copied().unwrap_or(i64::MAX) {
+                    dist.insert(next, new_cost);
+                    prev.insert(next, vertex_id);
+                    heap.push(State { cost: new_cost, vertex_id: next });
                 }
             }
         }
-
-        // Convert previous to include cost
-        let mut result = HashMap::new();
-        for (vertex_id, prev) in previous {
-            let cost = distances.get(&vertex_id).copied().unwrap_or(i64::MAX);
-            result.insert(vertex_id, (cost, Some(prev)));
+        let mut out = HashMap::new();
+        for (v, p) in prev {
+            out.insert(v, (dist[&v], Some(p)));
         }
-        // Include start vertex
-        result.entry(start).or_insert((0, None));
-
-        result
+        out.entry(start).or_insert((0, None));
+        out
     }
 
-    /// A* search with heuristic (simple: 0 = Dijkstra)
-    pub fn a_star(&self, start: Uuid, goal: Uuid) -> Option<(i64, Vec<Uuid>)> {
-        let mut distances: HashMap<Uuid, i64> = HashMap::new();
-        let mut previous: HashMap<Uuid, Uuid> = HashMap::new();
+    fn a_star(&self, start: Uuid, goal: Uuid) -> Option<(i64, Vec<Uuid>)> {
+        let mut dist: HashMap<Uuid, i64> = HashMap::new();
+        let mut prev: HashMap<Uuid, Uuid> = HashMap::new();
         let mut heap = BinaryHeap::new();
 
-        distances.insert(start, 0);
+        dist.insert(start, 0);
         heap.push(State { cost: 0, vertex_id: start });
 
         while let Some(State { cost, vertex_id }) = heap.pop() {
             if vertex_id == goal {
                 let mut path = vec![vertex_id];
-                let mut current = vertex_id;
-                while let Some(prev) = previous.get(&current) {
-                    path.push(*prev);
-                    current = *prev;
+                let mut cur = vertex_id;
+                while let Some(&p) = prev.get(&cur) {
+                    path.push(p);
+                    cur = p;
                 }
                 path.reverse();
                 return Some((cost, path));
             }
-
             for edge in self.outgoing_edges(&vertex_id) {
-                let weight = edge.properties
+                let w = edge.properties
                     .get("weight")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(1);
-
-                let next_id = edge.inbound_id.0;
-                let tentative_cost = cost + weight;
-
-                if tentative_cost < distances.get(&next_id).copied().unwrap_or(i64::MAX) {
-                    distances.insert(next_id, tentative_cost);
-                    previous.insert(next_id, vertex_id);
-
-                    let h = 0; // Simple heuristic
-                    let f = tentative_cost + h;
-                    heap.push(State { cost: f, vertex_id: next_id });
+                let next = edge.inbound_id.0;
+                let new_cost = dist[&vertex_id] + w;
+                if new_cost < dist.get(&next).copied().unwrap_or(i64::MAX) {
+                    dist.insert(next, new_cost);
+                    prev.insert(next, vertex_id);
+                    let h = 0i64; // 0 == Dijkstra
+                    heap.push(State { cost: new_cost + h, vertex_id: next });
                 }
             }
         }
-
         None
     }
 
-    /// Find all reachable vertices
-    pub fn reachable(&self, start: Uuid) -> HashSet<Uuid> {
-        let mut visited = HashSet::new();
+    fn reachable(&self, start: Uuid) -> HashSet<Uuid> {
+        let mut vis = HashSet::new();
         let mut stack = vec![start];
-
-        while let Some(current) = stack.pop() {
-            if visited.insert(current) {
-                for edge in self.outgoing_edges(&current) {
-                    stack.push(edge.inbound_id.0);
+        while let Some(cur) = stack.pop() {
+            if vis.insert(cur) {
+                for e in self.outgoing_edges(&cur) {
+                    stack.push(e.inbound_id.0);
                 }
             }
         }
-
-        visited
+        vis
     }
 
-    /// Shortest path using BFS (unweighted)
-    pub fn shortest_path(&self, start: Uuid, goal: Uuid) -> Option<Vec<Uuid>> {
-        let mut previous: HashMap<Uuid, Uuid> = HashMap::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(start);
-
-        while let Some(current) = queue.pop_front() {
-            if current == goal {
-                let mut path = vec![current];
-                let mut node = current;
-                while let Some(&prev) = previous.get(&node) {
-                    path.push(prev);
-                    node = prev;
+    fn shortest_path(&self, start: Uuid, goal: Uuid) -> Option<Vec<Uuid>> {
+        let mut prev: HashMap<Uuid, Uuid> = HashMap::new();
+        let mut q = VecDeque::new();
+        q.push_back(start);
+        while let Some(cur) = q.pop_front() {
+            if cur == goal {
+                let mut path = vec![cur];
+                let mut node = cur;
+                while let Some(&p) = prev.get(&node) {
+                    path.push(p);
+                    node = p;
                 }
                 path.reverse();
                 return Some(path);
             }
-
-            for edge in self.outgoing_edges(&current) {
-                let next = edge.inbound_id.0;
-                if !previous.contains_key(&next) {
-                    previous.insert(next, current);
-                    queue.push_back(next);
+            for e in self.outgoing_edges(&cur) {
+                let n = e.inbound_id.0;
+                if !prev.contains_key(&n) {
+                    prev.insert(n, cur);
+                    q.push_back(n);
                 }
             }
         }
-
         None
     }
 }

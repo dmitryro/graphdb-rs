@@ -3,10 +3,9 @@ pub mod wal;
 pub mod snapshot;
 pub mod recovery;
 
-use models::{Vertex, Edge, properties};
+use models::{Graph, Vertex, Edge, properties};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
-use crate::graph::{ Graph };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GraphOp {

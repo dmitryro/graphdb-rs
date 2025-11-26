@@ -9,6 +9,7 @@ pub mod properties;
 pub mod queries;
 pub mod to_vertex; // This was added/confirmed in the last step
 pub mod vertices;
+pub mod graph;
 pub mod errors;
 pub mod util;
 
@@ -30,5 +31,6 @@ pub use properties::{PropertyValue, PropertyMap};
 pub use identifiers::Identifier;
 pub use json::Json;
 pub use to_vertex::ToVertex; // Trait re-export - confirmed this is correct now
+pub use graph::*;
 
 // Re-export User and Login from medical models if

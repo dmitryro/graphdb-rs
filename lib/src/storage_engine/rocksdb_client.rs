@@ -6,8 +6,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::{self, spawn_blocking};
 use rocksdb::{DB, ColumnFamily, Options, DBCompressionType, WriteBatch, WriteOptions};
+use chrono::Utc;
 use tokio::fs as tokio_fs;
-use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
+use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid, Graph, PropertyValue};
 use models::errors::{GraphError, GraphResult};
 pub use crate::config::{QueryResult, RocksDBClient, RaftCommand, RocksDBClientMode, DEFAULT_STORAGE_PORT};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
@@ -16,6 +17,7 @@ use crate::storage_engine::storage_utils::{
     serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key
 };
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
+use crate::storage_engine::storage_engine::{ GraphOp };
 use crate::config::QueryPlan;
 use uuid::Uuid;
 use log::{info, error, debug, warn};
@@ -24,6 +26,7 @@ use tokio::time::Duration as TokioDuration;
 use base64::engine::general_purpose;
 use base64::Engine;
 use zmq::{Context as ZmqContext, Socket as ZmqSocket, Message, REQ, REP};
+use bincode::config;
 
 // Wrapper for ZmqSocket to implement Debug
 pub struct ZmqSocketWrapper(ZmqSocket);
@@ -1270,19 +1273,131 @@ impl StorageEngine for RocksDBClient {
         println!("===> Connecting to RocksDBClient");
         Ok(())
     }
+    
     async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), GraphError> {
         self.insert_into_cf("kv_pairs", &key, &value).await
     }
+    
     async fn retrieve(&self, key: &Vec<u8>) -> Result<Option<Vec<u8>>, GraphError> {
         self.retrieve_from_cf("kv_pairs", key).await
     }
+    
     async fn delete(&self, key: &Vec<u8>) -> Result<(), GraphError> {
         self.delete_from_cf("kv_pairs", key).await
     }
+    
     async fn flush(&self) -> Result<(), GraphError> {
         self.flush().await
     }
+    
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        // Serialize the operation
+        let op_bytes = serde_json::to_vec(&op)
+            .map_err(|e| GraphError::StorageError(format!("Failed to serialize GraphOp: {}", e)))?;
+        
+        // Create timestamped key
+        let timestamp = Utc::now().timestamp_nanos_opt()
+            .ok_or_else(|| GraphError::StorageError("Failed to get timestamp".into()))?;
+        let key = format!("wal_{}", timestamp);
+        
+        // Store in WAL column family
+        self.insert_into_cf("wal", key.as_bytes(), &op_bytes).await?;
+        
+        info!("RocksDBClient::append - persisted op: {:?}", op);
+        Ok(())
+    }
+
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+        info!("RocksDBClient::replay_into - starting replay from WAL");
+        
+        let db_path = self.db_path.as_ref()
+            .ok_or_else(|| GraphError::StorageError("db_path not set".into()))?;
+        
+        let port = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| GraphError::StorageError("Unable to determine port from db_path".into()))?;
+        
+        let request = json!({
+            "command": "scan_prefix",
+            "params": {
+                "cf": "wal",
+                "prefix": "wal_"
+            },
+            "request_id": uuid::Uuid::new_v4().to_string()
+        });
+        
+        let response = self.send_zmq_request(port, request).await?;
+        
+        let entries = response.get("entries")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| GraphError::StorageError("Invalid response: missing entries".into()))?;
+        
+        let mut sorted_entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in entries {
+            let key = entry.get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| GraphError::StorageError("Invalid entry: missing key".into()))?
+                .to_string();
+            
+            let value_b64 = entry.get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GraphError::StorageError("Invalid entry: missing value".into()))?;
+            
+            let value = base64::decode(value_b64)
+                .map_err(|e| GraphError::StorageError(format!("Base64 decode failed: {}", e)))?;
+            
+            sorted_entries.push((key, value));
+        }
+        
+        sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        // Use serde_json instead of bincode
+        for (_key, value) in sorted_entries {
+            let op: GraphOp = serde_json::from_slice(&value)
+                .map_err(|e| GraphError::StorageError(format!("JSON decode failed: {}", e)))?;
+            
+            match op {
+                GraphOp::InsertVertex(v) => graph.add_vertex(v),
+                GraphOp::InsertEdge(e) => graph.add_edge(e),
+                GraphOp::DeleteVertex(id) => {
+                    // Convert Identifier to Uuid
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        let _ = graph.vertices.remove(&uuid);
+                    }
+                }
+                GraphOp::DeleteEdge(id) => {
+                    // Convert Identifier to Uuid
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        let _ = graph.edges.remove(&uuid);
+                    }
+                }
+                GraphOp::UpdateVertex(id, updates) => {
+                    // Convert Identifier to Uuid
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            for (k, val) in updates {
+                                // Convert JsonValue to PropertyValue
+                                if let Ok(prop_value) = serde_json::from_value(val) {
+                                    v.properties.insert(k, prop_value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!(
+            "RocksDBClient::replay_into - completed: {} vertices, {} edges",
+            graph.vertices.len(),
+            graph.edges.len()
+        );
+        Ok(())
+    }
 }
+
 #[async_trait]
 impl GraphStorageEngine for RocksDBClient {
     async fn start(&self) -> Result<(), GraphError> {
