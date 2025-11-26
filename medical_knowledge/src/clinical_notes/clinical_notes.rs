@@ -32,10 +32,9 @@ impl ClinicalNoteService {
         {
             let service_clone = service.clone();
             let graph_service = GraphService::get().await;
-            let graph_ref = graph_service.inner();
 
             tokio::spawn(async move {
-                let mut graph = graph_ref.write().await;
+                let mut graph = graph_service.write_graph().await;
                 let service = service_clone;
 
                 // Observe ClinicalNote vertices
@@ -105,7 +104,7 @@ impl ClinicalNoteService {
         let vertex = note.to_vertex();
         let graph_service = GraphService::get().await;
         {
-            let mut graph = graph_service.write().await;
+            let mut graph = graph_service.write_graph().await;
             graph.add_vertex(vertex.clone());
             graph.add_edge(Edge::new(
                 encounter_id,

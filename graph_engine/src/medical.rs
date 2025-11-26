@@ -1,10 +1,8 @@
 // graph_engine/src/medical.rs
 // Clinical domain API — works 100% with current models crate (no from_vertex)
 
-use crate::graph::Graph;
+use models::{ Graph, Vertex, Edge };
 use models::medical::*;
-use models::vertices::Vertex;
-use models::edges::Edge;
 use models::properties::PropertyValue;
 use uuid::Uuid;
 use std::collections::HashSet;

@@ -72,7 +72,7 @@ pub use storage_engine::{
     SurrealdbGraphStorage,
     StorageEngineManager, emergency_cleanup_storage_engine_manager, init_storage_engine_manager, 
     GLOBAL_STORAGE_ENGINE_MANAGER, recover_sled, log_lock_file_diagnostics, lock_file_exists,
-    get_global_storage_registry,
+    GraphOp, get_global_storage_registry,
 };
 pub use storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 

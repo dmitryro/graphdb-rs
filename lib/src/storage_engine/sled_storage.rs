@@ -1,5 +1,6 @@
 use anyhow::{Result, Context, anyhow};
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -10,13 +11,15 @@ use log::{info, debug, warn, error, trace};
 pub use crate::config::{
     SledDbWithPath, SledConfig, SledStorage, SledDaemon, SledDaemonPool, load_storage_config_from_yaml, 
     DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, StorageConfig, StorageEngineType,
-    QueryResult, QueryPlan, SledClientMode, 
+    QueryResult, QueryPlan, SledClientMode,  json_to_prop,
 };
+use crate::storage_engine::storage_engine::{ GraphOp };
 use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
-use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
+use models::{Graph, Vertex, Edge, Identifier, identifiers::SerializableUuid, PropertyValue};
 use models::errors::{GraphError, GraphResult};
 use uuid::Uuid;
 use async_trait::async_trait;
+use chrono::Utc;
 use crate::storage_engine::storage_engine::{StorageEngine, GraphStorageEngine, get_global_storage_registry};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::daemon::db_daemon_registry::{ GLOBAL_DB_DAEMON_REGISTRY, DBDaemonMetadata };
@@ -29,7 +32,9 @@ use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use crate::storage_engine::sled_client::{ SledClient, ZmqSocketWrapper };
 use std::os::unix::fs::PermissionsExt;
 use sysinfo::{System, RefreshKind, ProcessRefreshKind, Pid, ProcessesToUpdate};
-use sled::Config;
+use sled::{Db, IVec,};
+use serde::{Deserialize, Serialize};
+use bincode::{ config as binconfig };
 
 pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
 pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
@@ -1029,6 +1034,90 @@ impl StorageEngine for SledStorage {
         info!("SledStorage::flush - flushed {} bytes to disk at {:?}", bytes_flushed, db_path);
         println!("===> FLUSHED {} BYTES TO DISK AT {:?}", bytes_flushed, db_path);
 
+        Ok(())
+    }
+
+    async fn append(&self, op: GraphOp) -> Result<(), GraphError> {
+        let db = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled database not initialized".into()))?;
+
+        let mut db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled lock".into()))?;
+
+        // Use serde_json instead
+        let op_bytes = serde_json::to_vec(&op)
+            .map_err(|e| GraphError::StorageError(format!("JSON encode failed: {}", e)))?;
+
+        let timestamp = Utc::now().timestamp_nanos_opt()
+            .ok_or_else(|| GraphError::StorageError("Failed to get timestamp".into()))?;
+        let key = format!("wal_{:0>20}", timestamp);
+
+        db_lock.db.insert(key.as_bytes(), op_bytes)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        let flushed = db_lock.db.flush_async().await
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        info!("SledStorage::append - persisted op, flushed {} bytes", flushed);
+        Ok(())
+    }
+
+    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+        info!("SledStorage::replay_into - starting replay");
+        let db = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled database not initialized".into()))?;
+        let db_lock = timeout(TokioDuration::from_secs(10), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled lock".into()))?;
+        
+        // Collect WAL records
+        let mut entries: Vec<(IVec, IVec)> = db_lock
+            .db
+            .scan_prefix(b"wal_")
+            .filter_map(Result::ok)
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        // Replay
+        for (_key, value) in entries {
+            // Use serde_json instead of bincode
+            let op: GraphOp = serde_json::from_slice(value.as_ref())
+                .map_err(|e| GraphError::StorageError(format!("deserialize GraphOp: {}", e)))?;
+            
+            match op {
+                GraphOp::InsertVertex(v) => graph.add_vertex(v),
+                GraphOp::InsertEdge(e) => graph.add_edge(e),
+                GraphOp::DeleteVertex(id) => {
+                    // Convert Identifier to Uuid via string parsing
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        graph.vertices.remove(&uuid);
+                    }
+                }
+                GraphOp::DeleteEdge(id) => {
+                    // Convert Identifier to Uuid via string parsing
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        graph.edges.remove(&uuid);
+                    }
+                }
+                GraphOp::UpdateVertex(id, updates) => {
+                    // Convert Identifier to Uuid via string parsing
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            for (k, json_val) in updates {
+                                v.properties.insert(k, json_to_prop(json_val)?);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!(
+            "SledStorage::replay_into - completed: {} vertices, {} edges",
+            graph.vertices.len(),
+            graph.edges.len()
+        );
         Ok(())
     }
 }

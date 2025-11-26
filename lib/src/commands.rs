@@ -12,6 +12,7 @@
 use clap::{Parser, Subcommand, Arg, Args, ArgAction};
 use std::path::PathBuf;
 use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
@@ -64,6 +65,7 @@ pub struct UnifiedQuery {
     pub query: String,
     pub language: Option<String>, // None → infer
 }
+
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CommandType {
@@ -152,12 +154,441 @@ pub enum CommandType {
     // Graph and Index commands - plain variants, no attributes
     Graph(GraphAction),
     Index(IndexAction),
+    
+    // =========================================================================
+    // PATIENT MANAGEMENT
+    // =========================================================================
+    Patient(PatientCommand),
+
+    // =========================================================================
+    // CLINICAL WORKFLOW
+    // =========================================================================
+    Encounter(EncounterCommand),
+    Diagnosis(DiagnosisCommand),
+    Prescription(PrescriptionCommand),
+    Note(NoteCommand),
+    Referral(ReferralCommand),
+    Triage(TriageCommand),
+    Disposition(DispositionCommand),
+    Vitals(VitalsCommand),
+    Allergy(AllergyCommand),
+    Appointment(AppointmentCommand),
+    Problem(ProblemCommand),
+    Order(OrderCommand),
+    // =========================================================================
+    // DRUG SAFETY & INTERACTIONS
+    // =========================================================================
+    Drug(DrugCommand),
+
+    // =========================================================================
+    // POPULATION HEALTH & ANALYTICS
+    // =========================================================================
+    Population(PopulationCommand),
+
+    // =========================================================================
+    // COMPLIANCE & AUDIT
+    // =========================================================================
+    Audit(AuditCommand),
+    Export(ExportCommand),
 }
 
-// lib/src/commands.rs
+// AppointmentCommand
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum AppointmentCommand {
+    /// Schedule a new appointment
+    Schedule {
+        patient_id: i32,
+        #[arg(long)] appointment_type: String,  // FOLLOW_UP, NEW_PATIENT, URGENT, PROCEDURE
+        #[arg(long)] provider: String,
+        #[arg(long)] days_out: Option<i32>,
+        #[arg(long)] date_time: Option<DateTime<Utc>>,
+        #[arg(long)] duration: Option<i32>,  // minutes
+        #[arg(long)] reason: Option<String>,
+        #[arg(long)] location: Option<String>,
+    },
+    /// List appointments for a patient
+    List {
+        patient_id: i32,
+        #[arg(long)] status: Option<String>,
+        #[arg(long)] from_date: Option<DateTime<Utc>>,
+        #[arg(long)] to_date: Option<DateTime<Utc>>,
+    },
+    /// Update appointment status
+    UpdateStatus {
+        appointment_id: i32,
+        status: String,  // CONFIRMED, CHECKED_IN, COMPLETED, CANCELLED, NO_SHOW
+        #[arg(long)] notes: Option<String>,
+    },
+    /// Cancel appointment
+    Cancel {
+        appointment_id: i32,
+        #[arg(long)] reason: Option<String>,
+    },
+    /// Reschedule appointment
+    Reschedule {
+        appointment_id: i32,
+        #[arg(long)] new_date_time: DateTime<Utc>,
+        #[arg(long)] reason: Option<String>,
+    },
+}
 
-// BEFORE (your current code):
-// pub enum GraphAction { ... }
+// ProblemCommand
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ProblemCommand {
+    /// Add a new problem to patient's problem list
+    Add {
+        patient_id: i32,
+        problem: String,
+        #[arg(long)] icd10: Option<String>,
+        #[arg(long)] status: Option<String>,  // ACTIVE, CHRONIC
+        #[arg(long)] onset_date: Option<DateTime<Utc>>,
+        #[arg(long)] severity: Option<String>,  // MILD, MODERATE, SEVERE
+        #[arg(long)] notes: Option<String>,
+    },
+    /// Update problem status
+    Update {
+        patient_id: i32,
+        problem: String,
+        #[arg(long)] status: String,  // ACTIVE, RESOLVED, IMPROVING, WORSENING, STABLE, CHRONIC
+        #[arg(long)] notes: Option<String>,
+    },
+    /// List all problems for a patient
+    List {
+        patient_id: i32,
+        #[arg(long)] status: Option<String>,  // filter by status
+        #[arg(long)] active_only: bool,
+    },
+    /// Resolve a problem
+    Resolve {
+        problem_id: i32,
+        #[arg(long)] resolved_date: Option<DateTime<Utc>>,
+        #[arg(long)] notes: Option<String>,
+    },
+}
+
+// OrderCommand
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum OrderCommand {
+    /// Place admission orders
+    Admit {
+        encounter_id: Uuid,
+        #[arg(long)] diet: Option<String>,
+        #[arg(long)] activity: Option<String>,
+        #[arg(long)] vitals: Option<String>,
+        #[arg(long)] iv_fluids: Option<String>,
+        #[arg(long)] medications: Option<String>,
+        #[arg(long)] labs: Option<String>,
+        #[arg(long)] imaging: Option<String>,
+        #[arg(long)] notes: Option<String>,
+    },
+    /// Place a lab order
+    Lab {
+        encounter_id: Uuid,
+        tests: String,
+        #[arg(long)] priority: Option<String>,  // ROUTINE, URGENT, STAT
+        #[arg(long)] notes: Option<String>,
+    },
+    /// Place an imaging order
+    Imaging {
+        encounter_id: Uuid,
+        study: String,
+        #[arg(long)] priority: Option<String>,
+        #[arg(long)] indication: Option<String>,
+        #[arg(long)] notes: Option<String>,
+    },
+    /// Place a medication order
+    Medication {
+        encounter_id: Uuid,
+        medication: String,
+        dose: String,
+        frequency: String,
+        #[arg(long)] route: Option<String>,
+        #[arg(long)] duration: Option<String>,
+        #[arg(long)] notes: Option<String>,
+    },
+    /// List orders for an encounter
+    List {
+        encounter_id: Uuid,
+        #[arg(long)] order_type: Option<String>,
+        #[arg(long)] status: Option<String>,
+    },
+    /// Update order status
+    UpdateStatus {
+        order_id: i32,
+        status: String,  // IN_PROGRESS, COMPLETED, CANCELLED, DISCONTINUED
+        #[arg(long)] notes: Option<String>,
+    },
+    /// Discontinue an order
+    Discontinue {
+        order_id: i32,
+        #[arg(long)] reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum PatientCommand {
+    Create {
+        first_name: String,
+        last_name: String,
+        dob: String,           // ISO date
+        gender: String,
+        #[arg(long)] ssn: Option<String>,
+        #[arg(long)] mrn: Option<String>,
+    },
+    View { patient_id: i32 },
+    Search { query: String },
+    Timeline { patient_id: i32 },
+    Problems { patient_id: i32 },
+    Meds { patient_id: i32 },
+    CareGaps { patient_id: Option<i32> }, // None = all
+    Allergies { patient_id: i32 },
+    Referrals { patient_id: i32 },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum EncounterCommand {
+    Start {
+        patient_id: i32,
+        doctor_id: i32,
+        encounter_type: String, // ED, INPATIENT, OUTPATIENT, TELEHEALTH
+        #[arg(long)] location: Option<String>,
+    },
+    Close {
+        encounter_id: Uuid,
+        disposition: String,
+        #[arg(long)] instructions: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum DiagnosisCommand {
+    Add {
+        encounter_id: Uuid,
+        description: String,
+        #[arg(long)] icd10: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum PrescriptionCommand {
+    Add {
+        encounter_id: Uuid,
+        medication_name: String,
+        dose: String,
+        frequency: String,
+        days: i64,
+        #[arg(long)] refills: Option<i32>,
+    },
+    CheckInteractions {
+        patient_id: i32,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum NoteCommand {
+    Add {
+        patient_id: i32,
+        author_id: i32,
+        text: String,
+        #[arg(long)] note_type: Option<String>, // H&P, PROGRESS, CONSULT
+    },
+    List {
+        patient_id: i32,
+        #[arg(long)] since: Option<DateTime<Utc>>,
+        #[arg(long)] limit: Option<usize>,
+    },
+}
+
+// Referrals
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum ReferralCommand {
+    /// Create a new referral
+    Create {
+        #[arg(long, value_name = "UUID")]
+        encounter_id: Uuid,
+        #[arg(long, value_name = "DOCTOR_ID")]
+        to_doctor_id: i32,
+        specialty: String,                 // Cardiology, Oncology, Nephrology ...
+        reason: String,
+        #[arg(long, value_enum, default_value = "ROUTINE")]
+        urgency: String, // ROUTINE, URGENT, STAT
+    },
+    /// List referrals that are still pending
+    Pending {
+        #[arg(long, value_name = "PATIENT")]
+        patient_id: Option<i32>,
+        #[arg(long, value_name = "DOCTOR")]
+        doctor_id: Option<i32>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum VitalsCommand {
+    /// Add vital signs for an encounter
+    Add {
+        encounter_id: Uuid,
+        #[arg(long)] bp: Option<String>,           // "120/80" format
+        #[arg(long)] hr: Option<i32>,              // heart rate
+        #[arg(long)] rr: Option<i32>,              // respiratory rate
+        #[arg(long)] temp: Option<f32>,            // temperature
+        #[arg(long)] spo2: Option<i32>,            // oxygen saturation
+        #[arg(long)] pain_score: Option<i32>,      // 0-10 pain scale
+        #[arg(long)] weight: Option<f32>,          // weight in kg
+        #[arg(long)] height: Option<f32>,          // height in cm
+    },
+    /// View vital signs for a patient
+    View {
+        patient_id: i32,
+        #[arg(long)] limit: Option<usize>,
+        #[arg(long)] since: Option<DateTime<Utc>>,
+    },
+    /// Get trending data for specific vital
+    Trending {
+        patient_id: i32,
+        vital_type: String,  // bp, hr, temp, spo2, etc.
+        #[arg(long)] days_back: Option<i32>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum TriageCommand {
+    Assess {
+        encounter_id: Uuid,
+        nurse_id: i32,
+        level: String, // ESI 1-5
+        chief_complaint: String,
+        #[arg(long)] symptoms: Option<String>,
+        #[arg(long)] pain_score: Option<i32>,
+        #[arg(long)] notes: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum DispositionCommand {
+    Set {
+        encounter_id: Uuid,
+        disposition_type: String, // DISCHARGED, ADMITTED, TRANSFER, EXPIRED
+        #[arg(long)] admitting_service: Option<String>,
+        #[arg(long)] admitting_doctor: Option<i32>,
+        #[arg(long)] transfer_facility: Option<i32>,
+        #[arg(long)] instructions: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum DrugCommand {
+    Check {
+        patient_id: i32,
+    },
+    AllergyCheck {
+        patient_id: i32,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum AllergyCommand {
+    /// Add a new allergy for a patient
+    Add {
+        patient_id: i32,
+        allergen: String,
+        #[arg(long)] reaction: Option<String>,
+        #[arg(long)] severity: String,  // MILD, MODERATE, SEVERE, LIFE_THREATENING
+        #[arg(long)] verified_by: Option<String>,
+        #[arg(long)] notes: Option<String>,
+    },
+    /// List all allergies for a patient
+    List {
+        patient_id: i32,
+        #[arg(long)] status: Option<String>,  // ACTIVE, INACTIVE, RESOLVED
+    },
+    /// Update allergy status
+    UpdateStatus {
+        allergy_id: i32,
+        status: String,  // ACTIVE, INACTIVE, RESOLVED
+        #[arg(long)] notes: Option<String>,
+    },
+    /// Remove/inactivate an allergy
+    Remove {
+        allergy_id: i32,
+        #[arg(long)] reason: Option<String>,
+    },
+    /// Check for allergies before prescribing
+    Check {
+        patient_id: i32,
+        #[arg(long)] medication: Option<String>,
+    },
+}
+
+// Population Health
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum PopulationCommand {
+    /// Patients overdue for a screening test
+    ScreeningDue {
+        screening_type: String,            // COLONOSCOPY, MAMMOGRAM, A1C, CERVICAL, LDL
+        #[arg(long, value_name = "AGE")]
+        age_min: Option<u32>,
+        #[arg(long, value_name = "AGE")]
+        age_max: Option<u32>,
+        #[arg(long, value_name = "MONTHS")]
+        months_overdue: Option<u32>,
+    },
+    /// Patients on high-risk medication combinations
+    HighRiskMeds,
+    /// Patients with uncontrolled chronic conditions
+    ChronicConditions {
+        condition: String,                 // diabetes, hypertension, copd, asthma, ckd
+        #[arg(long, value_name = "THRESHOLD")]
+        uncontrolled_threshold: Option<f64>,
+    },
+    /// Social-determinants screening
+    SocialDeterminants {
+        #[arg(long, value_name = "DOMAIN", value_enum)]
+        domains: Vec<String>,              // housing, food, transport, safety
+    },
+    /// Quality-measure performance
+    QualityMeasures {
+        measure_type: String,              // MIPS_2025, HEDIS_2025, CMS_STAR
+        #[arg(long, value_name = "PERIOD")]
+        time_period: Option<String>,
+    },
+    /// Population risk stratification
+    RiskStratification {
+        #[arg(long, value_name = "FACTOR")]
+        risk_factors: Vec<String>,         // readmission, fall, sepsis, stroke
+        #[arg(long, value_name = "LEVEL")]
+        risk_level: Option<String>,        // LOW, MEDIUM, HIGH
+    },
+    DrugAlertsToday,
+    /// One-row summary for executives
+    CareGapsSummary,
+}
+
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum AuditCommand {
+    Patient {
+        patient_id: i32,
+        #[arg(long)] from: DateTime<Utc>,
+        #[arg(long)] to: Option<DateTime<Utc>>,
+    },
+    ControlledSubstances {
+        #[arg(long)] from: DateTime<Utc>,
+        #[arg(long)] to: Option<DateTime<Utc>>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ExportCommand {
+    Patient {
+        patient_id: i32,
+        #[arg(long)] format: String, // json, fhir, hl7, cda
+        #[arg(long)] deidentify: bool,
+    },
+    Cohort {
+        query: String,
+        #[arg(long)] format: String,
+    },
+}
 
 // AFTER — this is the ONLY change you need:
 #[derive(Debug, Clone, PartialEq, Subcommand)]
@@ -447,6 +878,60 @@ pub enum Commands {
     /// Full-text and indexing operations
     #[clap(subcommand)]
     Index(IndexAction),
+
+    // =========================================================================
+    // PATIENT MANAGEMENT
+    // =========================================================================
+    #[clap(subcommand)]
+    Patient(PatientCommand),
+
+    // =========================================================================
+    // CLINICAL WORKFLOW
+    // =========================================================================
+    #[clap(subcommand)]
+    Encounter(EncounterCommand),
+    #[clap(subcommand)]
+    Diagnosis(DiagnosisCommand),
+    #[clap(subcommand)]
+    Prescription(PrescriptionCommand),
+    #[clap(subcommand)]
+    Note(NoteCommand),
+    #[clap(subcommand)]
+    Referral(ReferralCommand),
+    #[clap(subcommand)]
+    Triage(TriageCommand),
+    #[clap(subcommand)]
+    Disposition(DispositionCommand),
+    #[clap(subcommand)]
+    Allergy(AllergyCommand),
+    #[clap(subcommand)]
+    Appointment(AppointmentCommand),
+    #[clap(subcommand)]
+    Problem(ProblemCommand),
+    #[clap(subcommand)]
+    Order(OrderCommand),
+
+    // =========================================================================
+    // DRUG SAFETY & INTERACTIONS
+    // =========================================================================
+    #[clap(subcommand)]
+    Drug(DrugCommand),
+
+    // =========================================================================
+    // POPULATION HEALTH & ANALYTICS
+    // =========================================================================
+    #[clap(subcommand)]
+    Population(PopulationCommand),
+
+    // =========================================================================
+    // COMPLIANCE & AUDIT
+    // =========================================================================
+    #[clap(subcommand)]
+    Audit(AuditCommand),
+    #[clap(subcommand)]
+    Export(ExportCommand),
+    #[clap(subcommand)]
+    Vitals(VitalsCommand),
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]

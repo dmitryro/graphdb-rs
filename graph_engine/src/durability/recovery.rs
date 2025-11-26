@@ -1,6 +1,6 @@
 // lib/src/durability/recovery.rs
 use crate::durability::{DurabilityManager, GraphOp};
-use crate::graph::Graph;
+use models::Graph;
 
 pub fn recover(durability: &DurabilityManager) -> Graph {
     let mut graph = Graph::new();
