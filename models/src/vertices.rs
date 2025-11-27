@@ -54,3 +54,9 @@ impl Vertex {
             })
     }
 }
+
+impl Default for Vertex {
+    fn default() -> Self {
+        Vertex::new(Identifier::new("Vertex".to_string()).unwrap())
+    }
+}
