@@ -18,11 +18,7 @@ use models::errors::GraphError;
 use tokio::time::{timeout, Duration as TokioDuration};
 use std::future::Future;
 // Import modules
-use lib::commands::{
-    parse_kv_operation, ConfigAction, DaemonCliCommand, HelpArgs, ReloadAction, RestartAction,
-    RestCliCommand, SaveAction, ShowAction, StartAction, StatusAction, StopAction, StorageAction,
-    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction, MigrateAction, GraphAction, IndexAction,
-};
+use lib::commands::*;
 use lib::config::{
     self, load_storage_config_from_yaml, SelectedStorageConfig, StorageConfig,
     StorageConfigInner, StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
@@ -304,6 +300,156 @@ pub enum Commands {
     #[clap(subcommand)]
     Index(IndexAction),
 
+    // =========================================================================
+    // PATIENT MANAGEMENT
+    // =========================================================================
+    #[clap(subcommand)]
+    Patient(PatientCommand),
+
+    // =========================================================================
+    // CLINICAL WORKFLOW
+    // =========================================================================
+    #[clap(subcommand)]
+    Encounter(EncounterCommand),
+    #[clap(subcommand)]
+    Diagnosis(DiagnosisCommand),
+    #[clap(subcommand)]
+    Prescription(PrescriptionCommand),
+    #[clap(subcommand)]
+    Note(NoteCommand),
+    #[clap(subcommand)]
+    Referral(ReferralCommand),
+    #[clap(subcommand)]
+    Triage(TriageCommand),
+    #[clap(subcommand)]
+    Disposition(DispositionCommand),
+    #[clap(subcommand)]
+    Allergy(AllergyCommand),
+    #[clap(subcommand)]
+    Appointment(AppointmentCommand),
+    #[clap(subcommand)]
+    Problem(ProblemCommand),
+    #[clap(subcommand)]
+    Order(OrderCommand),
+    #[clap(subcommand)]
+    Discharge(DischargeCommand),
+    #[clap(subcommand)]
+    Procedure(ProcedureCommand),
+    // =========================================================================
+    // DOSING
+    // =========================================================================
+    #[clap(subcommand)]
+    Dosing(DosingCommand),
+
+    // =========================================================================
+    // ALERT & NOTIFICATION SYSTEM
+    // =========================================================================
+    #[clap(subcommand)]
+    Alert(AlertCommand),
+
+    // =========================================================================
+    // PATHOLOGY
+    // =========================================================================
+    #[clap(subcommand)]
+    Pathology(PathologyCommand),
+
+    // =========================================================================
+    // MICROBIOLOGY
+    // =========================================================================
+    #[clap(subcommand)]
+    Microbiology(MicrobiologyCommand),
+
+    // =========================================================================
+    // VITAL & OBSERVATION
+    // =========================================================================
+    #[clap(subcommand)]
+    Vitals(VitalsCommand),
+    #[clap(subcommand)]
+    Observation(ObservationCommand),
+
+    // =========================================================================
+    // LAB & IMAGING
+    // =========================================================================
+    #[clap(subcommand)]
+    Lab(LabCommand),
+    #[clap(subcommand)]
+    Imaging(ImagingCommand),
+
+    // =========================================================================
+    // SPECIALTY CARE
+    // =========================================================================
+    #[clap(subcommand)]
+    Chemo(ChemoCommand),
+    #[clap(subcommand)]
+    Radiation(RadiationCommand),
+    #[clap(subcommand)]
+    Surgery(SurgeryCommand),
+
+    // =========================================================================
+    // DRUG SAFETY & INTERACTIONS
+    // =========================================================================
+    #[clap(subcommand)]
+    Drug(DrugCommand),
+
+    // =========================================================================
+    // POPULATION HEALTH & ANALYTICS
+    // =========================================================================
+    #[clap(subcommand)]
+    Population(PopulationCommand),
+    #[clap(subcommand)]
+    Analytics(AnalyticsCommand),
+    #[clap(subcommand)]
+    Metrics(MetricsCommand),
+
+    // =========================================================================
+    // COMPLIANCE & AUDIT
+    // =========================================================================
+    #[clap(subcommand)]
+    Audit(AuditCommand),
+    #[clap(subcommand)]
+    Export(ExportCommand),
+
+    // =========================================================================
+    // FACILITY & ADMIN
+    // =========================================================================
+    #[clap(subcommand)]
+    Facility(FacilityCommand),
+    #[clap(subcommand)]
+    Access(AccessCommand),
+    #[clap(subcommand)]
+    Financial(FinancialCommand),
+
+    // =========================================================================
+    // QUALITY & COMPLIANCE
+    // =========================================================================
+    #[clap(subcommand)]
+    Quality(QualityCommand),
+    #[clap(subcommand)]
+    Incident(IncidentCommand),
+    #[clap(subcommand)]
+    Compliance(ComplianceCommand),
+
+    // =========================================================================
+    // RESEARCH & AI
+    // =========================================================================
+    #[clap(subcommand)]
+    Research(ResearchCommand),
+    #[clap(subcommand)]
+    Ml(MlCommand),
+    #[clap(subcommand)]
+    ClinicalTrial(ClinicalTrialCommand),
+    #[clap(subcommand)]
+    Model(ModelCommand),
+
+    // =========================================================================
+    // NURSING & CARE COORDINATION
+    // =========================================================================
+    #[clap(subcommand)]
+    Nursing(NursingCommand),
+    #[clap(subcommand)]
+    Education(EducationCommand),
+    #[clap(subcommand)]
+    DischargePlanning(DischargePlanningCommand),
 }
 
 // Use a TokioMutex to manage the singleton instance of the QueryExecEngine.
@@ -1001,6 +1147,141 @@ pub async fn run_single_command(
 
             info!("Index command executed successfully on port {}", daemon_port);
             println!("===> Index command completed successfully.");
+        }
+        Commands::Patient(action) => {
+
+        }
+        Commands::Encounter(action) => {
+            
+        }
+        Commands::Diagnosis(action) => {
+
+        }
+        Commands::Prescription(action) => {
+
+        }
+        Commands::Note(action) => {
+
+        }
+        Commands::Referral(action) => {
+
+        }
+        Commands::Triage(action) => {
+
+        }
+        Commands::Disposition(action) => {
+
+        }
+        Commands::Allergy(action) => {
+
+        }
+        Commands::Appointment(action) => {
+
+        }
+        Commands::Problem(action) => {
+
+        }
+        Commands::Order(action) => {
+
+        }
+        Commands::Discharge(action) => {
+
+        }
+        Commands::Procedure(action) => {
+
+        }
+        Commands::Dosing(action) => {
+
+        }
+        Commands::Alert(action) => {
+
+        }
+        Commands::Pathology(action) => {
+
+        }
+        Commands::Microbiology(action) => {
+
+        }
+        Commands::Vitals(action) => {
+
+        }
+        Commands::Observation(action) => {
+
+        }
+        Commands::Lab(action) => {
+
+        }
+        Commands::Imaging(action) => {
+
+        }
+        Commands::Chemo(action) => {
+
+        }
+        Commands::Radiation(action) => {
+
+        }
+        Commands::Surgery(action) => {
+
+        }
+        Commands::Drug(action) => {
+
+        }
+        Commands::Population(action) => {
+
+        }
+        Commands::Analytics(action) => {
+
+        }
+        Commands::Metrics(action) => {
+
+        }
+        Commands::Audit(action) => {
+
+        }
+        Commands::Export(action) => {
+
+        }
+        Commands::Facility(action) => {
+
+        }
+        Commands::Access(action) => {
+
+        }
+        Commands::Financial(action) => {
+
+        }
+        Commands::Financial(action) => {
+
+        }
+        Commands::Quality(action) => {
+
+        }
+        Commands::Incident(action) => {
+
+        }
+        Commands::Compliance(action) => {
+
+        }
+        Commands::Research(action) => {
+
+        }
+        Commands::Ml(action) => {
+
+        }
+        Commands::ClinicalTrial(action) => {
+
+        }
+        Commands::Model(action) => {
+
+        }
+        Commands::Nursing(action) => {
+
+        }
+        Commands::Education(action) => {
+
+        }
+        Commands::DischargePlanning(action) => {
+
         }
     }
     if env_var_set {
