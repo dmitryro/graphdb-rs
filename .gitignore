@@ -55,7 +55,8 @@ testem.log
 # System Files
 .DS_Store
 Thumbs.db
-
+.swp
+*.swp
 __pycache__
 CACHE*
 migrations

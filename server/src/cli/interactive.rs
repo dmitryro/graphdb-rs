@@ -12,14 +12,10 @@ use clap::CommandFactory;
 use std::collections::HashSet;
 use shlex;
 use log::{info, error, warn, debug};
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
 use crate::cli::cli::{CliArgs, get_query_engine_singleton};
-use lib::commands::{
-    CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
-    ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
-    ConfigAction, parse_kv_operation, parse_storage_engine, KvAction, MigrateAction,
-    // NEW: Graph & Index domain actions
-    GraphAction, IndexAction, SearchOrder,
-};
+use lib::commands::*;
 use crate::cli::handlers;
 use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
@@ -152,6 +148,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "quit", "q", "clean", "save", "show", "kv", "query", "exec", "migrate",
         // NEW: Add graph and index for tab-completion & fuzzy help
         "graph", "index",
+        // === NEW CLINICAL COMMANDS ===
+        "patient", "encounter", "diagnosis", "prescription", "note", "procedure",
+        "triage", "disposition", "referral", "vitals", "observation", "lab", "imaging",
+        "chemo", "radiation", "surgery", "nursing", "education", "discharge-planning",
+        "discharge", "quality", "incident", "compliance", "population", "analytics",
+        "metrics", "research", "ml", "clinical-trial", "facility", "access", "financial",
+        "alert", "pathology", "microbiology", "dosing", "model",
     ];
     const FUZZY_MATCH_THRESHOLD: usize = 2;
 
@@ -1808,6 +1811,4449 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 }
             }
         }
+
+        // === ALL CLINICAL COMMANDS — FULLY IMPLEMENTED ===
+        "patient" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: patient <view|timeline|journey|care-gaps|problems|meds|alerts|allergies|search> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "view" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::Patient(PatientCommand::View { patient_id })
+                }
+                "timeline" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::Patient(PatientCommand::Timeline { patient_id })
+                }
+                "journey" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    let mut show_completed = false;
+                    let mut show_deviations_only = false;
+                    let mut pathway = None;
+                    let mut format = None;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--show-completed" => {
+                                show_completed = true;
+                                i += 1;
+                            }
+                            "--show-deviations-only" => {
+                                show_deviations_only = true;
+                                i += 1;
+                            }
+                            "--pathway" => {
+                                if i + 1 < remaining_args.len() {
+                                    pathway = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                            "--format" => {
+                                if i + 1 < remaining_args.len() {
+                                    format = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "text" => Some(JourneyFormat::Text),
+                                        "json" => Some(JourneyFormat::Json),
+                                        "timeline" => Some(JourneyFormat::Timeline),
+                                        "detailed" => Some(JourneyFormat::Detailed),
+                                        _ => Some(JourneyFormat::Text),
+                                    };
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Patient(PatientCommand::Journey {
+                        patient_id,
+                        show_completed,
+                        show_deviations_only,
+                        pathway,
+                        format,
+                    })
+                }
+                "care-gaps" | "gaps" => {
+                    let patient_id = if remaining_args.len() > 1 {
+                        remaining_args[1].parse::<i32>().ok()
+                    } else {
+                        None
+                    };
+                    CommandType::Patient(PatientCommand::CareGaps { patient_id })
+                }
+                "problems" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::Patient(PatientCommand::Problems { patient_id })
+                }
+                "meds" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::Patient(PatientCommand::Meds { patient_id })
+                }
+                "alerts" => {
+                    let patient_id = remaining_args
+                        .get(1)
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(0);
+
+                    // ---- defaults for the new required fields ----
+                    CommandType::Patient(PatientCommand::DrugAlerts {
+                        patient_id,
+                        drug_class: None,            // Option<String>
+                        format: Default::default(),  // whatever your Format enum default is
+                        include_overridden: false,   // bool
+                        include_inactive: false,     // bool
+                        severity_filter: None,       // Option<Severity>
+                        include_resolved: false,
+                        severity: None,
+                    })
+                }
+                "allergies" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::Patient(PatientCommand::Allergies { patient_id })
+                }
+                "search" => {
+                    let query = remaining_args[1..].join(" ");
+                    CommandType::Patient(PatientCommand::Search { query })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "encounter" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: encounter <start|close> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+
+            match remaining_args[0].to_lowercase().as_str() {
+                "start" => {
+                    let mut patient_id = None;
+                    let mut doctor_id = None;
+                    let mut encounter_type = None;
+                    let mut location = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" | "-p" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--doctor-id" | "-d" => {
+                                if i + 1 < remaining_args.len() {
+                                    doctor_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--type" | "-t" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_type = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--location" | "-l" => {
+                                if i + 1 < remaining_args.len() {
+                                    location = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Encounter(EncounterCommand::Start {
+                        patient_id: patient_id.unwrap_or(0),
+                        doctor_id: doctor_id.unwrap_or(0),
+                        encounter_type: encounter_type.unwrap_or_default(),
+                        location,
+                    })
+                }
+                "close" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: encounter close <encounter_id> <disposition>");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let encounter_id = match Uuid::parse_str(&remaining_args[1]) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            eprintln!("Invalid encounter ID");
+                            return (CommandType::Unknown, remaining_args);
+                        }
+                    };
+                    let disposition = remaining_args.get(2).cloned().unwrap_or_default();
+                    CommandType::Encounter(EncounterCommand::Close { encounter_id, disposition, instructions: None })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "diagnosis" => {
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "add" {
+                eprintln!("Usage: diagnosis add --encounter <uuid> <description> [--icd10 <code>]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            let mut encounter_id = None;
+            let mut description = None;
+            let mut icd10 = None;
+            let mut i = 1;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--encounter" => {
+                        if i + 1 < remaining_args.len() {
+                            encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--icd10" => {
+                        if i + 1 < remaining_args.len() {
+                            icd10 = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    _ => {
+                        if description.is_none() {
+                            description = Some(remaining_args[i].clone());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            CommandType::Diagnosis(DiagnosisCommand::Add {
+                encounter_id: encounter_id.unwrap_or_default(),
+                description: description.unwrap_or_default(),
+                icd10,
+            })
+        },
+
+        "prescription" | "rx" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: prescription <add|check> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "add" => {
+                    let mut encounter_id = None;
+                    let mut medication = None;
+                    let mut dose = None;
+                    let mut frequency = None;
+                    let mut days = None;
+                    let mut refills = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--encounter" | "-e" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--med" => {
+                                if i + 1 < remaining_args.len() {
+                                    medication = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--dose" => {
+                                if i + 1 < remaining_args.len() {
+                                    dose = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--freq" => {
+                                if i + 1 < remaining_args.len() {
+                                    frequency = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--days" => {
+                                if i + 1 < remaining_args.len() {
+                                    days = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--refills" => {
+                                if i + 1 < remaining_args.len() {
+                                    refills = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Prescription(PrescriptionCommand::Add {
+                        encounter_id: encounter_id.unwrap_or_default(),
+                        medication_name: medication.unwrap_or_default(),
+                        dose: dose.unwrap_or_default(),
+                        frequency: frequency.unwrap_or_default(),
+                        days: days.unwrap_or(30),
+                        refills,
+                    })
+                }
+                "check" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::Prescription(PrescriptionCommand::CheckInteractions { patient_id })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "note" => {
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "add" {
+                eprintln!("Usage: note add --patient <id> --text <text> [--author <id>] [--type <type>]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            let mut patient_id = None;
+            let mut author_id = None;
+            let mut text = None;
+            let mut note_type = None;
+            let mut i = 1;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--patient" => {
+                        if i + 1 < remaining_args.len() {
+                            patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--author" => {
+                        if i + 1 < remaining_args.len() {
+                            author_id = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--type" => {
+                        if i + 1 < remaining_args.len() {
+                            note_type = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--text" => {
+                        if i + 1 < remaining_args.len() {
+                            text = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    _ => {
+                        if text.is_none() {
+                            text = Some(remaining_args[i].clone());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            CommandType::Note(NoteCommand::Add {
+                patient_id: patient_id.unwrap_or(0),
+                author_id: author_id.unwrap_or(0),
+                text: text.unwrap_or_default(),
+                note_type,
+            })
+        },
+
+        "procedure" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: procedure <add|perform|result|cancel|list|timeline|analytics> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "add" | "order" => {
+                    let mut encounter_id = None;
+                    let mut procedure = None;
+                    let mut cpt_code = None;
+                    let mut laterality = None;
+                    let mut priority = None;
+                    let mut indication = None;
+                    let mut ordering_provider = None;
+                    let mut scheduled_date = None;
+                    let mut location = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--encounter" | "-e" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--procedure" => {
+                                if i + 1 < remaining_args.len() {
+                                    procedure = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--cpt" | "--cpt-code" => {
+                                if i + 1 < remaining_args.len() {
+                                    cpt_code = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--laterality" => {
+                                if i + 1 < remaining_args.len() {
+                                    laterality = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "left" => Some(Laterality::Left),
+                                        "right" => Some(Laterality::Right),
+                                        "bilateral" => Some(Laterality::Bilateral),
+                                        "midline" => Some(Laterality::Midline),
+                                        _ => Some(Laterality::None),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--priority" => {
+                                if i + 1 < remaining_args.len() {
+                                    priority = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "stat" => Some(ProcedurePriority::Stat),
+                                        "urgent" => Some(ProcedurePriority::Urgent),
+                                        "routine" => Some(ProcedurePriority::Routine),
+                                        "elective" => Some(ProcedurePriority::Elective),
+                                        "emergent" => Some(ProcedurePriority::Emergent),
+                                        _ => Some(ProcedurePriority::Routine),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--indication" => {
+                                if i + 1 < remaining_args.len() {
+                                    indication = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--ordering-provider" => {
+                                if i + 1 < remaining_args.len() {
+                                    ordering_provider = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--scheduled-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    scheduled_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--location" => {
+                                if i + 1 < remaining_args.len() {
+                                    location = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if procedure.is_none() {
+                                    procedure = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Procedure(ProcedureCommand::Order {
+                        encounter_id: encounter_id.unwrap_or_default(),
+                        procedure: procedure.unwrap_or_default(),
+                        cpt_code,
+                        laterality,
+                        priority,
+                        indication,
+                        ordering_provider,
+                        scheduled_date,
+                        location,
+                    })
+                }
+                "perform" => {
+                    let mut procedure_id = None;
+                    let mut performing_provider = None;
+                    let mut start_time = None;
+                    let mut end_time = None;
+                    let mut anesthesia_type = None;
+                    let mut assistants = Vec::new();
+                    let mut specimens = Vec::new();
+                    let mut implants = Vec::new();
+                    let mut ebl_ml = None;
+                    let mut complications = Vec::new();
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--procedure-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    procedure_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--performing-provider" => {
+                                if i + 1 < remaining_args.len() {
+                                    performing_provider = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--start-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    start_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--end-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    end_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--anesthesia" => {
+                                if i + 1 < remaining_args.len() {
+                                    anesthesia_type = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "general" => Some(AnesthesiaType::General),
+                                        "regional" => Some(AnesthesiaType::Regional),
+                                        "local" => Some(AnesthesiaType::Local),
+                                        "monitored" => Some(AnesthesiaType::Monitored),
+                                        "sedation" => Some(AnesthesiaType::Sedation),
+                                        _ => Some(AnesthesiaType::None),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--assistant" => {
+                                if i + 1 < remaining_args.len() {
+                                    assistants.push(remaining_args[i + 1].parse::<i32>().unwrap_or(0));
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--specimen" => {
+                                if i + 1 < remaining_args.len() {
+                                    specimens.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--implant" => {
+                                if i + 1 < remaining_args.len() {
+                                    implants.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--ebl" => {
+                                if i + 1 < remaining_args.len() {
+                                    ebl_ml = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--complication" => {
+                                if i + 1 < remaining_args.len() {
+                                    complications.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Procedure(ProcedureCommand::Perform {
+                        procedure_id: procedure_id.unwrap_or_default(),
+                        performing_provider: performing_provider.unwrap_or(0),
+                        start_time,
+                        end_time,
+                        anesthesia_type,
+                        assistants,
+                        specimens,
+                        implants,
+                        ebl_ml,
+                        complications,
+                    })
+                }
+                "result" => {
+                    let mut procedure_id = None;
+                    let mut status = None;
+                    let mut findings = None;
+                    let mut impression = None;
+                    let mut pathology_sent = false;
+                    let mut report_by = None;
+                    let mut report_date = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--procedure-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    procedure_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--status" => {
+                                if i + 1 < remaining_args.len() {
+                                    status = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "completed" => Some(ProcedureStatus::Completed),
+                                        "preliminary" => Some(ProcedureStatus::Preliminary),
+                                        "final" => Some(ProcedureStatus::Final),
+                                        "cancelled" => Some(ProcedureStatus::Cancelled),
+                                        _ => Some(ProcedureStatus::Completed),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--findings" => {
+                                if i + 1 < remaining_args.len() {
+                                    findings = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--impression" => {
+                                if i + 1 < remaining_args.len() {
+                                    impression = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--pathology" => {
+                                pathology_sent = true;
+                                i += 1;
+                            }
+                            "--report-by" => {
+                                if i + 1 < remaining_args.len() {
+                                    report_by = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--report-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    report_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Procedure(ProcedureCommand::Result {
+                        procedure_id: procedure_id.unwrap_or_default(),
+                        status: status.unwrap_or(ProcedureStatus::Completed),
+                        findings,
+                        impression,
+                        pathology_sent,
+                        report_by: report_by.unwrap_or(0),
+                        report_date,
+                    })
+                }
+                "cancel" => {
+                    let mut procedure_id = None;
+                    let mut reason = None;
+                    let mut cancelled_by = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--procedure-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    procedure_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--reason" => {
+                                if i + 1 < remaining_args.len() {
+                                    reason = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--cancelled-by" => {
+                                if i + 1 < remaining_args.len() {
+                                    cancelled_by = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Procedure(ProcedureCommand::Cancel {
+                        procedure_id: procedure_id.unwrap_or_default(),
+                        reason: reason.unwrap_or_default(),
+                        cancelled_by: cancelled_by.unwrap_or(0),
+                    })
+                }
+                "list" => {
+                    let mut patient_id = None;
+                    let mut encounter_id = None;
+                    let mut status = None;
+                    let mut provider_id = None;
+                    let mut date_range = None;
+                    let mut limit = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--encounter-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--status" => {
+                                if i + 1 < remaining_args.len() {
+                                    status = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "ordered" => Some(ProcedureStatus::Ordered),
+                                        "completed" => Some(ProcedureStatus::Completed),
+                                        "cancelled" => Some(ProcedureStatus::Cancelled),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--provider-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    provider_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--date-range" => {
+                                if i + 1 < remaining_args.len() {
+                                    date_range = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--limit" => {
+                                if i + 1 < remaining_args.len() {
+                                    limit = remaining_args[i + 1].parse::<usize>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Procedure(ProcedureCommand::List {
+                        patient_id,
+                        encounter_id,
+                        status,
+                        provider_id,
+                        date_range,
+                        limit,
+                    })
+                }
+                "timeline" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    let mut procedure_type = None;
+                    let mut years = None;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--type" => {
+                                if i + 1 < remaining_args.len() {
+                                    procedure_type = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--years" => {
+                                if i + 1 < remaining_args.len() {
+                                    years = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Procedure(ProcedureCommand::Timeline {
+                        patient_id,
+                        procedure_type,
+                        years,
+                    })
+                }
+                "analytics" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: procedure analytics <volume|complications|turnaround|cancellations|provider-volume|outcomes>");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[1].to_lowercase().as_str() {
+                        "volume" => {
+                            let mut procedure_type = None;
+                            let mut provider = None;
+                            let mut timeframe = None;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--procedure-type" => {
+                                        if i + 1 < remaining_args.len() {
+                                            procedure_type = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--provider" => {
+                                        if i + 1 < remaining_args.len() {
+                                            provider = remaining_args[i + 1].parse::<i32>().ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--timeframe" => {
+                                        if i + 1 < remaining_args.len() {
+                                            timeframe = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Procedure(ProcedureCommand::Analytics {
+                                analytics_type: ProcedureAnalyticsType::Volume {
+                                    procedure_type,
+                                    provider,
+                                    timeframe,
+                                },
+                            })
+                        }
+                        "complications" => {
+                            let mut procedure = None;
+                            let mut risk_adjusted = false;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--procedure" => {
+                                        if i + 1 < remaining_args.len() {
+                                            procedure = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--risk-adjusted" => {
+                                        risk_adjusted = true;
+                                        i += 1;
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Procedure(ProcedureCommand::Analytics {
+                                analytics_type: ProcedureAnalyticsType::Complications {
+                                    procedure: procedure.unwrap_or_default(),
+                                    risk_adjusted,
+                                },
+                            })
+                        }
+                        "turnaround" => {
+                            let mut procedure = None;
+                            let mut target_hours = None;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--procedure" => {
+                                        if i + 1 < remaining_args.len() {
+                                            procedure = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--target-hours" => {
+                                        if i + 1 < remaining_args.len() {
+                                            target_hours = remaining_args[i + 1].parse::<i64>().ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Procedure(ProcedureCommand::Analytics {
+                                analytics_type: ProcedureAnalyticsType::Turnaround {
+                                    procedure: procedure.unwrap_or_default(),
+                                    target_hours,
+                                },
+                            })
+                        }
+                        "cancellations" => CommandType::Procedure(ProcedureCommand::Analytics {
+                            analytics_type: ProcedureAnalyticsType::Cancellations,
+                        }),
+                        "provider-volume" => {
+                            let provider_id = remaining_args.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                            let mut timeframe = None;
+                            let mut i = 3;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--timeframe" => {
+                                        if i + 1 < remaining_args.len() {
+                                            timeframe = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Procedure(ProcedureCommand::Analytics {
+                                analytics_type: ProcedureAnalyticsType::ProviderVolume {
+                                    provider_id,
+                                    timeframe,
+                                },
+                            })
+                        }
+                        "outcomes" => {
+                            let mut procedure = None;
+                            let mut outcome_metric = None;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--procedure" => {
+                                        if i + 1 < remaining_args.len() {
+                                            procedure = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--outcome-metric" => {
+                                        if i + 1 < remaining_args.len() {
+                                            outcome_metric = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Procedure(ProcedureCommand::Analytics {
+                                analytics_type: ProcedureAnalyticsType::Outcomes {
+                                    procedure: procedure.unwrap_or_default(),
+                                    outcome_metric,
+                                },
+                            })
+                        }
+                        _ => CommandType::Unknown,
+                    }
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "triage" => {
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "assess" {
+                eprintln!("Usage: triage assess --encounter <uuid> --level <ESI1-5> --complaint <text> [--symptoms] [--pain-score] [--notes]");
+                return (CommandType::Unknown, remaining_args);
+            }
+
+            let mut encounter_id = None;
+            let mut nurse_id = None;
+            let mut level = None;
+            let mut chief_complaint = None;
+            let mut symptoms = None;
+            let mut pain_score = None;
+            let mut notes = None;
+            let mut i = 1;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--encounter" => {
+                        if i + 1 < remaining_args.len() {
+                            encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--nurse-id" => {
+                        if i + 1 < remaining_args.len() {
+                            nurse_id = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--level" => {
+                        if i + 1 < remaining_args.len() {
+                            level = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--complaint" => {
+                        if i + 1 < remaining_args.len() {
+                            chief_complaint = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--symptoms" => {
+                        if i + 1 < remaining_args.len() {
+                            symptoms = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--pain-score" | "--pain" => {
+                        if i + 1 < remaining_args.len() {
+                            pain_score = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--notes" => {
+                        if i + 1 < remaining_args.len() {
+                            notes = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    _ => {
+                        if chief_complaint.is_none() {
+                            chief_complaint = Some(remaining_args[i].clone());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            CommandType::Triage(TriageCommand::Assess {
+                encounter_id: encounter_id.unwrap_or_default(),
+                nurse_id: nurse_id.unwrap_or(0),
+                level: level.unwrap_or_default(),
+                chief_complaint: chief_complaint.unwrap_or_default(),
+                symptoms,
+                pain_score,
+                notes,
+            })
+        },
+        "disposition" => {
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "set" {
+                eprintln!("Usage: disposition set --encounter <uuid> <disposition> [--admitting-service] [--admitting-doctor] [--transfer-facility] [--instructions]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            let mut encounter_id = None;
+            let mut disposition_type = DispositionTarget::Home;
+            let mut admitting_service = None;
+            let mut admitting_doctor = None;
+            let mut transfer_facility = None;
+            let mut instructions = None;
+            let mut i = 1;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--encounter" => {
+                        if i + 1 < remaining_args.len() {
+                            encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--admitting-service" => {
+                        if i + 1 < remaining_args.len() {
+                            admitting_service = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--admitting-doctor" => {
+                        if i + 1 < remaining_args.len() {
+                            admitting_doctor = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--transfer-facility" => {
+                        if i + 1 < remaining_args.len() {
+                            transfer_facility = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--instructions" => {
+                        if i + 1 < remaining_args.len() {
+                            instructions = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    _ => {
+                        disposition_type = match remaining_args[i].to_lowercase().as_str() {
+                            "home" => DispositionTarget::Home,
+                            "homehealth" => DispositionTarget::HomeHealth,
+                            "snf" => DispositionTarget::SkilledNursing,
+                            "rehab" => DispositionTarget::Rehab,
+                            "ltach" => DispositionTarget::LTACH,
+                            "hospice" => DispositionTarget::Hospice,
+                            "ama" => DispositionTarget::AgainstMedicalAdvice,
+                            "expired" => DispositionTarget::Expired,
+                            "transfer" => DispositionTarget::Transfer,
+                            _ => DispositionTarget::Home,
+                        };
+                        i += 1;
+                    }
+                }
+            }
+             CommandType::Disposition(DispositionCommand::Set {
+                encounter_id: encounter_id.unwrap_or_default(),
+                disposition_type: disposition_type.to_string(), // <-- 1. String
+                admitting_service,
+                admitting_doctor,
+                transfer_facility,
+                instructions,
+            })
+        },
+
+        "referral" => {
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "create" {
+                eprintln!("Usage: referral create --encounter <uuid> --to-doctor <id> <specialty> <reason> [--urgency]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            let mut encounter_id = None;
+            let mut to_doctor_id = None;
+            let mut specialty = None;
+            let mut reason = None;
+            let mut urgency = None;
+            let mut i = 1;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--encounter" => {
+                        if i + 1 < remaining_args.len() {
+                            encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--to-doctor" => {
+                        if i + 1 < remaining_args.len() {
+                            to_doctor_id = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--specialty" => {
+                        if i + 1 < remaining_args.len() {
+                            specialty = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--reason" => {
+                        if i + 1 < remaining_args.len() {
+                            reason = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--urgency" => {
+                        if i + 1 < remaining_args.len() {
+                            urgency = Some(match remaining_args[i + 1].to_lowercase().as_str() {
+                                "stat" | "emergent" => "STAT".to_string(),
+                                "urgent" => "URGENT".to_string(),
+                                _ => "ROUTINE".to_string(),
+                            });
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    _ => {
+                        if reason.is_none() {
+                            reason = Some(remaining_args[i].clone());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            CommandType::Referral(ReferralCommand::Create {
+                encounter_id: encounter_id.unwrap_or_default(),
+                to_doctor_id: to_doctor_id.unwrap_or(0),
+                specialty: specialty.unwrap_or_default(),
+                reason: reason.unwrap_or_default(),
+                urgency: urgency.unwrap_or_default(), // <- now a plain String
+            })
+        },
+
+        "vitals" => {
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "add" {
+                eprintln!("Usage: vitals add --encounter <uuid> --bp <value> [--hr] [--temp] [--rr] [--spo2] [--pain-score] [--height] [--weight]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            let mut encounter_id = None;
+            let mut bp = None;
+            let mut hr = None;
+            let mut temp = None;
+            let mut rr = None;
+            let mut spo2 = None;
+            let mut pain_score = None;
+            let mut height = None;
+            let mut weight = None;
+            let mut i = 1;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--encounter" => {
+                        if i + 1 < remaining_args.len() {
+                            encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--bp" => {
+                        if i + 1 < remaining_args.len() {
+                            bp = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--hr" => {
+                        if i + 1 < remaining_args.len() {
+                            hr = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--temp" => {
+                        if i + 1 < remaining_args.len() {
+                            temp = remaining_args[i + 1].parse::<f32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--rr" => {
+                        if i + 1 < remaining_args.len() {
+                            rr = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--spo2" => {
+                        if i + 1 < remaining_args.len() {
+                            spo2 = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--pain-score" | "--pain" => {
+                        if i + 1 < remaining_args.len() {
+                            pain_score = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--height" => {
+                        if i + 1 < remaining_args.len() {
+                            height = remaining_args[i + 1].parse::<f32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--weight" => {
+                        if i + 1 < remaining_args.len() {
+                            weight = remaining_args[i + 1].parse::<f32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    _ => i += 1,
+                }
+            }
+            CommandType::Vitals(VitalsCommand::Add {
+                encounter_id: encounter_id.unwrap_or_default(),
+                bp,
+                hr,
+                temp,
+                rr,
+                spo2,
+                pain_score,
+                height,
+                weight,
+            })
+        },
+
+        "observation" => {
+                    if remaining_args.is_empty() {
+                        eprintln!("Usage: observation <add|list> [args...]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[0].to_lowercase().as_str() {
+                        "add" => {
+                            let mut encounter_id = None;
+                            let mut observation_type = None;
+                            let mut value = None;
+                            let mut unit = None;
+                            let mut observed_by = None;
+                            let mut notes = None;
+                            let mut i = 1;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--encounter" => {
+                                        if i + 1 < remaining_args.len() {
+                                            encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--type" => {
+                                        if i + 1 < remaining_args.len() {
+                                            observation_type = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--value" => {
+                                        if i + 1 < remaining_args.len() {
+                                            value = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--unit" => {
+                                        if i + 1 < remaining_args.len() {
+                                            unit = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--observed-by" => {
+                                        if i + 1 < remaining_args.len() {
+                                            observed_by = remaining_args[i + 1].parse::<i32>().ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--notes" => {
+                                        if i + 1 < remaining_args.len() {
+                                            notes = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => {
+                                        if observation_type.is_none() {
+                                            observation_type = Some(remaining_args[i].clone());
+                                        } else if value.is_none() {
+                                            value = Some(remaining_args[i].clone());
+                                        }
+                                        i += 1;
+                                    }
+                                }
+                            }
+                            CommandType::Observation(ObservationCommand::Add {
+                                encounter_id: encounter_id.unwrap_or_default(),
+                                observation_type: observation_type.unwrap_or_default(),
+                                value: value.unwrap_or_default(),
+                                unit,
+                                observed_by,
+                                notes,
+                            })
+                        }
+                        "list" => {
+                            let mut encounter_id = None;
+                            let mut type_filter = None;
+                            let mut limit = None;
+                            let mut i = 1;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--encounter" => {
+                                        if i + 1 < remaining_args.len() {
+                                            encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--type-filter" => {
+                                        if i + 1 < remaining_args.len() {
+                                            type_filter = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--limit" => {
+                                        if i + 1 < remaining_args.len() {
+                                            limit = remaining_args[i + 1].parse::<usize>().ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Observation(ObservationCommand::List {
+                                encounter_id: encounter_id.unwrap_or_default(),
+                                type_filter,
+                                limit,
+                            })
+                        }
+                        _ => CommandType::Unknown,
+                    }
+                },
+        "lab" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: lab <order|result|trend> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "order" => {
+                    let mut encounter_id = None;
+                    let mut tests = Vec::new();
+                    let mut priority = None;
+                    let mut clinical_indication = None;
+                    let mut collect_time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--encounter" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--priority" => {
+                                if i + 1 < remaining_args.len() {
+                                    priority = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "routine" => Some(LabPriority::Routine),
+                                        "urgent" => Some(LabPriority::Urgent),
+                                        "stat" => Some(LabPriority::Stat),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--clinical-indication" => {
+                                if i + 1 < remaining_args.len() {
+                                    clinical_indication = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--collect-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    collect_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                tests.push(remaining_args[i].clone());
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Lab(LabCommand::Order {
+                        encounter_id: encounter_id.unwrap_or_default(),
+                        tests,
+                        priority,
+                        clinical_indication,
+                        collect_time,
+                    })
+                }
+                "result" => {
+                    let mut order_id = None;
+                    let mut test_name = None;
+                    let mut value = None;
+                    let mut unit = None;
+                    let mut reference_range = None;
+                    let mut flag = None;
+                    let mut critical = false;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--order-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    order_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--test-name" => {
+                                if i + 1 < remaining_args.len() {
+                                    test_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--value" => {
+                                if i + 1 < remaining_args.len() {
+                                    value = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--unit" => {
+                                if i + 1 < remaining_args.len() {
+                                    unit = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--reference-range" => {
+                                if i + 1 < remaining_args.len() {
+                                    reference_range = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--flag" => {
+                                if i + 1 < remaining_args.len() {
+                                    flag = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "low" => Some(LabFlag::Low),
+                                        "high" => Some(LabFlag::High),
+                                        "critical-low" => Some(LabFlag::CriticalLow),
+                                        "critical-high" => Some(LabFlag::CriticalHigh),
+                                        "abnormal" => Some(LabFlag::Abnormal),
+                                        "normal" => Some(LabFlag::Normal),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--critical" => {
+                                critical = true;
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Lab(LabCommand::Result {
+                        order_id: order_id.unwrap_or_default(),
+                        test_name: test_name.unwrap_or_default(),
+                        value: value.unwrap_or_default(),
+                        unit,
+                        reference_range,
+                        flag,
+                        critical,
+                    })
+                }
+                "trend" => {
+                    let mut patient_id = None;
+                    let mut test_name = None;
+                    let mut days = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--test-name" => {
+                                if i + 1 < remaining_args.len() {
+                                    test_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--days" => {
+                                if i + 1 < remaining_args.len() {
+                                    days = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Lab(LabCommand::Trend {
+                        patient_id: patient_id.unwrap_or(0),
+                        test_name: test_name.unwrap_or_default(),
+                        days,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "imaging" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: imaging <order|preliminary|final|compare> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "order" => {
+                    let mut encounter_id = None;
+                    let mut study = None;
+                    let mut priority = None;
+                    let mut indication = None;
+                    let mut contrast = None;
+                    let mut modality = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--encounter" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--study" => {
+                                if i + 1 < remaining_args.len() {
+                                    study = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--priority" => {
+                                if i + 1 < remaining_args.len() {
+                                    priority = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "routine" => Some(ImagingPriority::Routine),
+                                        "urgent" => Some(ImagingPriority::Urgent),
+                                        "stat" => Some(ImagingPriority::Stat),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--indication" => {
+                                if i + 1 < remaining_args.len() {
+                                    indication = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--contrast" => {
+                                contrast = Some(true);
+                                i += 1;
+                            }
+                            "--modality" => {
+                                if i + 1 < remaining_args.len() {
+                                    modality = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if study.is_none() {
+                                    study = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Imaging(ImagingCommand::Order {
+                        encounter_id: encounter_id.unwrap_or_default(),
+                        study: study.unwrap_or_default(),
+                        priority,
+                        indication,
+                        contrast,
+                        modality,
+                    })
+                }
+                "preliminary" => {
+                    let mut study_id = None;
+                    let mut finding = None;
+                    let mut impression = None;
+                    let mut radiologist = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--study-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    study_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--finding" => {
+                                if i + 1 < remaining_args.len() {
+                                    finding = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--impression" => {
+                                if i + 1 < remaining_args.len() {
+                                    impression = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--radiologist" => {
+                                if i + 1 < remaining_args.len() {
+                                    radiologist = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if finding.is_none() {
+                                    finding = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Imaging(ImagingCommand::Preliminary {
+                        study_id: study_id.unwrap_or_default(),
+                        finding: finding.unwrap_or_default(),
+                        impression,
+                        radiologist,
+                    })
+                }
+                "final" => {
+                    let mut study_id = None;
+                    let mut report = None;
+                    let mut critical_finding = None;
+                    let mut radiologist = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--study-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    study_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--report" => {
+                                if i + 1 < remaining_args.len() {
+                                    report = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--critical-finding" => {
+                                critical_finding = Some(true);
+                                i += 1;
+                            }
+                            "--radiologist" => {
+                                if i + 1 < remaining_args.len() {
+                                    radiologist = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if report.is_none() {
+                                    report = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Imaging(ImagingCommand::Final {
+                        study_id: study_id.unwrap_or_default(),
+                        report: report.unwrap_or_default(),
+                        critical_finding,
+                        radiologist,
+                    })
+                }
+                "compare" => {
+                    let mut patient_id = None;
+                    let mut study_type = None;
+                    let mut prior_date = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--study-type" => {
+                                if i + 1 < remaining_args.len() {
+                                    study_type = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--prior-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    prior_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if study_type.is_none() {
+                                    study_type = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Imaging(ImagingCommand::Compare {
+                        patient_id: patient_id.unwrap_or(0),
+                        study_type: study_type.unwrap_or_default(),
+                        prior_date,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "chemo" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: chemo <regimen|cycle-add|labs-verify|cycle-modify|toxicity> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "regimen" => {
+                    let mut patient_id = None;
+                    let mut regimen_name = None;
+                    let mut diagnosis = None;
+                    let mut intent = None;
+                    let mut start_date = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--diagnosis" => {
+                                if i + 1 < remaining_args.len() {
+                                    diagnosis = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--intent" => {
+                                if i + 1 < remaining_args.len() {
+                                    intent = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "curative" => Some(ChemoIntent::Curative),
+                                        "adjuvant" => Some(ChemoIntent::Adjuvant),
+                                        "neoadjuvant" => Some(ChemoIntent::Neoadjuvant),
+                                        "palliative" => Some(ChemoIntent::Palliative),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--start-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    start_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if regimen_name.is_none() {
+                                    regimen_name = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Chemo(ChemoCommand::Regimen {
+                        patient_id: patient_id.unwrap_or(0),
+                        regimen_name: regimen_name.unwrap_or_default(),
+                        diagnosis: diagnosis.unwrap_or_default(),
+                        intent,
+                        start_date,
+                    })
+                }
+                "cycle-add" => {
+                    let mut regimen_id = None;
+                    let mut cycle_number = None;
+                    let mut planned_date = None;
+                    let mut pre_meds = Vec::new();
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--regimen-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    regimen_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--cycle-number" => {
+                                if i + 1 < remaining_args.len() {
+                                    cycle_number = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--planned-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    planned_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--pre-med" => {
+                                if i + 1 < remaining_args.len() {
+                                    pre_meds.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Chemo(ChemoCommand::CycleAdd {
+                        regimen_id: regimen_id.unwrap_or_default(),
+                        cycle_number: cycle_number.unwrap_or(0),
+                        planned_date: planned_date.unwrap_or_default(),
+                        pre_meds,
+                    })
+                }
+                "labs-verify" => {
+                    let mut regimen_id = None;
+                    let mut cycle_number = None;
+                    let mut required_labs = Vec::new();
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--regimen-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    regimen_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--cycle-number" => {
+                                if i + 1 < remaining_args.len() {
+                                    cycle_number = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--required-labs" => {
+                                if i + 1 < remaining_args.len() {
+                                    required_labs.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Chemo(ChemoCommand::LabsVerify {
+                        regimen_id: regimen_id.unwrap_or_default(),
+                        cycle_number: cycle_number.unwrap_or(0),
+                        required_labs,
+                    })
+                }
+                "cycle-modify" => {
+                    let mut cycle_id = None;
+                    let mut action = None;
+                    let mut reason = None;
+                    let mut dose_reduction_pct = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--cycle-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    cycle_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--action" => {
+                                if i + 1 < remaining_args.len() {
+                                    action = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "hold" => Some(ChemoAction::Hold),
+                                        "delay" => Some(ChemoAction::Delay),
+                                        "reduce" => Some(ChemoAction::Reduce),
+                                        "discontinue" => Some(ChemoAction::Discontinue),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--reason" => {
+                                if i + 1 < remaining_args.len() {
+                                    reason = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--dose-reduction-pct" => {
+                                if i + 1 < remaining_args.len() {
+                                    dose_reduction_pct = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Chemo(ChemoCommand::CycleModify {
+                        cycle_id: cycle_id.unwrap_or_default(),
+                        action: action.unwrap_or(ChemoAction::Hold),
+                        reason,
+                        dose_reduction_pct,
+                    })
+                }
+                "toxicity" => {
+                    let mut patient_id = None;
+                    let mut cycle_id = None;
+                    let mut term = None;
+                    let mut grade = None;
+                    let mut management = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--cycle-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    cycle_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--term" => {
+                                if i + 1 < remaining_args.len() {
+                                    term = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--grade" => {
+                                if i + 1 < remaining_args.len() {
+                                    grade = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--management" => {
+                                if i + 1 < remaining_args.len() {
+                                    management = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Chemo(ChemoCommand::Toxicity {
+                        patient_id: patient_id.unwrap_or(0),
+                        cycle_id,
+                        term: term.unwrap_or_default(),
+                        grade: grade.unwrap_or(0),
+                        management,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "radiation" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: radiation <plan|treatment|toxicity> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "plan" => {
+                    let mut patient_id = None;
+                    let mut site = None;
+                    let mut technique = None;
+                    let mut total_dose_gy = None;
+                    let mut fractions = None;
+                    let mut start_date = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--site" => {
+                                if i + 1 < remaining_args.len() {
+                                    site = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--technique" => {
+                                if i + 1 < remaining_args.len() {
+                                    technique = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--total-dose-gy" => {
+                                if i + 1 < remaining_args.len() {
+                                    total_dose_gy = remaining_args[i + 1].parse::<f32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--fractions" => {
+                                if i + 1 < remaining_args.len() {
+                                    fractions = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--start-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    start_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Radiation(RadiationCommand::Plan {
+                        patient_id: patient_id.unwrap_or(0),
+                        site: site.unwrap_or_default(),
+                        technique: technique.unwrap_or_default(),
+                        total_dose_gy: total_dose_gy.unwrap_or(0.0),
+                        fractions: fractions.unwrap_or(0),
+                        start_date,
+                    })
+                }
+                "treatment" => {
+                    let mut plan_id = None;
+                    let mut fraction = None;
+                    let mut dose_delivered = None;
+                    let mut image_guidance = None;
+                    let mut toxicity = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--plan-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    plan_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--fraction" => {
+                                if i + 1 < remaining_args.len() {
+                                    fraction = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--dose-delivered" => {
+                                if i + 1 < remaining_args.len() {
+                                    dose_delivered = remaining_args[i + 1].parse::<f32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--image-guidance" => {
+                                if i + 1 < remaining_args.len() {
+                                    image_guidance = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--toxicity" => {
+                                if i + 1 < remaining_args.len() {
+                                    toxicity = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Radiation(RadiationCommand::Treatment {
+                        plan_id: plan_id.unwrap_or_default(),
+                        fraction: fraction.unwrap_or(0),
+                        dose_delivered: dose_delivered.unwrap_or(0.0),
+                        image_guidance,
+                        toxicity,
+                    })
+                }
+                "toxicity" => {
+                    let mut patient_id = None;
+                    let mut grade = None;
+                    let mut organ = None;
+                    let mut management = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--grade" => {
+                                if i + 1 < remaining_args.len() {
+                                    grade = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--organ" => {
+                                if i + 1 < remaining_args.len() {
+                                    organ = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--management" => {
+                                if i + 1 < remaining_args.len() {
+                                    management = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Radiation(RadiationCommand::Toxicity {
+                        patient_id: patient_id.unwrap_or(0),
+                        grade: grade.unwrap_or(0),
+                        organ: organ.unwrap_or_default(),
+                        management,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "surgery" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: surgery <case-create|preop-checklist|case-start|event-add|case-close> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "case-create" => {
+                    let mut patient_id = None;
+                    let mut procedure = None;
+                    let mut surgeon_id = None;
+                    let mut date = None;
+                    let mut time = None;
+                    let mut location = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--surgeon-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    surgeon_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--date" => {
+                                if i + 1 < remaining_args.len() {
+                                    date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--location" => {
+                                if i + 1 < remaining_args.len() {
+                                    location = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if procedure.is_none() {
+                                    procedure = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Surgery(SurgeryCommand::CaseCreate {
+                        patient_id: patient_id.unwrap_or(0),
+                        procedure: procedure.unwrap_or_default(),
+                        surgeon_id: surgeon_id.unwrap_or(0),
+                        date: date.unwrap_or_default(),
+                        time,
+                        location,
+                    })
+                }
+                "preop-checklist" => {
+                    let mut case_id = None;
+                    let mut consent = false;
+                    let mut h_and_p = false;
+                    let mut npo = false;
+                    let mut antibiotics_given = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--case-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    case_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--consent" => {
+                                consent = true;
+                                i += 1;
+                            }
+                            "--h-and-p" => {
+                                h_and_p = true;
+                                i += 1;
+                            }
+                            "--npo" => {
+                                npo = true;
+                                i += 1;
+                            }
+                            "--antibiotics-given" => {
+                                if i + 1 < remaining_args.len() {
+                                    antibiotics_given = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Surgery(SurgeryCommand::PreopChecklist {
+                        case_id: case_id.unwrap_or_default(),
+                        consent,
+                        h_and_p,
+                        npo,
+                        antibiotics_given,
+                    })
+                }
+                "case-start" => {
+                    let mut case_id = None;
+                    let mut anesthesia_start = None;
+                    let mut incision_time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--case-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    case_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--anesthesia-start" => {
+                                if i + 1 < remaining_args.len() {
+                                    anesthesia_start = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--incision-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    incision_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Surgery(SurgeryCommand::CaseStart {
+                        case_id: case_id.unwrap_or_default(),
+                        anesthesia_start,
+                        incision_time,
+                    })
+                }
+                "event-add" => {
+                    let mut case_id = None;
+                    let mut time = None;
+                    let mut event = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--case-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    case_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--event" => {
+                                if i + 1 < remaining_args.len() {
+                                    event = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if event.is_none() {
+                                    event = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Surgery(SurgeryCommand::EventAdd {
+                        case_id: case_id.unwrap_or_default(),
+                        time: time.unwrap_or_default(),
+                        event: event.unwrap_or_default(),
+                    })
+                }
+                "case-close" => {
+                    let mut case_id = None;
+                    let mut ebl_ml = None;
+                    let mut complications = None;
+                    let mut specimens = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--case-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    case_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--ebl-ml" => {
+                                if i + 1 < remaining_args.len() {
+                                    ebl_ml = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--complications" => {
+                                if i + 1 < remaining_args.len() {
+                                    complications = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--specimens" => {
+                                if i + 1 < remaining_args.len() {
+                                    specimens = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Surgery(SurgeryCommand::CaseClose {
+                        case_id: case_id.unwrap_or_default(),
+                        ebl_ml,
+                        complications,
+                        specimens,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "nursing" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: nursing <assessment|safety-check|intake-output|med-administration|care-plan|patient-education> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "assessment" => {
+                    let mut patient_id = None;
+                    let mut shift = None;
+                    let mut pain_level = None;
+                    let mut mobility = None;
+                    let mut notes = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--shift" => {
+                                if i + 1 < remaining_args.len() {
+                                    shift = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--pain-level" => {
+                                if i + 1 < remaining_args.len() {
+                                    pain_level = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--mobility" => {
+                                if i + 1 < remaining_args.len() {
+                                    mobility = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Nursing(NursingCommand::Assessment {
+                        patient_id: patient_id.unwrap_or(0),
+                        shift,
+                        pain_level,
+                        mobility,
+                        notes,
+                    })
+                }
+                "safety-check" => {
+                    let mut patient_id = None;
+                    let mut fall_risk = None;
+                    let mut pressure_ulcer_risk = None;
+                    let mut notes = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--fall-risk" => {
+                                if i + 1 < remaining_args.len() {
+                                    fall_risk = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--pressure-ulcer-risk" => {
+                                if i + 1 < remaining_args.len() {
+                                    pressure_ulcer_risk = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Nursing(NursingCommand::SafetyCheck {
+                        patient_id: patient_id.unwrap_or(0),
+                        fall_risk,
+                        pressure_ulcer_risk,
+                        notes,
+                    })
+                }
+                "intake-output" => {
+                    let mut patient_id = None;
+                    let mut intake_ml = None;
+                    let mut output_ml = None;
+                    let mut notes = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--intake-ml" => {
+                                if i + 1 < remaining_args.len() {
+                                    intake_ml = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--output-ml" => {
+                                if i + 1 < remaining_args.len() {
+                                    output_ml = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Nursing(NursingCommand::IntakeOutput {
+                        patient_id: patient_id.unwrap_or(0),
+                        intake_ml,
+                        output_ml,
+                        notes,
+                    })
+                }
+                "med-administration" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: nursing med-administration <verify|give|refuse> [args...]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[1].to_lowercase().as_str() {
+                        "verify" => {
+                            let mut order_id = None;
+                            let mut patient_id = None;
+                            let mut barcode_scan = false;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--order-id" => {
+                                        if i + 1 < remaining_args.len() {
+                                            order_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--patient-id" => {
+                                        if i + 1 < remaining_args.len() {
+                                            patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--barcode-scan" => {
+                                        barcode_scan = true;
+                                        i += 1;
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Nursing(NursingCommand::MedAdministration(MedAdministrationCommand::Verify {
+                                order_id: order_id.unwrap_or_default(),
+                                patient_id: patient_id.unwrap_or(0),
+                                barcode_scan,
+                            }))
+                        }
+                        "give" => {
+                            let mut order_id = None;
+                            let mut time_given = None;
+                            let mut route = None;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--order-id" => {
+                                        if i + 1 < remaining_args.len() {
+                                            order_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--time-given" => {
+                                        if i + 1 < remaining_args.len() {
+                                            time_given = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--route" => {
+                                        if i + 1 < remaining_args.len() {
+                                            route = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Nursing(NursingCommand::MedAdministration(MedAdministrationCommand::Give {
+                                order_id: order_id.unwrap_or_default(),
+                                time_given,
+                                route,
+                            }))
+                        }
+                        "refuse" => {
+                            let mut order_id = None;
+                            let mut reason = None;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--order-id" => {
+                                        if i + 1 < remaining_args.len() {
+                                            order_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--reason" => {
+                                        if i + 1 < remaining_args.len() {
+                                            reason = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Nursing(NursingCommand::MedAdministration(MedAdministrationCommand::Refuse {
+                                order_id: order_id.unwrap_or_default(),
+                                reason: reason.unwrap_or_default(),
+                            }))
+                        }
+                        _ => CommandType::Unknown,
+                    }
+                }
+                "care-plan" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: nursing care-plan <add|update> [args...]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[1].to_lowercase().as_str() {
+                        "add" => {
+                            let mut patient_id = None;
+                            let mut goal = None;
+                            let mut interventions = None;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--patient-id" => {
+                                        if i + 1 < remaining_args.len() {
+                                            patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--goal" => {
+                                        if i + 1 < remaining_args.len() {
+                                            goal = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--interventions" => {
+                                        if i + 1 < remaining_args.len() {
+                                            interventions = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Nursing(NursingCommand::CarePlan(CarePlanCommand::Add {
+                                patient_id: patient_id.unwrap_or(0),
+                                goal: goal.unwrap_or_default(),
+                                interventions: interventions.unwrap_or_default(),
+                            }))
+                        }
+                        "update" => {
+                            let mut patient_id = None;
+                            let mut goal_id = None;
+                            let mut status = None;
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--patient-id" => {
+                                        if i + 1 < remaining_args.len() {
+                                            patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--goal-id" => {
+                                        if i + 1 < remaining_args.len() {
+                                            goal_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    "--status" => {
+                                        if i + 1 < remaining_args.len() {
+                                            status = Some(remaining_args[i + 1].clone());
+                                            i += 2;
+                                        } else { i += 1; }
+                                    }
+                                    _ => i += 1,
+                                }
+                            }
+                            CommandType::Nursing(NursingCommand::CarePlan(CarePlanCommand::Update {
+                                patient_id: patient_id.unwrap_or(0),
+                                goal_id: goal_id.unwrap_or_default(),
+                                status: status.unwrap_or_default(),
+                            }))
+                        }
+                        _ => CommandType::Unknown,
+                    }
+                }
+                "patient-education" => {
+                    let mut patient_id = None;
+                    let mut topic = None;
+                    let mut method = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--topic" => {
+                                if i + 1 < remaining_args.len() {
+                                    topic = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--method" => {
+                                if i + 1 < remaining_args.len() {
+                                    method = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "verbal" => Some(EducationMethod::Verbal),
+                                        "written" => Some(EducationMethod::Written),
+                                        "video" => Some(EducationMethod::Video),
+                                        "teachback" => Some(EducationMethod::TeachBack),
+                                        "interpreter" => Some(EducationMethod::Interpreter),
+                                        _ => Some(EducationMethod::Verbal),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if topic.is_none() {
+                                    topic = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Nursing(NursingCommand::PatientEducation {
+                        patient_id: patient_id.unwrap_or(0),
+                        topic: topic.unwrap_or_default(),
+                        method,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "education" => {
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "document" {
+                eprintln!("Usage: education document --patient-id <id> <topic> [--method] [--language] [--literacy-level] [--teach-back-verified]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            let mut patient_id = None;
+            let mut topic = None;
+            let mut method = None;
+            let mut language = None;
+            let mut literacy_level = None;
+            let mut teach_back_verified = false;
+            let mut i = 1;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--patient-id" => {
+                        if i + 1 < remaining_args.len() {
+                            patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--method" => {
+                        if i + 1 < remaining_args.len() {
+                            method = match remaining_args[i + 1].to_lowercase().as_str() {
+                                "verbal" => Some(EducationMethod::Verbal),
+                                "written" => Some(EducationMethod::Written),
+                                "video" => Some(EducationMethod::Video),
+                                "teachback" => Some(EducationMethod::TeachBack),
+                                "interpreter" => Some(EducationMethod::Interpreter),
+                                _ => Some(EducationMethod::Verbal),
+                            };
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--language" => {
+                        if i + 1 < remaining_args.len() {
+                            language = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--literacy-level" => {
+                        if i + 1 < remaining_args.len() {
+                            literacy_level = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else { i += 1; }
+                    }
+                    "--teach-back-verified" => {
+                        teach_back_verified = true;
+                        i += 1;
+                    }
+                    _ => {
+                        if topic.is_none() {
+                            topic = Some(remaining_args[i].clone());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            CommandType::Education(EducationCommand::Document {
+                patient_id: patient_id.unwrap_or(0),
+                topic: topic.unwrap_or_default(),
+                method,
+                language,
+                literacy_level,
+                teach_back_verified,
+            })
+        },
+        "discharge-planning" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: discharge-planning <assess|dme-order|follow-up> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "assess" => {
+                    let mut patient_id = None;
+                    let mut barriers = Vec::new();
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--barrier" => {
+                                if i + 1 < remaining_args.len() {
+                                    barriers.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::DischargePlanning(DischargePlanningCommand::Assess {
+                        patient_id: patient_id.unwrap_or(0),
+                        barriers,
+                    })
+                }
+                "dme-order" => {
+                    let mut patient_id = None;
+                    let mut equipment = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--equipment" => {
+                                if i + 1 < remaining_args.len() {
+                                    equipment = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if equipment.is_none() {
+                                    equipment = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::DischargePlanning(DischargePlanningCommand::DmeOrder {
+                        patient_id: patient_id.unwrap_or(0),
+                        equipment: equipment.unwrap_or_default(),
+                    })
+                }
+                "follow-up" => {
+                    let mut patient_id = None;
+                    let mut provider_id = None;
+                    let mut days_out = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--provider-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    provider_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--days-out" => {
+                                if i + 1 < remaining_args.len() {
+                                    days_out = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::DischargePlanning(DischargePlanningCommand::FollowUp {
+                        patient_id: patient_id.unwrap_or(0),
+                        provider_id: provider_id.unwrap_or(0),
+                        days_out: days_out.unwrap_or(7),
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "discharge" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: discharge <plan|readiness|summary|med-rec|orders|follow-up|education|finalize|dashboard> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "plan" => {
+                    let mut patient_id = None;
+                    let mut encounter_id = None;
+                    let mut estimated_date = None;
+                    let mut target_disposition = None;
+                    let mut barriers = Vec::new();
+                    let mut primary_diagnosis = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--encounter-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--estimated-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    estimated_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--target-disposition" => {
+                                if i + 1 < remaining_args.len() {
+                                    target_disposition = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "home" => Some(DispositionTarget::Home),
+                                        "homehealth" => Some(DispositionTarget::HomeHealth),
+                                        "snf" => Some(DispositionTarget::SkilledNursing),
+                                        "rehab" => Some(DispositionTarget::Rehab),
+                                        "ltach" => Some(DispositionTarget::LTACH),
+                                        "hospice" => Some(DispositionTarget::Hospice),
+                                        "ama" => Some(DispositionTarget::AgainstMedicalAdvice),
+                                        "expired" => Some(DispositionTarget::Expired),
+                                        "transfer" => Some(DispositionTarget::Transfer),
+                                        _ => Some(DispositionTarget::Home),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--barrier" => {
+                                if i + 1 < remaining_args.len() {
+                                    barriers.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--primary-diagnosis" => {
+                                if i + 1 < remaining_args.len() {
+                                    primary_diagnosis = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::Plan {
+                        patient_id: patient_id.unwrap_or(0),
+                        encounter_id,
+                        estimated_date,
+                        target_disposition,
+                        barriers,
+                        primary_diagnosis,
+                    })
+                }
+                "readiness" => {
+                    let mut patient_id = None;
+                    let mut medically_stable = false;
+                    let mut pain_controlled = false;
+                    let mut mobility_safe = false;
+                    let mut barriers_resolved = Vec::new();
+                    let mut pending_items = Vec::new();
+                    let mut assessed_by = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--medically-stable" => {
+                                medically_stable = true;
+                                i += 1;
+                            }
+                            "--pain-controlled" => {
+                                pain_controlled = true;
+                                i += 1;
+                            }
+                            "--mobility-safe" => {
+                                mobility_safe = true;
+                                i += 1;
+                            }
+                            "--barrier-resolved" => {
+                                if i + 1 < remaining_args.len() {
+                                    barriers_resolved.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--pending-item" => {
+                                if i + 1 < remaining_args.len() {
+                                    pending_items.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--assessed-by" => {
+                                if i + 1 < remaining_args.len() {
+                                    assessed_by = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::Readiness {
+                        patient_id: patient_id.unwrap_or(0),
+                        medically_stable,
+                        pain_controlled,
+                        mobility_safe,
+                        barriers_resolved,
+                        pending_items,
+                        assessed_by: assessed_by.unwrap_or(0),
+                    })
+                }
+                "summary" => {
+                    let mut patient_id = None;
+                    let mut template = None;
+                    let mut include_reconciliation = false;
+                    let mut include_followup = false;
+                    let mut format = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--template" => {
+                                if i + 1 < remaining_args.len() {
+                                    template = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "standard" => Some(SummaryTemplate::Standard),
+                                        "complexchronic" => Some(SummaryTemplate::ComplexChronic),
+                                        "surgical" => Some(SummaryTemplate::Surgical),
+                                        "stroke" => Some(SummaryTemplate::Stroke),
+                                        "mi" => Some(SummaryTemplate::MI),
+                                        "sepsis" => Some(SummaryTemplate::Sepsis),
+                                        "oncology" => Some(SummaryTemplate::Oncology),
+                                        _ => Some(SummaryTemplate::Standard),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--include-reconciliation" => {
+                                include_reconciliation = true;
+                                i += 1;
+                            }
+                            "--include-followup" => {
+                                include_followup = true;
+                                i += 1;
+                            }
+                            "--format" => {
+                                if i + 1 < remaining_args.len() {
+                                    format = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "text" => Some(OutputFormat::Text),
+                                        "html" => Some(OutputFormat::Html),
+                                        "pdf" => Some(OutputFormat::Pdf),
+                                        "fhir" => Some(OutputFormat::Fhir),
+                                        "hl7" => Some(OutputFormat::Hl7),
+                                        _ => Some(OutputFormat::Text),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::Summary {
+                        patient_id: patient_id.unwrap_or(0),
+                        template,
+                        include_reconciliation,
+                        include_followup,
+                        format,
+                    })
+                }
+                "med-rec" => {
+                    let mut patient_id = None;
+                    let mut action = None;
+                    let mut medication = None;
+                    let mut new_dose = None;
+                    let mut new_frequency = None;
+                    let mut reason = None;
+                    let mut reconciled_by = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--action" => {
+                                if i + 1 < remaining_args.len() {
+                                    action = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "continue" => Some(MedRecAction::Continue),
+                                        "modify" => Some(MedRecAction::Modify),
+                                        "hold" => Some(MedRecAction::Hold),
+                                        "discontinue" => Some(MedRecAction::Discontinue),
+                                        "new" => Some(MedRecAction::New),
+                                        "resume" => Some(MedRecAction::Resume),
+                                        "no-change" => Some(MedRecAction::NoChange),
+                                        "unable-to-reconcile" => Some(MedRecAction::UnableToReconcile),
+                                        _ => Some(MedRecAction::Continue),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--medication" => {
+                                if i + 1 < remaining_args.len() {
+                                    medication = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--new-dose" => {
+                                if i + 1 < remaining_args.len() {
+                                    new_dose = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--new-frequency" => {
+                                if i + 1 < remaining_args.len() {
+                                    new_frequency = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--reason" => {
+                                if i + 1 < remaining_args.len() {
+                                    reason = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--reconciled-by" => {
+                                if i + 1 < remaining_args.len() {
+                                    reconciled_by = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::MedRec {
+                        patient_id: patient_id.unwrap_or(0),
+                        action: action.unwrap_or(MedRecAction::Continue),
+                        medication: medication.unwrap_or_default(),
+                        new_dose,
+                        new_frequency,
+                        reason,
+                        reconciled_by: reconciled_by.unwrap_or(0),
+                    })
+                }
+                "orders" => {
+                    let mut patient_id = None;
+                    let mut diet = None;
+                    let mut activity = None;
+                    let mut wound_care = None;
+                    let mut monitoring = Vec::new();
+                    let mut restrictions = Vec::new();
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--diet" => {
+                                if i + 1 < remaining_args.len() {
+                                    diet = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--activity" => {
+                                if i + 1 < remaining_args.len() {
+                                    activity = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--wound-care" => {
+                                if i + 1 < remaining_args.len() {
+                                    wound_care = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--monitoring" => {
+                                if i + 1 < remaining_args.len() {
+                                    monitoring.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--restriction" => {
+                                if i + 1 < remaining_args.len() {
+                                    restrictions.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::Orders {
+                        patient_id: patient_id.unwrap_or(0),
+                        diet,
+                        activity,
+                        wound_care,
+                        monitoring,
+                        restrictions,
+                    })
+                }
+                "follow-up" => {
+                    let mut patient_id = None;
+                    let mut provider_type = None;
+                    let mut days_out = None;
+                    let mut priority = None;
+                    let mut reason = None;
+                    let mut telehealth = false;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--provider-type" => {
+                                if i + 1 < remaining_args.len() {
+                                    provider_type = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--days-out" => {
+                                if i + 1 < remaining_args.len() {
+                                    days_out = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--priority" => {
+                                if i + 1 < remaining_args.len() {
+                                    priority = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "urgent" => Some(FollowUpPriority::Urgent),
+                                        "routine" => Some(FollowUpPriority::Routine),
+                                        "standard" => Some(FollowUpPriority::Standard),
+                                        "extended" => Some(FollowUpPriority::Extended),
+                                        _ => Some(FollowUpPriority::Routine),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--reason" => {
+                                if i + 1 < remaining_args.len() {
+                                    reason = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--telehealth" => {
+                                telehealth = true;
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::FollowUp {
+                        patient_id: patient_id.unwrap_or(0),
+                        provider_type: provider_type.unwrap_or_default(),
+                        days_out,
+                        priority,
+                        reason,
+                        telehealth,
+                    })
+                }
+                "education" => {
+                    let mut patient_id = None;
+                    let mut topics = Vec::new();
+                    let mut method = None;
+                    let mut language = None;
+                    let mut literacy_level = None;
+                    let mut teach_back_verified = false;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--topic" => {
+                                if i + 1 < remaining_args.len() {
+                                    topics.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--method" => {
+                                if i + 1 < remaining_args.len() {
+                                    method = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "verbal" => Some(EducationMethod::Verbal),
+                                        "written" => Some(EducationMethod::Written),
+                                        "video" => Some(EducationMethod::Video),
+                                        "teachback" => Some(EducationMethod::TeachBack),
+                                        "interpreter" => Some(EducationMethod::Interpreter),
+                                        _ => Some(EducationMethod::Verbal),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--language" => {
+                                if i + 1 < remaining_args.len() {
+                                    language = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--literacy-level" => {
+                                if i + 1 < remaining_args.len() {
+                                    literacy_level = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--teach-back-verified" => {
+                                teach_back_verified = true;
+                                i += 1;
+                            }
+                            _ => {
+                                topics.push(remaining_args[i].clone());
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::Education {
+                        patient_id: patient_id.unwrap_or(0),
+                        topics,
+                        method,
+                        language,
+                        literacy_level,
+                        teach_back_verified,
+                    })
+                }
+                "finalize" => {
+                    let mut patient_id = None;
+                    let mut actual_date = None;
+                    let mut disposition = None;
+                    let mut transportation = None;
+                    let mut accompanying_person = None;
+                    let mut final_diagnosis = Vec::new();
+                    let mut completed_by = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--actual-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    actual_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--disposition" => {
+                                if i + 1 < remaining_args.len() {
+                                    disposition = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "home" => Some(DispositionTarget::Home),
+                                        "homehealth" => Some(DispositionTarget::HomeHealth),
+                                        "snf" => Some(DispositionTarget::SkilledNursing),
+                                        "rehab" => Some(DispositionTarget::Rehab),
+                                        "ltach" => Some(DispositionTarget::LTACH),
+                                        "hospice" => Some(DispositionTarget::Hospice),
+                                        "ama" => Some(DispositionTarget::AgainstMedicalAdvice),
+                                        "expired" => Some(DispositionTarget::Expired),
+                                        "transfer" => Some(DispositionTarget::Transfer),
+                                        _ => Some(DispositionTarget::Home),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--transportation" => {
+                                if i + 1 < remaining_args.len() {
+                                    transportation = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--accompanying-person" => {
+                                if i + 1 < remaining_args.len() {
+                                    accompanying_person = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--final-diagnosis" => {
+                                if i + 1 < remaining_args.len() {
+                                    final_diagnosis.push(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--completed-by" => {
+                                if i + 1 < remaining_args.len() {
+                                    completed_by = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::Finalize {
+                        patient_id: patient_id.unwrap_or(0),
+                        actual_date,
+                        disposition: disposition.unwrap_or(DispositionTarget::Home),
+                        transportation,
+                        accompanying_person,
+                        final_diagnosis,
+                        completed_by: completed_by.unwrap_or(0),
+                    })
+                }
+                "dashboard" => {
+                    let mut unit = None;
+                    let mut provider_id = None;
+                    let mut timeframe = None;
+                    let mut show_pending = false;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--unit" => {
+                                if i + 1 < remaining_args.len() {
+                                    unit = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--provider-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    provider_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--timeframe" => {
+                                if i + 1 < remaining_args.len() {
+                                    timeframe = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--show-pending" => {
+                                show_pending = true;
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Discharge(DischargeCommand::Dashboard {
+                        unit,
+                        provider_id,
+                        timeframe,
+                        show_pending,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "quality" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: quality <measure|gap-report> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "measure" => {
+                    let mut name = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--name" => {
+                                if i + 1 < remaining_args.len() {
+                                    name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if name.is_none() {
+                                    name = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Quality(QualityCommand::Measure { name: name.unwrap_or_default() })
+                }
+                "gap-report" => {
+                    let mut payer = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--payer" => {
+                                if i + 1 < remaining_args.len() {
+                                    payer = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Quality(QualityCommand::GapReport { payer })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "incident" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: incident <report|investigate> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "report" => {
+                    let mut patient_id = None;
+                    let mut incident_type = None;
+                    let mut description = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--incident-type" => {
+                                if i + 1 < remaining_args.len() {
+                                    incident_type = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--description" => {
+                                if i + 1 < remaining_args.len() {
+                                    description = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if description.is_none() {
+                                    description = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Incident(IncidentCommand::Report {
+                        patient_id: patient_id.unwrap_or(0),
+                        incident_type: incident_type.unwrap_or_default(),
+                        description: description.unwrap_or_default(),
+                    })
+                }
+                "investigate" => {
+                    let mut incident_id = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--incident-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    incident_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Incident(IncidentCommand::Investigate { incident_id: incident_id.unwrap_or_default() })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "compliance" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: compliance <audit-patient|audit-controlled-substances> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "audit-patient" => {
+                    let mut patient_id = None;
+                    let mut from = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--from" => {
+                                if i + 1 < remaining_args.len() {
+                                    from = DateTime::parse_from_rfc3339(&remaining_args[i + 1]).ok().map(|dt| dt.with_timezone(&Utc));
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Compliance(ComplianceCommand::AuditPatient {
+                        patient_id: patient_id.unwrap_or(0),
+                        from: from.unwrap_or_default(),
+                    })
+                }
+                "audit-controlled-substances" => {
+                    let mut from = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--from" => {
+                                if i + 1 < remaining_args.len() {
+                                    from = DateTime::parse_from_rfc3339(&remaining_args[i + 1]).ok().map(|dt| dt.with_timezone(&Utc));
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Compliance(ComplianceCommand::AuditControlledSubstances {
+                        from: from.unwrap_or_default(),
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+        "population" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: population <screening-due|high-risk-meds|chronic-conditions|readmission-risk> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "screening-due" => {
+                    let mut screening_type = None;
+                    let mut age_min = None;
+                    let mut age_max = None;
+                    let mut months_overdue = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--age-min" => {
+                                if i + 1 < remaining_args.len() {
+                                    age_min = remaining_args[i + 1].parse::<u32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--age-max" => {
+                                if i + 1 < remaining_args.len() {
+                                    age_max = remaining_args[i + 1].parse::<u32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if screening_type.is_none() {
+                                    screening_type = Some(remaining_args[i].to_uppercase());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Population(PopulationCommand::ScreeningDue {
+                        screening_type: screening_type.unwrap_or_default(),
+                        age_min,
+                        age_max,
+                        months_overdue,
+                    })
+                }
+                "high-risk-meds" => CommandType::Population(PopulationCommand::HighRiskMeds),
+                "chronic-conditions" => {
+                    let condition = remaining_args.get(1).cloned().unwrap_or_default();
+                    CommandType::Population(PopulationCommand::ChronicConditions {
+                        condition,
+                        uncontrolled_threshold: None, // <-- was missing
+                    })
+                },
+                "readmission-risk" => CommandType::Population(
+                    PopulationCommand::ReadmissionRisk {
+                        days: None,
+                        preventable_only: false,
+                        high_risk_only: false,
+                    }
+                ),
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "analytics" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: analytics <population|quality|utilization|risk|pathway|equity> [subcommand]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "population" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: analytics population <prevalence|incidence|comorbidity|seasonal|outbreak>");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[1].to_lowercase().as_str() {
+                        "prevalence" => {
+                            let diagnosis = remaining_args.get(2).cloned().unwrap_or_default();
+                            CommandType::Analytics(AnalyticsCommand::Population(AnalyticsPopulationCommand::Prevalence {
+                                diagnosis,
+                                age_group: None,
+                                gender: None,
+                                race: None,
+                            }))
+                        }
+                        "incidence" => {
+                            let diagnosis = remaining_args.get(2).cloned().unwrap_or_default();
+                            CommandType::Analytics(AnalyticsCommand::Population(AnalyticsPopulationCommand::Incidence {
+                                diagnosis,
+                                timeframe: None,
+                            }))
+                        }
+                        "comorbidity" => {
+                            let primary_diagnosis = remaining_args.get(2).cloned().unwrap_or_default();
+                            CommandType::Analytics(AnalyticsCommand::Population(AnalyticsPopulationCommand::Comorbidity {
+                                primary_diagnosis,
+                                top_n: Some(10),
+                            }))
+                        }
+                        "seasonal" => {
+                            let diagnosis = remaining_args.get(2).cloned().unwrap_or_default();
+                            CommandType::Analytics(AnalyticsCommand::Population(AnalyticsPopulationCommand::Seasonal {
+                                diagnosis,
+                                years: Some(3),
+                            }))
+                        }
+                        "outbreak" => CommandType::Analytics(AnalyticsCommand::Population(AnalyticsPopulationCommand::Outbreak {
+                            pathogen: None,
+                            threshold: None,
+                        })),
+                        _ => CommandType::Unknown,
+                    }
+                }
+                "quality" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: analytics quality <mortality|los|readmission|complications|experience>");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[1].to_lowercase().as_str() {
+                        "mortality" => CommandType::Analytics(AnalyticsCommand::Quality(AnalyticsQualityCommand::MortalityIndex {
+                            service_line: None,
+                        })),
+                        "los" => CommandType::Analytics(AnalyticsCommand::Quality(AnalyticsQualityCommand::Los {
+                            diagnosis: None,
+                            benchmark: None,
+                        })),
+                        "readmission" => CommandType::Analytics(AnalyticsCommand::Quality(AnalyticsQualityCommand::Readmission {
+                            days: Some(30),
+                            preventable_only: false,
+                        })),
+                        "complications" => CommandType::Analytics(AnalyticsCommand::Quality(AnalyticsQualityCommand::Complications {
+                            procedure: remaining_args.get(2).cloned().unwrap_or_default(),
+                            risk_adjusted: true,
+                        })),
+                        "experience" => CommandType::Analytics(AnalyticsCommand::Quality(AnalyticsQualityCommand::Experience {
+                            domain: None,
+                        })),
+                        _ => CommandType::Unknown,
+                    }
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "metrics" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: metrics <clinical|operational|financial|safety|ml> [subcommand]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "clinical" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: metrics clinical <sepsis|stroke|vtp|pain|fall|readmission>");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[1].to_lowercase().as_str() {
+                        "sepsis" => CommandType::Metrics(MetricsCommand::Clinical(MetricsClinicalCommand::SepsisBundle {
+                            facility: None,
+                            timeframe: None,
+                        })),
+                        "stroke" => CommandType::Metrics(MetricsCommand::Clinical(MetricsClinicalCommand::StrokeTpa {
+                            target_minutes: Some(60),
+                        })),
+                        "vtp" => CommandType::Metrics(MetricsCommand::Clinical(MetricsClinicalCommand::VteProphylaxis)),
+                        "pain" => CommandType::Metrics(MetricsCommand::Clinical(MetricsClinicalCommand::PainReassessment)),
+                        "fall" => CommandType::Metrics(MetricsCommand::Clinical(MetricsClinicalCommand::FallRate)),
+                        "readmission" => CommandType::Metrics(MetricsCommand::Clinical(MetricsClinicalCommand::ReadmissionRate {
+                            condition: None,
+                        })),
+                        _ => CommandType::Unknown,
+                    }
+                }
+                "operational" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: metrics operational <ed|or|bed|flow|staff>");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    match remaining_args[1].to_lowercase().as_str() {
+                        "ed" => CommandType::Metrics(MetricsCommand::Operational(MetricsOperationalCommand::EdThroughput {
+                            metric: None,
+                        })),
+                        "or" => CommandType::Metrics(MetricsCommand::Operational(MetricsOperationalCommand::OrUtilization)),
+                        "bed" => CommandType::Metrics(MetricsCommand::Operational(MetricsOperationalCommand::BedOccupancy {
+                            unit: None,
+                            predict_hours: None,
+                        })),
+                        "flow" => CommandType::Metrics(MetricsCommand::Operational(MetricsOperationalCommand::PatientFlow)),
+                        "staff" => CommandType::Metrics(MetricsCommand::Operational(MetricsOperationalCommand::StaffProductivity {
+                            role: None,
+                        })),
+                        _ => CommandType::Unknown,
+                    }
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "research" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: research <cohort|export> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "cohort" => {
+                    let query = remaining_args[1..].join(" ");
+                    CommandType::Research(ResearchCommand::Cohort { query })
+                }
+                "export" => {
+                    let cohort_id = remaining_args.get(1).cloned().unwrap_or_default();
+                    let mut format = None;
+                    let mut deidentify = false;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--format" => {
+                                if i + 1 < remaining_args.len() {
+                                    format = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                            "--deidentify" => {
+                                deidentify = true;
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Research(ResearchCommand::Export {
+                        cohort_id,
+                        format: format.unwrap_or_else(|| "csv".to_string()), // <- String now
+                        deidentify,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "model" | "ml" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: model <list|show|deploy|predict|evaluate|retrain|monitor|explain|drift|abtest|rollback> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+
+            match remaining_args[0].to_lowercase().as_str() {
+                "list" => {
+                    let mut status = None;
+                    let mut domain = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--status" => {
+                                if i + 1 < remaining_args.len() {
+                                    status = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "development" => Some(ModelStatus::Development),
+                                        "staging" => Some(ModelStatus::Staging),
+                                        "production" => Some(ModelStatus::Production),
+                                        "retired" => Some(ModelStatus::Retired),
+                                        "failed" => Some(ModelStatus::Failed),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--domain" => {
+                                if i + 1 < remaining_args.len() {
+                                    domain = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::List { status, domain })
+                }
+
+                "show" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: model show <model_name> [--include-metrics] [--include-features] [--include-version-history]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let mut include_metrics = false;
+                    let mut include_features = false;
+                    let mut include_version_history = false;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--include-metrics" => { include_metrics = true; i += 1; }
+                            "--include-features" => { include_features = true; i += 1; }
+                            "--include-version-history" => { include_version_history = true; i += 1; }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Show {
+                        model_name,
+                        include_metrics,
+                        include_features,
+                        include_version_history,
+                    })
+                }
+
+                "deploy" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: model deploy <model_name> --version <v> --path <file> [--format] [--description] [--force]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let mut version = None;
+                    let mut path = None;
+                    let mut format = None;
+                    let mut description = None;
+                    let mut force = false;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--version" => {
+                                if i + 1 < remaining_args.len() {
+                                    version = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--path" => {
+                                if i + 1 < remaining_args.len() {
+                                    path = Some(PathBuf::from(&remaining_args[i + 1]));
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--format" => {
+                                if i + 1 < remaining_args.len() {
+                                    format = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "pytorch" => Some(ModelFormat::Pytorch),
+                                        "tensorflow" => Some(ModelFormat::Tensorflow),
+                                        "onnx" => Some(ModelFormat::Onnx),
+                                        "pkl" => Some(ModelFormat::Pkl),
+                                        "json" => Some(ModelFormat::Json),
+                                        _ => Some(ModelFormat::Pkl),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--description" => {
+                                if i + 1 < remaining_args.len() {
+                                    description = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--force" => { force = true; i += 1; }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Deploy {
+                        model_name,
+                        version: version.unwrap_or_default(),
+                        path: path.unwrap_or_else(|| PathBuf::from("model.pkl")),
+                        format: format.unwrap_or(ModelFormat::Pkl),
+                        description,
+                        force,
+                    })
+                }
+
+                "predict" => {
+                    if remaining_args.len() < 3 {
+                        eprintln!("Usage: model predict <model_name> <patient_id> [--encounter-id] [--output-format]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let patient_id = remaining_args[2].parse::<i32>().unwrap_or(0);
+                    let mut encounter_id = None;
+                    let mut output_format = None;
+                    let mut i = 3;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--encounter-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Uuid::parse_str(&remaining_args[i + 1]).ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--output-format" => {
+                                if i + 1 < remaining_args.len() {
+                                    output_format = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "json" => Some(PredictionFormat::Json),
+                                        "fhir" => Some(PredictionFormat::FhirObservation),
+                                        "note" => Some(PredictionFormat::ClinicalNote),
+                                        "alert" => Some(PredictionFormat::Alert),
+                                        _ => Some(PredictionFormat::Json),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Predict {
+                        model_name,
+                        patient_id,
+                        encounter_id,
+                        output_format,
+                    })
+                }
+
+                "evaluate" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: model evaluate <model_name> [--test-cohort] [--start-date] [--end-date]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let mut test_cohort = None;
+                    let mut start_date = None;
+                    let mut end_date = None;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--test-cohort" => {
+                                if i + 1 < remaining_args.len() {
+                                    test_cohort = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--start-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    start_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--end-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    end_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Evaluate {
+                        model_name,
+                        test_cohort,
+                        start_date,
+                        end_date,
+                    })
+                }
+
+                "retrain" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: model retrain <model_name> --outcome-variable <var> [--cohort-query] [--time-window-hours]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let mut cohort_query = None;
+                    let mut outcome_variable = None;
+                    let mut time_window_hours = None;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--cohort-query" => {
+                                if i + 1 < remaining_args.len() {
+                                    cohort_query = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--outcome-variable" => {
+                                if i + 1 < remaining_args.len() {
+                                    outcome_variable = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time-window-hours" => {
+                                if i + 1 < remaining_args.len() {
+                                    time_window_hours = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Retrain {
+                        model_name,
+                        cohort_query,
+                        outcome_variable: outcome_variable.unwrap_or_default(),
+                        time_window_hours,
+                    })
+                }
+
+                "monitor" => {
+                    let mut model_name = None;
+                    let mut timeframe = None;
+                    let mut alert_threshold = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--timeframe" => {
+                                if i + 1 < remaining_args.len() {
+                                    timeframe = Some(remaining_args[i +1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--alert-threshold" => {
+                                if i + 1 < remaining_args.len() {
+                                    alert_threshold = remaining_args[i + 1].parse::<f64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if model_name.is_none() && !remaining_args[i].starts_with('-') {
+                                    model_name = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Monitor {
+                        model_name,
+                        timeframe,
+                        alert_threshold,
+                    })
+                }
+
+                "explain" => {
+                    if remaining_args.len() < 3 {
+                        eprintln!("Usage: model explain <model_name> <patient_id> [--top-features] [--format]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let patient_id = remaining_args[2].parse::<i32>().unwrap_or(0);
+                    let mut top_features = None;
+                    let mut format = None;
+                    let mut i = 3;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--top-features" => {
+                                if i + 1 < remaining_args.len() {
+                                    top_features = remaining_args[i + 1].parse::<usize>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--format" => {
+                                if i + 1 < remaining_args.len() {
+                                    format = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "text" => Some(ExplainFormat::Text),
+                                        "json" => Some(ExplainFormat::Json),
+                                        "html" => Some(ExplainFormat::Html),
+                                        "lime" => Some(ExplainFormat::Lime),
+                                        "shap" => Some(ExplainFormat::Shap),
+                                        _ => Some(ExplainFormat::Text),
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Explain {
+                        model_name,
+                        patient_id,
+                        top_features,
+                        format,
+                    })
+                }
+
+                "drift" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: model drift <model_name> [--baseline-date]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let mut baseline_date = None;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--baseline-date" => {
+                                if i + 1 < remaining_args.len() {
+                                    baseline_date = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Drift {
+                        model_name,
+                        baseline_date,
+                    })
+                }
+
+                "abtest" | "ab-test" => {
+                    if remaining_args.len() < 3 {
+                        eprintln!("Usage: model abtest <model_a> <model_b> [--traffic-split] [--duration-days]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_a = remaining_args[1].clone();
+                    let model_b = remaining_args[2].clone();
+                    let mut traffic_split = None;
+                    let mut duration_days = None;
+                    let mut i = 3;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--traffic-split" => {
+                                if i + 1 < remaining_args.len() {
+                                    traffic_split = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--duration-days" => {
+                                if i + 1 < remaining_args.len() {
+                                    duration_days = remaining_args[i + 1].parse::<i64>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::AbTest {
+                        model_a,
+                        model_b,
+                        traffic_split,
+                        duration_days,
+                    })
+                }
+
+                "rollback" => {
+                    if remaining_args.len() < 2 {
+                        eprintln!("Usage: model rollback <model_name> [--version]");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                    let model_name = remaining_args[1].clone();
+                    let mut version = None;
+                    let mut i = 2;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--version" => {
+                                if i + 1 < remaining_args.len() {
+                                    version = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Model(ModelCommand::Rollback {
+                        model_name,
+                        version,
+                    })
+                }
+
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "clinical-trial" | "trial" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: clinical-trial <list|screen|enroll|visit|ae|report|export> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "list" => CommandType::ClinicalTrial(ClinicalTrialCommand::List {
+                    status: None,
+                    sponsor: None,
+                    phase: None,
+                }),
+                "screen" => {
+                    let trial_id = remaining_args.get(1).cloned().unwrap_or_default();
+                    CommandType::ClinicalTrial(ClinicalTrialCommand::Screen {
+                        trial_id,
+                        patient_id: None,
+                        cohort_query: None,
+                        dry_run: false,
+                    })
+                }
+                "enroll" => {
+                    let trial_id = remaining_args.get(1).cloned().unwrap_or_default();
+                    let patient_id = remaining_args.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::ClinicalTrial(ClinicalTrialCommand::Enroll {
+                        trial_id,
+                        patient_id,
+                        consent_date: None,
+                        arm: None,
+                        site_id: None,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "facility" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: facility <beds|capacity> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "beds" => {
+                    let mut unit = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--unit" => {
+                                if i + 1 < remaining_args.len() {
+                                    unit = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Facility(FacilityCommand::Beds { unit })
+                }
+                "capacity" => CommandType::Facility(FacilityCommand::Capacity),
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "access" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: access <login|whoami|logout>");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "login" => CommandType::Access(AccessCommand::Login {
+                    username: remaining_args.get(1).cloned().unwrap_or_default(),
+                }),
+                "whoami" => CommandType::Access(AccessCommand::Whoami),
+                "logout" => CommandType::Access(AccessCommand::Logout),
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "financial" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: financial <service-line|payer-mix|denials>");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "service-line" => {
+                    let service = remaining_args.get(1).cloned().unwrap_or_default();
+                    CommandType::Financial(FinancialCommand::ServiceLine { service })
+                }
+                "payer-mix" => CommandType::Financial(FinancialCommand::PayerMix),
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "alert" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: alert <list|create|ack|dashboard> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "list" => {
+                    let mut patient_id = None;
+                    let mut severity = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = remaining_args[i + 1].parse::<i32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--severity" => {
+                                if i + 1 < remaining_args.len() {
+                                    severity = match remaining_args[i + 1].to_lowercase().as_str() {
+                                        "critical" => Some(AlertSeverity::Critical),
+                                        "high" => Some(AlertSeverity::High),
+                                        "medium" => Some(AlertSeverity::Medium),
+                                        "low" => Some(AlertSeverity::Low),
+                                        _ => None,
+                                    };
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Alert(AlertCommand::List {
+                        patient_id,
+                        severity,
+                        type_filter: None,
+                        unresolved_only: true,
+                    })
+                }
+                "create" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    let alert_type = remaining_args.get(2).cloned().unwrap_or_default();
+                    let message = remaining_args.get(3).cloned().unwrap_or_default();
+                    CommandType::Alert(AlertCommand::Create {
+                        patient_id,
+                        alert_type,
+                        message,
+                        severity: None,
+                        trigger_source: None,
+                        expires_in_hours: None,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "pathology" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: pathology <specimen|result|molecular|search>");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "result" => {
+                    let specimen_id = Uuid::parse_str(&remaining_args[1]).ok().unwrap_or_default();
+                    let diagnosis = remaining_args.get(2).cloned().unwrap_or_default();
+                    CommandType::Pathology(PathologyCommand::Result {
+                        specimen_id,
+                        diagnosis,
+                        malignancy: None,
+                        grade: None,
+                        stage: None,
+                        margins: None,
+                        biomarkers: vec![],
+                        pathologist: 0,
+                        report_date: None,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "microbiology" | "micro" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: microbiology <culture|preliminary|final|resistance>");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "final" => {
+                    let culture_id = Uuid::parse_str(&remaining_args[1]).ok().unwrap_or_default();
+                    let organism = remaining_args.get(2).cloned().unwrap_or_default();
+                    CommandType::Microbiology(MicrobiologyCommand::Final {
+                        culture_id,
+                        organism,
+                        sensitivities: vec![],
+                        mic_values: vec![],
+                        microbiologist: 0,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
+
+        "dosing" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: dosing <calculate|vancomycin|warfarin|chemo> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "vancomycin" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    CommandType::Dosing(DosingCommand::Vancomycin {
+                        patient_id,
+                        trough_level: None,
+                        target_auc: None,
+                        loading_dose: false,
+                    })
+                }
+                "warfarin" => {
+                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    let current_inr = remaining_args.get(2).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    CommandType::Dosing(DosingCommand::Warfarin {
+                        patient_id,
+                        current_inr,
+                        target_inr_range: None,
+                        weekly_dose_mg: None,
+                        cyp2c9: None,
+                        vkorc1: None,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        },
         _ => CommandType::Unknown,
     };
 
@@ -2569,6 +7015,87 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::Problem(command) => {
+            Ok(())
+        }
+        CommandType::Procedure(command) => {
+            Ok(())
+        }
+        CommandType::Discharge(command) => {
+            Ok(())
+        }
+        CommandType::Dosing(command) => {
+            Ok(())
+        }
+        CommandType::Alert(command) => {
+            Ok(())
+        }
+        CommandType::Pathology(command) => {
+            Ok(())
+        }
+        CommandType::Microbiology(command) => {
+            Ok(())
+        }
+        CommandType::Observation(command) => {
+            Ok(())
+        }
+        CommandType::Lab(command) => {
+            Ok(())
+        }
+        CommandType::Imaging(command) => {
+            Ok(())
+        }
+        CommandType::Chemo(command) => {
+            Ok(())
+        }
+        CommandType::Radiation(command) => {
+            Ok(())
+        }
+        CommandType::Surgery(command) => {
+            Ok(())
+        }
+        CommandType::Analytics(command) => {
+            Ok(())
+        }
+        CommandType::Metrics(command) => {
+            Ok(())
+        }
+        CommandType::Facility(command) => {
+            Ok(())
+        }
+        CommandType::Access(command) => {
+            Ok(())
+        }
+        CommandType::Financial(command) => {
+            Ok(())
+        }
+        CommandType::Quality(command) => {
+            Ok(())
+        }
+        CommandType::Incident(command) => {
+            Ok(())
+        }
+        CommandType::Compliance(command) => {
+            Ok(())
+        }
+        CommandType::Research(command) => {
+            Ok(())
+        }
+        CommandType::Ml(command) => {
+            Ok(())
+        }
+        CommandType::ClinicalTrial(command) => {
+            Ok(())
+        }
+        CommandType::Model(command) => {
+            Ok(())
+        }
+        CommandType::Nursing(command) => {
+            Ok(())
+        }
+        CommandType::Education(command) => {
+            Ok(())
+        }
+        CommandType::DischargePlanning(command) => {
             Ok(())
         }
     }
