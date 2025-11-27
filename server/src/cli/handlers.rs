@@ -65,6 +65,16 @@ pub use crate::cli::handlers_visualizing::{
                                         };
 pub use crate::cli::handlers_graph::handle_graph_command;
 pub use crate::cli::handlers_index::handle_index_command;
+pub use crate::cli::handlers_medical::*;
+pub use crate::cli::handlers_connectors::*;
+pub use crate::cli::handlers_hl7::*;
+pub use crate::cli::handlers_fhir::*;
+pub use crate::cli::handlers_notes::*;
+pub use crate::cli::handlers_snomed_codes::*;
+pub use crate::cli::handlers_patient_journey::*;
+pub use crate::cli::handlers_encounters::*;
+pub use crate::cli::handlers_drug_interactions::*;
+pub use crate::cli::handlers_mpi::*;
 
 use daemon_api::{stop_daemon, start_daemon};
 use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
