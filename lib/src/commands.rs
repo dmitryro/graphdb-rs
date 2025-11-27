@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, Arg, Args, ArgAction, ValueEnum};
 use std::path::PathBuf;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
-
+use std::fmt;
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
 
@@ -377,6 +377,22 @@ pub enum DispositionTarget {
     AgainstMedicalAdvice,
     Expired,
     Transfer,
+}
+
+impl fmt::Display for DispositionTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DispositionTarget::Home               => write!(f, "Home"),
+            DispositionTarget::HomeHealth         => write!(f, "HomeHealth"),
+            DispositionTarget::SkilledNursing     => write!(f, "SkilledNursing"),
+            DispositionTarget::Rehab              => write!(f, "Rehab"),
+            DispositionTarget::LTACH              => write!(f, "LTACH"),
+            DispositionTarget::Hospice            => write!(f, "Hospice"),
+            DispositionTarget::AgainstMedicalAdvice => write!(f, "AgainstMedicalAdvice"),
+            DispositionTarget::Expired            => write!(f, "Expired"),
+            DispositionTarget::Transfer           => write!(f, "Transfer"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
@@ -756,6 +772,42 @@ pub enum PatientCommand {
     CareGaps { patient_id: Option<i32> }, // None = all
     Allergies { patient_id: i32 },
     Referrals { patient_id: i32 },
+    /// View full patient clinical journey with pathways, milestones, deviations
+    Journey {
+        patient_id: i32,
+        #[clap(long)] pathway: Option<String>,        // Filter by pathway name
+        #[clap(long)] show_completed: bool,           // Include completed pathways
+        #[clap(long)] show_deviations_only: bool,     // Show only deviations
+        #[clap(long)] format: Option<JourneyFormat>,  // text, json, timeline
+    },
+
+    /// View all active drug alerts and interactions for patient
+    DrugAlerts {
+        patient_id: i32,
+        #[clap(long)] severity: Option<AlertSeverity>,     // Critical, High, Medium, Low
+        #[clap(long)] include_resolved: bool,             // Show resolved alerts
+        #[clap(long)] include_overridden: bool,            // Show overridden alerts
+        #[clap(long)] drug_class: Option<String>,          // Filter by drug class
+        #[clap(long)] format: Option<AlertFormat>,         // text, json, summary
+        #[clap(long)] include_inactive: bool,
+        #[clap(long)] severity_filter: Option<AlertSeverity>,  
+   },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum JourneyFormat {
+    Text,
+    Json,
+    Timeline,
+    Detailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum AlertFormat {
+    Text,
+    Json,
+    Summary,
+    Detailed,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -1199,7 +1251,7 @@ pub enum AllergyCommand {
 pub enum PopulationCommand {
     /// Patients overdue for a screening test
     ScreeningDue {
-        screening_type: String,            // COLONOSCOPY, MAMMOGRAM, A1C, CERVICAL, LDL
+        screening_type: String, // COLONOSCOPY, MAMMOGRAM, A1C, CERVICAL, LDL
         #[arg(long, value_name = "AGE")]
         age_min: Option<u32>,
         #[arg(long, value_name = "AGE")]
@@ -1211,28 +1263,38 @@ pub enum PopulationCommand {
     HighRiskMeds,
     /// Patients with uncontrolled chronic conditions
     ChronicConditions {
-        condition: String,                 // diabetes, hypertension, copd, asthma, ckd
+        condition: String, // diabetes, hypertension, copd, asthma, ckd
         #[arg(long, value_name = "THRESHOLD")]
         uncontrolled_threshold: Option<f64>,
     },
     /// Social-determinants screening
     SocialDeterminants {
         #[arg(long, value_name = "DOMAIN", value_enum)]
-        domains: Vec<String>,              // housing, food, transport, safety
+        domains: Vec<String>, // housing, food, transport, safety
     },
     /// Quality-measure performance
     QualityMeasures {
-        measure_type: String,              // MIPS_2025, HEDIS_2025, CMS_STAR
+        measure_type: String, // MIPS_2025, HEDIS_2025, CMS_STAR
         #[arg(long, value_name = "PERIOD")]
         time_period: Option<String>,
     },
     /// Population risk stratification
     RiskStratification {
         #[arg(long, value_name = "FACTOR")]
-        risk_factors: Vec<String>,         // readmission, fall, sepsis, stroke
+        risk_factors: Vec<String>, // readmission, fall, sepsis, stroke
         #[arg(long, value_name = "LEVEL")]
-        risk_level: Option<String>,        // LOW, MEDIUM, HIGH
+        risk_level: Option<String>, // LOW, MEDIUM, HIGH
     },
+    /// Patients at high risk for 30-day readmission
+    ReadmissionRisk {
+        #[arg(long, value_name = "DAYS")]
+        days: Option<i32>, // default 30
+        #[arg(long)]
+        preventable_only: bool,
+        #[arg(long)]
+        high_risk_only: bool,
+    },
+    /// Today's active drug-drug interaction and allergy alerts
     DrugAlertsToday,
     /// One-row summary for executives
     CareGapsSummary,
@@ -2312,15 +2374,39 @@ pub enum MicrobiologyCommand {
 // =========================================================================
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum NursingCommand {
-    Assessment { patient_id: i32, #[clap(long)] pain_level: Option<i32>, #[clap(long)] mobility: Option<String> },
-    SafetyCheck { patient_id: i32, #[clap(long)] fall_risk: Option<String> },
-    IntakeOutput { patient_id: i32, #[clap(long)] intake_ml: Option<i64>, #[clap(long)] output_ml: Option<i64> },
-    MedAdministration { order_id: Uuid, #[clap(long)] time_given: Option<String>, #[clap(long)] route: Option<String> },
+    Assessment { patient_id: i32, #[clap(long)] shift: Option<String>, #[clap(long)] pain_level: Option<i32>, #[clap(long)] mobility: Option<String>, #[clap(long)] notes: Option<String> },
+    SafetyCheck { patient_id: i32, #[clap(long)] fall_risk: Option<String>, #[clap(long)] pressure_ulcer_risk: Option<String>, #[clap(long)] notes: Option<String> },
+    IntakeOutput { patient_id: i32, #[clap(long)] intake_ml: Option<i64>, #[clap(long)] output_ml: Option<i64>, #[clap(long)] notes: Option<String> },
+    #[clap(subcommand)]
+    MedAdministration(MedAdministrationCommand),
+    #[clap(subcommand)]
+    CarePlan(CarePlanCommand),
+    PatientEducation { patient_id: i32, topic: String, #[clap(long)] method: Option<EducationMethod> },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum MedAdministrationCommand {
+    Verify { order_id: Uuid, patient_id: i32, #[clap(long)] barcode_scan: bool },
+    Give { order_id: Uuid, #[clap(long)] time_given: Option<String>, #[clap(long)] route: Option<String> },
+    Refuse { order_id: Uuid, reason: String },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum CarePlanCommand {
+    Add { patient_id: i32, goal: String, interventions: String },
+    Update { patient_id: i32, goal_id: Uuid, status: String },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum EducationCommand {
-    Document { patient_id: i32, topic: String, #[clap(long)] method: Option<String> },
+    Document { patient_id: i32, 
+               topic: String, 
+               #[clap(long)] 
+               teach_back_verified: bool,
+               language: Option<String>,
+               literacy_level: Option<String>,
+               method: Option<EducationMethod> 
+    },
 }
 
 // =========================================================================
