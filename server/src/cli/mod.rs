@@ -18,15 +18,17 @@ pub mod handlers_index;
 pub mod handlers_graph;
 pub mod handlers_visualizing;
 pub mod query_classifier;
-/*
-pub mod serializers;
-pub mod config_structs;
-pub mod config_constants;
-pub mod config_defaults;
-pub mod config_helpers;
-pub mod config_impl_cli;
-pub mod config_impl_storage;
-*/
+pub mod handlers_medical;
+pub mod handlers_connectors;
+pub mod handlers_hl7;
+pub mod handlers_fhir;
+pub mod handlers_notes;
+pub mod handlers_snomed_codes;
+pub mod handlers_patient_journey;
+pub mod handlers_encounters;
+pub mod handlers_drug_interactions;
+pub mod handlers_mpi;
+
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
 pub use lib::daemon::*;
@@ -123,6 +125,17 @@ pub use handlers_visualizing:: {
     handle_unified_query_visualizing,
     handle_interactive_query_visualizing,
 };
+
+pub use handlers_medical::*;
+pub use handlers_connectors::*;
+pub use handlers_hl7::*;
+pub use handlers_fhir::*;
+pub use handlers_notes::*;
+pub use handlers_snomed_codes::*;
+pub use handlers_patient_journey::*;
+pub use handlers_encounters::*;
+pub use handlers_drug_interactions::*;
+pub use handlers_mpi::*;
 
 pub use handlers_main::{
     DaemonArgs,
