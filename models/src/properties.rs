@@ -48,6 +48,7 @@ pub enum PropertyValue {
     Float(SerializableFloat),
     String(String),
     Uuid(crate::identifiers::SerializableUuid),
+    Byte(u8),
 }
 
 impl PropertyValue {

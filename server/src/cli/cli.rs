@@ -54,6 +54,7 @@ use crate::cli::handlers_queries::{
 };
 
 use crate::cli::handlers_visualizing::{
+    self,
     handle_cypher_query_visualizing,
     handle_sql_query_visualizing,
     handle_graphql_query_visualizing,
@@ -583,6 +584,26 @@ pub async fn run_single_command(
     }
     info!("Running command: {:?}", command);
     println!("===> Running command: {:?}", command);
+
+    // === AUTO-CONVERT: visualize "..." → Visualize subcommand (NO RECURSION) ===
+    // === AUTO-CONVERT: visualize "..." → Visualize subcommand ===
+    if let Commands::Query { query: positional_query, language: _ } = &command {
+        let raw = positional_query.trim();
+        if raw.to_lowercase().starts_with("visualize ") {
+            let inner_query = raw["visualize ".len()..].trim();
+            // Strip outer quotes if present
+            let cleaned_query = inner_query
+                .strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
+                .or_else(|| inner_query.strip_prefix('"').and_then(|s| s.strip_suffix('"')));
+            let query_to_use = cleaned_query.unwrap_or(inner_query).to_string();
+            info!("Auto-converted positional 'visualize' to Visualize subcommand");
+            println!("Visualizing: {}", query_to_use);
+            let query_engine = get_query_engine_singleton().await?;
+            let query_to_execute = sanitize_cypher_query(&query_to_use);
+            return handlers_visualizing::handle_cypher_query_visualizing(query_engine, query_to_execute).await;
+        }
+    }
+
     match command {
         Commands::Start {
             port: top_port,
@@ -991,6 +1012,7 @@ pub async fn run_single_command(
                 }
             }
         }
+
         Commands::Visualize { query, language } => {
             let raw_query = query.trim().to_string();
             let detected_lang = if language.is_none() {
@@ -998,13 +1020,11 @@ pub async fn run_single_command(
             } else {
                 ""
             };
-
             let effective_lang = language
                 .as_deref()
                 .unwrap_or(detected_lang)
                 .trim()
                 .to_lowercase();
-
             let query_to_execute = if effective_lang == "cypher" {
                 sanitize_cypher_query(&raw_query)
             } else {
@@ -1012,28 +1032,34 @@ pub async fn run_single_command(
             };
 
             info!(
-                "Executing query: '{}', language: {} (detected: {}, explicit: {:?})",
+                "Executing visualization query: '{}', language: {} (detected: {}, explicit: {:?})",
                 query_to_execute, effective_lang, detected_lang, language
             );
             println!(
-                "===> Executing query: '{}', language: {}",
+                "Executing visualization: '{}', language: {}",
                 query_to_execute, effective_lang
             );
 
             let query_engine = get_query_engine_singleton().await?;
 
             match effective_lang.as_str() {
-                "cypher" => handle_cypher_query_visualizing(query_engine, query_to_execute).await?,
-                "sql" => handle_sql_query_visualizing(query_engine, query_to_execute).await?,
-                "graphql" => handle_graphql_query_visualizing(query_engine, query_to_execute).await?,
+                "cypher" => {
+                    handlers_visualizing::handle_cypher_query_visualizing(query_engine, query_to_execute).await?
+                }
+                "sql" => {
+                    handlers_visualizing::handle_sql_query_visualizing(query_engine, query_to_execute).await?
+                }
+                "graphql" => {
+                    handlers_visualizing::handle_graphql_query_visualizing(query_engine, query_to_execute).await?
+                }
                 "unknown" | "" => {
                     return Err(anyhow!(
-                        "Could not detect query language. Use --language sql|cypher|graphql"
+                        "Could not detect query language for visualization. Use --language sql|cypher|graphql"
                     ));
                 }
                 _ => {
                     return Err(anyhow!(
-                        "Unsupported query language: '{}'. Use sql, cypher, or graphql",
+                        "Unsupported query language for visualization: '{}'. Use sql, cypher, or graphql",
                         effective_lang
                     ));
                 }
@@ -1284,6 +1310,7 @@ pub async fn run_single_command(
 
         }
     }
+
     if env_var_set {
         info!("Removing GRAPHDB_CLI_INTERACTIVE after command execution");
         println!("===> Removed GRAPHDB_CLI_INTERACTIVE after command execution");
