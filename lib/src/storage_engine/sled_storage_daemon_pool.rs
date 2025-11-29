@@ -1830,6 +1830,22 @@ impl SledDaemon {
                         response
                     }
                     // === READ COMMANDS — YOUR ORIGINAL LOGIC
+                    Some("get_all_edges") => {
+                        let mut vec = Vec::new();
+                        let len = edges.len();
+                        info!("Edges tree has {} entries", len);
+                        println!("===> Number of entries in edges tree: {:?}", len);
+                        for item in edges.iter() {
+                            let (_, value) = item?;
+                            match deserialize_edge(&value) {
+                                Ok(e) => vec.push(e),
+                                Err(e) => warn!("Failed to deserialize edge: {}", e),
+                            }
+                        }
+                        json!({"status": "success", "edges": vec})   // <- no Ok()
+                    }
+                    // Other cases...
+                    // === READ COMMANDS — YOUR ORIGINAL LOGIC
                     Some(cmd) if [
                         "get_key", "get_vertex", "get_edge",
                         "get_all_vertices", "get_all_edges",

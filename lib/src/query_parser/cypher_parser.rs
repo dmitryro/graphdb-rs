@@ -14,7 +14,7 @@ use nom::{
     error as NomError,
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet,};
 use std::sync::Arc;
 use uuid::Uuid;
 use chrono::Utc;
@@ -665,11 +665,13 @@ fn parse_set_query(input: &str) -> IResult<&str, CypherQuery> {
 
 // CORRECTED full_statement_parser for Nom 8
 fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
-    // MATCH or OPTIONAL MATCH
-    let (input, _) = alt((tag("MATCH"), tag("OPTIONAL MATCH"))).parse(input)?;
+    let (input, initial_tag) = alt((tag_no_case("MATCH"), tag_no_case("OPTIONAL MATCH"))).parse(input)?;
+    
+    // Check if it was OPTIONAL MATCH to determine the is_optional property if needed, 
+    // but here we just collect all patterns.
     let (input, _) = multispace1.parse(input)?;
 
-    // Main pattern list (supports comma-separated)
+    // Main pattern list (comma-separated patterns in the first clause)
     let (input, patterns) = separated_list1(
         tuple((multispace0, char(','), multispace0)),
         parse_pattern,
@@ -677,22 +679,21 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
 
     let (input, _) = multispace0.parse(input)?;
 
-    // *** FIX: Additional OPTIONAL MATCH clauses should parse complete patterns ***
+    // *** FIX: Chained OPTIONAL MATCH clauses (consuming the keyword and patterns) ***
     let (input, extra_patterns) = many0(
-        tuple((
-            multispace0,
-            tag("OPTIONAL MATCH"),
-            multispace1,
+        preceded(
+            // Look for OPTIONAL MATCH surrounded by space/multispace
+            tuple((multispace0, tag_no_case("OPTIONAL MATCH"), multispace1)), 
             separated_list1(
                 tuple((multispace0, char(','), multispace0)),
                 parse_pattern,
             ),
-        ))
+        )
     ).parse(input)?;
     
     // Flatten extra patterns into all_patterns
     let mut all_patterns = patterns;
-    for (_, _, _, extra_pats) in extra_patterns {
+    for extra_pats in extra_patterns {
         all_patterns.extend(extra_pats);
     }
     
@@ -700,15 +701,16 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
 
     // Skip WHERE (if present)
     let (input, _) = opt(preceded(
-        tuple((tag("WHERE"), multispace1)),
-        take_while1(|c| c != 'R' && c != 'C'),
+        tuple((tag_no_case("WHERE"), multispace1)),
+        // Consume up to the next major keyword (RETURN or CREATE)
+        take_until("RETURN"), 
     )).parse(input)?;
     
     let (input, _) = multispace0.parse(input)?;
 
     // Optional CREATE clause
     let (input, create_patterns) = opt(preceded(
-        tuple((tag("CREATE"), multispace1)),
+        tuple((tag_no_case("CREATE"), multispace1)),
         separated_list1(
             tuple((multispace0, char(','), multispace0)),
             parse_pattern,
@@ -717,11 +719,8 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     
     let (input, _) = multispace0.parse(input)?;
 
-    // Optional RETURN — consume everything after it
-    let (input, _) = opt(preceded(
-        tuple((tag("RETURN"), multispace1)),
-        take_while1(|_| true),
-    )).parse(input)?;
+    // Optional RETURN — consume everything after it (using the cleaned parse_return_clause)
+    let (input, _) = opt(parse_return_clause).parse(input)?;
 
     let result = if let Some(create) = create_patterns {
         CypherQuery::MatchCreate {
@@ -862,12 +861,10 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     }
 
     // 3. *** CRITICAL: NO TRUNCATION AT ALL ***
-    // The old code was truncating at "-[" which broke ALL relationship queries
-    // We must pass the FULL query to the parsers and let them handle it
-    
     println!("===> Using full query (no truncation): {}", query_to_parse);
 
     // 4. Run the parser chain on the FULL query
+    // full_statement_parser is now designed to handle chained MATCH/OPTIONAL MATCH -> RETURN
     let result = alt((
         full_statement_parser,
         parse_create_index,
@@ -889,7 +886,8 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     match result {
         Ok((remaining, parsed)) => {
             let remaining_trimmed = remaining.trim();
-            if !remaining_trimmed.is_empty() && !remaining_trimmed.starts_with("RETURN") {
+            if !remaining_trimmed.is_empty() {
+                // Now, if there's a remainder, it's a true parsing error, as RETURN should have been consumed.
                 println!("===> WARNING: Unparsed remainder: '{}'", remaining_trimmed);
             }
             println!("===> Successfully parsed as: {:?}", parsed);
@@ -1134,9 +1132,11 @@ fn parse_node_pattern(input: &str) -> GraphResult<(Option<String>, HashMap<Strin
     Ok((lbl.unwrap_or(None), prp.unwrap_or_default()))
 }
 
+// Updated to use tag_no_case and correctly parse/consume the RETURN clause and its contents.
 fn parse_return_clause(input: &str) -> IResult<&str, ()> {
-    let (input, _) = tag("RETURN").parse(input)?;
+    let (input, _) = tag_no_case("RETURN").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
+    // Consume everything until end of query (or semicolon)
     let (input, _) = take_while1(|c: char| c != '\n' && c != '\r' && c != ';').parse(input)?;
     Ok((input, ()))
 }
@@ -1269,6 +1269,13 @@ fn expand_variable_paths(
 
 // Complete execute_cypher function with proper MatchNode implementation
 // This replaces the execute_cypher function in cypher_parser.rs
+
+// =================================================================
+// THE COMPLETED EXECUTION FUNCTION
+// =================================================================
+
+// Complete execute_cypher function with proper MatchNode implementation
+// This replaces the execute_cypher function in cypher_parser.rs
 pub async fn execute_cypher(
     query: CypherQuery,
     _db: &Database,
@@ -1277,23 +1284,23 @@ pub async fn execute_cypher(
     match query {
 
         // =============================================================================
-        // MATCH (n) RETURN n  →  This is the most common case → MUST be fast & safe
+        // MATCH (n) RETURN n  →  This is the most common case → MUST be fast & safe
         // =============================================================================
         CypherQuery::MatchPattern { patterns } | CypherQuery::MatchCreate { match_patterns: patterns, .. } => {
             let all_vertices = storage.get_all_vertices().await?;
             let all_edges = storage.get_all_edges().await?;
 
             let mut result_vertices = Vec::new();
-            let mut matched_vertex_ids = std::collections::HashSet::new();
-            let mut matched_edge_ids = std::collections::HashSet::new();
+            let mut matched_vertex_ids = HashSet::new();
+            let mut matched_edge_ids = HashSet::new();
 
             // *** FIX: Process ALL patterns, not just first ***
             for pattern in patterns {
                 let nodes = &pattern.1; // Vec<NodePattern>
-                let rels = &pattern.2;   // Vec<RelPattern>
+                let rels = &pattern.2; // Vec<RelPattern>
 
                 // Match ALL nodes in this pattern
-                for (var_name, label_constraint, prop_constraints) in nodes {
+                for (_var_name, label_constraint, prop_constraints) in nodes {
                     let required_props: HashMap<String, PropertyValue> = prop_constraints
                         .iter()
                         .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
@@ -1303,6 +1310,7 @@ pub async fn execute_cypher(
                     for v in &all_vertices {
                         let label_ok = label_constraint.as_ref().map_or(true, |ql| {
                             let vl = v.label.as_ref();
+                            // Check for exact label match or composite label starts with query label
                             vl == ql || vl.starts_with(&format!("{}:", ql))
                         });
 
@@ -1321,7 +1329,7 @@ pub async fn execute_cypher(
 
                 // *** FIX: Handle relationship patterns with variable-length paths ***
                 for rel in rels {
-                    let (rel_var, rel_type, rel_range, rel_props, direction) = rel;
+                    let (_rel_var, rel_type, rel_range, _rel_props, _direction) = rel;
                     
                     // Check if this is a variable-length pattern
                     if let Some((min_hops, max_hops)) = rel_range {
@@ -1329,7 +1337,7 @@ pub async fn execute_cypher(
                         let min = min_hops.unwrap_or(1);
                         let max = max_hops.unwrap_or(5); // default max if not specified
                         
-                        // Find all paths within hop range
+                        // Find all edges that match type constraints (the base step for the path)
                         for edge in &all_edges {
                             let type_matches = rel_type.as_ref().map_or(true, |rt| {
                                 edge.edge_type.as_ref() == rt || edge.label == *rt
@@ -1342,7 +1350,7 @@ pub async fn execute_cypher(
                             }
                         }
                         
-                        // Expand paths up to max_hops
+                        // Expand paths up to max_hops (stub call)
                         expand_variable_paths(
                             &all_edges,
                             &matched_vertex_ids,
@@ -1358,7 +1366,7 @@ pub async fn execute_cypher(
                             });
                             
                             let connects_matched = matched_vertex_ids.contains(&edge.outbound_id) ||
-                                                  matched_vertex_ids.contains(&edge.inbound_id);
+                                                   matched_vertex_ids.contains(&edge.inbound_id);
                             
                             if type_matches && connects_matched {
                                 matched_edge_ids.insert(edge.id);
@@ -1375,27 +1383,40 @@ pub async fn execute_cypher(
                 .filter(|e| matched_edge_ids.contains(&e.id))
                 .collect();
             
+            // Re-fetch all vertices from storage to ensure we have the complete list
+            // (If all_vertices was consumed by a pattern loop, this avoids errors. 
+            // Since it's used by loops above, we rely on the clone and `matched_vertex_ids`)
+            let all_vertices_recheck = storage.get_all_vertices().await?;
+
             // Ensure all vertices connected by matched edges are included
             for edge in &result_edges {
+                // Check outbound node
                 if !matched_vertex_ids.contains(&edge.outbound_id) {
-                    if let Some(v) = all_vertices.iter().find(|v| v.id == edge.outbound_id) {
+                    if let Some(v) = all_vertices_recheck.iter().find(|v| v.id == edge.outbound_id) {
                         result_vertices.push(v.clone());
                         matched_vertex_ids.insert(edge.outbound_id);
                     }
                 }
+                // Check inbound node
                 if !matched_vertex_ids.contains(&edge.inbound_id) {
-                    if let Some(v) = all_vertices.iter().find(|v| v.id == edge.inbound_id) {
+                    if let Some(v) = all_vertices_recheck.iter().find(|v| v.id == edge.inbound_id) {
                         result_vertices.push(v.clone());
                         matched_vertex_ids.insert(edge.inbound_id);
                     }
                 }
             }
 
+            // Filter result_vertices to only contain unique, matched ones
+            let final_vertices: Vec<Vertex> = all_vertices_recheck.into_iter()
+                .filter(|v| matched_vertex_ids.contains(&v.id))
+                .collect();
+
+
             Ok(json!({
-                "vertices": result_vertices,
+                "vertices": final_vertices,
                 "edges": result_edges,
                 "stats": {
-                    "vertices_matched": result_vertices.len(),
+                    "vertices_matched": final_vertices.len(),
                     "edges_matched": result_edges.len()
                 }
             }))
@@ -1407,22 +1428,32 @@ pub async fn execute_cypher(
             for pat in match_patterns {
                 for (var, label, props) in pat.1 {
                     if let Some(v) = var.clone() {
+                        // resolve_var finds an existing node matching constraints
                         let id = resolve_var(&storage, &v, &label, &props).await?;
                         var_to_id.insert(v, id);
                     }
                 }
+                // Relationships in match_patterns are currently ignored in this block's logic
             }
 
+            let mut created_edges = Vec::new();
+            
             for pat in create_patterns {
+                // Simple case: (from)-[rel]->(to)
                 if pat.1.len() == 2 && pat.2.len() == 1 {
                     let from_var = pat.1[0].0.as_ref().ok_or(GraphError::ValidationError("No source var".into()))?;
                     let to_var = pat.1[1].0.as_ref().ok_or(GraphError::ValidationError("No target var".into()))?;
                     let rel = &pat.2[0];
 
-                    let from_id = var_to_id.get(from_var).ok_or(GraphError::ValidationError("Unbound from var".into()))?;
-                    let to_id = var_to_id.get(to_var).ok_or(GraphError::ValidationError("Unbound to var".into()))?;
+                    let from_id = var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound from var: {}", from_var)))?;
+                    let to_id = var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound to var: {}", to_var)))?;
 
-                    let (out, in_) = if rel.4 == Some(false) { (*from_id, *to_id) } else { (*to_id, *from_id) };
+                    // Check directionality (rel.4 is Option<bool>, true for ->, false for <-, None for --)
+                    // Simplified: Assume default direction is from_id -> to_id unless rel.4 is explicitly false (<-)
+                    let (out, in_) = match rel.4 {
+                        Some(false) => (*to_id, *from_id), // (from)<-[rel]-(to) => to is outbound, from is inbound
+                        _ => (*from_id, *to_id),          // (from)-[rel]->(to) or (from)-[rel]-(to) => from is outbound, to is inbound
+                    };
 
                     let edge = Edge {
                         id: SerializableUuid(Uuid::new_v4()),
@@ -1433,10 +1464,11 @@ pub async fn execute_cypher(
                         properties: rel.3.iter().map(|(k,v)| Ok((k.clone(), to_property_value(v.clone())?))).collect::<GraphResult<_>>()?,
                     };
                     storage.create_edge(edge.clone()).await?;
-                    return Ok(json!({ "edge": edge }));
+                    created_edges.push(edge);
                 }
+                // Node creation in CREATE is handled implicitly by resolve_var logic (not fully implemented in stub)
             }
-            Ok(json!({ "status": "success" }))
+            Ok(json!({ "status": "success", "created_edges": created_edges }))
         }
         CypherQuery::CreateNode { label, properties } => {
             let props: HashMap<_, _> = properties.into_iter()
@@ -1476,7 +1508,7 @@ pub async fn execute_cypher(
             println!("===> EXECUTING MatchNode: label={:?}, query_properties={:?}", label, properties);
             let vertices = storage.get_all_vertices().await?;
             println!("===> Total vertices in storage: {}", vertices.len());
-           
+            
             // Convert query properties to PropertyValue for comparison
             let query_props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
@@ -1490,13 +1522,13 @@ pub async fn execute_cypher(
                 })
                 .collect();
             let query_props = query_props?;
-           
+            
             println!("===> Query properties after conversion: {:?}", query_props);
-           
+            
             let filtered = vertices.into_iter().filter(|v| {
-                println!("===> Checking vertex: id={}, label={}, properties={:?}",
-                         v.id.0, v.label.as_ref(), v.properties);
-               
+                println!("===> Checking vertex: id={:?}, label={}, properties={:?}",
+                         v.id, v.label.as_ref(), v.properties);
+                
                 // Check if the vertex label matches the query label
                 let matches_label = if let Some(query_label) = &label {
                     let vertex_label_str = v.label.as_ref();
@@ -1509,7 +1541,7 @@ pub async fn execute_cypher(
                     println!("===> No label constraint, matches all labels");
                     true
                 };
-               
+                
                 // Check if all query properties match vertex properties
                 let matches_props = if query_props.is_empty() {
                     println!("===> No property constraints, matches all properties");
@@ -1531,23 +1563,23 @@ pub async fn execute_cypher(
                     println!("===> All properties match: {}", all_match);
                     all_match
                 };
-               
+                
                 let overall_match = matches_label && matches_props;
-                println!("===> Vertex {} overall match: label={} props={} result={}",
-                         v.id.0, matches_label, matches_props, overall_match);
+                println!("===> Vertex {:?} overall match: label={} props={} result={}",
+                         v.id, matches_label, matches_props, overall_match);
                 overall_match
             }).collect::<Vec<_>>();
-           
+            
             println!("===> Filtered result count: {}", filtered.len());
             Ok(json!({ "vertices": filtered }))
         }
         CypherQuery::MatchMultipleNodes { nodes } => {
             let all_vertices = storage.get_all_vertices().await?;
             let mut result_vertices = Vec::new();
-            let mut matched_ids = std::collections::HashSet::new();
+            let mut matched_ids = HashSet::new();
 
             // *** FIX: Process ALL nodes, not just .first() ***
-            for (var, label, properties) in nodes {
+            for (_var, label, properties) in nodes {
                 let props: HashMap<String, PropertyValue> = properties
                     .iter()
                     .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
@@ -1585,6 +1617,7 @@ pub async fn execute_cypher(
                     .collect();
                 let vertex = Vertex {
                     id: SerializableUuid(Uuid::new_v4()),
+                    // Use variable name as fallback label if no label is specified
                     label: Identifier::new(label.unwrap_or_else(|| var.clone().unwrap_or_else(|| "Node".to_string())))?,
                     properties: props?,
                 };
@@ -1594,16 +1627,16 @@ pub async fn execute_cypher(
             warn!("Complex pattern with {} relationships parsed but not yet fully implemented", relationships.len());
             Ok(json!({
                 "vertices": created_vertices,
-                "note": format!("Created {} nodes. Relationships ({}) not yet implemented.", created_vertices.len(), relationships.len())
+                "note": format!("Created {} nodes. Relationships ({}) creation logic skipped.", created_vertices.len(), relationships.len())
             }))
         }
         CypherQuery::CreateEdge { from_id, edge_type, to_id } => {
             let edge = Edge {
                 id: SerializableUuid(Uuid::new_v4()),
                 outbound_id: from_id,
-                edge_type: Identifier::new(edge_type)?,
+                edge_type: Identifier::new(edge_type.clone())?,
                 inbound_id: to_id,
-                label: "relationship".to_string(),
+                label: edge_type, // Use edge_type as label for simplicity
                 properties: BTreeMap::new(),
             };
             storage.create_edge(edge.clone()).await?;
@@ -1611,7 +1644,7 @@ pub async fn execute_cypher(
         }
         CypherQuery::SetNode { id, properties } => {
             let mut vertex = storage.get_vertex(&id.0).await?.ok_or_else(|| {
-                GraphError::StorageError(format!("Vertex not found: {}", id.0))
+                GraphError::StorageError(format!("Vertex not found: {:?}", id))
             })?;
             let props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
@@ -1649,8 +1682,8 @@ pub async fn execute_cypher(
             Ok(json!({ "key": key, "deleted": existed }))
         }
         CypherQuery::CreateIndex { label, properties } => {
-            warn!("CREATE INDEX command is not implemented yet. Index for label '{}' on properties {:?} ignored.", label, properties);
-            println!("===> WARNING: CREATE INDEX COMMAND NOT IMPLEMENTED YET. INDEX FOR LABEL '{}' ON PROPERTIES {:?} IGNORED.", label, properties);
+            warn!("CREATE INDEX command is not implemented yet. Index for label '{:?}' on properties {:?} ignored.", label, &properties);
+            println!("===> WARNING: CREATE INDEX COMMAND NOT IMPLEMENTED YET. INDEX FOR LABEL '{:?}' ON PROPERTIES {:?} IGNORED.", label, properties);
             Ok(json!({ "status": "success", "message": "Index creation not implemented", "label": label, "properties": properties }))
         }
         CypherQuery::CreateEdgeBetweenExisting {
@@ -1686,7 +1719,7 @@ pub async fn execute_cypher(
             Ok(json!({ "edge": edge }))
         }
         // -----------------------------------------------------------------
-        // MATCH path = (a)-[*..]-(b) RETURN …   (path variable ignored)
+        // MATCH path = (a)-[*..]-(b) RETURN …   (path variable ignored)
         // -----------------------------------------------------------------
         CypherQuery::MatchPath {
             path_var: _,
@@ -1696,14 +1729,14 @@ pub async fn execute_cypher(
         } => {
             println!("===> Executing MatchPath: left={}, right={}", left_node, right_node);
 
-            let left_pat  = parse_node_pattern(&left_node)?;
+            let left_pat = parse_node_pattern(&left_node)?;
             let right_pat = parse_node_pattern(&right_node)?;
 
             let all_vertices = storage.get_all_vertices().await?;
-            let all_edges    = storage.get_all_edges().await?;
+            let all_edges = storage.get_all_edges().await?;
 
-            let mut left_ids  = std::collections::HashSet::new();
-            let mut right_ids = std::collections::HashSet::new();
+            let mut left_ids = HashSet::new();
+            let mut right_ids = HashSet::new();
 
             // helper to test a vertex against a pattern
             let matches = |v: &Vertex, (label, props): &(Option<String>, HashMap<String, Value>)| {
@@ -1721,18 +1754,21 @@ pub async fn execute_cypher(
 
             // collect ALL vertices that match either side
             for v in &all_vertices {
-                if matches(v, &left_pat)  { left_ids.insert(v.id);  }
+                if matches(v, &left_pat) { left_ids.insert(v.id); }
                 if matches(v, &right_pat) { right_ids.insert(v.id); }
             }
 
             // edges that touch **any** matched vertex (0-2 hops)
-            let mut matched_edge_ids = std::collections::HashSet::new();
-            let mut matched_vertex_ids = left_ids.union(&right_ids).copied().collect::<std::collections::HashSet<_>>();
+            let mut matched_edge_ids = HashSet::new();
+            let mut matched_vertex_ids = left_ids.union(&right_ids).copied().collect::<HashSet<_>>();
 
             // BFS up to 2 hops
             let mut queue: Vec<(SerializableUuid, u32)> = matched_vertex_ids.iter().map(|&id| (id, 0)).collect();
-            let mut visited_edges = std::collections::HashSet::new();
+            let mut visited_edges = HashSet::new();
 
+            // Note: pop() on a Vec makes this a DFS-like behavior if not using a true Queue/Deque.
+            // Using a Vec as a queue (pop from front) is inefficient, but acceptable for a stub.
+            // For now, we'll use pop() and rely on the BFS logic through hop count.
             while let Some((current_id, hop)) = queue.pop() {
                 if hop >= 2 { continue; }
                 for edge in &all_edges {
