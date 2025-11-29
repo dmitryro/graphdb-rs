@@ -3,7 +3,7 @@
 use log::{debug, error, info, warn, trace};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while1, take_until},
+    bytes::complete::{tag, tag_no_case, take_while1, take_until, take_while},
     character::complete::{char, multispace0, multispace1},
     combinator::{map, opt, recognize, value},
     multi::{separated_list0, separated_list1, many0}, 
@@ -105,8 +105,112 @@ pub fn is_cypher(query: &str) -> bool {
     cypher_keywords.iter().any(|kw| query.trim().to_uppercase().starts_with(kw))
 }
 
+// =============================================================================
+// COMPLETE REPLACEMENT FOR full_statement_parser AND HELPERS
+// Place these functions in your cypher_parser.rs file
+// =============================================================================
+
+// Helper: Check if a character could start a Cypher keyword
+fn is_cypher_keyword_start(c: char) -> bool {
+    matches!(c, 'O' | 'o' | 'W' | 'w' | 'R' | 'r' | 'C' | 'c' | 'M' | 'm' | 'S' | 's' | 'D' | 'd')
+}
+
 fn parse_identifier(input: &str) -> IResult<&str, &str> {
     take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '&').parse(input)
+}
+
+// Check if we're at the start of a new Cypher clause
+fn is_at_keyword_boundary(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    trimmed.is_empty() 
+        || trimmed.starts_with("OPTIONAL")
+        || trimmed.starts_with("optional")
+        || trimmed.starts_with("WHERE")
+        || trimmed.starts_with("where")
+        || trimmed.starts_with("RETURN")
+        || trimmed.starts_with("return")
+        || trimmed.starts_with("CREATE")
+        || trimmed.starts_with("create")
+        || trimmed.starts_with("SET")
+        || trimmed.starts_with("set")
+        || trimmed.starts_with("DELETE")
+        || trimmed.starts_with("delete")
+        || trimmed.starts_with(';')
+}
+
+// Parse a single pattern (node or node-relationship-node chain)
+// Stops at keyword boundaries
+fn parse_single_pattern(input: &str) -> IResult<&str, Pattern> {
+    println!("===> parse_single_pattern START, input: '{}'", input.chars().take(60).collect::<String>());
+    
+    let (input, path_var) = opt(terminated(
+        parse_identifier, 
+        tuple((multispace0, char('='), multispace0))
+    )).parse(input)?;
+    
+    let (input, first_node) = parse_node(input)?;
+    println!("===> Parsed first node, remaining: '{}'", input.chars().take(60).collect::<String>());
+    
+    let (input, _) = multispace0.parse(input)?;
+    
+    let mut nodes = vec![first_node];
+    let mut rels = Vec::new();
+    let mut remaining = input;
+    
+    // Parse relationships and subsequent nodes
+    loop {
+        println!("===> Loop iteration, remaining: '{}'", remaining.chars().take(60).collect::<String>());
+        
+        // Check if we're at a keyword boundary BEFORE trying to parse relationship
+        if is_at_keyword_boundary(remaining) {
+            println!("===> Hit keyword boundary before relationship");
+            break;
+        }
+        
+        // Check if next character could start a relationship
+        let trimmed = remaining.trim_start();
+        if !trimmed.starts_with('-') && !trimmed.starts_with('<') {
+            println!("===> No relationship pattern detected");
+            break;
+        }
+        
+        println!("===> Attempting to parse relationship...");
+        match parse_relationship(remaining) {
+            Ok((rest, rel)) => {
+                println!("===> Relationship parsed successfully, remaining: '{}'", rest.chars().take(60).collect::<String>());
+                rels.push(rel);
+                let (rest, _) = multispace0(rest)?;
+                
+                // CRITICAL FIX: Check for keyword boundary BEFORE parsing node
+                if is_at_keyword_boundary(rest) {
+                    println!("===> Hit keyword boundary after relationship, stopping");
+                    remaining = rest;
+                    break;
+                }
+                
+                println!("===> Attempting to parse node after relationship...");
+                match parse_node(rest) {
+                    Ok((rest, node)) => {
+                        println!("===> Node parsed successfully");
+                        nodes.push(node);
+                        let (rest, _) = multispace0(rest)?;
+                        remaining = rest;
+                    }
+                    Err(e) => {
+                        println!("===> Failed to parse node after relationship: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("===> Failed to parse relationship: {:?}", e);
+                break;
+            }
+        }
+    }
+    
+    println!("===> parse_single_pattern END, {} nodes, {} rels", nodes.len(), rels.len());
+    Ok((remaining, (path_var.map(String::from), nodes, rels)))
 }
 
 fn parse_string_literal(input: &str) -> IResult<&str, &str> {
@@ -664,46 +768,48 @@ fn parse_set_query(input: &str) -> IResult<&str, CypherQuery> {
 // Then use .parse(input)? syntax everywhere:
 
 // CORRECTED full_statement_parser for Nom 8
+// Replace your full_statement_parser function with this corrected version
+// FINAL CORRECTED full_statement_parser
+
+// MAIN PARSER - Replace your existing full_statement_parser with this
 fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
-    let (input, initial_tag) = alt((tag_no_case("MATCH"), tag_no_case("OPTIONAL MATCH"))).parse(input)?;
+    println!("===> full_statement_parser START");
+    println!("===> NEW PARSER VERSION 2.0 ACTIVE"); // Debug marker
+    println!("===> NEW PARSER VERSION LOADED - CHECKING KEYWORD BOUNDARIES");
     
-    // Check if it was OPTIONAL MATCH to determine the is_optional property if needed, 
-    // but here we just collect all patterns.
+    // Parse initial MATCH or OPTIONAL MATCH keyword
+    let (input, _initial_tag) = alt((tag_no_case("MATCH"), tag_no_case("OPTIONAL MATCH"))).parse(input)?;
     let (input, _) = multispace1.parse(input)?;
 
-    // Main pattern list (comma-separated patterns in the first clause)
-    let (input, patterns) = separated_list1(
-        tuple((multispace0, char(','), multispace0)),
-        parse_pattern,
-    ).parse(input)?;
-
+    // Parse patterns in the first clause, stopping at keyword boundaries
+    let (input, first_patterns) = parse_match_clause_patterns(input)?;
     let (input, _) = multispace0.parse(input)?;
+    
+    println!("===> First clause parsed, {} patterns, remaining: '{}'", 
+             first_patterns.len(), input.chars().take(60).collect::<String>());
+    
+    let mut all_patterns = first_patterns;
 
-    // *** FIX: Chained OPTIONAL MATCH clauses (consuming the keyword and patterns) ***
-    let (input, extra_patterns) = many0(
+    // Parse subsequent OPTIONAL MATCH clauses
+    let (mut input, extra_optional_clauses) = many0(
         preceded(
-            // Look for OPTIONAL MATCH surrounded by space/multispace
-            tuple((multispace0, tag_no_case("OPTIONAL MATCH"), multispace1)), 
-            separated_list1(
-                tuple((multispace0, char(','), multispace0)),
-                parse_pattern,
-            ),
+            tuple((tag_no_case("OPTIONAL"), multispace1, tag_no_case("MATCH"), multispace1)),
+            parse_match_clause_patterns,
         )
     ).parse(input)?;
     
-    // Flatten extra patterns into all_patterns
-    let mut all_patterns = patterns;
-    for extra_pats in extra_patterns {
-        all_patterns.extend(extra_pats);
+    println!("===> Found {} OPTIONAL MATCH clauses", extra_optional_clauses.len());
+    
+    for optional_patterns in extra_optional_clauses {
+        all_patterns.extend(optional_patterns);
     }
     
     let (input, _) = multispace0.parse(input)?;
 
-    // Skip WHERE (if present)
+    // Skip WHERE clause if present
     let (input, _) = opt(preceded(
         tuple((tag_no_case("WHERE"), multispace1)),
-        // Consume up to the next major keyword (RETURN or CREATE)
-        take_until("RETURN"), 
+        take_while(|c: char| !is_cypher_keyword_start(c)),
     )).parse(input)?;
     
     let (input, _) = multispace0.parse(input)?;
@@ -711,16 +817,15 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     // Optional CREATE clause
     let (input, create_patterns) = opt(preceded(
         tuple((tag_no_case("CREATE"), multispace1)),
-        separated_list1(
-            tuple((multispace0, char(','), multispace0)),
-            parse_pattern,
-        ),
+        parse_match_clause_patterns,
     )).parse(input)?;
     
     let (input, _) = multispace0.parse(input)?;
 
-    // Optional RETURN — consume everything after it (using the cleaned parse_return_clause)
+    // Consume RETURN clause
     let (input, _) = opt(parse_return_clause).parse(input)?;
+
+    println!("===> full_statement_parser END, total patterns: {}", all_patterns.len());
 
     let result = if let Some(create) = create_patterns {
         CypherQuery::MatchCreate {
@@ -1083,6 +1188,41 @@ fn parse_relationship_full(input: &str) -> IResult<&str, RelPattern> {
     Ok((input, (detail.0, detail.1, detail.2, detail.3, direction)))
 }
 
+// Parse patterns within a single MATCH clause, stopping at keyword boundaries
+fn parse_match_clause_patterns(input: &str) -> IResult<&str, Vec<Pattern>> {
+    println!("===> parse_match_clause_patterns START");
+    let mut patterns = Vec::new();
+    let mut remaining = input;
+    
+    // Parse first pattern
+    let (rest, pattern) = parse_single_pattern(remaining)?;
+    patterns.push(pattern);
+    remaining = rest;
+    
+    // Parse additional comma-separated patterns
+    loop {
+        let (rest, _) = multispace0.parse(remaining)?;
+        
+        // Check if we hit a keyword boundary
+        if is_at_keyword_boundary(rest) {
+            remaining = rest;
+            break;
+        }
+        
+        // Try to parse comma + pattern
+        match tuple((char(','), multispace0, parse_single_pattern)).parse(rest) {
+            Ok((rest, (_, _, pattern))) => {
+                patterns.push(pattern);
+                remaining = rest;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    println!("===> parse_match_clause_patterns END, {} patterns", patterns.len());
+    Ok((remaining, patterns))
+}
+
 fn parse_match_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
     let (input, _) = tag("MATCH").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
@@ -1132,12 +1272,19 @@ fn parse_node_pattern(input: &str) -> GraphResult<(Option<String>, HashMap<Strin
     Ok((lbl.unwrap_or(None), prp.unwrap_or_default()))
 }
 
-// Updated to use tag_no_case and correctly parse/consume the RETURN clause and its contents.
+// =============================================================================
+// INSTRUCTIONS FOR INTEGRATION:
+// =============================================================================
+// 1. Find your existing full_statement_parser function in cypher_parser.rs
+// 2. Delete it completely
+// 3. Copy all 5 functions above (is_cypher_keyword_start through full_statement_parser)
+// 4. Paste them into your file where the old full_statement_parser was
+// 5. Make sure parse_return_clause exists and looks like this:
 fn parse_return_clause(input: &str) -> IResult<&str, ()> {
     let (input, _) = tag_no_case("RETURN").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
-    // Consume everything until end of query (or semicolon)
-    let (input, _) = take_while1(|c: char| c != '\n' && c != '\r' && c != ';').parse(input)?;
+    let (input, _) = take_while(|c: char| c != ';').parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
     Ok((input, ()))
 }
 
