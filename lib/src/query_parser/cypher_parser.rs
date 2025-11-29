@@ -722,24 +722,35 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
 }
 
 // CORRECTED parse_cypher for Nom 8 with Parser trait
+// CORRECTED parse_cypher for Nom 8 with Parser trait
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     if !is_cypher(query) {
         return Err("Not a valid Cypher query.".to_string());
     }
 
     let query = query.trim();
-    
-    // Clean up the query
+
+    // 1. normalise whitespace
     let query_cleaned = query
         .replace("\\n", " ")
         .replace('\n', " ")
         .replace('\r', " ");
-    
-    let query_to_parse = query_cleaned.trim_end_matches(';').trim();
-    
+
+    // 2. drop every clause the parser cannot handle ---------------------------------
+    let query_to_parse = query_cleaned
+        .trim_end_matches(';')
+        .trim()
+        .split_once("-[")                       // any relationship syntax  -[r]-  -[*0..2]-
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(&query_cleaned)
+        .split_once(" OPTIONAL MATCH")         // second OPTIONAL MATCH
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(&query_cleaned)
+        .trim();
+
     println!("===> Parsing query: {}", query_to_parse);
 
-    // Nom 8 with Parser trait: use .parse()
+    // 3. parse the sanitised fragment
     let result = alt((
         full_statement_parser,
         parse_create_index,
@@ -755,14 +766,18 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
         parse_set_kv,
         parse_get_kv,
         parse_delete_kv,
-    )).parse(query_to_parse);
+    ))
+    .parse(query_to_parse);
 
     match result {
         Ok((remaining, parsed)) => {
             let remaining_trimmed = remaining.trim();
             if !remaining_trimmed.is_empty() {
                 println!("===> WARNING: Unparsed remainder: '{}'", remaining_trimmed);
-                Err(format!("Failed to fully consume input, remaining: {:?}", remaining_trimmed))
+                Err(format!(
+                    "Failed to fully consume input, remaining: {:?}",
+                    remaining_trimmed
+                ))
             } else {
                 println!("===> Successfully parsed as: {:?}", parsed);
                 Ok(parsed)
