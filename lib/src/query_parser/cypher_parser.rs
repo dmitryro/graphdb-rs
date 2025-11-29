@@ -3,14 +3,15 @@
 use log::{debug, error, info, warn, trace};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while1, take_until},
+    bytes::complete::{tag, tag_no_case, take_while1, take_until},
     character::complete::{char, multispace0, multispace1},
-    combinator::{map, opt,},
-    multi::{separated_list0, separated_list1, many0},
+    combinator::{map, opt, recognize, value},
+    multi::{separated_list0, separated_list1, many0}, 
     number::complete::double,
-    sequence::{delimited, preceded, tuple, terminated},
+    sequence::{delimited, pair, preceded, tuple, terminated},
     IResult,
     Parser,
+    error as NomError,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -89,6 +90,13 @@ pub enum CypherQuery {
     CreateIndex {
         label: String,
         properties: Vec<String>,
+    },
+    // ---------- NEW ----------
+    MatchPath {
+        path_var: String,      //  e.g.  path
+        left_node: String,     //  e.g.  (p:Patient {id: "12345"})
+        right_node: String,    //  e.g.  (related)
+        return_clause: String, //  e.g.  collect(DISTINCT …
     },
 }
 
@@ -721,6 +729,77 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     Ok((input, result))
 }
 
+// ------------------------------------------------------------------
+// MATCH path = (left)-[*..]-(right) RETURN …  (single statement only)
+// ------------------------------------------------------------------
+pub fn parse_match_path(input: &str) -> IResult<&str, CypherQuery, nom::error::Error<&str>> {
+    use nom::character::complete::{alpha1, alphanumeric1, digit1};
+
+    let match_kw  = tag_no_case("MATCH");
+    let return_kw = tag_no_case("RETURN");
+
+    // identifier
+    let identifier = recognize(pair(alpha1, many0(alphanumeric1)));
+
+    // relationship  -[*0..2]-  or  -[]-
+    let rel_pattern = delimited(
+        tag("-["),
+        opt(terminated(
+            tag("*"),
+            recognize(tuple((digit1, tag(".."), digit1))),
+        )),
+        tag("]-"),
+    );
+
+    // node pattern factory
+    let node_pat = || delimited(tag("("), recognize(many0(none_of(")"))), tag(")"));
+
+    // full pattern:  pathVar = (n)-[*..]-(m)
+    let pattern = tuple((
+        identifier,
+        delimited(multispace0, tag("="), multispace0),
+        node_pat(),
+        rel_pattern,
+        node_pat(),
+    ));
+
+    // MATCH … RETURN …  (stop at first newline or semicolon)
+    let stmt = tuple((
+        terminated(match_kw, multispace1),
+        pattern,
+        preceded(multispace1, return_kw),
+        recognize(many0(none_of(";\n"))),
+    ));
+
+    map(stmt, |(_, (var, _, left, _, right), _, ret)| {
+        CypherQuery::MatchPath {
+            path_var: var.to_string(),
+            left_node: left.to_string(),
+            right_node: right.to_string(),
+            return_clause: ret.to_string(),
+        }
+    })
+    .parse(input)
+}
+
+// ------------------------------------------------------------------
+// reusable identifier parser
+// ------------------------------------------------------------------
+pub fn identifier(input: &str) -> IResult<&str, &str, nom::error::Error<&str>> {
+    use nom::character::complete::{alpha1, alphanumeric1};
+    recognize(pair(alpha1, many0(alphanumeric1))).parse(input)
+}
+
+// ------------------------------------------------------------------
+// helper used above
+// ------------------------------------------------------------------
+fn none_of<'a>(chars: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, &'a str, nom::error::Error<&'a str>> {
+    move |i: &'a str| match i.chars().next() {
+        Some(c) if !chars.contains(c) => Ok((&i[c.len_utf8()..], &i[..c.len_utf8()])),
+        _ => Err(nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::NoneOf))),
+    }
+}
+
 // CORRECTED parse_cypher for Nom 8 with Parser trait
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     if !is_cypher(query) {
@@ -960,6 +1039,38 @@ fn parse_where(input: &str) -> IResult<&str, ()> {
     let (input, _) = multispace0.parse(input)?;
     let (input, _) = take_until("RETURN").parse(input)?;
     Ok((input, ()))
+}
+
+
+/// Parse a raw node pattern string
+///     ( [var][:Label] [{props}] )
+/// into (label, properties) exactly like the old logic.
+fn parse_node_pattern(input: &str) -> GraphResult<(Option<String>, HashMap<String, Value>)> {
+    type E<'a> = nom::error::Error<&'a str>;
+
+    // label part  ->  ( ':' Label )
+    let label = map(
+        preceded(tuple((tag::<_, _, E>("("), take_until(":"), tag::<_, _, E>(":"))), take_until(" }")),
+        |s: &str| Some(s.trim().to_string()),
+    );
+
+    // properties  ->  { … }
+    let props = map(
+        delimited(tag::<_, _, E>("{"), take_until("}"), tag::<_, _, E>("}")),
+        |s: &str| serde_json::from_str::<HashMap<String, Value>>(s).unwrap_or_default(),
+    );
+
+    // full parser
+    let mut parser = tuple((
+        opt(label),
+        opt(preceded(multispace0::<_, E>, props)),
+        take_until::<_, _, E>(")"), // throw away variable name if present
+    ));
+
+    let (_, (lbl, prp, _)) = parser(input)
+        .map_err(|_| GraphError::ValidationError("Malformed node pattern".into()))?;
+
+    Ok((lbl.unwrap_or(None), prp.unwrap_or_default()))
 }
 
 fn parse_return_clause(input: &str) -> IResult<&str, ()> {
@@ -1389,6 +1500,59 @@ pub async fn execute_cypher(
             };
             storage.create_edge(edge.clone()).await?;
             Ok(json!({ "edge": edge }))
+        }
+        // -----------------------------------------------------------------
+        // MATCH path = (a)-[*..]-(b) RETURN …   (path variable ignored)
+        // -----------------------------------------------------------------
+        CypherQuery::MatchPath {
+            path_var: _,
+            left_node,
+            right_node,
+            return_clause: _,
+        } => {
+            // Parse the two node patterns exactly like we do in MatchPattern
+            let left_pat = parse_node_pattern(&left_node)?;
+            let right_pat = parse_node_pattern(&right_node)?;
+
+            let all_vertices = storage.get_all_vertices().await?;
+            let all_edges = storage.get_all_edges().await?;
+
+            let mut matched_ids = std::collections::HashSet::new();
+
+            // helper closure that returns true if a vertex matches a pattern
+            let matches = |v: &Vertex, (label, props): &(Option<String>, HashMap<String, Value>)| {
+                let label_ok = label.as_ref().map_or(true, |l| {
+                    let vl = v.label.as_ref();
+                    vl == l || vl.starts_with(&format!("{}:", l))
+                });
+                let props_ok = props.iter().all(|(k, expected)| {
+                    v.properties
+                        .get(k)
+                        .map_or(false, |actual| actual == &to_property_value(expected.clone()).unwrap())
+                });
+                label_ok && props_ok
+            };
+
+            // vertices that match either side of the pattern
+            for v in &all_vertices {
+                if matches(v, &left_pat) || matches(v, &right_pat) {
+                    matched_ids.insert(v.id);
+                }
+            }
+
+            // edges that touch any matched vertex
+            let edges = all_edges
+                .into_iter()
+                .filter(|e| matched_ids.contains(&e.outbound_id) || matched_ids.contains(&e.inbound_id))
+                .collect::<Vec<_>>();
+
+            // vertices that are actually used in those edges
+            let vertices = all_vertices
+                .into_iter()
+                .filter(|v| matched_ids.contains(&v.id))
+                .collect::<Vec<_>>();
+
+            Ok(json!({ "vertices": vertices, "edges": edges }))
         }
     }
 }
