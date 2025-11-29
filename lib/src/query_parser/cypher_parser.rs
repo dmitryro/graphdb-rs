@@ -731,6 +731,8 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
 
 // ------------------------------------------------------------------
 // MATCH path = (left)-[*..]-(right) RETURN …  (single statement only)
+/// Parse **only**   MATCH path = (left)-[*..]-(right) RETURN …
+/// Fail fast on anything else so the old parsers keep their queries.
 // ------------------------------------------------------------------
 pub fn parse_match_path(input: &str) -> IResult<&str, CypherQuery, nom::error::Error<&str>> {
     use nom::character::complete::{alpha1, alphanumeric1, digit1};
@@ -738,23 +740,16 @@ pub fn parse_match_path(input: &str) -> IResult<&str, CypherQuery, nom::error::E
     let match_kw  = tag_no_case("MATCH");
     let return_kw = tag_no_case("RETURN");
 
-    // identifier
     let identifier = recognize(pair(alpha1, many0(alphanumeric1)));
 
-    // relationship  -[*0..2]-  or  -[]-
     let rel_pattern = delimited(
         tag("-["),
-        opt(terminated(
-            tag("*"),
-            recognize(tuple((digit1, tag(".."), digit1))),
-        )),
+        opt(terminated(tag("*"), recognize(tuple((digit1, tag(".."), digit1))))),
         tag("]-"),
     );
 
-    // node pattern factory
     let node_pat = || delimited(tag("("), recognize(many0(none_of(")"))), tag(")"));
 
-    // full pattern:  pathVar = (n)-[*..]-(m)
     let pattern = tuple((
         identifier,
         delimited(multispace0, tag("="), multispace0),
@@ -763,7 +758,6 @@ pub fn parse_match_path(input: &str) -> IResult<&str, CypherQuery, nom::error::E
         node_pat(),
     ));
 
-    // MATCH … RETURN …  (stop at first newline or semicolon)
     let stmt = tuple((
         terminated(match_kw, multispace1),
         pattern,
@@ -782,17 +776,6 @@ pub fn parse_match_path(input: &str) -> IResult<&str, CypherQuery, nom::error::E
     .parse(input)
 }
 
-// ------------------------------------------------------------------
-// reusable identifier parser
-// ------------------------------------------------------------------
-pub fn identifier(input: &str) -> IResult<&str, &str, nom::error::Error<&str>> {
-    use nom::character::complete::{alpha1, alphanumeric1};
-    recognize(pair(alpha1, many0(alphanumeric1))).parse(input)
-}
-
-// ------------------------------------------------------------------
-// helper used above
-// ------------------------------------------------------------------
 fn none_of<'a>(chars: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, &'a str, nom::error::Error<&'a str>> {
     move |i: &'a str| match i.chars().next() {
         Some(c) if !chars.contains(c) => Ok((&i[c.len_utf8()..], &i[..c.len_utf8()])),
@@ -814,29 +797,35 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
         .replace('\n', " ")
         .replace('\r', " ");
 
-    // 2. drop every clause the parser cannot handle ---------------------------------
-    let query_to_parse = query_cleaned
+    // 2. *** preserve original truncation logic ***
+    let mut query_to_parse = query_cleaned
         .trim_end_matches(';')
         .trim();
 
-    // keep the part before the first *variable-length* or *bare* relationship
-    let query_to_parse: &str = if let Some(eq_pos) = query_to_parse.find('=') {
-        let (prefix, _) = query_to_parse.split_at(eq_pos);
-        prefix
-            .trim_end()
-            .split_once("-[")
-            .map(|(p, _)| p)
-            .unwrap_or(prefix)
+    // NEW: if the **kept** fragment starts with  path =  offer the **whole** line to the path parser
+    let try_path = if let Some(eq_pos) = query_to_parse.find('=') {
+        let (prefix, suffix) = query_to_parse.split_at(eq_pos);
+        if prefix.trim_end().ends_with("path") && suffix.starts_with("-[") {
+            // hand the **entire** original line to the path parser
+            query_cleaned.trim_end_matches(';').trim()
+        } else {
+            // original behaviour – truncate at first -[
+            query_to_parse
+                .split_once("-[")
+                .map(|(p, _)| p)
+                .unwrap_or(query_to_parse)
+        }
     } else {
         query_to_parse
             .split_once("-[")
             .map(|(p, _)| p)
             .unwrap_or(query_to_parse)
     };
+    query_to_parse = try_path;
 
     println!("===> Parsing query: {}", query_to_parse);
 
-    // 3. parse the sanitised fragment
+    // 3. parse the (possibly truncated) fragment
     let result = alt((
         full_statement_parser,
         parse_create_index,
@@ -852,6 +841,7 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
         parse_set_kv,
         parse_get_kv,
         parse_delete_kv,
+        parse_match_path, // *** LAST ***  only sees  path = …
     ))
     .parse(query_to_parse);
 
