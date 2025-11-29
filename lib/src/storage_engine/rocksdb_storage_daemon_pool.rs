@@ -1887,8 +1887,51 @@ async fn run_zmq_server_lazy(
                 }
                 Ok(json!({"status": "success", "vertices": vec}))
             }
+            "get_vertex" => {
+                let vertex_id_str = request.get("vertex_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing or invalid 'vertex_id' in request")?;
 
+                let vertex_id = Uuid::parse_str(vertex_id_str)
+                    .map_err(|_| format!("Invalid UUID format for vertex_id: {}", vertex_id_str))?;
+
+                let key = vertex_id.as_bytes();
+                let value_opt = db.get_cf(&Arc::clone(vertices), key)?;
+
+                match value_opt {
+                    Some(value) => {
+                        let vertex = deserialize_vertex(&value)
+                            .map_err(|e| format!("Failed to deserialize vertex: {}", e))?;
+                        Ok(json!({"status": "success", "vertex": vertex}))
+                    }
+                    None => {
+                        Ok(json!({"status": "not_found", "message": format!("Vertex {} not found", vertex_id_str)}))
+                    }
+                }
+            },
             // ---------- EDGES ----------
+            "get_edge" => {
+                let edge_id_str = request.get("edge_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing or invalid 'edge_id' in request")?;
+
+                let edge_id = Uuid::parse_str(edge_id_str)
+                    .map_err(|_| format!("Invalid UUID format for edge_id: {}", edge_id_str))?;
+
+                let key = edge_id.as_bytes();
+                let value_opt = db.get_cf(&Arc::clone(edges), key)?;
+
+                match value_opt {
+                    Some(value) => {
+                        let edge = deserialize_edge(&value)
+                            .map_err(|e| format!("Failed to deserialize edge: {}", e))?;
+                        Ok(json!({"status": "success", "edge": edge}))
+                    }
+                    None => {
+                        Ok(json!({"status": "not_found", "message": format!("Edge {} not found", edge_id_str)}))
+                    }
+                }
+            },
             "get_all_edges" => {
                 let iterator = db.iterator_cf(&Arc::clone(edges), rocksdb::IteratorMode::Start);
                 let mut vec = Vec::new();
