@@ -697,73 +697,70 @@ impl SledDaemon {
         indexing_service: Arc<TokioMutex<IndexingService>>, 
     ) -> GraphResult<()> {
      
-        // info!("Starting WAL replay for port {}", current_port);
         println!("===> STARTING WAL REPLAY FOR PORT {}", current_port);
-
         let wal_path = canonical_path.join("wal_shared").join("shared.wal");
-        // Assuming tokio_fs::try_exists is imported
+        
         if !tokio_fs::try_exists(&wal_path).await? {
-            // info!("No WAL file at {:?}, skipping", wal_path);
             println!("===> NO WAL FILE, SKIPPING REPLAY");
             return Ok(());
         }
-
+        
         let offset_key = format!("__wal_offset_port_{}", current_port);
         let last_offset: u64 = db.get(&offset_key.as_bytes())?
             .and_then(|v| String::from_utf8(v.to_vec()).ok())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        
         println!("========? BEFORE SledWalManager CASE 1");
         let wal_mgr = SledWalManager::new(canonical_path.clone(), current_port).await?;
         let current_lsn = wal_mgr.current_lsn().await?;
-
         println!("===> LAST OFFSET: {}, WAL LSN: {}", last_offset, current_lsn);
-
+        
         if last_offset >= current_lsn {
             println!("===> PORT {} IS UP TO DATE", current_port);
             return Ok(());
         }
-
+        
         let operations = wal_mgr.read_since(last_offset).await?;
         if operations.is_empty() {
             return Ok(());
         }
-
+        
         println!("===> REPLAYING {} OPS ({} → {})", operations.len(), last_offset, current_lsn);
-
         let mut latest_offset = last_offset;
         let mut applied = 0;
-
+        
         for (offset, op) in operations {
             let op_size = bincode::encode_to_vec(&op, bincode::config::standard())
-                                     .map(|v| v.len() as u64)
-                                     .unwrap_or(0);
-
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            
             // 1. Apply Sled operation locally
             if let Err(e) = SledDaemon::apply_op_locally(db, &op).await {
                 error!("SLED Replay failed at {}: {}", offset, e);
                 break;
             }
-
-            // 2. Update the full-text index
-            // Use the retrieved indexing_service
+            
+            // 2. Update the full-text index - BUT CATCH AND CONTINUE ON ERROR
+            // Indexing failures should NOT break WAL replay since Sled data is already consistent
             if let Err(e) = SledDaemon::handle_indexing_op(&indexing_service, &op).await {
-                error!("INDEXING Replay failed at {}: {}", offset, e);
-                // Log error but continue with the WAL replay to maintain Sled consistency.
+                // Log the error but CONTINUE - indexing is supplementary to core data storage
+                warn!("INDEXING Replay failed at {} (continuing): {}", offset, e);
+                // Don't break - continue processing the WAL
             }
-
+            
             applied += 1;
             latest_offset = offset + 4 + op_size;
         }
-
+        
         if latest_offset > last_offset {
             let _ = db.insert(&offset_key.as_bytes(), latest_offset.to_string().as_bytes());
             let _ = db.flush_async().await;
             println!("===> REPLAYED {} OPS ({} → {})", applied, last_offset, latest_offset);
         }
-
+        
         Ok(())
-    } 
+    }
 
     /// Start background task to replicate WAL to other ports
     pub fn start_wal_replication(
@@ -1917,7 +1914,50 @@ impl SledDaemon {
                 }
                 Ok(json!({"status": "success", "vertices": vec}))
             }
-            
+            "get_vertex" => {
+                let vertex_id_str = request.get("vertex_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing or invalid 'vertex_id' in request")?;
+
+                let vertex_id = Uuid::parse_str(vertex_id_str)
+                    .map_err(|_| format!("Invalid UUID format for vertex_id: {}", vertex_id_str))?;
+
+                let key = vertex_id.as_bytes();
+                let value_opt = vertices.get(key)?;
+
+                match value_opt {
+                    Some(value) => {
+                        let vertex = deserialize_vertex(&value)
+                            .map_err(|e| format!("Failed to deserialize vertex: {}", e))?;
+                        Ok(json!({"status": "success", "vertex": vertex}))
+                    }
+                    None => {
+                        Ok(json!({"status": "not_found", "message": format!("Vertex with ID {} not found", vertex_id_str)}))
+                    }
+                }
+            }
+            "get_edge" => {
+                let edge_id_str = request.get("edge_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing or invalid 'edge_id' in request")?;
+
+                let edge_id = Uuid::parse_str(edge_id_str)
+                    .map_err(|_| format!("Invalid UUID format for edge_id: {}", edge_id_str))?;
+
+                let key = edge_id.as_bytes();
+                let value_opt = edges.get(key)?;
+
+                match value_opt {
+                    Some(value) => {
+                        let edge = deserialize_edge(&value)
+                            .map_err(|e| format!("Failed to deserialize edge: {}", e))?;
+                        Ok(json!({"status": "success", "edge": edge}))
+                    }
+                    None => {
+                        Ok(json!({"status": "not_found", "message": format!("Edge with ID {} not found", edge_id_str)}))
+                    }
+                }
+            }           
             "get_all_vertices_by_type" => {
                 let vertex_type: Identifier = serde_json::from_value(request["vertex_type"].clone())
                     .map_err(|_| "Invalid or missing vertex_type")?;

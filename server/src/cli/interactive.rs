@@ -145,7 +145,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     let top_level_commands = vec![
         "start", "stop", "status", "auth", "authenticate", "register", "version", "health",
         "reload", "restart", "clear", "help", "exit", "daemon", "rest", "storage", "use",
-        "quit", "q", "clean", "save", "show", "kv", "query", "exec", "migrate",
+        "quit", "q", "clean", "save", "show", "kv", "query", "exec", "migrate", "visualize",
         // NEW: Add graph and index for tab-completion & fuzzy help
         "graph", "index",
         // === NEW CLINICAL COMMANDS ===
@@ -1411,8 +1411,58 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 CommandType::Unknown
             }
         },
-        // === query / exec with quote stripping ===
-        "query" | "exec" | "visualize" => {
+        // === NEW: visualize ===
+        "visualize" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: visualize <query> | visualize \"<query>\" | visualize --query <query> [--language <lang>]");
+                CommandType::Unknown
+            } else {
+                let mut query: Option<String> = None;
+                let mut language: Option<String> = None;
+                let mut i = 0;
+                // 1. Positional argument (may be quoted)
+                if i < remaining_args.len() && !remaining_args[i].starts_with('-') {
+                    query = Some(strip_surrounding_quotes(&remaining_args[i]));
+                    i = remaining_args.len();
+                }
+                // 2. Flag parsing
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--query" => {
+                            if i + 1 < remaining_args.len() {
+                                query = Some(strip_surrounding_quotes(&remaining_args[i + 1]));
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: '--query' requires a value.");
+                                i += 1;
+                            }
+                        }
+                        "--language" => {
+                            if i + 1 < remaining_args.len() {
+                                language = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: '--language' requires a value.");
+                                i += 1;
+                            }
+                        }
+                        _ => {
+                            eprintln!("Warning: Unknown argument for 'visualize': {}", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                if let Some(q) = query {
+                    CommandType::Visualize { query: q, language }
+                } else {
+                    eprintln!("Missing query for 'visualize' command.");
+                    CommandType::Unknown
+                }
+            }
+        },
+
+        // === query / exec ===
+        "query" | "exec" => {
             if remaining_args.is_empty() {
                 eprintln!(
                     "Usage: {} <query> | {} \"<query>\" | {} --query <query> [--language <lang>]",
@@ -6293,159 +6343,6 @@ pub async fn handle_interactive_command(
             Ok(engine)
         }
     }
-
-    // === Query execution (raw or via query/exec) ===
-    if let CommandType::Query { query, language } = command {
-        let query_engine = ensure_query_engine(state).await?;
-        let lang = language.as_deref().unwrap_or("").to_ascii_lowercase();
-        let trimmed = query.trim();
-
-        let detected_lang = if lang == "cypher"
-            || trimmed.to_ascii_lowercase().starts_with("match ")
-            || trimmed.to_ascii_lowercase().starts_with("create ")
-            || trimmed.to_ascii_lowercase().starts_with("merge ")
-        {
-            "cypher"
-        } else if lang == "sql"
-            || trimmed.to_ascii_uppercase().starts_with("SELECT ")
-            || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-            || trimmed.to_ascii_uppercase().starts_with("UPDATE ")
-            || trimmed.to_ascii_uppercase().starts_with("DELETE ")
-        {
-            "sql"
-        } else if lang == "graphql"
-            || trimmed.starts_with('{')
-            || trimmed.to_ascii_lowercase().starts_with("query ")
-            || trimmed.to_ascii_lowercase().starts_with("mutation ")
-        {
-            "graphql"
-        } else {
-            // Final fallback
-            if trimmed.to_ascii_lowercase().starts_with("match ")
-                || trimmed.to_ascii_lowercase().starts_with("create ")
-                || trimmed.to_ascii_lowercase().starts_with("merge ")
-            {
-                "cypher"
-            } else if trimmed.to_ascii_uppercase().starts_with("SELECT ")
-                || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-                || trimmed.to_ascii_uppercase().starts_with("UPDATE ")
-                || trimmed.to_ascii_uppercase().starts_with("DELETE ")
-            {
-                "sql"
-            } else if trimmed.starts_with('{')
-                || trimmed.to_ascii_lowercase().starts_with("query ")
-                || trimmed.to_ascii_lowercase().starts_with("mutation ")
-            {
-                "graphql"
-            } else {
-                eprintln!("Warning: Could not detect query language. Use --language cypher|sql|graphql");
-                return Ok(());
-            }
-        };
-
-        match detected_lang {
-            "cypher" => {
-                println!("[Cypher] {}", trimmed);
-                match query_engine.execute_cypher(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("Cypher Error: {}", e),
-                }
-            }
-            "sql" => {
-                println!("[SQL] {}", trimmed);
-                match query_engine.execute_sql(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("SQL Error: {}", e),
-                }
-            }
-            "graphql" => {
-                println!("[GraphQL]\n{}", trimmed);
-                match query_engine.execute_graphql(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("GraphQL Error: {}", e),
-                }
-            }
-            _ => unreachable!(),
-        }
-        return Ok(());
-    }
-
-    // === Query visualizing (raw or via query/exec) ===
-    if let CommandType::Visualize { query, language } = command {
-        let query_engine = ensure_query_engine(state).await?;
-        let lang = language.as_deref().unwrap_or("").to_ascii_lowercase();
-        let trimmed = query.trim();
-
-        let detected_lang = if lang == "cypher"
-            || trimmed.to_ascii_lowercase().starts_with("match ")
-            || trimmed.to_ascii_lowercase().starts_with("create ")
-            || trimmed.to_ascii_lowercase().starts_with("merge ")
-        {
-            "cypher"
-        } else if lang == "sql"
-            || trimmed.to_ascii_uppercase().starts_with("SELECT ")
-            || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-            || trimmed.to_ascii_uppercase().starts_with("UPDATE ")
-            || trimmed.to_ascii_uppercase().starts_with("DELETE ")
-        {
-            "sql"
-        } else if lang == "graphql"
-            || trimmed.starts_with('{')
-            || trimmed.to_ascii_lowercase().starts_with("query ")
-            || trimmed.to_ascii_lowercase().starts_with("mutation ")
-        {
-            "graphql"
-        } else {
-            // Final fallback
-            if trimmed.to_ascii_lowercase().starts_with("match ")
-                || trimmed.to_ascii_lowercase().starts_with("create ")
-                || trimmed.to_ascii_lowercase().starts_with("merge ")
-            {
-                "cypher"
-            } else if trimmed.to_ascii_uppercase().starts_with("SELECT ")
-                || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-                || trimmed.to_ascii_uppercase().starts_with("UPDATE ")
-                || trimmed.to_ascii_uppercase().starts_with("DELETE ")
-            {
-                "sql"
-            } else if trimmed.starts_with('{')
-                || trimmed.to_ascii_lowercase().starts_with("query ")
-                || trimmed.to_ascii_lowercase().starts_with("mutation ")
-            {
-                "graphql"
-            } else {
-                eprintln!("Warning: Could not detect query language. Use --language cypher|sql|graphql");
-                return Ok(());
-            }
-        };
-
-        match detected_lang {
-            "cypher" => {
-                println!("[Cypher] {}", trimmed);
-                match query_engine.execute_cypher(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("Cypher Error: {}", e),
-                }
-            }
-            "sql" => {
-                println!("[SQL] {}", trimmed);
-                match query_engine.execute_sql(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("SQL Error: {}", e),
-                }
-            }
-            "graphql" => {
-                println!("[GraphQL]\n{}", trimmed);
-                match query_engine.execute_graphql(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("GraphQL Error: {}", e),
-                }
-            }
-            _ => unreachable!(),
-        }
-        return Ok(());
-    }
-
     // === All other CLI commands (unchanged) ===
     match command {
         CommandType::Daemon(daemon_cmd) => {
@@ -6909,28 +6806,19 @@ pub async fn handle_interactive_command(
                     return Ok(());
                 }
             };
-            // === Execution ===
+            // === VISUALIZATION (NOT PRINTING) ===
             match detected_lang {
                 "cypher" => {
                     println!("[Cypher] {}", query);
-                    match query_engine.execute_cypher(&query).await {
-                        Ok(res) => println!("{}", res),
-                        Err(e) => eprintln!("Cypher Error: {}", e),
-                    }
+                    handlers::handle_cypher_query_visualizing(query_engine, query.to_string()).await?
                 }
                 "sql" => {
                     println!("[SQL] {}", query);
-                    match query_engine.execute_sql(&query).await {
-                        Ok(res) => println!("{}", res),
-                        Err(e) => eprintln!("SQL Error: {}", e),
-                    }
+                    handlers::handle_sql_query_visualizing(query_engine, query.to_string()).await?
                 }
                 "graphql" => {
                     println!("[GraphQL]\n{}", query);
-                    match query_engine.execute_graphql(&query).await {
-                        Ok(res) => println!("{}", res),
-                        Err(e) => eprintln!("GraphQL Error: {}", e),
-                    }
+                    handlers::handle_graphql_query_visualizing(query_engine, query.to_string()).await?
                 }
                 _ => unreachable!(),
             }

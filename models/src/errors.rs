@@ -59,6 +59,8 @@ pub enum GraphError {
     NotFound(Identifier),
     #[error("Validation error: {0}")]
     Validation(ValidationError),
+    #[error("Validation error: {0}")]
+    ValidationError(String),
     #[cfg(feature = "rocksdb-errors")]
     #[error("RocksDB error: {0}")]
     Rocksdb(String),
