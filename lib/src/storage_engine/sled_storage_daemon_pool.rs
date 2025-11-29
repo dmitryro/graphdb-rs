@@ -1914,7 +1914,50 @@ impl SledDaemon {
                 }
                 Ok(json!({"status": "success", "vertices": vec}))
             }
-            
+            "get_vertex" => {
+                let vertex_id_str = request.get("vertex_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing or invalid 'vertex_id' in request")?;
+
+                let vertex_id = Uuid::parse_str(vertex_id_str)
+                    .map_err(|_| format!("Invalid UUID format for vertex_id: {}", vertex_id_str))?;
+
+                let key = vertex_id.as_bytes();
+                let value_opt = vertices.get(key)?;
+
+                match value_opt {
+                    Some(value) => {
+                        let vertex = deserialize_vertex(&value)
+                            .map_err(|e| format!("Failed to deserialize vertex: {}", e))?;
+                        Ok(json!({"status": "success", "vertex": vertex}))
+                    }
+                    None => {
+                        Ok(json!({"status": "not_found", "message": format!("Vertex with ID {} not found", vertex_id_str)}))
+                    }
+                }
+            }
+            "get_edge" => {
+                let edge_id_str = request.get("edge_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing or invalid 'edge_id' in request")?;
+
+                let edge_id = Uuid::parse_str(edge_id_str)
+                    .map_err(|_| format!("Invalid UUID format for edge_id: {}", edge_id_str))?;
+
+                let key = edge_id.as_bytes();
+                let value_opt = edges.get(key)?;
+
+                match value_opt {
+                    Some(value) => {
+                        let edge = deserialize_edge(&value)
+                            .map_err(|e| format!("Failed to deserialize edge: {}", e))?;
+                        Ok(json!({"status": "success", "edge": edge}))
+                    }
+                    None => {
+                        Ok(json!({"status": "not_found", "message": format!("Edge with ID {} not found", edge_id_str)}))
+                    }
+                }
+            }           
             "get_all_vertices_by_type" => {
                 let vertex_type: Identifier = serde_json::from_value(request["vertex_type"].clone())
                     .map_err(|_| "Invalid or missing vertex_type")?;
