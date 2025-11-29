@@ -722,7 +722,6 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
 }
 
 // CORRECTED parse_cypher for Nom 8 with Parser trait
-// CORRECTED parse_cypher for Nom 8 with Parser trait
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     if !is_cypher(query) {
         return Err("Not a valid Cypher query.".to_string());
@@ -739,14 +738,22 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     // 2. drop every clause the parser cannot handle ---------------------------------
     let query_to_parse = query_cleaned
         .trim_end_matches(';')
-        .trim()
-        .split_once("-[")                       // any relationship syntax  -[r]-  -[*0..2]-
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(&query_cleaned)
-        .split_once(" OPTIONAL MATCH")         // second OPTIONAL MATCH
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(&query_cleaned)
         .trim();
+
+    // keep the part before the first *variable-length* or *bare* relationship
+    let query_to_parse: &str = if let Some(eq_pos) = query_to_parse.find('=') {
+        let (prefix, _) = query_to_parse.split_at(eq_pos);
+        prefix
+            .trim_end()
+            .split_once("-[")
+            .map(|(p, _)| p)
+            .unwrap_or(prefix)
+    } else {
+        query_to_parse
+            .split_once("-[")
+            .map(|(p, _)| p)
+            .unwrap_or(query_to_parse)
+    };
 
     println!("===> Parsing query: {}", query_to_parse);
 
