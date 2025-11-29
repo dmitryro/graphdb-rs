@@ -675,19 +675,27 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         parse_pattern,
     ).parse(input)?;
 
-    // Consume any trailing whitespace after patterns
     let (input, _) = multispace0.parse(input)?;
 
-    // Additional OPTIONAL MATCH clauses
-    let (input, extra) = many0(preceded(
-        tuple((multispace0, tag("OPTIONAL MATCH"), multispace1)),
-        parse_pattern,
-    )).parse(input)?;
+    // *** FIX: Additional OPTIONAL MATCH clauses should parse complete patterns ***
+    let (input, extra_patterns) = many0(
+        tuple((
+            multispace0,
+            tag("OPTIONAL MATCH"),
+            multispace1,
+            separated_list1(
+                tuple((multispace0, char(','), multispace0)),
+                parse_pattern,
+            ),
+        ))
+    ).parse(input)?;
     
+    // Flatten extra patterns into all_patterns
     let mut all_patterns = patterns;
-    all_patterns.extend(extra);
+    for (_, _, _, extra_pats) in extra_patterns {
+        all_patterns.extend(extra_pats);
+    }
     
-    // Consume whitespace again
     let (input, _) = multispace0.parse(input)?;
 
     // Skip WHERE (if present)
@@ -696,7 +704,6 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         take_while1(|c| c != 'R' && c != 'C'),
     )).parse(input)?;
     
-    // Consume whitespace
     let (input, _) = multispace0.parse(input)?;
 
     // Optional CREATE clause
@@ -708,7 +715,6 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         ),
     )).parse(input)?;
     
-    // Consume whitespace
     let (input, _) = multispace0.parse(input)?;
 
     // Optional RETURN — consume everything after it
@@ -826,6 +832,7 @@ fn none_of<'a>(chars: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, &
 
 // CORRECTED parse_cypher for Nom 8 with Parser trait
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
+    println!("=====> PARSING CYPHER");
     if !is_cypher(query) {
         return Err("Not a valid Cypher query.".to_string());
     }
@@ -842,7 +849,7 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
 
     println!("===> Parsing query: {}", query_to_parse);
 
-    // 2. Try parse_match_path FIRST if it contains path variable pattern
+    // 2. Try parse_match_path FIRST for explicit path patterns
     if query_to_parse.contains("path") && query_to_parse.contains("=") && query_to_parse.contains("-[") {
         println!("===> Attempting parse_match_path");
         if let Ok((remaining, parsed)) = parse_match_path.parse(query_to_parse) {
@@ -854,7 +861,13 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
         }
     }
 
-    // 3. Try regular parsers (NO TRUNCATION)
+    // 3. *** CRITICAL: NO TRUNCATION AT ALL ***
+    // The old code was truncating at "-[" which broke ALL relationship queries
+    // We must pass the FULL query to the parsers and let them handle it
+    
+    println!("===> Using full query (no truncation): {}", query_to_parse);
+
+    // 4. Run the parser chain on the FULL query
     let result = alt((
         full_statement_parser,
         parse_create_index,
@@ -1682,20 +1695,17 @@ pub async fn execute_cypher(
             return_clause: _,
         } => {
             println!("===> Executing MatchPath: left={}, right={}", left_node, right_node);
-            
-            // Parse node patterns
-            let left_pat = parse_node_pattern(&left_node)?;
+
+            let left_pat  = parse_node_pattern(&left_node)?;
             let right_pat = parse_node_pattern(&right_node)?;
 
             let all_vertices = storage.get_all_vertices().await?;
-            let all_edges = storage.get_all_edges().await?;
+            let all_edges    = storage.get_all_edges().await?;
 
-            println!("===> Total vertices: {}, edges: {}", all_vertices.len(), all_edges.len());
+            let mut left_ids  = std::collections::HashSet::new();
+            let mut right_ids = std::collections::HashSet::new();
 
-            let mut left_matches = std::collections::HashSet::new();
-            let mut right_matches = std::collections::HashSet::new();
-
-            // Helper to match vertices against pattern
+            // helper to test a vertex against a pattern
             let matches = |v: &Vertex, (label, props): &(Option<String>, HashMap<String, Value>)| {
                 let label_ok = label.as_ref().map_or(true, |l| {
                     let vl = v.label.as_ref();
@@ -1703,103 +1713,57 @@ pub async fn execute_cypher(
                 });
                 let props_ok = props.iter().all(|(k, expected)| {
                     v.properties.get(k).map_or(false, |actual| {
-                        if let Ok(pv) = to_property_value(expected.clone()) {
-                            actual == &pv
-                        } else {
-                            false
-                        }
+                        to_property_value(expected.clone()).ok().map_or(false, |pv| actual == &pv)
                     })
                 });
                 label_ok && props_ok
             };
 
-            // Find ALL matching left and right nodes
+            // collect ALL vertices that match either side
             for v in &all_vertices {
-                if matches(v, &left_pat) {
-                    left_matches.insert(v.id);
-                    println!("===> Left match: {} ({})", v.id.0, v.label.as_ref());
-                }
-                if matches(v, &right_pat) {
-                    right_matches.insert(v.id);
-                    println!("===> Right match: {} ({})", v.id.0, v.label.as_ref());
-                }
+                if matches(v, &left_pat)  { left_ids.insert(v.id);  }
+                if matches(v, &right_pat) { right_ids.insert(v.id); }
             }
 
-            println!("===> Found {} left matches, {} right matches", left_matches.len(), right_matches.len());
+            // edges that touch **any** matched vertex (0-2 hops)
+            let mut matched_edge_ids = std::collections::HashSet::new();
+            let mut matched_vertex_ids = left_ids.union(&right_ids).copied().collect::<std::collections::HashSet<_>>();
 
-            // *** CRITICAL FIX: Actually collect vertices and edges ***
-            let mut matched_edges = std::collections::HashSet::new();
-            let mut matched_vertices = std::collections::HashSet::new();
+            // BFS up to 2 hops
+            let mut queue: Vec<(SerializableUuid, u32)> = matched_vertex_ids.iter().map(|&id| (id, 0)).collect();
+            let mut visited_edges = std::collections::HashSet::new();
 
-            // BFS to find ALL paths within 0-2 hops from left matches
-            for start_id in &left_matches {
-                matched_vertices.insert(*start_id); // Include starting node (0-hop)
-                
-                let mut visited_edges = std::collections::HashSet::new();
-                let mut queue = vec![(*start_id, 0)]; // (vertex_id, hop_count)
-                let mut queue_idx = 0;
-                
-                while queue_idx < queue.len() {
-                    let (current_id, hops) = queue[queue_idx];
-                    queue_idx += 1;
-                    
-                    if hops >= 2 {
-                        continue;
-                    }
-                    
-                    // Find all edges connected to current vertex
-                    for edge in &all_edges {
-                        let next_id = if edge.outbound_id == current_id {
-                            Some(edge.inbound_id)
-                        } else if edge.inbound_id == current_id {
-                            Some(edge.outbound_id)
-                        } else {
-                            None
-                        };
-                        
-                        if let Some(next) = next_id {
-                            if !visited_edges.contains(&edge.id) {
-                                visited_edges.insert(edge.id);
-                                matched_edges.insert(edge.id);
-                                matched_vertices.insert(current_id);
-                                matched_vertices.insert(next);
-                                
-                                println!("===> Found edge at hop {}: {} -> {} ({})", 
-                                         hops + 1, current_id.0, next.0, edge.label);
-                                
-                                // Continue BFS if not at max hops
-                                if hops < 1 {
-                                    queue.push((next, hops + 1));
-                                }
-                            }
-                        }
+            while let Some((current_id, hop)) = queue.pop() {
+                if hop >= 2 { continue; }
+                for edge in &all_edges {
+                    if visited_edges.contains(&edge.id) { continue; }
+                    let (from, to) = (edge.outbound_id, edge.inbound_id);
+                    let next_id = if from == current_id {
+                        Some(to)
+                    } else if to == current_id {
+                        Some(from)
+                    } else {
+                        None
+                    };
+                    if let Some(next) = next_id {
+                        visited_edges.insert(edge.id);
+                        matched_edge_ids.insert(edge.id);
+                        matched_vertex_ids.insert(next);
+                        if hop < 1 { queue.push((next, hop + 1)); }
                     }
                 }
             }
 
-            println!("===> Matched {} edges, {} vertices total", matched_edges.len(), matched_vertices.len());
-
-            // *** CRITICAL FIX: Actually return the vertex and edge objects ***
-            let edges: Vec<Edge> = all_edges.into_iter()
-                .filter(|e| matched_edges.contains(&e.id))
-                .collect();
-
+            // materialise the collections
             let vertices: Vec<Vertex> = all_vertices.into_iter()
-                .filter(|v| matched_vertices.contains(&v.id))
+                .filter(|v| matched_vertex_ids.contains(&v.id))
+                .collect();
+            let edges: Vec<Edge> = all_edges.into_iter()
+                .filter(|e| matched_edge_ids.contains(&e.id))
                 .collect();
 
             println!("===> Returning {} vertices, {} edges", vertices.len(), edges.len());
-
-            Ok(json!({ 
-                "vertices": vertices, 
-                "edges": edges,
-                "stats": {
-                    "left_matches": left_matches.len(),
-                    "right_matches": right_matches.len(),
-                    "paths_found": edges.len(),
-                    "vertices_matched": vertices.len()
-                }
-            }))
+            Ok(json!({ "vertices": vertices, "edges": edges }))
         }
     }
 }
