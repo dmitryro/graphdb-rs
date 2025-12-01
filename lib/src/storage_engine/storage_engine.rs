@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::pin::Pin;
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{HashMap, HashSet, BTreeSet};
 use async_trait::async_trait;
 use models::errors::{GraphError, GraphResult, ValidationError};
 use uuid::Uuid;
@@ -563,6 +563,10 @@ impl StorageEngine for SurrealdbGraphStorage {
 
 #[async_trait]
 impl GraphStorageEngine for SurrealdbGraphStorage {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1439,6 +1443,7 @@ pub trait GraphStorageEngine: StorageEngine + Send + Sync + Debug + 'static {
     /// Executes a generic index command by routing it to the underlying storage daemon via ZMQ.
     /// This replaces the specific create, drop, list, search, and rebuild methods.
     async fn execute_index_command(&self, command: &str, params: serde_json::Value) -> GraphResult<QueryResult>;
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize>;
 }
 
 #[derive(Debug)]

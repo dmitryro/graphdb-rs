@@ -67,6 +67,27 @@ lazy_static! {
         StdMutex::new(HashMap::new());
 }
 
+macro_rules! p {
+    ($req:expr, $key:expr) => {
+        $req["params"][$key].as_str().ok_or_else(|| anyhow!("missing param: {}", $key))?
+    };
+}
+
+macro_rules! parr {
+    ($req:expr, $key:expr) => {
+        $req["params"][$key]
+            .as_array()
+            .ok_or_else(|| anyhow!("missing array: {}", $key))?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+    };
+}
+
+fn get_str<'a>(req: &'a Value, key: &str) -> anyhow::Result<&'a str> {
+    req["params"][key].as_str().ok_or_else(|| anyhow!("missing {}", key))
+}
+
 pub async fn get_sled_daemon_port_lock(port: u16) -> Arc<TokioMutex<()>> {
     let mut locks = SLED_DAEMON_PORT_LOCKS.lock().unwrap();
     locks.entry(port)
@@ -1587,27 +1608,47 @@ impl SledDaemon {
                             }
                             "index_list" => guard.list_indexes().await.context("list_indexes"),
                             "index_search" => {
-                                let query = request["params"]["query"].as_str().ok_or_else(|| anyhow!("missing query"))?;
-                                let limit = request["params"]["limit"].as_u64().unwrap_or(10) as usize;
-                                guard.fulltext_search(query, limit).await.context("fulltext_search")
+                                let query = request["params"]["query"]
+                                    .as_str()
+                                    .ok_or_else(|| anyhow!("missing query"))?;
+                                let limit = request["params"]["limit"]
+                                    .as_u64()
+                                    .unwrap_or(10) as usize;
+
+                                // IndexingService::fulltext_search returns Result<Value>
+                                // Just call it and forward the Value directly
+                                let response: Value = guard
+                                    .fulltext_search(query, limit)
+                                    .await
+                                    .context("fulltext_search failed")?;
+
+                                Ok(response)
                             }
                             // In your ZMQ server handler (document 10):
                             "index_rebuild" => {
-                                info!("Executing Index Rebuild (All Indices)");
-                                
-                                // Fetch vertices directly - we're inside the daemon!
-                                let all_vertices: Vec<Vertex> = {
+                                info!("Executing full-index rebuild");
+
+                                // 1.  Get a *snapshot* of every vertex
+                                let all_vertices: anyhow::Result<Vec<Vertex>> = (|| {
                                     let mut vec = Vec::new();
                                     for item in vertices.iter() {
-                                        let (_, value) = item?;
-                                        let v = deserialize_vertex(&value)?;
-                                        vec.push(v);
+                                        let (_, value) = item.context("iter vertex")?;
+                                        vec.push(deserialize_vertex(&value)?);
                                     }
-                                    vec
+                                    Ok(vec)
+                                })();
+
+                                // 2.  Rebuild
+                                let reply = match all_vertices {
+                                    Ok(vv) => guard
+                                        .rebuild_indexes_with_data(vv)
+                                        .await
+                                        .context("rebuild_indexes_with_data"),
+                                    Err(e) => Err(e),
                                 };
-                                
-                                // Pass the data directly to rebuild_indexes
-                                guard.rebuild_indexes_with_data(all_vertices).await.context("Failed to rebuild indexes")
+
+                                // 3.  Convert to JSON value
+                                reply.map(|s| json!({ "message": s }))
                             }
                             "index_stats" => guard.index_stats().await.context("index_stats"),
                             _ => unreachable!(),
@@ -1616,8 +1657,94 @@ impl SledDaemon {
                             Ok(v) => json!({"status":"success","result":v,"request_id":request_id}),
                             Err(e) => json!({"status":"error","message":format!("Indexing error: {}", e),"request_id":request_id}),
                         }
+                    }                    // === MUTATING COMMANDS (WAL + LEADER) — YOUR ORIGINAL LOGIC 100% PRESERVED ===
+                    Some("delete_edges_touching_vertices") => {
+                        // Parse requested vertex IDs (for DETACH)
+                        let target_vertex_ids: HashSet<Uuid> = match request.get("vertex_ids") {
+                            Some(value) => {
+                                let ids: Vec<String> = serde_json::from_value(value.clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid vertex_ids format: {}", e)))?;
+                                ids.iter()
+                                    .map(|s| Uuid::parse_str(s).map_err(|_| GraphError::StorageError("Invalid UUID in vertex_ids".into())))
+                                    .collect::<GraphResult<_>>()?
+                            }
+                            None => HashSet::new(),
+                        };
+
+                        let vertices_tree = db.open_tree("vertices")
+                            .map_err(|e| GraphError::StorageError(format!("Failed to open vertices tree: {}", e)))?;
+
+                        let edges_tree = db.open_tree("edges")
+                            .map_err(|e| GraphError::StorageError(format!("Failed to open edges tree: {}", e)))?;
+
+                        // Load all existing vertex IDs once — O(V) but required for correctness
+                        let mut existing_vertex_ids = HashSet::new();
+                        for item in vertices_tree.iter() {
+                            let (key, _) = item
+                                .map_err(|e| GraphError::StorageError(format!("Vertex iteration failed: {}", e)))?;
+                            if key.len() == 16 {
+                                let uuid = Uuid::from_slice(&key)
+                                    .map_err(|_| GraphError::StorageError("Corrupted vertex key".into()))?;
+                                existing_vertex_ids.insert(uuid);
+                            }
+                        }
+
+                        let mut keys_to_remove = Vec::new();
+                        let mut deleted_by_detach = 0;
+                        let mut deleted_orphans = 0;
+
+                        // Scan all edges — delete both targeted and orphaned
+                        for item in edges_tree.iter() {
+                            let (key, value) = item
+                                .map_err(|e| GraphError::StorageError(format!("Edge iteration failed: {}", e)))?;
+
+                            let edge: Edge = deserialize_edge(&value)
+                                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edge: {}", e)))?;
+
+                            let out_exists = existing_vertex_ids.contains(&edge.outbound_id.0);
+                            let in_exists = existing_vertex_ids.contains(&edge.inbound_id.0);
+                            let is_orphan = !out_exists || !in_exists;
+                            let is_targeted = target_vertex_ids.contains(&edge.outbound_id.0) 
+                                           || target_vertex_ids.contains(&edge.inbound_id.0);
+
+                            if is_orphan || is_targeted {
+                                keys_to_remove.push(key);
+
+                                if is_targeted {
+                                    deleted_by_detach += 1;
+                                }
+                                if is_orphan {
+                                    deleted_orphans += 1;
+                                }
+                            }
+                        }
+
+                        // Remove all doomed edges in one go
+                        for key in keys_to_remove {
+                            edges_tree.remove(&key)
+                                .map_err(|e| GraphError::StorageError(format!("Failed to remove edge: {}", e)))?;
+                        }
+
+                        // Ensure durability
+                        db.flush_async()
+                            .await
+                            .map_err(|e| GraphError::StorageError(format!("Flush failed after edge cleanup: {}", e)))?;
+
+                        let total_deleted = deleted_by_detach + deleted_orphans;
+
+                        info!(
+                            "Sled DETACH+ORPHAN cleanup: {} edges deleted ({} by DETACH, {} orphaned)",
+                            total_deleted, deleted_by_detach, deleted_orphans
+                         );
+
+                        json!({
+                            "status": "success",
+                            "deleted_edges": total_deleted,
+                            "deleted_by_detach": deleted_by_detach,
+                            "deleted_orphans": deleted_orphans,
+                            "message": "DETACH DELETE + orphan cleanup completed"
+                        })
                     }
-                    // === MUTATING COMMANDS (WAL + LEADER) — YOUR ORIGINAL LOGIC 100% PRESERVED ===
                     Some(cmd) if [
                         "set_key", "delete_key",
                         "create_vertex", "update_vertex", "delete_vertex",

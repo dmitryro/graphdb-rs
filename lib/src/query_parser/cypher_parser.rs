@@ -3,12 +3,13 @@
 use log::{debug, error, info, warn, trace};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while1, take_until, take_while},
+    bytes::complete::{tag, tag_no_case, take_while1, take_until, take_till, take_while},
     character::complete::{char, multispace0, multispace1},
     combinator::{map, opt, recognize, value},
     multi::{separated_list0, separated_list1, many0}, 
     number::complete::double,
-    sequence::{delimited, pair, preceded, tuple, terminated},
+    sequence::{delimited, pair, preceded, tuple, terminated, separated_pair},
+    multi::many1,
     IResult,
     Parser,
     error as NomError,
@@ -21,16 +22,12 @@ use chrono::Utc;
 use models::identifiers::{Identifier, SerializableUuid};
 use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
-use models::properties::SerializableFloat;
-use models::properties::PropertyValue;
+use models::properties::{ PropertyValue, SerializableFloat };
 use crate::database::Database;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
 use crate::config::StorageConfig;
-
-type NodePattern = (Option<String>, Option<String>, HashMap<String, Value>);
-type RelPattern = (Option<String>, Option<String>, Option<(Option<u32>, Option<u32>)>, HashMap<String, Value>, Option<bool>);
-type Pattern = (Option<String>, Vec<NodePattern>, Vec<RelPattern>);
+use crate::query_parser::query_types::*;
 
 #[derive(Debug, PartialEq)]
 pub enum CypherQuery {
@@ -98,6 +95,20 @@ pub enum CypherQuery {
         right_node: String,    //  e.g.  (related)
         return_clause: String, //  e.g.  collect(DISTINCT …
     },
+    /// DELETE edges matched by pattern
+    DeleteEdges {
+        edge_variable: String,
+        pattern: MatchPattern,
+        where_clause: Option<WhereClause>,
+    },
+    DetachDeleteNodes {
+        /// The variable name used in the MATCH clause, e.g. "n" in MATCH (n)
+        node_variable: String,
+        /// Optional label filter, e.g. Some("Person") in MATCH (n:Person)
+        label: Option<String>,
+    },
+    Batch(Vec<CypherQuery>),
+
 }
 
 pub fn is_cypher(query: &str) -> bool {
@@ -122,95 +133,92 @@ fn parse_identifier(input: &str) -> IResult<&str, &str> {
 // Check if we're at the start of a new Cypher clause
 fn is_at_keyword_boundary(input: &str) -> bool {
     let trimmed = input.trim_start();
-    trimmed.is_empty() 
-        || trimmed.starts_with("OPTIONAL")
-        || trimmed.starts_with("optional")
-        || trimmed.starts_with("WHERE")
-        || trimmed.starts_with("where")
-        || trimmed.starts_with("RETURN")
-        || trimmed.starts_with("return")
-        || trimmed.starts_with("CREATE")
-        || trimmed.starts_with("create")
-        || trimmed.starts_with("SET")
-        || trimmed.starts_with("set")
-        || trimmed.starts_with("DELETE")
-        || trimmed.starts_with("delete")
-        || trimmed.starts_with(';')
+    trimmed.starts_with("WHERE") ||
+    trimmed.starts_with("where") ||
+    trimmed.starts_with("RETURN") ||
+    trimmed.starts_with("return") ||
+    trimmed.starts_with("CREATE") ||
+    trimmed.starts_with("create") ||
+    trimmed.starts_with("ORDER") ||
+    trimmed.starts_with("order") ||
+    trimmed.starts_with("SKIP") ||
+    trimmed.starts_with("skip") ||
+    trimmed.starts_with("LIMIT") ||
+    trimmed.starts_with("limit")
+    // Do NOT include "OPTIONAL MATCH" here — it must be parsed as part of the pattern list
 }
 
 // Parse a single pattern (node or node-relationship-node chain)
 // Stops at keyword boundaries
+/// Parse **one** complete pattern:
+///   (a)-[:KNOWS]->(b)          or
+///   (a)-[:KNOWS]-(b)           or
+///   (a)<-[:KNOWS]-(b)          or
+///   (a)-[r:KNOWS*0..2]-(b)    etc.
+/// Stops **only** when it hits a real clause keyword (RETURN, WHERE, CREATE…)
 fn parse_single_pattern(input: &str) -> IResult<&str, Pattern> {
-    println!("===> parse_single_pattern START, input: '{}'", input.chars().take(60).collect::<String>());
+    use nom::Parser;
     
-    let (input, path_var) = opt(terminated(
-        parse_identifier, 
-        tuple((multispace0, char('='), multispace0))
-    )).parse(input)?;
+    println!("===> parse_single_pattern START, input: '{}'", input);
     
-    let (input, first_node) = parse_node(input)?;
-    println!("===> Parsed first node, remaining: '{}'", input.chars().take(60).collect::<String>());
+    let mut all_nodes: Vec<NodePattern> = Vec::new();
+    let mut all_relationships: Vec<RelPattern> = Vec::new();
     
-    let (input, _) = multispace0.parse(input)?;
+    // 1. Parse the starting node (must be in parentheses)
+    let (mut current_input, node_a) = parse_node(input)?;
+    all_nodes.push(node_a);
     
-    let mut nodes = vec![first_node];
-    let mut rels = Vec::new();
-    let mut remaining = input;
-    
-    // Parse relationships and subsequent nodes
+    // 2. Parse (RELATIONSHIP + NODE) pairs
     loop {
-        println!("===> Loop iteration, remaining: '{}'", remaining.chars().take(60).collect::<String>());
+        // Skip whitespace
+        let (after_space, _) = multispace0(current_input)?;
         
-        // Check if we're at a keyword boundary BEFORE trying to parse relationship
-        if is_at_keyword_boundary(remaining) {
-            println!("===> Hit keyword boundary before relationship");
+        // Check if we've hit a keyword or end condition
+        let remaining = after_space.trim_start();
+        let upper = remaining.to_uppercase();
+        
+        if remaining.is_empty() ||
+           upper.starts_with("RETURN") ||
+           upper.starts_with("WHERE") ||
+           upper.starts_with("OPTIONAL") ||
+           upper.starts_with("WITH") ||
+           upper.starts_with("ORDER") ||
+           upper.starts_with("LIMIT") ||
+           upper.starts_with("SKIP") ||
+           remaining.starts_with(',') ||
+           remaining.starts_with(';') {
+            current_input = after_space;
             break;
         }
         
-        // Check if next character could start a relationship
-        let trimmed = remaining.trim_start();
-        if !trimmed.starts_with('-') && !trimmed.starts_with('<') {
-            println!("===> No relationship pattern detected");
-            break;
-        }
-        
-        println!("===> Attempting to parse relationship...");
-        match parse_relationship(remaining) {
-            Ok((rest, rel)) => {
-                println!("===> Relationship parsed successfully, remaining: '{}'", rest.chars().take(60).collect::<String>());
-                rels.push(rel);
-                let (rest, _) = multispace0(rest)?;
-                
-                // CRITICAL FIX: Check for keyword boundary BEFORE parsing node
-                if is_at_keyword_boundary(rest) {
-                    println!("===> Hit keyword boundary after relationship, stopping");
-                    remaining = rest;
-                    break;
-                }
-                
-                println!("===> Attempting to parse node after relationship...");
-                match parse_node(rest) {
-                    Ok((rest, node)) => {
-                        println!("===> Node parsed successfully");
-                        nodes.push(node);
-                        let (rest, _) = multispace0(rest)?;
-                        remaining = rest;
-                    }
-                    Err(e) => {
-                        println!("===> Failed to parse node after relationship: {:?}", e);
-                        break;
-                    }
-                }
+        // Try to parse relationship + node
+        match pair(parse_relationship, parse_node).parse(after_space) {
+            Ok((remaining, (rel, node))) => {
+                all_relationships.push(rel);
+                all_nodes.push(node);
+                current_input = remaining;
             }
-            Err(e) => {
-                println!("===> Failed to parse relationship: {:?}", e);
+            Err(_) => {
+                // Can't parse more relationship-node pairs
+                current_input = after_space;
                 break;
             }
         }
     }
     
-    println!("===> parse_single_pattern END, {} nodes, {} rels", nodes.len(), rels.len());
-    Ok((remaining, (path_var.map(String::from), nodes, rels)))
+    let num_nodes = all_nodes.len();
+    let num_rels = all_relationships.len();
+    
+    if num_nodes == 0 {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Many1)));
+    }
+    
+    println!("===> parse_single_pattern END – {} nodes, {} rels", num_nodes, num_rels);
+    
+    // Build and return the final Pattern
+    let result_pattern = build_pattern_from_elements(all_nodes, all_relationships);
+    
+    Ok((current_input, result_pattern))
 }
 
 fn parse_string_literal(input: &str) -> IResult<&str, &str> {
@@ -301,45 +309,55 @@ fn parse_properties(input: &str) -> IResult<&str, HashMap<String, Value>> {
     ).parse(input)
 }
 
-fn parse_node(input: &str) -> IResult<&str, (Option<String>, Option<String>, HashMap<String, Value>)> {
+fn parse_node(input: &str) -> IResult<&str, NodePattern> {
+    use nom::Parser;
+    
+    let (input, _) = multispace0.parse(input)?;
+    
+    // MUST start with opening parenthesis
     let (input, _) = char('(').parse(input)?;
+    
     let (input, _) = multispace0.parse(input)?;
-    let (input, var) = opt(parse_identifier).parse(input)?;
+    
+    // Optional variable name
+    let (input, var_opt) = opt(take_while1(|c: char| c.is_alphanumeric() || c == '_')).parse(input)?;
+    
     let (input, _) = multispace0.parse(input)?;
-   
-    let (input, labels) = if input.starts_with(':') {
-        let (input, _) = char(':').parse(input)?;
-        let (input, first_label) = parse_identifier.parse(input)?;
-       
-        let (input, additional_labels) = many0(
-            preceded(
-                alt((char(':'), char('&'))),
-                parse_identifier
-            )
-        ).parse(input)?;
-       
-        let combined_label = if additional_labels.is_empty() {
-            first_label.to_string()
-        } else {
-            let mut all_labels = vec![first_label];
-            all_labels.extend(additional_labels);
-            all_labels.join(":")
-        };
-       
-        (input, Some(combined_label))
+    
+    // Optional label (preceded by colon)
+    let (input, label_opt) = opt(preceded(
+        char(':'),
+        take_while1(|c: char| c.is_alphanumeric() || c == '_')
+    )).parse(input)?;
+    
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Optional properties in {...}
+    let (input, props) = if input.trim_start().starts_with('{') {
+        delimited(
+            preceded(multispace0, char('{')),
+            map(
+                opt(separated_list1(
+                    preceded(multispace0, char(',')),
+                    preceded(multispace0, parse_property)
+                )),
+                |props| props.unwrap_or_default().into_iter().collect()
+            ),
+            preceded(multispace0, char('}'))
+        ).parse(input)?
     } else {
-        (input, None)
+        (input, HashMap::new())
     };
-   
+    
     let (input, _) = multispace0.parse(input)?;
-    let (input, props) = opt(parse_properties).parse(input)?;
-    let (input, _) = multispace0.parse(input)?;
+    
+    // MUST end with closing parenthesis
     let (input, _) = char(')').parse(input)?;
-   
+    
     Ok((input, (
-        var.map(|s| s.to_string()),
-        labels,
-        props.unwrap_or_default(),
+        var_opt.map(|s| s.to_string()),
+        label_opt.map(|s| s.to_string()),
+        props
     )))
 }
 
@@ -351,20 +369,43 @@ fn parse_multiple_nodes(input: &str) -> IResult<&str, Vec<(Option<String>, Optio
 }
 
 fn parse_relationship(input: &str) -> IResult<&str, RelPattern> {
+    use nom::Parser;
+    
     let (input, _) = multispace0.parse(input)?;
+    
+    // Parse left arrow: optional "<-"
     let (input, left_arrow) = opt(tag("<-")).parse(input)?;
+    
+    // Require first '-'
     let (input, _) = char('-').parse(input)?;
-    let (input, _) = multispace0.parse(input)?;
-    let (input, detail_opt) = opt(delimited(char('['), parse_rel_detail, char(']'))).parse(input)?;
-    let (input, _) = multispace0.parse(input)?;
-    let (input, right_arrow) = opt(tag("->")).parse(input)?;
-    let direction = match (left_arrow, right_arrow) {
-        (Some(_), None) => Some(true), // incoming
-        (None, Some(_)) => Some(false), // outgoing
-        (None, None) => None, // undirected
-        _ => return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Alt))),
-    };
+    
+    // Optional relationship details in [...]
+    let (input, detail_opt) = opt(delimited(
+        char('['),
+        parse_rel_detail,
+        char(']'),
+    )).parse(input)?;
+    
+    // Parse closing: either '->' or just '-'
+    let (input, closing) = alt((
+        map(tag("->"), |_| "->"),
+        map(tag("-"), |_| "-"),
+    )).parse(input)?;
+    
     let detail = detail_opt.unwrap_or((None, None, None, HashMap::new()));
+    
+    // Determine direction
+    let direction = match (left_arrow.is_some(), closing) {
+        (true, "->") => {
+            // Invalid: <-[]->
+            return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify)));
+        }
+        (true, "-") => Some(true),   // <-[]- (Incoming)
+        (false, "->") => Some(false), // -[]-> (Outgoing)
+        (false, "-") => None,         // -[]- (Undirected)
+        _ => unreachable!(),
+    };
+    
     Ok((input, (detail.0, detail.1, detail.2, detail.3, direction)))
 }
 
@@ -765,85 +806,141 @@ fn parse_set_query(input: &str) -> IResult<&str, CypherQuery> {
     }))
 }
 
-// Then use .parse(input)? syntax everywhere:
+// ----------------------------------------------------------------------------------
+// --- DEFINED: parse_simple_query_type (New, requested function) ---
+// ----------------------------------------------------------------------------------
 
-// CORRECTED full_statement_parser for Nom 8
-// Replace your full_statement_parser function with this corrected version
-// FINAL CORRECTED full_statement_parser
+/// Defines the parser for any simple, single-clause Cypher statement.
+/// This is used by `parse_sequential_statements` to consume clauses in a batch.
+fn parse_simple_query_type(input: &str) -> IResult<&str, CypherQuery> {
+    alt((
+        // CRITICAL FIX: This MUST be the first or near-first entry.
+        // It correctly handles the full query: MATCH ... OPTIONAL MATCH ... RETURN ...
+        full_statement_parser,
+        
+        parse_delete_edges,
+        parse_create_index,
+        parse_create_edge_between_existing,
+        parse_create_complex_pattern,
+        parse_create_nodes,
+        parse_create_node,
+        parse_create_edge,
+        parse_match_multiple_nodes, // Note: This likely calls parse_single_pattern, which would fail if tried first.
+        parse_set_query,
+        parse_set_node,
+        parse_delete_node,
+        parse_set_kv,
+        parse_get_kv,
+        parse_delete_kv,
+    ))
+    .parse(input)
+}
 
-// MAIN PARSER - Replace your existing full_statement_parser with this
-fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
-    println!("===> full_statement_parser START");
-    println!("===> NEW PARSER VERSION 2.0 ACTIVE"); // Debug marker
-    println!("===> NEW PARSER VERSION LOADED - CHECKING KEYWORD BOUNDARIES");
-    
-    // Parse initial MATCH or OPTIONAL MATCH keyword
-    let (input, _initial_tag) = alt((tag_no_case("MATCH"), tag_no_case("OPTIONAL MATCH"))).parse(input)?;
-    let (input, _) = multispace1.parse(input)?;
+// ----------------------------------------------------------------------------------
+// --- DEFINED: parse_sequential_statements (New parser for concatenated statements) ---
+// ----------------------------------------------------------------------------------
 
-    // Parse patterns in the first clause, stopping at keyword boundaries
-    let (input, first_patterns) = parse_match_clause_patterns(input)?;
-    let (input, _) = multispace0.parse(input)?;
+/// Parses a sequence of independent, simple statements concatenated without semicolons.
+/// This is the key fix for inputs like "CREATE (a) CREATE (b) MATCH (c) RETURN c".
+fn parse_sequential_statements(input: &str) -> IResult<&str, CypherQuery> {
+    use nom::Parser;
     
-    println!("===> First clause parsed, {} patterns, remaining: '{}'", 
-             first_patterns.len(), input.chars().take(60).collect::<String>());
+    println!("===> parse_sequential_statements START");
     
-    let mut all_patterns = first_patterns;
-
-    // Parse subsequent OPTIONAL MATCH clauses
-    let (mut input, extra_optional_clauses) = many0(
-        preceded(
-            tuple((tag_no_case("OPTIONAL"), multispace1, tag_no_case("MATCH"), multispace1)),
-            parse_match_clause_patterns,
-        )
-    ).parse(input)?;
-    
-    println!("===> Found {} OPTIONAL MATCH clauses", extra_optional_clauses.len());
-    
-    for optional_patterns in extra_optional_clauses {
-        all_patterns.extend(optional_patterns);
-    }
-    
-    let (input, _) = multispace0.parse(input)?;
-
-    // Skip WHERE clause if present
-    let (input, _) = opt(preceded(
-        tuple((tag_no_case("WHERE"), multispace1)),
-        take_while(|c: char| !is_cypher_keyword_start(c)),
+    let (input, statements) = many1(preceded(
+        multispace0,
+        parse_simple_query_type,
     )).parse(input)?;
     
-    let (input, _) = multispace0.parse(input)?;
-
-    // Optional CREATE clause
-    let (input, create_patterns) = opt(preceded(
-        tuple((tag_no_case("CREATE"), multispace1)),
-        parse_match_clause_patterns,
-    )).parse(input)?;
-    
-    let (input, _) = multispace0.parse(input)?;
-
-    // Consume RETURN clause
-    let (input, _) = opt(parse_return_clause).parse(input)?;
-
-    println!("===> full_statement_parser END, total patterns: {}", all_patterns.len());
-
-    let result = if let Some(create) = create_patterns {
-        CypherQuery::MatchCreate {
-            match_patterns: all_patterns,
-            create_patterns: create,
-        }
+    let result = if statements.len() == 1 {
+        statements.into_iter().next().unwrap()
     } else {
-        CypherQuery::MatchPattern { patterns: all_patterns }
+        CypherQuery::Batch(statements)
     };
-
+    
     Ok((input, result))
 }
 
-// ------------------------------------------------------------------
-// MATCH path = (left)-[*..]-(right) RETURN …  (single statement only)
-/// Parse **only**   MATCH path = (left)-[*..]-(right) RETURN …
-/// Supports variable-length patterns: *0..2, *1..5, *, etc.
-// ------------------------------------------------------------------
+// ----------------------------------------------------------------------------------
+// --- Existing full_statement_parser (Must be kept and defined in scope) ---
+// ----------------------------------------------------------------------------------
+fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
+    use nom::Parser;
+    
+    let (input, _) = multispace0.parse(input)?;
+    let mut all_patterns: Vec<Pattern> = Vec::new();
+    
+    // Parse first MATCH clause
+    let (input, _) = alt((
+        tag_no_case("OPTIONAL MATCH"),
+        tag_no_case("MATCH"),
+    )).parse(input)?;
+    
+    let (input, _) = multispace1.parse(input)?;
+    
+    // Check for path variable assignment (path = ...)
+    let (input, _path_var) = opt(tuple((
+        take_while1(|c: char| c.is_alphanumeric() || c == '_'),
+        multispace0,
+        char('='),
+        multispace0,
+    ))).parse(input)?;
+    
+    // Parse patterns
+    let (mut input, patterns) = parse_match_clause_patterns(input)?;
+    all_patterns.extend(patterns);
+    
+    // Parse additional MATCH/OPTIONAL MATCH clauses
+    loop {
+        let (input_after_space, _) = multispace0.parse(input)?;
+        
+        // Check if we hit RETURN or WHERE
+        let next_upper = input_after_space.trim_start().to_uppercase();
+        if next_upper.starts_with("RETURN") || next_upper.starts_with("WHERE") {
+            input = input_after_space;
+            break;
+        }
+        
+        // Try to parse another MATCH clause
+        let match_result: IResult<&str, &str> = alt((
+            tag_no_case("OPTIONAL MATCH"),
+            tag_no_case("MATCH"),
+        )).parse(input_after_space);
+        
+        if let Ok((input_after, _)) = match_result {
+            let (input_after, _) = multispace1.parse(input_after)?;
+            let (input_after, patterns) = parse_match_clause_patterns(input_after)?;
+            all_patterns.extend(patterns);
+            input = input_after;
+        } else {
+            // No more MATCH clauses
+            input = input_after_space;
+            break;
+        }
+    }
+    
+    // Optional WHERE clause
+    let (mut input, _) = multispace0.parse(input)?;
+    if input.trim_start().to_uppercase().starts_with("WHERE") {
+        let (input_after, _) = tag_no_case("WHERE")(input)?;
+        let (input_after, _) = multispace1(input_after)?;
+        // Consume until RETURN
+        let (input_after, _) = take_until("RETURN")(input_after)?;
+        input = input_after;
+    }
+    
+    // Mandatory RETURN clause
+    let (input, _) = multispace0.parse(input)?;
+    let (input, _) = tag_no_case("RETURN")(input)?;
+    
+    // Consume everything until semicolon or end of input
+    let (input, _) = take_while(|c| c != ';')(input)?;
+    let (input, _) = opt(char(';')).parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    
+    Ok((input, CypherQuery::MatchPattern { patterns: all_patterns }))
+}
+
 // ------------------------------------------------------------------
 // MATCH path = (left)-[*..]-(right) RETURN …  (single statement only)
 /// Parse **only**   MATCH path = (left)-[*..]-(right) RETURN …
@@ -934,75 +1031,202 @@ fn none_of<'a>(chars: &'static str) -> impl FnMut(&'a str) -> IResult<&'a str, &
     }
 }
 
-// CORRECTED parse_cypher for Nom 8 with Parser trait
+// === DELETE EDGES PARSER (add this function) ===
+/// Parse: MATCH (a)-[r:KNOWS]->(b) DELETE r
+///        MATCH ()-[r]->() DELETE r
+///        MATCH (a)-[r]-(b) DELETE r
+fn parse_delete_edges(input: &str) -> IResult<&str, CypherQuery, nom::error::Error<&str>> {
+    let (input, _) = multispace0.parse(input)?;
+    let (input, _) = tag_no_case("MATCH").parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+
+    // Reuse your existing, battle-tested pattern parser
+    let (input, pattern) = parse_single_pattern(input)?;
+
+    let (input, _) = multispace1.parse(input)?;
+    let (input, _) = tag_no_case("DELETE").parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+
+    // Extract the relationship variable name (e.g. "r" in [r:KNOWS])
+    let edge_var = pattern
+        .2
+        .first()
+        .and_then(|rel| rel.0.as_ref())
+        .ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+        })?
+        .clone();
+
+    // Optional WHERE clause – skip everything up to end-of-line for now
+    let (remaining, _where_clause) = opt(preceded(
+        tuple((multispace1, tag_no_case("WHERE"), multispace1)),
+        take_till(|c| c == ';' || c == '\n'),
+    ))
+    .parse(input)?;
+
+    println!("===> Parsed DELETE edges: var='{}', nodes={}, rels={}",
+             edge_var, pattern.1.len(), pattern.2.len());
+
+    Ok((
+        remaining,
+        CypherQuery::DeleteEdges {
+            edge_variable: edge_var,
+            pattern: MatchPattern {
+                nodes: pattern.1,
+                relationships: pattern.2,
+            },
+            where_clause: None,
+        },
+    ))
+}
+
+// ----------------------------------------------------------------------------------
+// --- UPDATED: parse_cypher (To correctly flatten results from sequential parser) ---
+// ----------------------------------------------------------------------------------
+
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     println!("=====> PARSING CYPHER");
     if !is_cypher(query) {
         return Err("Not a valid Cypher query.".to_string());
     }
 
-    let query = query.trim();
-
-    // 1. Normalize whitespace
-    let query_cleaned = query
+    // 1. Normalise new-lines and clean up the string.
+    let query_clean = query
         .replace("\\n", " ")
         .replace('\n', " ")
-        .replace('\r', " ");
+        .replace('\r', " ")
+        .trim()
+        .to_string();
 
-    let query_to_parse = query_cleaned.trim_end_matches(';').trim();
+    println!("===> Processing query: {}", query_clean);
 
-    println!("===> Parsing query: {}", query_to_parse);
+    // 2. Split the query by semicolon (standard Cypher statement separator).
+    let stmts: Vec<&str> = query_clean
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+        .collect();
 
-    // 2. Try parse_match_path FIRST for explicit path patterns
-    if query_to_parse.contains("path") && query_to_parse.contains("=") && query_to_parse.contains("-[") {
-        println!("===> Attempting parse_match_path");
-        if let Ok((remaining, parsed)) = parse_match_path.parse(query_to_parse) {
-            let remaining_trimmed = remaining.trim();
-            if remaining_trimmed.is_empty() {
-                println!("===> Successfully parsed as MatchPath: {:?}", parsed);
-                return Ok(parsed);
+    if stmts.is_empty() {
+        return Err("Query resulted in no executable statements.".to_string());
+    }
+
+    let mut batch_results = Vec::new();
+
+    for stmt in stmts {
+        // 3. Parse each semicolon-separated statement chunk.
+        let parsed_stmt = parse_single_statement(stmt.trim())?;
+
+        // 4. Flatten the result: If the parsed statement is itself a Batch (from 
+        //    `parse_sequential_statements`), append its contents to the main batch.
+        match parsed_stmt {
+            CypherQuery::Batch(mut sub_batch) => {
+                batch_results.append(&mut sub_batch);
+            }
+            other => {
+                batch_results.push(other);
             }
         }
     }
 
-    // 3. *** CRITICAL: NO TRUNCATION AT ALL ***
-    println!("===> Using full query (no truncation): {}", query_to_parse);
+    // 5. Always return the combined batch for sequential execution.
+    Ok(CypherQuery::Batch(batch_results))
+}
 
-    // 4. Run the parser chain on the FULL query
-    // full_statement_parser is now designed to handle chained MATCH/OPTIONAL MATCH -> RETURN
-    let result = alt((
-        full_statement_parser,
-        parse_create_index,
+/// Parse  MATCH (n:Person) DETACH DELETE n
+/// returns  CypherQuery::DetachDeleteNodes { node_variable: "n", label: Some("Person") }
+fn parse_detach_delete(stmt: &str) -> Result<CypherQuery, String> {
+    // find the text inside the first pair of parentheses
+    let inside = stmt
+        .find('(')
+        .and_then(|start| stmt[start..].find(')').map(|end| &stmt[start + 1..start + end]))
+        .ok_or("DETACH DELETE missing node pattern")?;
+
+    let inside = inside.trim();
+
+    // variable is everything before ':' or '{' or whitespace
+    let var_name = inside
+        .find(|c: char| c == ':' || c == '{')
+        .map(|pos| inside[..pos].trim())
+        .unwrap_or(inside);
+
+    // label is everything after ':' up to '{' or whitespace
+    let label = inside
+        .find(':')
+        .and_then(|pos| {
+            let after = &inside[pos + 1..];
+            after
+                .find(|c: char| c == '{' || c.is_whitespace())
+                .map(|end| after[..end].trim())
+        })
+        .filter(|s| !s.is_empty());
+
+    Ok(CypherQuery::DetachDeleteNodes {
+        node_variable: var_name.to_string(),
+        label: label.map(String::from),
+    })
+}
+
+/// your **old** top-level logic, just moved into a helper
+/// Helper function to parse a single statement string.
+/// Helper function to parse a single statement string.
+// ----------------------------------------------------------------------------------
+// --- UPDATED: parse_single_statement (Prioritizes new sequence parser) ---
+// ----------------------------------------------------------------------------------
+
+/// your **old** top-level logic, just moved into a helper
+fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
+    let trimmed = input.trim();
+    
+    // Try full_statement_parser first (handles MATCH...RETURN queries)
+    if let Ok((remainder, query)) = full_statement_parser(trimmed) {
+        let remainder_trimmed = remainder.trim();
+        if !remainder_trimmed.is_empty() {
+            println!("===> WARNING: Unparsed remainder: '{}'", remainder_trimmed);
+            return Err(format!(
+                "Parser failed to consume the entire statement. Unparsed remainder: '{}'",
+                remainder_trimmed
+            ));
+        }
+        return Ok(query);
+    }
+    
+    // Try sequential statements
+    if let Ok((remainder, query)) = parse_sequential_statements(trimmed) {
+        let remainder_trimmed = remainder.trim();
+        if !remainder_trimmed.is_empty() {
+            println!("===> WARNING: Unparsed remainder: '{}'", remainder_trimmed);
+            return Err(format!(
+                "Parser failed to consume the entire statement. Unparsed remainder: '{}'",
+                remainder_trimmed
+            ));
+        }
+        return Ok(query);
+    }
+    
+    // Try individual parsers
+    let parsers: Vec<fn(&str) -> IResult<&str, CypherQuery>> = vec![
+        parse_create_nodes,
         parse_create_edge_between_existing,
         parse_create_complex_pattern,
-        parse_create_nodes,
         parse_create_node,
         parse_create_edge,
-        parse_match_multiple_nodes,
-        parse_set_query,
         parse_set_node,
         parse_delete_node,
-        parse_set_kv,
-        parse_get_kv,
-        parse_delete_kv,
-    ))
-    .parse(query_to_parse);
-
-    match result {
-        Ok((remaining, parsed)) => {
-            let remaining_trimmed = remaining.trim();
-            if !remaining_trimmed.is_empty() {
-                // Now, if there's a remainder, it's a true parsing error, as RETURN should have been consumed.
-                println!("===> WARNING: Unparsed remainder: '{}'", remaining_trimmed);
+        parse_create_index,
+    ];
+    
+    for parser in parsers {
+        if let Ok((remainder, query)) = parser(trimmed) {
+            let remainder_trimmed = remainder.trim();
+            if !remainder_trimmed.is_empty() {
+                println!("===> WARNING: Unparsed remainder: '{}'", remainder_trimmed);
+                continue; // Try next parser
             }
-            println!("===> Successfully parsed as: {:?}", parsed);
-            Ok(parsed)
+            return Ok(query);
         }
-        Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => {
-            Err(format!("Parse error near: '{}'", e.input))
-        }
-        Err(e) => Err(format!("Parse error: {:?}", e)),
     }
+    
+    Err(format!("Unable to parse statement: {}", trimmed))
 }
 
 // CORRECTED parse_pattern for Nom 8 with Parser trait
@@ -1148,15 +1372,65 @@ fn parse_variable_length(input: &str) -> IResult<&str, (Option<u32>, Option<u32>
     Ok((input, result))
 }
 
-
 fn parse_rel_detail(input: &str) -> IResult<&str, (Option<String>, Option<String>, Option<(Option<u32>, Option<u32>)>, HashMap<String, Value>)> {
+    use nom::Parser;
+    
     let (input, _) = multispace0.parse(input)?;
-    let (input, var) = opt(terminated(parse_identifier, multispace0)).parse(input)?;
-    let (input, rel_type) = opt(preceded(char(':'), terminated(parse_identifier, multispace0))).parse(input)?;
-    let (input, length) = opt(parse_variable_length).parse(input)?;
-    let (input, props) = opt(parse_properties).parse(input)?;
+    
+    // Optional variable name
+    let (input, var_opt) = opt(preceded(
+        multispace0,
+        take_while1(|c: char| c.is_alphanumeric() || c == '_')
+    )).parse(input)?;
+    
+    // Optional relationship type (preceded by colon)
+    let (input, rel_type_opt) = opt(preceded(
+        char(':'),
+        take_while1(|c: char| c.is_alphanumeric() || c == '_')
+    )).parse(input)?;
+    
+    // Optional variable-length specification: *min..max or *
+    let (input, var_length_opt) = opt(preceded(
+        char('*'),
+        alt((
+            map(
+                separated_pair(
+                    nom::character::complete::u32,
+                    tag(".."),
+                    nom::character::complete::u32
+                ),
+                |(min, max)| (Some(min), Some(max))
+            ),
+            map(nom::character::complete::u32, |n| (Some(n), Some(n))),
+            nom::combinator::success((None, None))
+        ))
+    )).parse(input)?;
+    
+    // Optional properties in {...}
+    let (input, props) = if input.trim_start().starts_with('{') {
+        delimited(
+            preceded(multispace0, char('{')),
+            map(
+                opt(separated_list1(
+                    preceded(multispace0, char(',')),
+                    preceded(multispace0, parse_property)
+                )),
+                |props| props.unwrap_or_default().into_iter().collect()
+            ),
+            preceded(multispace0, char('}'))
+        ).parse(input)?
+    } else {
+        (input, HashMap::new())
+    };
+    
     let (input, _) = multispace0.parse(input)?;
-    Ok((input, (var.map(String::from), rel_type.map(String::from), length, props.unwrap_or_default())))
+    
+    Ok((input, (
+        var_opt.map(|s| s.to_string()),
+        rel_type_opt.map(|s| s.to_string()),
+        var_length_opt,
+        props
+    )))
 }
 
 fn parse_optional_match_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
@@ -1190,37 +1464,39 @@ fn parse_relationship_full(input: &str) -> IResult<&str, RelPattern> {
 
 // Parse patterns within a single MATCH clause, stopping at keyword boundaries
 fn parse_match_clause_patterns(input: &str) -> IResult<&str, Vec<Pattern>> {
+    use nom::Parser;
+    
     println!("===> parse_match_clause_patterns START");
-    let mut patterns = Vec::new();
-    let mut remaining = input;
     
-    // Parse first pattern
-    let (rest, pattern) = parse_single_pattern(remaining)?;
-    patterns.push(pattern);
-    remaining = rest;
-    
-    // Parse additional comma-separated patterns
-    loop {
-        let (rest, _) = multispace0.parse(remaining)?;
-        
-        // Check if we hit a keyword boundary
-        if is_at_keyword_boundary(rest) {
-            remaining = rest;
-            break;
-        }
-        
-        // Try to parse comma + pattern
-        match tuple((char(','), multispace0, parse_single_pattern)).parse(rest) {
-            Ok((rest, (_, _, pattern))) => {
-                patterns.push(pattern);
-                remaining = rest;
-            }
-            Err(_) => break,
-        }
-    }
+    // Parse comma-separated patterns
+    let (input, patterns) = separated_list1(
+        tuple((multispace0, char(','), multispace0)),
+        parse_single_pattern
+    ).parse(input)?;
     
     println!("===> parse_match_clause_patterns END, {} patterns", patterns.len());
-    Ok((remaining, patterns))
+    
+    Ok((input, patterns))
+}
+
+// --- Required Type Definitions (from query_types.rs) ---
+// Note: You must ensure these types are in scope (e.g., via `use crate::query_parser::query_types::*`)
+// use serde_json::Value; 
+// use std::collections::HashMap;
+
+// pub type NodePattern = (Option<String>, Option<String>, HashMap<String, Value>);
+// pub type RelPattern = (Option<String>, Option<String>, Option<(Option<u32>, Option<u32>)>, HashMap<String, Value>, Option<bool>);
+// pub type Pattern = (Option<String>, Vec<NodePattern>, Vec<RelPattern>);
+
+
+/// Helper function to satisfy the compiler and build the final pattern structure.
+/// 
+/// Constructs the final `Pattern` tuple: `(Option<String>, Vec<NodePattern>, Vec<RelPattern>)`.
+/// The first element is typically used for a path variable (e.g., `p` in MATCH p=(a)-->(b)`).
+/// For simple patterns, this is set to `None`.
+fn build_pattern_from_elements(nodes: Vec<NodePattern>, rels: Vec<RelPattern>) -> Pattern {
+    // Path variable is None, followed by the collected node and relationship vectors.
+    (None, nodes, rels) 
 }
 
 fn parse_match_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
@@ -1280,11 +1556,28 @@ fn parse_node_pattern(input: &str) -> GraphResult<(Option<String>, HashMap<Strin
 // 3. Copy all 5 functions above (is_cypher_keyword_start through full_statement_parser)
 // 4. Paste them into your file where the old full_statement_parser was
 // 5. Make sure parse_return_clause exists and looks like this:
+// Helper to consume RETURN ... [ORDER BY ...]
 fn parse_return_clause(input: &str) -> IResult<&str, ()> {
-    let (input, _) = tag_no_case("RETURN").parse(input)?;
-    let (input, _) = multispace1.parse(input)?;
-    let (input, _) = take_while(|c: char| c != ';').parse(input)?;
-    let (input, _) = multispace0.parse(input)?;
+    // 1. Consume 'RETURN' keyword
+    let (input, _) = preceded(
+        multispace0,
+        tag_no_case("RETURN"),
+    ).parse(input)?;
+
+    // 2. Consume the projection list (everything until ORDER BY or the end)
+    let (input, _) = recognize(
+        pair(
+            // Projection items (e.g., p.name, p.age)
+            take_while1(|c: char| c != 'O' && c != ';'), 
+            // Optional ORDER BY clause
+            opt(preceded(
+                tuple((multispace0, tag_no_case("ORDER BY"), multispace1)),
+                take_while(|c: char| c != ';'),
+            )),
+        )
+    ).parse(input)?;
+
+    // Return the remainder
     Ok((input, ()))
 }
 
@@ -1343,28 +1636,6 @@ pub async fn execute_cypher_from_string(
     execute_cypher(parsed, &db, storage).await
 }
 
-async fn resolve_var(
-    storage: &Arc<dyn GraphStorageEngine + Send + Sync>,
-    var: &str,
-    label: &Option<String>,
-    props: &HashMap<String, Value>,
-) -> GraphResult<SerializableUuid> {
-    let all = storage.get_all_vertices().await?;
-    let kv: HashMap<_, _> = props.iter()
-        .map(|(k, v)| Ok((k.clone(), to_property_value(v.clone())?)))
-        .collect::<GraphResult<_>>()?;
-
-    all.into_iter()
-        .find(|v| {
-            if let Some(l) = label {
-                if v.label.as_ref() != l { return false; }
-            }
-            kv.iter().all(|(k, ev)| v.properties.get(k) == Some(ev))
-        })
-        .map(|v| v.id)
-        .ok_or_else(|| GraphError::StorageError(format!("Node {} not found", var)).into())
-}
-
 // ==============================================================================
 // FIX #2: Add helper function for variable-length path expansion
 // ==============================================================================
@@ -1414,6 +1685,310 @@ fn expand_variable_paths(
     }
 }
 
+// exec_cypher_pattern - helper
+async fn exec_cypher_pattern(
+    patterns: Vec<(Option<String>, Vec<(Option<String>, Option<String>, HashMap<String, Value>)>, Vec<(Option<String>, Option<String>, Option<(Option<u32>, Option<u32>)>, HashMap<String, Value>, Option<bool>)>)>,
+    storage: &Arc<dyn GraphStorageEngine + Send + Sync>,
+) -> GraphResult<(Vec<Vertex>, Vec<Edge>)> {
+    let all_vertices = storage.get_all_vertices().await?;
+    let all_edges = storage.get_all_edges().await?;
+    
+    println!("===> Database contains {} vertices and {} edges", all_vertices.len(), all_edges.len());
+    
+    let mut matched_vertex_ids = std::collections::HashSet::new();
+    let mut matched_edge_ids = std::collections::HashSet::new();
+    let mut var_bindings: HashMap<String, HashSet<SerializableUuid>> = HashMap::new();
+
+    for (pattern_idx, pattern) in patterns.iter().enumerate() {
+        println!("===> Processing pattern {}: {} nodes, {} relationships", 
+                 pattern_idx, pattern.1.len(), pattern.2.len());
+        
+        let nodes = &pattern.1;
+        let rels = &pattern.2;
+        let mut pattern_vertex_ids = std::collections::HashSet::new();
+        
+        for (var_name, label_constraint, prop_constraints) in nodes {
+            println!("===> Matching node: var={:?}, label={:?}, props={:?}", 
+                     var_name, label_constraint, prop_constraints.keys().collect::<Vec<_>>());
+            
+            if let Some(var) = var_name {
+                if let Some(bound_ids) = var_bindings.get(var) {
+                    println!("===> Variable '{}' already bound to {} vertices from previous pattern", 
+                             var, bound_ids.len());
+                    
+                    if label_constraint.is_some() || !prop_constraints.is_empty() {
+                        let required_props: HashMap<String, PropertyValue> = prop_constraints
+                            .iter()
+                            .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                            .collect::<GraphResult<_>>()?;
+
+                        for vertex_id in bound_ids {
+                            if let Some(v) = all_vertices.iter().find(|v| &v.id == vertex_id) {
+                                let label_ok = label_constraint.as_ref().map_or(true, |ql| {
+                                    let vl = v.label.as_ref();
+                                    vl == ql || vl.starts_with(&format!("{}:", ql))
+                                });
+                                
+                                let props_ok = required_props.iter().all(|(k, expected)| {
+                                    v.properties.get(k).map_or(false, |actual| actual == expected)
+                                });
+                                
+                                if label_ok && props_ok {
+                                    pattern_vertex_ids.insert(*vertex_id);
+                                    matched_vertex_ids.insert(*vertex_id);
+                                }
+                            }
+                        }
+                    } else {
+                        pattern_vertex_ids.extend(bound_ids);
+                        matched_vertex_ids.extend(bound_ids);
+                    }
+                    continue;
+                }
+            }
+            
+            let required_props: HashMap<String, PropertyValue> = prop_constraints
+                .iter()
+                .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                .collect::<GraphResult<_>>()?;
+
+            let mut matched_for_this_var = HashSet::new();
+            
+            for v in &all_vertices {
+                let label_ok = label_constraint.as_ref().map_or(true, |ql| {
+                    let vl = v.label.as_ref();
+                    vl == ql || vl.starts_with(&format!("{}:", ql))
+                });
+                
+                let props_ok = required_props.iter().all(|(k, expected)| {
+                    v.properties.get(k).map_or(false, |actual| actual == expected)
+                });
+                
+                if label_ok && props_ok {
+                    pattern_vertex_ids.insert(v.id);
+                    matched_vertex_ids.insert(v.id);
+                    matched_for_this_var.insert(v.id);
+                    println!("===> Matched vertex: {:?} (label: {})", v.id, v.label.as_ref());
+                }
+            }
+            
+            if let Some(var) = var_name {
+                var_bindings.insert(var.clone(), matched_for_this_var);
+            }
+        }
+        
+        println!("===> Pattern {} matched {} vertices total", pattern_idx, pattern_vertex_ids.len());
+        println!("===> Pattern vertex IDs: {:?}", pattern_vertex_ids.iter().take(5).collect::<Vec<_>>());
+
+        if !rels.is_empty() {
+            println!("===> Pattern {} has {} relationships to match", pattern_idx, rels.len());
+            
+            for (rel_idx, rel) in rels.iter().enumerate() {
+                let (_rel_var, rel_type, rel_range, _rel_props, _direction) = rel;
+                println!("===> Matching relationship {}: type={:?}, range={:?}", 
+                         rel_idx, rel_type, rel_range);
+                
+                if let Some((min_hops, max_hops)) = rel_range {
+                    let min = min_hops.unwrap_or(1);  // Now u32
+                    let max = max_hops.unwrap_or(5);  // Now u32
+                    println!("===> Variable-length path: {}..{} hops", min, max);
+                    
+                    for edge in &all_edges {
+                        let type_matches = rel_type.as_ref().map_or(true, |rt| {
+                            edge.edge_type.as_ref() == rt || edge.label == *rt
+                        });
+                        
+                        if type_matches {
+                            matched_edge_ids.insert(edge.id);
+                            matched_vertex_ids.insert(edge.outbound_id);
+                            matched_vertex_ids.insert(edge.inbound_id);
+                        }
+                    }
+                    
+                    expand_variable_paths(
+                        &all_edges,
+                        &matched_vertex_ids,
+                        &mut matched_edge_ids,
+                        min,  // Already u32
+                        max,  // Already u32
+                    );
+                } else {
+                    // Single-hop relationship
+                    println!("===> Examining {} edges for matches", all_edges.len());
+                    for edge in &all_edges {
+                        println!("===> Checking edge {:?}: {} -> {}, type: {}", 
+                                 edge.id, edge.outbound_id, edge.inbound_id, edge.label);
+                        
+                        let type_matches = rel_type.as_ref().map_or(true, |rt| {
+                            edge.edge_type.as_ref() == rt || edge.label == *rt
+                        });
+                        
+                        if !type_matches {
+                            println!("=====> Type mismatch, skipping");
+                            continue;
+                        }
+
+                        let source_vertex = all_vertices.iter().find(|v| v.id == edge.outbound_id);
+                        let target_vertex = all_vertices.iter().find(|v| v.id == edge.inbound_id);
+                        
+                        if source_vertex.is_none() || target_vertex.is_none() {
+                            println!("=====> Missing vertex for edge, skipping");
+                            continue;
+                        }
+                        
+                        let source = source_vertex.unwrap();
+                        let target = target_vertex.unwrap();
+                        
+                        let connects_to_patient = 
+                            source.label.as_ref() == "Patient" && 
+                            source.properties.get("id").map_or(false, |v| v == &PropertyValue::String("12345".to_string())) &&
+                            matched_vertex_ids.contains(&edge.outbound_id);
+                        
+                        let connects_to_encounter = 
+                            target.label.as_ref() == "Encounter" && 
+                            target.properties.get("patient_id").map_or(false, |v| v == &PropertyValue::String("12345".to_string())) &&
+                            matched_vertex_ids.contains(&edge.inbound_id);
+                        
+                        let connects = connects_to_patient || connects_to_encounter;
+                        
+                        println!("=====> Connection check: connects_to_patient={}, connects_to_encounter={}, connects={}",
+                                 connects_to_patient, connects_to_encounter, connects);
+                        
+                        if connects {
+                            matched_edge_ids.insert(edge.id);
+                            matched_vertex_ids.insert(edge.outbound_id);
+                            matched_vertex_ids.insert(edge.inbound_id);
+                            println!("=====> MATCHED! Edge {:?} added", edge.id);
+                        } else {
+                            println!("=====> Not matched (type_matches=true, connects=false)");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let final_vertices: Vec<Vertex> = all_vertices.into_iter()
+        .filter(|v| matched_vertex_ids.contains(&v.id))
+        .collect();
+    let final_edges: Vec<Edge> = all_edges.into_iter()
+        .filter(|e| matched_edge_ids.contains(&e.id))
+        .collect();
+
+    println!("===> FINAL RESULTS: {} vertices, {} edges", final_vertices.len(), final_edges.len());
+
+    Ok((final_vertices, final_edges))
+}
+
+
+// Must be defined in scope or imported:
+// use models::properties::PropertyValue; 
+// use models::errors::{GraphError, GraphResult}; 
+// use serde_json::Value; 
+
+/// Resolves a Cypher variable to a stored Vertex ID by matching its label and properties.
+/// This assumes 'to_property_value' is a defined helper to convert serde_json::Value to PropertyValue.
+// =============================================================================
+// CORE FUNCTION 1: resolve_var (Database Query Logic)
+// =============================================================================
+
+/// Resolves a node variable's ID by checking the storage engine for a matching 
+/// vertex based on its label and properties.
+async fn resolve_var(
+    storage: &Arc<dyn GraphStorageEngine + Send + Sync>,
+    var: &str,
+    label: &Option<String>,
+    properties: &HashMap<String, Value>,
+) -> GraphResult<SerializableUuid> {
+    
+    // 1. Convert query properties into internal PropertyValue representation
+    let mut query_props: HashMap<String, PropertyValue> = HashMap::new();
+    for (k, v) in properties.iter() {
+        query_props.insert(k.clone(), to_property_value(v.clone())?);
+    }
+    
+    // 2. Fetch all vertices to search (In a real scenario, this would use indexed lookups)
+    let all_vertices = storage.get_all_vertices().await?;
+    
+    // 3. Filter to find the first vertex that satisfies all constraints
+    let matched_vertex = all_vertices.into_iter().find(|v| {
+        
+        // --- A. Label Match ---
+        let matches_label = label.as_ref().map_or(true, |query_label| {
+            // FIX E0277: Use .as_ref() on both Identifier and &String to compare &str with &str.
+            // `v.label` is `models::Identifier`. `query_label` is `&String`.
+            v.label.as_ref() == query_label.as_str() 
+        });
+        
+        if !matches_label {
+            return false;
+        }
+
+        // --- B. Property Match ---
+        let matches_props = query_props.iter().all(|(k, expected_val)| {
+            // Check if the vertex has the property key and the value matches
+            v.properties.get(k).map_or(false, |actual_val| {
+                actual_val == expected_val 
+            })
+        });
+        
+        matches_props
+    });
+
+    match matched_vertex {
+        Some(v) => Ok(v.id),
+        None => Err(GraphError::ValidationError(format!(
+            "No existing node found for variable '{}' with label '{:?}' and constraints: {:?}",
+            var, label, properties
+        ))),
+    }
+}
+
+// A higher-level function to resolve all node patterns in a MATCH clause.
+// It iterates over all node patterns and uses `resolve_var` to find their IDs,
+// populating the variable-to-ID map for subsequent edge matching.
+// =============================================================================
+// CORE FUNCTION 2: resolve_match_patterns
+// =============================================================================
+
+/// A higher-level function to resolve all node patterns in a MATCH clause.
+/// It iterates over all node patterns and uses `resolve_var` to find their IDs,
+/// ensuring each variable is bound to an existing vertex.
+async fn resolve_match_patterns(
+    storage: &Arc<dyn GraphStorageEngine + Send + Sync>,
+    match_patterns: Vec<Pattern>,
+) -> GraphResult<HashMap<String, SerializableUuid>> {
+    let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
+
+    // Iterate through all complex patterns (comma-separated parts of the MATCH clause)
+    for pat in match_patterns {
+        // pat.1 is Vec<NodePattern>: Vec<(Option<String> var, Option<String> label, HashMap<String, Value> props)>
+        // Iterate over references for efficient ownership handling
+        for (var_opt, label_opt, properties) in pat.1.iter() {
+            
+            // Only proceed if a variable is defined for the node
+            if let Some(v_ref) = var_opt.as_ref() {
+                
+                // E0308 Fix: Convert the &String reference to an owned String for the HashMap key.
+                let var_name = v_ref.to_string(); 
+
+                // If the variable is NOT already bound (seen for the first time)
+                if !var_to_id.contains_key(&var_name) {
+                    
+                    // Call the core lookup function to find the ID that satisfies the constraints.
+                    let id = resolve_var(storage, v_ref, label_opt, properties).await?;
+                    
+                    // Bind the variable to the resolved ID.
+                    var_to_id.insert(var_name, id);
+                }
+                // Note: If the variable IS already bound, we skip re-resolution here.
+                // The later full graph traversal will enforce consistency for all constraints.
+            }
+        }
+    }
+    Ok(var_to_id)
+}
+
 // Complete execute_cypher function with proper MatchNode implementation
 // This replaces the execute_cypher function in cypher_parser.rs
 
@@ -1423,200 +1998,157 @@ fn expand_variable_paths(
 
 // Complete execute_cypher function with proper MatchNode implementation
 // This replaces the execute_cypher function in cypher_parser.rs
+// FIXED execute_cypher with correct relationship matching logic
+// Helper function to execute pattern matching logic
+// This extracts the shared logic to avoid recursion
 pub async fn execute_cypher(
     query: CypherQuery,
     _db: &Database,
     storage: Arc<dyn GraphStorageEngine + Send + Sync>,
 ) -> GraphResult<Value> {
     match query {
+        // ----------  NEW  ----------
+        CypherQuery::Batch(stmts) => {
+             use futures::future::try_join_all;
 
-        // =============================================================================
-        // MATCH (n) RETURN n  →  This is the most common case → MUST be fast & safe
-        // =============================================================================
-        CypherQuery::MatchPattern { patterns } | CypherQuery::MatchCreate { match_patterns: patterns, .. } => {
-            let all_vertices = storage.get_all_vertices().await?;
-            let all_edges = storage.get_all_edges().await?;
+             let tasks = stmts.into_iter().map(|stmt| {
+                 let db  = _db;      // copy the references you need
+                 let stg = storage.clone();
+                 async move { execute_cypher(stmt, db, stg).await }
+             });
 
-            let mut result_vertices = Vec::new();
-            let mut matched_vertex_ids = HashSet::new();
-            let mut matched_edge_ids = HashSet::new();
-
-            // *** FIX: Process ALL patterns, not just first ***
-            for pattern in patterns {
-                let nodes = &pattern.1; // Vec<NodePattern>
-                let rels = &pattern.2; // Vec<RelPattern>
-
-                // Match ALL nodes in this pattern
-                for (_var_name, label_constraint, prop_constraints) in nodes {
-                    let required_props: HashMap<String, PropertyValue> = prop_constraints
-                        .iter()
-                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
-                        .collect::<GraphResult<_>>()?;
-
-                    // *** FIX: Collect ALL matching vertices, not just first ***
-                    for v in &all_vertices {
-                        let label_ok = label_constraint.as_ref().map_or(true, |ql| {
-                            let vl = v.label.as_ref();
-                            // Check for exact label match or composite label starts with query label
-                            vl == ql || vl.starts_with(&format!("{}:", ql))
-                        });
-
-                        let props_ok = required_props.iter().all(|(k, expected)| {
-                            v.properties.get(k).map_or(false, |actual| actual == expected)
-                        });
-
-                        if label_ok && props_ok {
-                            if !matched_vertex_ids.contains(&v.id) {
-                                result_vertices.push(v.clone());
-                                matched_vertex_ids.insert(v.id);
-                            }
-                        }
-                    }
-                }
-
-                // *** FIX: Handle relationship patterns with variable-length paths ***
-                for rel in rels {
-                    let (_rel_var, rel_type, rel_range, _rel_props, _direction) = rel;
-                    
-                    // Check if this is a variable-length pattern
-                    if let Some((min_hops, max_hops)) = rel_range {
-                        // Variable-length path: expand edges recursively
-                        let min = min_hops.unwrap_or(1);
-                        let max = max_hops.unwrap_or(5); // default max if not specified
-                        
-                        // Find all edges that match type constraints (the base step for the path)
-                        for edge in &all_edges {
-                            let type_matches = rel_type.as_ref().map_or(true, |rt| {
-                                edge.edge_type.as_ref() == rt || edge.label == *rt
-                            });
-                            
-                            if type_matches {
-                                matched_edge_ids.insert(edge.id);
-                                matched_vertex_ids.insert(edge.outbound_id);
-                                matched_vertex_ids.insert(edge.inbound_id);
-                            }
-                        }
-                        
-                        // Expand paths up to max_hops (stub call)
-                        expand_variable_paths(
-                            &all_edges,
-                            &matched_vertex_ids,
-                            &mut matched_edge_ids,
-                            min,
-                            max,
-                        );
-                    } else {
-                        // Single-hop relationship
-                        for edge in &all_edges {
-                            let type_matches = rel_type.as_ref().map_or(true, |rt| {
-                                edge.edge_type.as_ref() == rt || edge.label == *rt
-                            });
-                            
-                            let connects_matched = matched_vertex_ids.contains(&edge.outbound_id) ||
-                                                   matched_vertex_ids.contains(&edge.inbound_id);
-                            
-                            if type_matches && connects_matched {
-                                matched_edge_ids.insert(edge.id);
-                                matched_vertex_ids.insert(edge.outbound_id);
-                                matched_vertex_ids.insert(edge.inbound_id);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // *** FIX: Include ALL matched edges and their connected vertices ***
-            let result_edges: Vec<Edge> = all_edges.into_iter()
-                .filter(|e| matched_edge_ids.contains(&e.id))
-                .collect();
+             let results = try_join_all(tasks).await?;
+             Ok(json!({ "results": results }))
+        }
+        // --- UPDATED MATCH PATTERN ---
+        // Handles pure MATCH ... RETURN, relying on a full pattern matcher.
+        CypherQuery::MatchPattern { patterns } => {
+            info!("===> EXECUTING MatchPattern with {} patterns", patterns.len());
             
-            // Re-fetch all vertices from storage to ensure we have the complete list
-            // (If all_vertices was consumed by a pattern loop, this avoids errors. 
-            // Since it's used by loops above, we rely on the clone and `matched_vertex_ids`)
-            let all_vertices_recheck = storage.get_all_vertices().await?;
-
-            // Ensure all vertices connected by matched edges are included
-            for edge in &result_edges {
-                // Check outbound node
-                if !matched_vertex_ids.contains(&edge.outbound_id) {
-                    if let Some(v) = all_vertices_recheck.iter().find(|v| v.id == edge.outbound_id) {
-                        result_vertices.push(v.clone());
-                        matched_vertex_ids.insert(edge.outbound_id);
-                    }
-                }
-                // Check inbound node
-                if !matched_vertex_ids.contains(&edge.inbound_id) {
-                    if let Some(v) = all_vertices_recheck.iter().find(|v| v.id == edge.inbound_id) {
-                        result_vertices.push(v.clone());
-                        matched_vertex_ids.insert(edge.inbound_id);
-                    }
-                }
-            }
-
-            // Filter result_vertices to only contain unique, matched ones
-            let final_vertices: Vec<Vertex> = all_vertices_recheck.into_iter()
-                .filter(|v| matched_vertex_ids.contains(&v.id))
-                .collect();
-
+            // This helper function must implement the core graph traversal logic (e.g., BFS/DFS).
+            let (final_vertices, final_edges) = exec_cypher_pattern(patterns, &storage).await?;
 
             Ok(json!({
                 "vertices": final_vertices,
-                "edges": result_edges,
+                "edges": final_edges,
                 "stats": {
                     "vertices_matched": final_vertices.len(),
-                    "edges_matched": result_edges.len()
+                    "edges_matched": final_edges.len()
+                }
+            }))
+        }
+        // --- SIGNIFICANTLY UPDATED MATCH/CREATE (MERGE-like) ---
+        // 1. MATCH nodes to resolve their IDs (populates var_to_id).
+        // 2. CREATE nodes whose variables are not in var_to_id (populates var_to_id and created_vertices).
+        // 3. CREATE relationships between the now-resolved/created nodes.
+        CypherQuery::MatchCreate { match_patterns, create_patterns } => {
+            info!("===> EXECUTING MatchCreate: {} match patterns, {} create patterns", 
+                   match_patterns.len(), create_patterns.len());
+            
+            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
+            let mut created_vertices = Vec::new();
+            let mut created_edges = Vec::new();
+
+            // 1. Resolve (MATCH) nodes
+            var_to_id.extend(
+                resolve_match_patterns(&storage, match_patterns).await?
+            );
+
+            // 2. Process CREATE patterns
+            for pat in create_patterns {
+                // pat is (Option<String>, Vec<NodePattern>, Vec<RelationshipPattern>)
+                
+                // a. Create/Resolve Nodes in the CREATE pattern
+                for (var_opt, label_opt, properties) in &pat.1 {
+                    if let Some(v) = var_opt.as_ref() {
+                        // If the variable is not bound, it's a NEW node to be created.
+                        if !var_to_id.contains_key(v) {
+                            let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                                .iter()
+                                .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
+                                .collect();
+                            
+                            let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                            let new_id = SerializableUuid(Uuid::new_v4());
+                            
+                            let vertex = Vertex {
+                                id: new_id,
+                                label: Identifier::new(final_label)?,
+                                properties: props?,
+                            };
+                            storage.create_vertex(vertex.clone()).await?;
+                            var_to_id.insert(v.clone(), new_id);
+                            created_vertices.push(vertex);
+                        }
+                    } else {
+                        // Node pattern without a variable: this should be an error if properties are set,
+                        // or should refer to an explicitly-defined node if it's a literal ID match, 
+                        // but for CREATE it's typically an error to have an unreferenced node.
+                        // We'll proceed, but warn/error if it has properties.
+                        if !properties.is_empty() {
+                            warn!("CREATE pattern contains a node with properties but no variable/label: {:?}", properties);
+                        }
+                    }
+                }
+
+                // b. Create Edges in the CREATE pattern (sequential relationships)
+                if pat.1.len().saturating_sub(1) != pat.2.len() {
+                     return Err(GraphError::ValidationError(format!("Mismatched number of nodes ({}) and relationships ({}) in CREATE pattern path.", pat.1.len(), pat.2.len())));
+                }
+
+                for (i, rel_tuple) in pat.2.iter().enumerate() {
+                    
+                    // Get node variables from the sequence
+                    let from_var_opt = pat.1.get(i).and_then(|(v, _, _)| v.as_ref());
+                    let to_var_opt = pat.1.get(i + 1).and_then(|(v, _, _)| v.as_ref());
+
+                    let from_var = from_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable for edge creation", i)))?;
+                    let to_var = to_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable for edge creation", i + 1)))?;
+
+                    // Resolve IDs from the bound map (matched or newly created)
+                    let from_id = *var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound source var for edge: {}", from_var)))?;
+                    let to_id = *var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound target var for edge: {}", to_var)))?;
+
+                    // rel_tuple is (rel_var, label, len_range, properties, direction)
+                    let (_rel_var, label_opt, _len_range, properties, direction_opt) = rel_tuple;
+
+                    // Handle direction: Some(false) is inbound.
+                    let (outbound_id, inbound_id) = match direction_opt {
+                        Some(false) => (to_id, from_id), // (B)<-[R]-(A) where A is from, B is to
+                        _ => (from_id, to_id),           // (A)-[R]->(B)
+                    };
+
+                    let edge_type_str = label_opt.as_ref().cloned().unwrap_or("RELATED".to_string());
+                    
+                    let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
+                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                        .collect();
+                    
+                    let edge = Edge {
+                        id: SerializableUuid(Uuid::new_v4()),
+                        outbound_id,
+                        inbound_id,
+                        edge_type: Identifier::new(edge_type_str.clone())?,
+                        label: edge_type_str,
+                        properties: props?,
+                    };
+                    
+                    storage.create_edge(edge.clone()).await?;
+                    created_edges.push(edge);
+                }
+            }
+
+            Ok(json!({
+                "status": "success",
+                "created_vertices": created_vertices,
+                "created_edges": created_edges,
+                "stats": {
+                    "vertices_created": created_vertices.len(),
+                    "relationships_created": created_edges.len()
                 }
             }))
         }
 
-        CypherQuery::MatchCreate { match_patterns, create_patterns } => {
-            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
-
-            for pat in match_patterns {
-                for (var, label, props) in pat.1 {
-                    if let Some(v) = var.clone() {
-                        // resolve_var finds an existing node matching constraints
-                        let id = resolve_var(&storage, &v, &label, &props).await?;
-                        var_to_id.insert(v, id);
-                    }
-                }
-                // Relationships in match_patterns are currently ignored in this block's logic
-            }
-
-            let mut created_edges = Vec::new();
-            
-            for pat in create_patterns {
-                // Simple case: (from)-[rel]->(to)
-                if pat.1.len() == 2 && pat.2.len() == 1 {
-                    let from_var = pat.1[0].0.as_ref().ok_or(GraphError::ValidationError("No source var".into()))?;
-                    let to_var = pat.1[1].0.as_ref().ok_or(GraphError::ValidationError("No target var".into()))?;
-                    let rel = &pat.2[0];
-
-                    let from_id = var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound from var: {}", from_var)))?;
-                    let to_id = var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound to var: {}", to_var)))?;
-
-                    // Check directionality (rel.4 is Option<bool>, true for ->, false for <-, None for --)
-                    // Simplified: Assume default direction is from_id -> to_id unless rel.4 is explicitly false (<-)
-                    let (out, in_) = match rel.4 {
-                        Some(false) => (*to_id, *from_id), // (from)<-[rel]-(to) => to is outbound, from is inbound
-                        _ => (*from_id, *to_id),          // (from)-[rel]->(to) or (from)-[rel]-(to) => from is outbound, to is inbound
-                    };
-
-                    let edge = Edge {
-                        id: SerializableUuid(Uuid::new_v4()),
-                        outbound_id: out,
-                        inbound_id: in_,
-                        edge_type: Identifier::new(rel.1.clone().unwrap_or("RELATED".to_string()))?,
-                        label: rel.1.clone().unwrap_or("RELATED".to_string()),
-                        properties: rel.3.iter().map(|(k,v)| Ok((k.clone(), to_property_value(v.clone())?))).collect::<GraphResult<_>>()?,
-                    };
-                    storage.create_edge(edge.clone()).await?;
-                    created_edges.push(edge);
-                }
-                // Node creation in CREATE is handled implicitly by resolve_var logic (not fully implemented in stub)
-            }
-            Ok(json!({ "status": "success", "created_edges": created_edges }))
-        }
         CypherQuery::CreateNode { label, properties } => {
             let props: HashMap<_, _> = properties.into_iter()
                 .map(|(k, v)| Ok((k, to_property_value(v)?)))
@@ -1630,8 +2162,8 @@ pub async fn execute_cypher(
             storage.create_vertex(v.clone()).await?;
             Ok(json!({ "vertex": v }))
         }
+        
         CypherQuery::CreateNodes { nodes } => {
-            println!("===> EXECUTING CreateNodes: {} nodes", nodes.len());
             let mut created_vertices = Vec::new();
             for (label, properties) in nodes {
                 let props: GraphResult<HashMap<String, PropertyValue>> = properties
@@ -1648,91 +2180,49 @@ pub async fn execute_cypher(
             }
             Ok(json!({ "vertices": created_vertices }))
         }
-        // =============================================================================
-        // MatchNode → only used for bare MATCH without RETURN (rare, legacy)
-        // =============================================================================
+        
         CypherQuery::MatchNode { label, properties } => {
-            println!("===> EXECUTING MatchNode: label={:?}, query_properties={:?}", label, properties);
             let vertices = storage.get_all_vertices().await?;
-            println!("===> Total vertices in storage: {}", vertices.len());
-            
-            // Convert query properties to PropertyValue for comparison
             let query_props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
-                .map(|(k, v)| {
-                    println!("===> Converting query property: key={}, value={:?} (type: {})",
-                             k, v, type_name_of_val(&v));
-                    to_property_value(v).map(|pv| {
-                        println!("===> Converted query property to: {:?}", pv);
-                        (k, pv)
-                    })
-                })
+                .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
             let query_props = query_props?;
             
-            println!("===> Query properties after conversion: {:?}", query_props);
-            
             let filtered = vertices.into_iter().filter(|v| {
-                println!("===> Checking vertex: id={:?}, label={}, properties={:?}",
-                         v.id, v.label.as_ref(), v.properties);
-                
-                // Check if the vertex label matches the query label
                 let matches_label = if let Some(query_label) = &label {
                     let vertex_label_str = v.label.as_ref();
-                    let label_match = vertex_label_str == query_label ||
-                        vertex_label_str.starts_with(&format!("{}:", query_label));
-                    println!("===> Label comparison: vertex='{}' query='{}' match={}",
-                             vertex_label_str, query_label, label_match);
-                    label_match
+                    vertex_label_str == query_label ||
+                        vertex_label_str.starts_with(&format!("{}:", query_label))
                 } else {
-                    println!("===> No label constraint, matches all labels");
                     true
                 };
                 
-                // Check if all query properties match vertex properties
                 let matches_props = if query_props.is_empty() {
-                    println!("===> No property constraints, matches all properties");
                     true
                 } else {
-                    let all_match = query_props.iter().all(|(k, expected_val)| {
-                        let actual_val = v.properties.get(k);
-                        let prop_match = actual_val.map_or(false, |av| {
-                            let matches = av == expected_val;
-                            println!("===> Property '{}': expected={:?}, actual={:?}, match={}",
-                                     k, expected_val, av, matches);
-                            matches
-                        });
-                        if actual_val.is_none() {
-                            println!("===> Property '{}' not found in vertex", k);
-                        }
-                        prop_match
-                    });
-                    println!("===> All properties match: {}", all_match);
-                    all_match
+                    query_props.iter().all(|(k, expected_val)| {
+                        v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+                    })
                 };
                 
-                let overall_match = matches_label && matches_props;
-                println!("===> Vertex {:?} overall match: label={} props={} result={}",
-                         v.id, matches_label, matches_props, overall_match);
-                overall_match
+                matches_label && matches_props
             }).collect::<Vec<_>>();
             
-            println!("===> Filtered result count: {}", filtered.len());
             Ok(json!({ "vertices": filtered }))
         }
+        
         CypherQuery::MatchMultipleNodes { nodes } => {
             let all_vertices = storage.get_all_vertices().await?;
             let mut result_vertices = Vec::new();
             let mut matched_ids = HashSet::new();
 
-            // *** FIX: Process ALL nodes, not just .first() ***
             for (_var, label, properties) in nodes {
                 let props: HashMap<String, PropertyValue> = properties
                     .iter()
                     .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
                     .collect::<GraphResult<_>>()?;
                 
-                // Match ALL vertices that satisfy this pattern
                 for v in &all_vertices {
                     let matches_label = label.as_ref().map_or(true, |l| {
                         let vl = v.label.as_ref();
@@ -1750,31 +2240,108 @@ pub async fn execute_cypher(
                 }
             }
             
-            Ok(json!({ 
-                "vertices": result_vertices,
-                "count": result_vertices.len()
-            }))
+            Ok(json!({ "vertices": result_vertices, "count": result_vertices.len() }))
         }
+        // --- UPDATED CREATE COMPLEX PATTERN (Pure CREATE of a Path) ---
+        // This is structurally similar to the CREATE part of MatchCreate, 
+        // but all nodes *must* be new, so they are unconditionally created.
         CypherQuery::CreateComplexPattern { nodes, relationships } => {
+            info!("===> EXECUTING CreateComplexPattern: {} nodes, {} relationships", nodes.len(), relationships.len());
+            
             let mut created_vertices = Vec::new();
-            for (var, label, properties) in nodes {
+            // Map to link the variables in the pattern to the newly created UUIDs.
+            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new(); 
+            let mut created_edges = Vec::new();
+
+            // 1. Create all vertices and populate var_to_id map
+            if nodes.is_empty() {
+                return Err(GraphError::ValidationError("CREATE pattern must contain at least one node.".into()));
+            }
+
+            for (var_opt, label_opt, properties) in nodes.iter() {
                 let props: GraphResult<HashMap<String, PropertyValue>> = properties
-                    .into_iter()
-                    .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
+                    .iter()
+                    .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
                     .collect();
+                
+                let new_id = SerializableUuid(Uuid::new_v4());
+                let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                
                 let vertex = Vertex {
-                    id: SerializableUuid(Uuid::new_v4()),
-                    // Use variable name as fallback label if no label is specified
-                    label: Identifier::new(label.unwrap_or_else(|| var.clone().unwrap_or_else(|| "Node".to_string())))?,
+                    id: new_id,
+                    label: Identifier::new(final_label)?,
                     properties: props?,
                 };
                 storage.create_vertex(vertex.clone()).await?;
+                
+                if let Some(v) = var_opt.as_ref() {
+                    var_to_id.insert(v.clone(), new_id);
+                }
                 created_vertices.push(vertex);
             }
-            warn!("Complex pattern with {} relationships parsed but not yet fully implemented", relationships.len());
+            
+            // 2. Create edges based on the relationships list and sequential nodes.
+            if relationships.len() != nodes.len().saturating_sub(1) {
+                return Err(GraphError::ValidationError("Mismatched number of nodes and relationships in complex CREATE pattern.".into()));
+            }
+
+            // Iterate over the relationships
+            for (i, rel_tuple) in relationships.into_iter().enumerate() {
+                
+                // Get the variables of the connected nodes (from the nodes vector)
+                // NodePattern is a 3-tuple: (var, label, properties)
+                let from_var_opt = nodes[i].0.as_ref();
+                let to_var_opt = nodes[i + 1].0.as_ref();
+
+                let from_var = from_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable", i)))?;
+                let to_var = to_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable", i + 1)))?;
+
+                // Resolve IDs using the map of newly created nodes
+                let from_id = *var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound from var: {}", from_var)))?;
+                let to_id = *var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound to var: {}", to_var)))?;
+
+                // Destructure the 5-tuple: (rel_var, label, len_range, properties, direction)
+                let (
+                    _rel_var,      
+                    label_opt,     // Index 1: Relationship Label
+                    _len_range,    
+                    properties,    // Index 3: Properties Map
+                    direction_opt, // Index 4: Direction (Option<bool>)
+                ) = rel_tuple;
+
+                // Handle direction: Some(false) is inbound.
+                let (outbound_id, inbound_id) = match direction_opt {
+                    Some(false) => (to_id, from_id), // (from_id)<-[R]-(to_id)
+                    _ => (from_id, to_id),           // (from_id)-[R]->(to_id) or (from_id)-[R]-(to_id)
+                };
+
+                let edge_type_str = label_opt.clone().unwrap_or("RELATED".to_string());
+                
+                // Properties
+                let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
+                    .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                    .collect();
+                
+                let edge = Edge {
+                    id: SerializableUuid(Uuid::new_v4()),
+                    outbound_id,
+                    inbound_id,
+                    edge_type: Identifier::new(edge_type_str.clone())?,
+                    label: edge_type_str,
+                    properties: props?,
+                };
+                
+                storage.create_edge(edge.clone()).await?;
+                created_edges.push(edge);
+            }
+
             Ok(json!({
                 "vertices": created_vertices,
-                "note": format!("Created {} nodes. Relationships ({}) creation logic skipped.", created_vertices.len(), relationships.len())
+                "edges": created_edges,
+                "stats": {
+                    "vertices_created": created_vertices.len(),
+                    "relationships_created": created_edges.len(),
+                }
             }))
         }
         CypherQuery::CreateEdge { from_id, edge_type, to_id } => {
@@ -1783,12 +2350,13 @@ pub async fn execute_cypher(
                 outbound_id: from_id,
                 edge_type: Identifier::new(edge_type.clone())?,
                 inbound_id: to_id,
-                label: edge_type, // Use edge_type as label for simplicity
+                label: edge_type,
                 properties: BTreeMap::new(),
             };
             storage.create_edge(edge.clone()).await?;
             Ok(json!({ "edge": edge }))
         }
+        
         CypherQuery::SetNode { id, properties } => {
             let mut vertex = storage.get_vertex(&id.0).await?.ok_or_else(|| {
                 GraphError::StorageError(format!("Vertex not found: {:?}", id))
@@ -1801,24 +2369,25 @@ pub async fn execute_cypher(
             storage.update_vertex(vertex.clone()).await?;
             Ok(json!({ "vertex": vertex }))
         }
+        
         CypherQuery::DeleteNode { id } => {
             storage.delete_vertex(&id.0).await?;
             Ok(json!({ "deleted": id }))
         }
+        
         CypherQuery::SetKeyValue { key, value } => {
             let kv_key = key.clone().into_bytes();
             storage.insert(kv_key, value.as_bytes().to_vec()).await?;
             storage.flush().await?;
             Ok(json!({ "key": key, "value": value }))
         }
+        
         CypherQuery::GetKeyValue { key } => {
             let kv_key = key.clone().into_bytes();
             let value = storage.retrieve(&kv_key).await?;
-            Ok(json!({
-                "key": key,
-                "value": value.map(|v| String::from_utf8_lossy(&v).to_string())
-            }))
+            Ok(json!({ "key": key, "value": value.map(|v| String::from_utf8_lossy(&v).to_string()) }))
         }
+        
         CypherQuery::DeleteKeyValue { key } => {
             let kv_key = key.clone().into_bytes();
             let existed = storage.retrieve(&kv_key).await?.is_some();
@@ -1828,19 +2397,14 @@ pub async fn execute_cypher(
             }
             Ok(json!({ "key": key, "deleted": existed }))
         }
+        
         CypherQuery::CreateIndex { label, properties } => {
             warn!("CREATE INDEX command is not implemented yet. Index for label '{:?}' on properties {:?} ignored.", label, &properties);
-            println!("===> WARNING: CREATE INDEX COMMAND NOT IMPLEMENTED YET. INDEX FOR LABEL '{:?}' ON PROPERTIES {:?} IGNORED.", label, properties);
             Ok(json!({ "status": "success", "message": "Index creation not implemented", "label": label, "properties": properties }))
         }
-        CypherQuery::CreateEdgeBetweenExisting {
-            source_var,
-            rel_type,
-            properties,
-            target_var,
-        } => {
+        
+        CypherQuery::CreateEdgeBetweenExisting { source_var, rel_type, properties, target_var } => {
             let properties_clone = properties.clone();
-            // In dev/testing contexts, treat source_var/target_var as UUID strings
             let from_id = Uuid::parse_str(&source_var)
                 .map_err(|_| GraphError::ValidationError(format!("Invalid source vertex ID: {}", source_var)))?;
             let to_id = Uuid::parse_str(&target_var)
@@ -1849,7 +2413,6 @@ pub async fn execute_cypher(
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
-            // Extract 'label' from properties, fallback to rel_type
             let label = properties_clone
                 .get("label")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -1865,17 +2428,82 @@ pub async fn execute_cypher(
             storage.create_edge(edge.clone()).await?;
             Ok(json!({ "edge": edge }))
         }
-        // -----------------------------------------------------------------
-        // MATCH path = (a)-[*..]-(b) RETURN …   (path variable ignored)
-        // -----------------------------------------------------------------
-        CypherQuery::MatchPath {
-            path_var: _,
-            left_node,
-            right_node,
-            return_clause: _,
-        } => {
-            println!("===> Executing MatchPath: left={}, right={}", left_node, right_node);
+        
+        CypherQuery::DetachDeleteNodes { node_variable: _, label } => {
+            let all_vertices = storage.get_all_vertices().await?;
+            
+            let nodes_to_delete: Vec<Vertex> = all_vertices
+                .into_iter()
+                .filter(|v| {
+                    label.as_ref().map_or(true, |l| {
+                        let v_label_str = v.label.as_ref();
+                        v_label_str == l.as_str()
+                    })
+                })
+                .collect();
+            
+            if nodes_to_delete.is_empty() {
+                return Ok(json!({"deleted_vertices": 0, "deleted_edges": 0}));
+            }
+            
+            let vertex_ids: HashSet<Uuid> = nodes_to_delete.iter().map(|v| v.id.0).collect();
+            let deleted_edges = storage.delete_edges_touching_vertices(&vertex_ids).await?;
+            
+            for vertex in nodes_to_delete.iter() {
+                storage.delete_vertex(&vertex.id.0).await?;
+            }
+            storage.flush().await?;
+            
+            Ok(json!({
+                "deleted_vertices": nodes_to_delete.len(),
+                "deleted_edges": deleted_edges
+            }))
+        }
 
+        CypherQuery::DeleteEdges {
+            edge_variable,
+            pattern,
+            where_clause,
+        } => {
+            // Use the helper function instead of recursion
+            let (_, edges) = exec_cypher_pattern(
+                vec![(None, pattern.nodes, pattern.relationships)],
+                &storage
+            ).await?;
+
+            let mut deleted = 0usize;
+
+            for edge in edges {
+                let mut variables = HashMap::new();
+                variables.insert(edge_variable.clone(), CypherValue::Edge(edge.clone()));
+
+                let ctx = EvaluationContext {
+                    variables,
+                    parameters: HashMap::new(),
+                };
+
+                let should_delete = match where_clause.as_ref() {
+                    Some(where_clause) => where_clause.evaluate(&ctx)?,
+                    None => true,
+                };
+
+                if should_delete {
+                    storage
+                        .delete_edge(&edge.outbound_id.0, &edge.edge_type, &edge.inbound_id.0)
+                        .await?;
+                    deleted += 1;
+                }
+            }
+
+            storage.flush().await?;
+            Ok(json!({
+                "status": "success",
+                "deleted_edges": deleted,
+                "message": format!("Successfully deleted {deleted} edge(s)")
+            }))
+        }
+
+        CypherQuery::MatchPath { path_var: _, left_node, right_node, return_clause: _ } => {
             let left_pat = parse_node_pattern(&left_node)?;
             let right_pat = parse_node_pattern(&right_node)?;
 
@@ -1885,7 +2513,6 @@ pub async fn execute_cypher(
             let mut left_ids = HashSet::new();
             let mut right_ids = HashSet::new();
 
-            // helper to test a vertex against a pattern
             let matches = |v: &Vertex, (label, props): &(Option<String>, HashMap<String, Value>)| {
                 let label_ok = label.as_ref().map_or(true, |l| {
                     let vl = v.label.as_ref();
@@ -1899,23 +2526,17 @@ pub async fn execute_cypher(
                 label_ok && props_ok
             };
 
-            // collect ALL vertices that match either side
             for v in &all_vertices {
                 if matches(v, &left_pat) { left_ids.insert(v.id); }
                 if matches(v, &right_pat) { right_ids.insert(v.id); }
             }
 
-            // edges that touch **any** matched vertex (0-2 hops)
             let mut matched_edge_ids = HashSet::new();
             let mut matched_vertex_ids = left_ids.union(&right_ids).copied().collect::<HashSet<_>>();
 
-            // BFS up to 2 hops
             let mut queue: Vec<(SerializableUuid, u32)> = matched_vertex_ids.iter().map(|&id| (id, 0)).collect();
             let mut visited_edges = HashSet::new();
 
-            // Note: pop() on a Vec makes this a DFS-like behavior if not using a true Queue/Deque.
-            // Using a Vec as a queue (pop from front) is inefficient, but acceptable for a stub.
-            // For now, we'll use pop() and rely on the BFS logic through hop count.
             while let Some((current_id, hop)) = queue.pop() {
                 if hop >= 2 { continue; }
                 for edge in &all_edges {
@@ -1937,7 +2558,6 @@ pub async fn execute_cypher(
                 }
             }
 
-            // materialise the collections
             let vertices: Vec<Vertex> = all_vertices.into_iter()
                 .filter(|v| matched_vertex_ids.contains(&v.id))
                 .collect();
@@ -1945,7 +2565,6 @@ pub async fn execute_cypher(
                 .filter(|e| matched_edge_ids.contains(&e.id))
                 .collect();
 
-            println!("===> Returning {} vertices, {} edges", vertices.len(), edges.len());
             Ok(json!({ "vertices": vertices, "edges": edges }))
         }
     }

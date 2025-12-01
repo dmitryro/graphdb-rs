@@ -1,3 +1,4 @@
+pub mod query_types;
 pub mod query_parser;
 pub mod cypher_parser;
 pub mod graphql_parser;
@@ -10,6 +11,7 @@ pub use cypher_parser::{
   is_cypher,
   execute_cypher, 
 };
+pub use query_types::*;
 pub use sql_parser::{
 
 };

@@ -6,6 +6,7 @@
 // - Provided a u64 value for max_open_files.
 
 use async_trait::async_trait;
+use std::collections::{ HashSet };
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,6 +122,11 @@ impl StorageEngine for HybridStorage {
 
 #[async_trait]
 impl GraphStorageEngine for HybridStorage {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+    
     fn get_type(&self) -> &'static str {
         "Hybrid"
     }

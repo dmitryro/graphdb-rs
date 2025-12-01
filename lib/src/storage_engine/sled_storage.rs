@@ -489,155 +489,44 @@ impl SledStorage {
 
     // Internal implementation methods (same pattern as RocksDBStorage)
     pub async fn add_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO ADD VERTEX");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.create_vertex(vertex).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO ADD VERTEX ========================");
-        drop(guard);
-        
-        // Fallback to direct access
         self.create_vertex_direct(vertex).await
     }
 
     pub async fn get_vertex_internal(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO GET VERTEX");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_vertex(id).await;
-        }
-        
+        // ALWAYS use direct DB access to avoid ZMQ deadlock
+        // The ZMQ client would create a request to ourselves, causing a hang
         println!("========================== USING DIRECT DB ACCESS TO GET VERTEX ========================");
-        drop(guard);
-        
         self.get_vertex_direct(id).await
     }
 
     pub async fn delete_vertex_internal(&self, id: &Uuid) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO DELETE VERTEX");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.delete_vertex(id).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO DELETE VERTEX ========================");
-        drop(guard);
-        
         self.delete_vertex_direct(id).await
     }
 
     pub async fn add_edge(&self, edge: Edge) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO ADD EDGE");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.create_edge(edge).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO ADD EDGE ========================");
-        drop(guard);
-        
         self.create_edge_direct(edge).await
     }
 
     pub async fn get_edge_internal(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO GET EDGE");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_edge(outbound_id, edge_type, inbound_id).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO GET EDGE ========================");
-        drop(guard);
-        
         self.get_edge_direct(outbound_id, edge_type, inbound_id).await
     }
 
     pub async fn delete_edge_internal(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO DELETE EDGE");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.delete_edge(outbound_id, edge_type, inbound_id).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO DELETE EDGE ========================");
-        drop(guard);
-        
         self.delete_edge_direct(outbound_id, edge_type, inbound_id).await
     }
 
     pub async fn get_all_vertices_internal(&self) -> GraphResult<Vec<Vertex>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO FETCH ALL VERTICES");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_all_vertices().await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO GET ALL VERTICES ========================");
-        drop(guard);
-        
         self.get_all_vertices_direct().await
     }
 
     pub async fn get_all_edges_internal(&self) -> GraphResult<Vec<Edge>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO FETCH ALL EDGES");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_all_edges().await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO GET ALL EDGES ========================");
-        drop(guard);
-        
         self.get_all_edges_direct().await
     }
 
@@ -1124,6 +1013,63 @@ impl StorageEngine for SledStorage {
 
 #[async_trait]
 impl GraphStorageEngine for SledStorage {
+    // NOTE: This assumes SLED_DB is a static structure holding a Mutex<SledStorageInner>
+    // and SledStorageInner contains a 'client' field (Arc<ZmqClient>, ...)
+
+    // Placeholder for the method containing the error
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".into()))?;
+
+        // Acquire the lock for client check
+        let guard = singleton.lock().await;
+
+        // FIX E0505: Extract the client reference/clone before potentially dropping the guard 
+        // inside the conditional block, preventing the lifetime issue.
+        // Assuming client is stored as `(Arc<ZmqClient>, ...)` in `guard.client`.
+        let client_to_use = guard.client.as_ref().map(|(client, _)| client.clone());
+        
+        // If connected via ZMQ client → forward (WAL-safe)
+        if let Some(client) = client_to_use {
+            // Drop the guard here to release the lock *before* the potentially long-running await call
+            drop(guard); 
+            return client.delete_edges_touching_vertices(vertex_ids).await;
+        }
+
+        // Now safe to drop the guard if the client call was skipped.
+        drop(guard); 
+
+        let db_guard = SLED_DB.get().unwrap().lock().await;
+        // Assuming db_guard.db is the sled::Db instance
+        let edges_tree = db_guard.db.open_tree("edges")
+            .map_err(|e| GraphError::StorageError(e.to_string()))?; 
+
+        let mut deleted = 0;
+        let mut to_remove = Vec::new();
+
+        // The iter() method on sled::Tree requires `&self`, 
+        // which relies on the `db_guard` lock being held.
+        for item in edges_tree.iter() {
+            let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let edge: Edge = deserialize_edge(&value)?;
+            
+            if vertex_ids.contains(&edge.outbound_id.0) || vertex_ids.contains(&edge.inbound_id.0) {
+                to_remove.push(key);
+                deleted += 1;
+            }
+        }
+
+        for key in to_remove {
+            edges_tree.remove(key).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+
+        db_guard.db.flush_async()
+            .await
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            
+        Ok(deleted)
+    }
+
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
         SledStorage::add_vertex(self, vertex).await
     }
@@ -1137,7 +1083,8 @@ impl GraphStorageEngine for SledStorage {
     }
 
     async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        SledStorage::delete_vertex_internal(self, id).await
+        println!("===> SledStorage::delete_vertex DIRECT (id={})", id);
+        self.delete_vertex_direct(id).await
     }
     
     async fn create_edge(&self, edge: Edge) -> GraphResult<()> {

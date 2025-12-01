@@ -2184,6 +2184,72 @@ impl StorageEngine for RocksDBStorage {
 
 #[async_trait]
 impl GraphStorageEngine for RocksDBStorage {
+    // Assuming this is within a trait implementation for RocksdbStorage or a similar struct
+    // and assuming necessary imports like rocksdb::IteratorMode, ROCKSDB_DB, deserialize_edge,
+    // Edge, Vertex, GraphResult, GraphError, Uuid, and HashSet are in scope.
+
+    // NOTE: This file is generated based on the method provided by the user. 
+    // Contextual placeholders (like ROCKSDB_DB, deserialize_edge) are assumed to be defined elsewhere.
+
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        let singleton = ROCKSDB_DB.get()
+            .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".into()))?;
+        
+        // Acquire the lock for client check
+        let guard = singleton.lock().await;
+        
+        // FIX E0505: Extract the client reference/clone before potentially dropping the guard 
+        // inside the conditional block, preventing the lifetime issue.
+        // Assuming client is stored as `(Arc<ZmqClient>, ...)` in `guard.client`.
+        let client_to_use = guard.client.as_ref().map(|(client, _)| client.clone());
+        
+        // If connected via ZMQ client → forward (WAL-safe)
+        if let Some(client) = client_to_use {
+            // Drop the guard here to release the lock *before* the potentially long-running await call
+            drop(guard); 
+            return client.delete_edges_touching_vertices(vertex_ids).await;
+        }
+
+        // Now safe to drop the guard if the client call was skipped.
+        drop(guard); 
+
+        let db_guard = ROCKSDB_DB.get().unwrap().lock().await;
+
+        // Retrieve the ColumnFamily handle. If the CF handle type is Arc<BoundColumnFamily>, 
+        // the methods require a reference, causing the E0308 error.
+        let edges_cf = db_guard.db.cf_handle("edges")
+            .ok_or(GraphError::StorageError("Edges CF not found".into()))?;
+
+        let mut deleted = 0;
+        let mut to_remove = Vec::new();
+
+        // FIX E0308: Borrow `edges_cf` at the call site.
+        // This resolves the expected reference `&_` vs found `Arc<BoundColumnFamily<'_>>` mismatch.
+        let iter = db_guard.db.iterator_cf(&edges_cf, IteratorMode::Start);
+        
+        for item in iter {
+            let (_, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            // Assuming `deserialize_edge` is defined elsewhere and converts the byte value to an Edge struct
+            let edge: Edge = deserialize_edge(&value)?; 
+            
+            if vertex_ids.contains(&edge.outbound_id.0) || vertex_ids.contains(&edge.inbound_id.0) {
+                // Note: Uuid::as_bytes() returns [u8; 16], so we convert it to Vec<u8> for storage/removal
+                to_remove.push(edge.id.0.as_bytes().to_vec()); 
+                deleted += 1;
+            }
+        }
+        
+        for key in to_remove {
+            // FIX E0308: Borrow `edges_cf` here as well.
+            db_guard.db.delete_cf(&edges_cf, &key).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+
+        // FIX E0308: Borrow `edges_cf` here as well.
+        db_guard.db.flush_cf(&edges_cf).map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        Ok(deleted)
+    }
+
     async fn start(&self) -> Result<(), GraphError> {
         info!("Starting RocksDBStorage");
         println!("===> STARTING ROCKSDB STORAGE");

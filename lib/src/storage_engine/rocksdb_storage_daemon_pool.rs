@@ -12,7 +12,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use quick_cache::sync::Cache;
 use rocksdb::{DB, Env, Options, WriteBatch, WriteOptions, ColumnFamily, BoundColumnFamily, ColumnFamilyDescriptor, 
-              DBCompressionType, DBCompactionStyle, Cache as RocksDBCache, BlockBasedOptions,};
+              DBCompressionType, DBCompactionStyle, Cache as RocksDBCache, BlockBasedOptions, IteratorMode,};
 use rocksdb::backup::{BackupEngine, BackupEngineOptions, RestoreOptions};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as TokioMutex, RwLock, OnceCell, Semaphore, SemaphorePermit, 
@@ -105,6 +105,23 @@ lazy_static! {
 lazy_static::lazy_static! {
     /// canonical data directory to list of ports that belong to it
     static ref CANONICAL_DB_MAP: RwLock<HashMap<PathBuf, Vec<u16>>> = RwLock::new(HashMap::new());
+}
+
+macro_rules! p {
+    ($req:expr, $key:expr) => {
+        $req["params"][$key].as_str().ok_or_else(|| anyhow!("missing param: {}", $key))?
+    };
+}
+
+macro_rules! parr {
+    ($req:expr, $key:expr) => {
+        $req["params"][$key]
+            .as_array()
+            .ok_or_else(|| anyhow!("missing array: {}", $key))?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+    };
 }
 // ────────────────────────────────────────────────────────────────
 // Global lazy DB cache + per-port watch channel
@@ -1523,7 +1540,6 @@ async fn run_zmq_server_lazy(
                     Ok(_) => json!({"status":"success","request_id": request_id}),
                     Err(e)=> json!({"status":"error","message":e.to_string(),"request_id": request_id}),
                 },
-
                 // ---------- INDEX COMMANDS ----------
                 idx_cmd @ (
                     "index_create" | "index_init" |
@@ -1559,10 +1575,23 @@ async fn run_zmq_server_lazy(
                             guard.drop_fulltext_index(name).await.context("drop_fulltext_index")
                         }
                         "index_list" => guard.list_indexes().await.context("list_indexes"),
+                        // inside RocksDBDaemon::run_zmq_server_lazy  (match arm)
                         "index_search" => {
-                            let query = request["params"]["query"].as_str().ok_or_else(|| anyhow!("missing query"))?;
-                            let limit = request["params"]["limit"].as_u64().unwrap_or(10) as usize;
-                            guard.fulltext_search(query, limit).await.context("fulltext_search")
+                            let query = request["params"]["query"]
+                                .as_str()
+                                .ok_or_else(|| anyhow!("missing query"))?;
+                            let limit = request["params"]["limit"]
+                                .as_u64()
+                                .unwrap_or(10) as usize;
+
+                            // IndexingService::fulltext_search returns Result<Value>
+                            // Just forward it directly — no conversion needed
+                            let response: Value = guard
+                                .fulltext_search(query, limit)
+                                .await
+                                .context("fulltext_search failed")?;
+
+                            Ok(response)
                         }
                         "index_rebuild" => {
                             info!("Executing Index Rebuild (All Indices)");
@@ -1588,6 +1617,91 @@ async fn run_zmq_server_lazy(
                 }
 
                 // --- MUTATING / READ-ONLY / force_ipc_init  (unchanged) ---
+                    "delete_edges_touching_vertices" => {
+                        // Parse requested vertex IDs (for DETACH)
+                        let target_vertex_ids: HashSet<Uuid> = match request.get("vertex_ids") {
+                            Some(value) => {
+                                let ids: Vec<String> = serde_json::from_value(value.clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid vertex_ids format: {}", e)))?;
+                                ids.iter()
+                                    .map(|s| Uuid::parse_str(s).map_err(|_| GraphError::StorageError("Invalid UUID in vertex_ids".into())))
+                                    .collect::<GraphResult<_>>()?
+                            }
+                            None => HashSet::new(),
+                        };
+
+                        let edges_cf = db.cf_handle("edges")
+                            .ok_or(GraphError::StorageError("Missing 'edges' column family".into()))?;
+
+                        let vertices_cf = db.cf_handle("vertices")
+                            .ok_or(GraphError::StorageError("Missing 'vertices' column family".into()))?;
+
+                        // Load all existing vertex IDs (for orphan detection)
+                        let mut existing_vertex_ids = HashSet::new();
+                        let vertex_iter = db.iterator_cf(&vertices_cf, rocksdb::IteratorMode::Start);
+                        for item in vertex_iter {
+                            let (key, _) = item
+                                .map_err(|e| GraphError::StorageError(format!("Vertex iteration failed: {}", e)))?;
+                            if key.len() == 16 {
+                                let uuid = Uuid::from_slice(&key)
+                                    .map_err(|_| GraphError::StorageError("Corrupted vertex key".into()))?;
+                                existing_vertex_ids.insert(uuid);
+                            }
+                        }
+
+                        let mut write_batch = rocksdb::WriteBatch::default();
+                        let mut deleted_by_detach = 0usize;
+                        let mut deleted_orphans = 0usize;
+
+                        // Scan all edges — collect deletions
+                        let edge_iter = db.iterator_cf(&edges_cf, rocksdb::IteratorMode::Start);
+                        for item in edge_iter {
+                            let (key, value) = item
+                                .map_err(|e| GraphError::StorageError(format!("Edge iteration failed: {}", e)))?;
+
+                            let edge: Edge = deserialize_edge(&value)
+                                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edge: {}", e)))?;
+
+                            let out_exists = existing_vertex_ids.contains(&edge.outbound_id.0);
+                            let in_exists = existing_vertex_ids.contains(&edge.inbound_id.0);
+                            let is_orphan = !out_exists || !in_exists;
+                            let is_targeted = target_vertex_ids.contains(&edge.outbound_id.0)
+                                           || target_vertex_ids.contains(&edge.inbound_id.0);
+
+                            if is_orphan || is_targeted {
+                                write_batch.delete_cf(&edges_cf, &key);
+
+                                if is_targeted {
+                                    deleted_by_detach += 1;
+                                }
+                                if is_orphan {
+                                    deleted_orphans += 1;
+                                }
+                            }
+                        }
+
+                        // Critical fix: pass by value, not by reference
+                        db.write(write_batch)
+                            .map_err(|e| GraphError::StorageError(format!("Batch delete failed: {}", e)))?;
+
+                        // Optional: ensure data is on disk (ignore error if not supported)
+                        let _ = db.flush_cf(&edges_cf);
+
+                        let total_deleted = deleted_by_detach + deleted_orphans;
+
+                        info!(
+                            "RocksDB: DETACH+ORPHAN cleanup — {} edges deleted ({} targeted, {} orphaned)",
+                            total_deleted, deleted_by_detach, deleted_orphans
+                        );
+
+                        json!({
+                            "status": "success",
+                            "deleted_edges": total_deleted,
+                            "deleted_by_detach": deleted_by_detach,
+                            "deleted_orphans": deleted_orphans,
+                            "message": "DETACH DELETE + full orphan cleanup completed"
+                        })
+                    }
                     cmd if [
                         "set_key","delete_key",
                         "create_vertex","update_vertex","delete_vertex",

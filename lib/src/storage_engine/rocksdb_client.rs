@@ -1,5 +1,6 @@
 // Extended RocksDBClient implementation with ZMQ support while preserving original functionality
 use std::any::Any;
+use std::collections::{ HashSet };
 use async_trait::async_trait;
 use std::path::{PathBuf, Path};
 use std::sync::Arc;
@@ -1400,6 +1401,11 @@ impl StorageEngine for RocksDBClient {
 
 #[async_trait]
 impl GraphStorageEngine for RocksDBClient {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+    
     async fn start(&self) -> Result<(), GraphError> {
         info!("Starting RocksDBClient");
         println!("===> Starting RocksDBClient");

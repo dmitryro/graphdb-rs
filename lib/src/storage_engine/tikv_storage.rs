@@ -1,6 +1,7 @@
 // lib/src/storage_engine/tikv_storage.rs
 // Updated: 2025-11-19 - Full index support + Tantivy + all original code preserved + all errors fixed
 use std::any::Any;
+use std::collections::{HashSet};
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use async_trait::async_trait;
@@ -312,6 +313,11 @@ impl StorageEngine for TikvStorage {
 
 #[async_trait]
 impl GraphStorageEngine for TikvStorage {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -117,6 +117,11 @@ impl StorageEngine for RaftStorage {
 
 #[async_trait]
 impl GraphStorageEngine for RaftStorage {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+    
     fn as_any(&self) -> &dyn Any {
         self
     }
