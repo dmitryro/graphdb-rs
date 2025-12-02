@@ -4,6 +4,7 @@
 #![cfg_attr(feature = "bench-suite", feature(test))]
 pub mod connectors;
 pub mod query_parser;
+pub mod graph_engine;
 pub mod graph_evolution;
 pub mod graph_indexing;
 pub mod network_interfaces;
@@ -36,6 +37,7 @@ pub use commands::*;
 pub use daemon::*;
 pub use graph_indexing::*;
 pub use indexing::*;
+pub use graph_engine::*;
 
 #[cfg(feature = "bench-suite")]
 extern crate test;

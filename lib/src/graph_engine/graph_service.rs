@@ -1,13 +1,13 @@
 // graph_engine/src/graph_service.rs
 //! Global singleton GraphService — fully persistent using lib's StorageEngine + GraphError
 
-use models::graph::Graph;
-use crate::medical::*;
-use lib::errors::GraphError;
-use lib::storage_engine::{StorageEngine, GraphOp};
+use crate::graph_engine::medical::*;
+use crate::storage_engine::{StorageEngine, GraphOp};
 use models::medical::*;
+use models::graph::Graph;
 use models::vertices::Vertex;
 use models::edges::Edge;
+use models::errors::GraphError;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
@@ -142,5 +142,30 @@ impl GraphService {
     /// Mutable access to the inner `Graph` (replaces `.write()` on `Arc`).
     pub async fn write_graph(&self) -> tokio::sync::RwLockWriteGuard<'_, Graph> {
         self.graph.write().await
+    }
+}
+
+// =========================================================================
+// HELPER FOR INITIALIZATION/RETRIEVAL
+// =========================================================================
+
+/// Helper to ensure the global GraphService is initialized.
+/// If already initialized, returns the existing instance.
+/// If not initialized, calls `GraphService::global_init` using the provided storage.
+pub async fn initialize_graph_service(
+    storage: Arc<dyn StorageEngine>,
+) -> Result<Arc<GraphService>, GraphError> {
+    match GRAPH_SERVICE.get() {
+        Some(service) => Ok(service.clone()),
+        None => {
+            // Service not initialized, attempt one-time initialization.
+            // We clone storage because global_init takes ownership of the Arc (or needs a clone).
+            GraphService::global_init(storage.clone()).await?;
+            
+            // Initialization succeeded, retrieve the newly set service (now unwrap is safe)
+            GRAPH_SERVICE.get()
+                .cloned()
+                .ok_or_else(|| GraphError::StorageError("Failed to retrieve GraphService after initialization".into()))
+        }
     }
 }
