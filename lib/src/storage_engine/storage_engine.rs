@@ -567,6 +567,12 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
         // TODO: implement it.
         Ok(0)
     }
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1444,6 +1450,9 @@ pub trait GraphStorageEngine: StorageEngine + Send + Sync + Debug + 'static {
     /// This replaces the specific create, drop, list, search, and rebuild methods.
     async fn execute_index_command(&self, command: &str, params: serde_json::Value) -> GraphResult<QueryResult>;
     async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize>;
+    /// Scans the edge store and removes any edges whose source or target vertex 
+    /// does not exist. Returns the number of edges removed.
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize>;
 }
 
 #[derive(Debug)]

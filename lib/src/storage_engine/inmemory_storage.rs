@@ -113,6 +113,11 @@ impl GraphStorageEngine for InMemoryStorage {
         Ok(0)
     }
     
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
     async fn clear_data(&self) -> Result<(), GraphError> {
         let mut vertices = self.vertices.lock().await;
         let mut edges = self.edges.lock().await;

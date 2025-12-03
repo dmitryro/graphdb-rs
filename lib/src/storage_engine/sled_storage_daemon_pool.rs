@@ -1745,6 +1745,83 @@ impl SledDaemon {
                             "message": "DETACH DELETE + orphan cleanup completed"
                         })
                     }
+                    Some("cleanup_orphaned_edges") | Some("cleanup_storage") | Some("cleanup_storage_force") => {
+                        // This operation has no input parameters, so we use an empty set
+                        let target_vertex_ids: HashSet<Uuid> = HashSet::new();
+                        
+                        let vertices_tree = db.open_tree("vertices")
+                            .map_err(|e| GraphError::StorageError(format!("Failed to open vertices tree: {}", e)))?;
+
+                        let edges_tree = db.open_tree("edges")
+                            .map_err(|e| GraphError::StorageError(format!("Failed to open edges tree: {}", e)))?;
+
+                        // Load all existing vertex IDs once — O(V) but required for correctness
+                        let mut existing_vertex_ids = HashSet::new();
+                        for item in vertices_tree.iter() {
+                            let (key, _) = item
+                                .map_err(|e| GraphError::StorageError(format!("Vertex iteration failed: {}", e)))?;
+                            if key.len() == 16 {
+                                let uuid = Uuid::from_slice(&key)
+                                    .map_err(|_| GraphError::StorageError("Corrupted vertex key".into()))?;
+                                existing_vertex_ids.insert(uuid);
+                            }
+                        }
+
+                        let mut keys_to_remove = Vec::new();
+                        let mut deleted_by_detach = 0; // Will be 0 since target_vertex_ids is empty
+                        let mut deleted_orphans = 0;
+
+                        // Scan all edges — only orphaned edges will be deleted here
+                        for item in edges_tree.iter() {
+                            let (key, value) = item
+                                .map_err(|e| GraphError::StorageError(format!("Edge iteration failed: {}", e)))?;
+
+                            let edge: Edge = deserialize_edge(&value)
+                                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edge: {}", e)))?;
+
+                            let out_exists = existing_vertex_ids.contains(&edge.outbound_id.0);
+                            let in_exists = existing_vertex_ids.contains(&edge.inbound_id.0);
+                            let is_orphan = !out_exists || !in_exists;
+                            
+                            // is_targeted will be false since target_vertex_ids is empty
+                            // let is_targeted = target_vertex_ids.contains(&edge.outbound_id.0) 
+                            //                 || target_vertex_ids.contains(&edge.inbound_id.0);
+
+                            if is_orphan /* || is_targeted */ { 
+                                keys_to_remove.push(key);
+
+                                // if is_targeted { deleted_by_detach += 1; } // Skipped: is_targeted is always false
+                                if is_orphan {
+                                    deleted_orphans += 1;
+                                }
+                            }
+                        }
+
+                        // Remove all doomed edges
+                        for key in keys_to_remove {
+                            edges_tree.remove(&key)
+                                .map_err(|e| GraphError::StorageError(format!("Failed to remove edge: {}", e)))?;
+                        }
+
+                        // Ensure durability
+                        db.flush_async()
+                            .await
+                            .map_err(|e| GraphError::StorageError(format!("Flush failed after orphan cleanup: {}", e)))?;
+
+                        let total_deleted = deleted_orphans;
+
+                        info!(
+                            "Sled ORPHAN cleanup: {} edges deleted ({} orphaned)",
+                            total_deleted, deleted_orphans
+                        );
+
+                        json!({
+                            "status": "success",
+                            "deleted_edges": total_deleted,
+                            "deleted_orphans": deleted_orphans,
+                            "message": "Orphan cleanup completed"
+                        })
+                    }
                     Some(cmd) if [
                         "set_key", "delete_key",
                         "create_vertex", "update_vertex", "delete_vertex",

@@ -116,6 +116,52 @@ impl GraphService {
             .collect()
     }
 
+    /// Asynchronously removes a single edge from the in-memory graph structure.
+    /// This requires acquiring a write lock on the in-memory graph.
+    // Inside the implementation block for GraphService in lib/src/graph_engine/graph_service.rs
+
+    /// Asynchronously removes a single edge from the in-memory graph structure.
+    /// This requires acquiring a write lock on the in-memory graph.
+    pub async fn delete_edge_from_memory(&self, edge: &Edge) -> Result<(), GraphError> {
+        // Acquire the write lock on the in-memory graph
+        let mut graph = self.graph.write().await; 
+
+        // 1. Remove the edge from the main edges map using its unique ID
+        if graph.edges.remove(&edge.id.0).is_some() {
+            // Edge was present, now perform cleanup in the adjacency lists
+
+            // 2. Cleanup adjacency list for the Outbound (Start) Node
+            // FIX: Use the available field name: `out_edges`
+            if let Some(outbound_set) = graph.out_edges.get_mut(&edge.outbound_id.0) {
+                outbound_set.remove(&edge.id.0);
+                
+                // Optional cleanup: remove the entry if the set is now empty
+                if outbound_set.is_empty() {
+                    graph.out_edges.remove(&edge.outbound_id.0);
+                }
+            }
+
+            // 3. Cleanup adjacency list for the Inbound (End) Node
+            // FIX: Use the available field name: `in_edges`
+            if let Some(inbound_set) = graph.in_edges.get_mut(&edge.inbound_id.0) {
+                inbound_set.remove(&edge.id.0);
+                
+                // Optional cleanup: remove the entry if the set is now empty
+                if inbound_set.is_empty() {
+                    graph.in_edges.remove(&edge.inbound_id.0);
+                }
+            }
+
+            // 4. Decrement the in-memory edge count
+            // FIX: Use the available field name: `edge_count`
+            // Note: The E0609 error for edge_count is resolved because you confirmed
+            // this field was added to the Graph model in the previous step.
+            graph.edge_count = graph.edge_count.saturating_sub(1);
+        }
+
+        Ok(())
+    }
+
     // =====  observer helpers  =====
     pub async fn add_vertex_observer<F>(&self, f: F) -> Result<(), GraphError>
     where

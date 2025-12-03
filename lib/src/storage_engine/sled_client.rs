@@ -1572,6 +1572,11 @@ impl GraphStorageEngine for SledClient {
         Ok(0)
     }
 
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+    
     async fn stop(&self) -> GraphResult<()> {
         info!("Stopping SledClient");
         let port = match &self.mode {

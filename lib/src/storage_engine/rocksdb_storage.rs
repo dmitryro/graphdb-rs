@@ -8,7 +8,7 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{OnceCell, Mutex as TokioMutex, RwLock};
 use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use log::{info, debug, warn, error, trace};
-use rocksdb::{ColumnFamilyDescriptor, DB, Options, DBCompactionStyle, WriteOptions, BoundColumnFamily, IteratorMode};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options, DBCompactionStyle, WriteOptions, BoundColumnFamily, IteratorMode, WriteBatch,};
 use crate::storage_engine::rocksdb_storage_daemon_pool::{ FULLTEXT_INDEX };
 use crate::storage_engine::storage_engine::{ GraphOp };
 use serde_json::{json, Value};
@@ -48,6 +48,11 @@ pub static ROCKSDB_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<Tokio
 
 // Singleton protection for RocksDB database instances
 static ROCKSDB_ACTIVE_DATABASES: Lazy<RwLock<HashMap<PathBuf, u32>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+// RocksDB Metadata Tree and Key
+pub const METADATA_TREE: &str = "metadata";
+pub const EDGE_COUNT_KEY: &str = "edge_count";
+
 
 impl RocksDBStorage {
     // Enhanced singleton protection that allows reuse within the same process
@@ -2192,62 +2197,191 @@ impl GraphStorageEngine for RocksDBStorage {
     // Contextual placeholders (like ROCKSDB_DB, deserialize_edge) are assumed to be defined elsewhere.
 
     async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // 1. ZMQ forwarding (Sled practice)
         let singleton = ROCKSDB_DB.get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".into()))?;
         
-        // Acquire the lock for client check
-        let guard = singleton.lock().await;
+        let client_to_use = {
+            let guard = singleton.lock().await;
+            guard.client.as_ref().map(|(client, _)| client.clone())
+        };
         
-        // FIX E0505: Extract the client reference/clone before potentially dropping the guard 
-        // inside the conditional block, preventing the lifetime issue.
-        // Assuming client is stored as `(Arc<ZmqClient>, ...)` in `guard.client`.
-        let client_to_use = guard.client.as_ref().map(|(client, _)| client.clone());
-        
-        // If connected via ZMQ client → forward (WAL-safe)
         if let Some(client) = client_to_use {
-            // Drop the guard here to release the lock *before* the potentially long-running await call
-            drop(guard); 
             return client.delete_edges_touching_vertices(vertex_ids).await;
         }
 
-        // Now safe to drop the guard if the client call was skipped.
-        drop(guard); 
+        // 2. Local execution
+        let db_guard = singleton.lock().await;
+        let db: &DB = &db_guard.db;
 
-        let db_guard = ROCKSDB_DB.get().unwrap().lock().await;
+        // Get all required Column Family handles (CFs)
+        // FIX E0308 (CF Handle): The handles themselves are Arc<T>. We pass &handle later.
+        let edges_cf = db.cf_handle("edges")
+            .ok_or_else(|| GraphError::StorageError("Edges CF not found".into()))?;
+        let outbound_cf = db.cf_handle("outbound_index") // Assuming index CF names
+            .ok_or_else(|| GraphError::StorageError("Outbound CF not found".into()))?;
+        let inbound_cf = db.cf_handle("inbound_index") // Assuming index CF names
+            .ok_or_else(|| GraphError::StorageError("Inbound CF not found".into()))?;
+        let metadata_cf = db.cf_handle("metadata") // Assuming metadata CF name
+            .ok_or_else(|| GraphError::StorageError("Metadata CF not found".into()))?;
 
-        // Retrieve the ColumnFamily handle. If the CF handle type is Arc<BoundColumnFamily>, 
-        // the methods require a reference, causing the E0308 error.
-        let edges_cf = db_guard.db.cf_handle("edges")
-            .ok_or(GraphError::StorageError("Edges CF not found".into()))?;
+        // 3. Collect edges to delete (Read-only pass)
+        let mut deleted_count: usize = 0;
+        let mut edges_data_to_delete: Vec<Edge> = Vec::new();
 
-        let mut deleted = 0;
-        let mut to_remove = Vec::new();
-
-        // FIX E0308: Borrow `edges_cf` at the call site.
-        // This resolves the expected reference `&_` vs found `Arc<BoundColumnFamily<'_>>` mismatch.
-        let iter = db_guard.db.iterator_cf(&edges_cf, IteratorMode::Start);
+        // FIX E0308 (Iterator): Borrow the CF handle: &edges_cf
+        // FIX E0599 (map_err): map_err is removed from iterator_cf result
+        let iter = db.iterator_cf(&edges_cf, IteratorMode::Start);
         
         for item in iter {
-            let (_, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            // Assuming `deserialize_edge` is defined elsewhere and converts the byte value to an Edge struct
-            let edge: Edge = deserialize_edge(&value)?; 
+            // map_err applied to the result of the iterator's next item
+            let (_key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?; 
             
-            if vertex_ids.contains(&edge.outbound_id.0) || vertex_ids.contains(&edge.inbound_id.0) {
-                // Note: Uuid::as_bytes() returns [u8; 16], so we convert it to Vec<u8> for storage/removal
-                to_remove.push(edge.id.0.as_bytes().to_vec()); 
-                deleted += 1;
+            if let Ok(edge) = deserialize_edge(&value) {
+                if vertex_ids.contains(&edge.outbound_id.0) || vertex_ids.contains(&edge.inbound_id.0) {
+                    edges_data_to_delete.push(edge);
+                    deleted_count += 1;
+                }
+            } else {
+                log::warn!("Failed to deserialize edge during delete_edges_touching_vertices scan.");
             }
         }
         
-        for key in to_remove {
-            // FIX E0308: Borrow `edges_cf` here as well.
-            db_guard.db.delete_cf(&edges_cf, &key).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        // 4. Run atomic transaction using Write Batch
+        if deleted_count > 0 {
+            let mut batch = WriteBatch::default();
+
+            for edge in &edges_data_to_delete {
+                // Edge ID key (for "edges" CF)
+                let edge_id_key: Vec<u8> = edge.id.0.as_bytes().to_vec();
+                
+                // FIX E0308 (Uuid types): Convert Uuid (edge.id.0) to SerializableUuid (edge.id)
+                let outbound_uuid_wrapper = SerializableUuid(edge.outbound_id.0);
+                let inbound_uuid_wrapper = SerializableUuid(edge.inbound_id.0);
+
+                // Outbound index key
+                // FIX E0308 (Uuid types): Pass wrapper types
+                let outbound_index_key: Vec<u8> = create_edge_key(
+                    &outbound_uuid_wrapper,
+                    &edge.edge_type, 
+                    &inbound_uuid_wrapper
+                ).unwrap_or_else(|e| {
+                    log::error!("Failed to create outbound key: {}", e); 
+                    edge_id_key.clone()
+                });
+
+                // Inbound index key
+                // FIX E0308 (Uuid types): Pass wrapper types (reversed order)
+                let inbound_index_key: Vec<u8> = create_edge_key(
+                    &inbound_uuid_wrapper, 
+                    &edge.edge_type, 
+                    &outbound_uuid_wrapper
+                ).unwrap_or_else(|e| {
+                    log::error!("Failed to create inbound key: {}", e); 
+                    edge_id_key.clone()
+                });
+
+                // Delete from all three places in the batch for atomicity
+                // FIX E0308 (delete_cf): Borrow the CF handles: &edges_cf, &outbound_cf, &inbound_cf
+                batch.delete_cf(&edges_cf, &edge_id_key);
+                batch.delete_cf(&outbound_cf, &outbound_index_key);
+                batch.delete_cf(&inbound_cf, &inbound_index_key);
+            }
+
+            // --- Update global edge count in the batch ---
+            // FIX E0308 (get_cf): Borrow the CF handle: &metadata_cf
+            let current_bytes = db.get_cf(&metadata_cf, EDGE_COUNT_KEY.as_bytes())
+                .map_err(|e| GraphError::StorageError(e.to_string()))?
+                .unwrap_or_else(|| b"0".to_vec());
+
+            let current_count: usize = String::from_utf8_lossy(&current_bytes)
+                .parse()
+                .unwrap_or(0);
+
+            let new_count = current_count.saturating_sub(deleted_count);
+            
+            // Add the metadata update to the batch
+            // FIX E0308 (put_cf): Borrow the CF handle: &metadata_cf
+            batch.put_cf(&metadata_cf, EDGE_COUNT_KEY.as_bytes(), new_count.to_string().as_bytes());
+
+            // Apply the batch atomically
+            db.write(batch).map_err(|e| GraphError::StorageError(e.to_string()))?;
         }
 
-        // FIX E0308: Borrow `edges_cf` here as well.
-        db_guard.db.flush_cf(&edges_cf).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        // 5. Final result
+        Ok(deleted_count)
+    }
 
-        Ok(deleted)
+    /// Scans the edge store and removes any edges whose source or target vertex 
+    /// does not exist. Returns the number of edges removed.
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        let db = &self.db;
+
+        // 1. Get the Column Family handles from the DB instance
+        let edges_cf_handle = db.cf_handle("edges")
+            .ok_or_else(|| GraphError::StorageError("RocksDB Column Family 'edges' not found".into()))?;
+        let vertices_cf_handle = db.cf_handle("vertices")
+            .ok_or_else(|| GraphError::StorageError("RocksDB Column Family 'vertices' not found".into()))?;
+
+        let mut orphaned_keys: Vec<Vec<u8>> = Vec::new();
+
+        // 2. Scan all edges and check for vertex existence
+        // FIX E0308 (Iterator): Borrow the CF handle: &edges_cf_handle
+        // FIX E0599 (map_err): map_err removed here, handled inside the loop.
+        let iter = db.iterator_cf(&edges_cf_handle, IteratorMode::Start);
+            // .map_err(|e| GraphError::StorageError(e.to_string()))?; // Removed (E0599 fix)
+        
+        for item in iter {
+            let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            
+            // NOTE: Replace with your actual deserialization function if it's not global
+            let edge: Edge = match crate::storage_engine::storage_utils::deserialize_edge(&value) {
+                Ok(e) => e,
+                Err(_) => {
+                    // Corrupted record
+                    orphaned_keys.push(key.to_vec());
+                    continue;
+                }
+            };
+
+            // Prepare keys for lookup in the vertices CF
+            let source_key: Vec<u8> = edge.outbound_id.0.as_bytes().to_vec();
+            let target_key: Vec<u8> = edge.inbound_id.0.as_bytes().to_vec();
+
+            // Check existence in the vertices column family
+            // FIX E0308 (get_cf): Borrow the CF handle: &vertices_cf_handle
+            let source_exists = db.get_cf(&vertices_cf_handle, &source_key)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?
+                .is_some();
+            
+            // FIX E0308 (get_cf): Borrow the CF handle: &vertices_cf_handle
+            let target_exists = db.get_cf(&vertices_cf_handle, &target_key)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?
+                .is_some();
+
+            if !source_exists || !target_exists {
+                orphaned_keys.push(key.to_vec());
+            }
+        }
+
+        let deleted_count = orphaned_keys.len();
+
+        // 3. Delete orphaned edges using an atomic Write Batch
+        if deleted_count > 0 {
+            let mut batch = WriteBatch::default();
+            
+            for key in &orphaned_keys {
+                // Mark the edge record for atomic deletion
+                // FIX E0308 (delete_cf): Borrow the CF handle: &edges_cf_handle
+                batch.delete_cf(&edges_cf_handle, key);
+            }
+            
+            // Apply the batch atomically
+            db.write(batch).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+
+        // 4. Return the count
+        Ok(deleted_count)
     }
 
     async fn start(&self) -> Result<(), GraphError> {

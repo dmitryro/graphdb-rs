@@ -126,7 +126,12 @@ impl GraphStorageEngine for HybridStorage {
         // TODO: implement it.
         Ok(0)
     }
-    
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
     fn get_type(&self) -> &'static str {
         "Hybrid"
     }

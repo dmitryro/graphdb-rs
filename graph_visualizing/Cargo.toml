@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-graph_engine = { path = "../graph_engine", version = "0.1.0"}
 lib = { path = "../lib", version = "0.1.0"}
 models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] }
 caching = { path = "../caching" }

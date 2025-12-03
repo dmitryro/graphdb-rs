@@ -82,6 +82,11 @@ impl GraphStorageEngine for RedisStorage {
         Ok(0)
     }
 
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

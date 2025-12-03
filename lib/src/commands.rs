@@ -141,6 +141,7 @@ pub enum CommandType {
     Show(ShowAction),
     // Utility Commands
     Clear,
+    Cleanup(CleanupCommand), // <--- ADDED
     Help(HelpArgs),
     Exit,
     Unknown,
@@ -263,6 +264,39 @@ pub enum CommandType {
     DischargePlanning(DischargePlanningCommand),
 }
 
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum CleanupCommand {
+    /// Cleans up old log files based on a retention policy.
+    Logs {
+        /// Number of days of logs to keep. Defaults to 7.
+        #[clap(long, default_value = "7")]
+        days_retention: i32,
+        /// Force cleanup without confirmation.
+        #[clap(long)]
+        force: bool,
+    },
+    /// Removes temporary and cache files from the application's working directory.
+    TemporaryFiles,
+    /// Clears data in a specific storage engine (DANGEROUS and non-recoverable).
+    Storage {
+        /// Storage engine whose data directory should be cleared.
+        #[arg(value_parser = parse_storage_engine)]
+        engine: StorageEngineType,
+        /// Force cleanup without confirmation.
+        #[clap(long)]
+        force: bool,
+    },
+    /// Executes all standard cleanup operations (logs and temporary files).
+    All {
+        /// Number of days of logs to keep. Defaults to 7.
+        #[clap(long, default_value = "7")]
+        days_retention: i32,
+        /// Force cleanup without confirmation.
+        #[clap(long)]
+        force: bool,
+    },
+    Graph, 
+}
 
 // =========================================================================
 // CLINICAL WORKFLOW
@@ -2682,6 +2716,8 @@ pub enum Commands {
     #[clap(subcommand)]
     Index(IndexAction),
 
+    #[clap(subcommand)]
+    Cleanup(CleanupCommand), // <--- ADDED
     // =========================================================================
     // PATIENT MANAGEMENT
     // =========================================================================

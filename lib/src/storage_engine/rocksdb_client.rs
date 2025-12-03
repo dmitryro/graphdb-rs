@@ -1406,6 +1406,11 @@ impl GraphStorageEngine for RocksDBClient {
         Ok(0)
     }
     
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+    
     async fn start(&self) -> Result<(), GraphError> {
         info!("Starting RocksDBClient");
         println!("===> Starting RocksDBClient");

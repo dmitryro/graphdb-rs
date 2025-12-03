@@ -1702,7 +1702,82 @@ async fn run_zmq_server_lazy(
                             "message": "DETACH DELETE + full orphan cleanup completed"
                         })
                     }
-                    cmd if [
+                    "cleanup_orphaned_edges" | "cleanup_storage" | "cleanup_storage_force" => {
+                        // 1. Target vertex IDs are always empty for this call
+                        let target_vertex_ids: HashSet<Uuid> = HashSet::new();
+
+                        let edges_cf = db.cf_handle("edges")
+                            .ok_or(GraphError::StorageError("Missing 'edges' column family".into()))?;
+
+                        let vertices_cf = db.cf_handle("vertices")
+                            .ok_or(GraphError::StorageError("Missing 'vertices' column family".into()))?;
+
+                        // 2. Load all existing vertex IDs (for orphan detection)
+                        let mut existing_vertex_ids = HashSet::new();
+                        let vertex_iter = db.iterator_cf(&vertices_cf, rocksdb::IteratorMode::Start);
+                        for item in vertex_iter {
+                            let (key, _) = item
+                                .map_err(|e| GraphError::StorageError(format!("Vertex iteration failed: {}", e)))?;
+                            if key.len() == 16 {
+                                let uuid = Uuid::from_slice(&key)
+                                    .map_err(|_| GraphError::StorageError("Corrupted vertex key".into()))?;
+                                existing_vertex_ids.insert(uuid);
+                            }
+                        }
+
+                        let mut write_batch = rocksdb::WriteBatch::default();
+                        let mut deleted_by_detach = 0usize; // Will remain 0
+                        let mut deleted_orphans = 0usize;
+
+                        // 3. Scan all edges — only orphaned edges will be collected
+                        let edge_iter = db.iterator_cf(&edges_cf, rocksdb::IteratorMode::Start);
+                        for item in edge_iter {
+                            let (key, value) = item
+                                .map_err(|e| GraphError::StorageError(format!("Edge iteration failed: {}", e)))?;
+
+                            let edge: Edge = deserialize_edge(&value)
+                                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edge: {}", e)))?;
+
+                            let out_exists = existing_vertex_ids.contains(&edge.outbound_id.0);
+                            let in_exists = existing_vertex_ids.contains(&edge.inbound_id.0);
+                            let is_orphan = !out_exists || !in_exists;
+                            
+                            // is_targeted is always false when target_vertex_ids is empty
+                            let is_targeted = target_vertex_ids.contains(&edge.outbound_id.0)
+                                            || target_vertex_ids.contains(&edge.inbound_id.0); 
+
+                            if is_orphan || is_targeted { // Only is_orphan will be true
+                                write_batch.delete_cf(&edges_cf, &key);
+
+                                // if is_targeted { deleted_by_detach += 1; } // Skipped: is_targeted is always false
+                                if is_orphan {
+                                    deleted_orphans += 1;
+                                }
+                            }
+                        }
+
+                        // 4. Apply atomic deletion batch
+                        db.write(write_batch)
+                            .map_err(|e| GraphError::StorageError(format!("Batch delete failed: {}", e)))?;
+
+                        // Optional: ensure data is on disk (ignore error if not supported)
+                        let _ = db.flush_cf(&edges_cf);
+
+                        let total_deleted = deleted_orphans; // deleted_by_detach is 0
+
+                        info!(
+                            "RocksDB: ORPHAN cleanup — {} edges deleted ({} orphaned)",
+                            total_deleted, deleted_orphans
+                        );
+
+                        json!({
+                            "status": "success",
+                            "deleted_edges": total_deleted,
+                            "deleted_orphans": deleted_orphans,
+                            "message": "Orphan cleanup completed"
+                        })
+                    }
+                            cmd if [
                         "set_key","delete_key",
                         "create_vertex","update_vertex","delete_vertex",
                         "create_edge","update_edge","delete_edge",

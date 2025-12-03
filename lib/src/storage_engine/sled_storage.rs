@@ -32,7 +32,9 @@ use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use crate::storage_engine::sled_client::{ SledClient, ZmqSocketWrapper };
 use std::os::unix::fs::PermissionsExt;
 use sysinfo::{System, RefreshKind, ProcessRefreshKind, Pid, ProcessesToUpdate};
-use sled::{Db, IVec,};
+use sled::{Db, IVec, transaction::{abort, ConflictableTransactionError, TransactionResult, 
+                                   TransactionError, UnabortableTransactionError}, 
+                                   Transactional, Tree};
 use serde::{Deserialize, Serialize};
 use bincode::{ config as binconfig };
 
@@ -40,6 +42,20 @@ pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::n
 pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
 pub static SLED_ACTIVE_DATABASES: LazyLock<OnceCell<TokioMutex<HashSet<PathBuf>>>> = LazyLock::new(|| OnceCell::new());
 
+// Sled Tree Names (analogous to tables or column families)
+pub const EDGES_TREE: &str = "edges";
+pub const VERTICES_TREE: &str = "vertices"; // Needed for completeness, even if not used in edge deletion
+
+pub const OUTBOUND_TREE: &str = "outbound_edges_idx"; // Adjacency list for outgoing edges
+pub const INBOUND_TREE: &str = "inbound_edges_idx";  // Adjacency list for incoming edges
+
+// Sled Metadata Tree and Key
+pub const METADATA_TREE: &str = "metadata";
+pub const EDGE_COUNT_KEY: &str = "edge_count";
+pub type TxResult<T> = Result<T, TransactionError<GraphError>>;
+
+// Define the Transactional Error Type (needs to be defined outside the transaction closure if used explicitly)
+type TxError = sled::transaction::TransactionError<GraphError>;
 // sled_storage.rs  (or wherever the impl lives)
 
 /// Initialise the global SLED_DB singleton exactly once.
@@ -1018,56 +1034,197 @@ impl GraphStorageEngine for SledStorage {
 
     // Placeholder for the method containing the error
     async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
-        let singleton = SLED_DB.get()
+        // --- ZMQ forwarding (unchanged) ---
+        let singleton = SLED_DB
+            .get()
             .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".into()))?;
 
-        // Acquire the lock for client check
-        let guard = singleton.lock().await;
-
-        // FIX E0505: Extract the client reference/clone before potentially dropping the guard 
-        // inside the conditional block, preventing the lifetime issue.
-        // Assuming client is stored as `(Arc<ZmqClient>, ...)` in `guard.client`.
-        let client_to_use = guard.client.as_ref().map(|(client, _)| client.clone());
-        
-        // If connected via ZMQ client → forward (WAL-safe)
-        if let Some(client) = client_to_use {
-            // Drop the guard here to release the lock *before* the potentially long-running await call
-            drop(guard); 
-            return client.delete_edges_touching_vertices(vertex_ids).await;
-        }
-
-        // Now safe to drop the guard if the client call was skipped.
-        drop(guard); 
-
-        let db_guard = SLED_DB.get().unwrap().lock().await;
-        // Assuming db_guard.db is the sled::Db instance
-        let edges_tree = db_guard.db.open_tree("edges")
-            .map_err(|e| GraphError::StorageError(e.to_string()))?; 
-
-        let mut deleted = 0;
-        let mut to_remove = Vec::new();
-
-        // The iter() method on sled::Tree requires `&self`, 
-        // which relies on the `db_guard` lock being held.
-        for item in edges_tree.iter() {
-            let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let edge: Edge = deserialize_edge(&value)?;
-            
-            if vertex_ids.contains(&edge.outbound_id.0) || vertex_ids.contains(&edge.inbound_id.0) {
-                to_remove.push(key);
-                deleted += 1;
+        {
+            let guard = singleton.lock().await;
+            if let Some((client, _)) = guard.client.as_ref() {
+                return client.delete_edges_touching_vertices(vertex_ids).await;
             }
         }
 
-        for key in to_remove {
-            edges_tree.remove(key).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        // --- Local execution ---
+        let db_guard = singleton.lock().await;
+        let db = &db_guard.db;
+
+        let edges_tree = db.open_tree(EDGES_TREE)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let outbound_tree = db.open_tree(OUTBOUND_TREE)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let inbound_tree = db.open_tree(INBOUND_TREE)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let metadata_tree = db.open_tree(METADATA_TREE)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        // 1. Collect edges to delete (read-only pass)
+        let mut deleted_count = 0;
+        let mut edge_keys_to_delete: Vec<IVec> = Vec::new();
+
+        for item in edges_tree.iter() {
+            let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            if let Ok(edge) = deserialize_edge(&value) {
+                if vertex_ids.contains(&edge.outbound_id.0) || vertex_ids.contains(&edge.inbound_id.0) {
+                    edge_keys_to_delete.push(key);
+                    deleted_count += 1;
+                }
+            }
         }
 
-        db_guard.db.flush_async()
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        // 2. Run atomic transaction using the tuple-based API
+        let tx_result: TransactionResult<(), GraphError> = (
+            &edges_tree,
+            &outbound_tree,
+            &inbound_tree,
+            &metadata_tree,
+        ).transaction(|(edges, outbound, inbound, metadata)| {
             
-        Ok(deleted)
+            // REMOVED: let abort = |e: GraphError| TxError::Abort(e);
+            
+            for edge_key in &edge_keys_to_delete {
+                // Get edge inside transaction
+                let edge_ivec = edges.get(edge_key)?;
+                
+                // --- Logic to handle missing edge (ok_or_else replacement) ---
+                        let edge_ivec = match edge_ivec {
+                            Some(ivec) => ivec,
+                            None => {
+                                // 1. Convert IVec bytes to [u8; 16] using TryInto for Uuid.
+                                let key_bytes: &[u8] = edge_key.as_ref();
+                                
+                                let key_uuid_option = key_bytes.try_into()
+                                    .ok()
+                                    .map(|bytes| Uuid::from_bytes(bytes));
+
+                                // Use the Uuid string or a placeholder for the Identifier
+                                let id_string = key_uuid_option.map(|u| u.to_string())
+                                    .unwrap_or_else(|| format!("Invalid key bytes: {:?}", key_bytes));
+
+                                // FIX: Wrap the call to Identifier::new_unchecked in an unsafe block.
+                                let identifier = unsafe { 
+                                    Identifier::new_unchecked(id_string)
+                                };
+
+                                // Return the GraphError directly, wrapped in ConflictableTransactionError::Abort.
+                                return Err(ConflictableTransactionError::Abort(
+                                    GraphError::NotFound(identifier)
+                                ));
+                            }
+                        };
+
+                // --- Deserialize – abort on failure ---
+                let edge: Edge = match deserialize_edge(&edge_ivec) {
+                    Ok(e) => e,
+                    // FIX: Return the GraphError directly, wrapped in ConflictableTransactionError::Abort.
+                    Err(_) => return Err(ConflictableTransactionError::Abort(
+                        GraphError::SerializationError("failed in tx".into())
+                    )),
+                };
+
+                // --- Remove from all indexes ---
+                edges.remove(edge_key).map_err(ConflictableTransactionError::from)?;
+                outbound.remove(edge.outbound_id.0.as_bytes()).map_err(ConflictableTransactionError::from)?;
+                inbound.remove(edge.inbound_id.0.as_bytes()).map_err(ConflictableTransactionError::from)?;
+            }
+
+            // --- Update global edge count (unchanged) ---
+            if deleted_count > 0 {
+                let current_bytes = metadata
+                    .get(EDGE_COUNT_KEY)?
+                    .unwrap_or_else(|| IVec::from("0".as_bytes()));
+
+                let current_count: usize = String::from_utf8_lossy(&current_bytes)
+                    .parse()
+                    .unwrap_or(0);
+
+                let new_count = current_count.saturating_sub(deleted_count);
+                
+                metadata.insert(EDGE_COUNT_KEY, new_count.to_string().as_bytes())?;
+            }
+
+            Ok(())
+        });
+
+        // 3. Final result
+        match tx_result {
+            Ok(()) => Ok(deleted_count),
+            Err(TransactionError::Abort(e)) => Err(e),
+            Err(TransactionError::Storage(e)) => Err(GraphError::StorageError(e.to_string())),
+        }
+    }
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // Shared Sled state access setup (using the shared singleton/guard)
+        let singleton = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".into()))?;
+        let db_guard = singleton.lock().await;
+        let db: &sled::Db = &db_guard.db;
+
+        // Open required trees
+        let edges_tree = db.open_tree(EDGES_TREE)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let vertices_tree = db.open_tree(VERTICES_TREE)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        let mut orphaned_keys: Vec<sled::IVec> = Vec::new();
+
+        // 1. Scan all edges and check for vertex existence (Read-only iteration)
+        for item in edges_tree.iter() {
+            let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            
+            // Re-use edge deserialization logic
+            let edge: Edge = match deserialize_edge(&value) {
+                Ok(e) => e,
+                Err(_) => {
+                    // Treat corrupted record as orphaned/invalid
+                    orphaned_keys.push(key);
+                    continue;
+                }
+            };
+
+            // Edge UUIDs are stored as raw bytes (16 bytes)
+            let source_key: sled::IVec = edge.outbound_id.0.as_bytes().to_vec().into();
+            let target_key: sled::IVec = edge.inbound_id.0.as_bytes().to_vec().into();
+
+            // Check existence in the vertices tree
+            let source_exists = vertices_tree.contains_key(&source_key)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let target_exists = vertices_tree.contains_key(&target_key)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+            if !source_exists || !target_exists {
+                orphaned_keys.push(key);
+            }
+        }
+
+        let deleted_count = orphaned_keys.len();
+
+        // 2. Delete orphaned edges in an atomic transaction
+        let tx_result: sled::transaction::TransactionResult<(), GraphError> = edges_tree.transaction(|edges| {
+            for key in &orphaned_keys {
+                // Remove the primary edge record
+                edges.remove(key)?;
+            }
+            Ok(())
+        });
+
+        // 3. Handle result and return
+        match tx_result {
+            Ok(()) => {
+                // NOTE: If you update a global EDGE_COUNT, you must do it here.
+                // This would require a separate atomic operation or a multi-tree transaction 
+                // if the metadata tree is a different sled::Tree.
+                Ok(deleted_count)
+            },
+            Err(e) => {
+                let graph_err = match e {
+                    sled::transaction::TransactionError::Abort(inner) => inner,
+                    sled::transaction::TransactionError::Storage(sled_err) => GraphError::StorageError(sled_err.to_string()),
+                };
+                Err(graph_err)
+            }
+        }
     }
 
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
