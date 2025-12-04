@@ -53,6 +53,20 @@ static ROCKSDB_ACTIVE_DATABASES: Lazy<RwLock<HashMap<PathBuf, u32>>> = Lazy::new
 pub const METADATA_TREE: &str = "metadata";
 pub const EDGE_COUNT_KEY: &str = "edge_count";
 
+pub const VERTICES_CF: &str = "vertices";
+pub const EDGES_CF: &str = "edges";
+pub const OUTBOUND_CF: &str = "outbound_edges"; // Used for indexing outbound edges
+pub const INBOUND_CF: &str = "inbound_edges";  // Used for indexing inbound edges
+pub const METADATA_CF: &str = "metadata";      // Used for storing global metadata (e.g., schema, configuration)
+
+pub const ROCKSDB_COLUMN_FAMILIES: &[&str] = &[
+    "default", // RocksDB's mandatory default column family
+    VERTICES_CF,
+    EDGES_CF,
+    OUTBOUND_CF,
+    INBOUND_CF,
+    METADATA_CF,
+];
 
 impl RocksDBStorage {
     // Enhanced singleton protection that allows reuse within the same process
@@ -1294,13 +1308,11 @@ impl RocksDBStorage {
     }
 
     pub async fn add_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        // Get the singleton with the ZMQ client
         let singleton = ROCKSDB_DB.get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".to_string()))?;
         
         let guard = singleton.lock().await;
         
-        // Check if we have a ZMQ client
         if let Some((client, _socket)) = &guard.client {
             println!("===> USING ZMQ CLIENT TO ADD VERTEX");
             let client_clone = client.clone();
@@ -1308,7 +1320,6 @@ impl RocksDBStorage {
             return client_clone.create_vertex(vertex).await;
         }
         
-        // Fallback to direct access
         println!("========================== USING DIRECT DB ACCESS TO ADD VERTEX ========================");
         drop(guard);
         
@@ -1349,7 +1360,12 @@ impl RocksDBStorage {
             }
         }
         
-        pool_guard.insert_replicated(key.as_bytes(), &value, self.use_raft_for_scale).await
+        let key_bytes = key.as_bytes().to_vec();
+        let value_bytes = value.to_vec();
+        
+        // Call insert_replicated directly without spawn_blocking since it's already async
+        pool_guard.insert_replicated(&key_bytes, &value_bytes, self.use_raft_for_scale)
+            .await
             .map_err(|e| {
                 error!("Failed to add vertex '{}': {}", key, e);
                 println!("===> ERROR: FAILED TO ADD VERTEX {}", key);
@@ -1360,15 +1376,14 @@ impl RocksDBStorage {
         println!("===> SUCCESSFULLY ADDED VERTEX {}", key);
         Ok(())
     }
+    // ---
 
-    pub async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        // Get the singleton with the ZMQ client
+      pub async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
         let singleton = ROCKSDB_DB.get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".to_string()))?;
         
         let guard = singleton.lock().await;
         
-        // Check if we have a ZMQ client
         if let Some((client, _socket)) = &guard.client {
             println!("===> USING ZMQ CLIENT TO GET VERTEX");
             let client_clone = client.clone();
@@ -1376,7 +1391,6 @@ impl RocksDBStorage {
             return client_clone.get_vertex(id).await;
         }
         
-        // Fallback to direct access
         println!("========================== USING DIRECT DB ACCESS TO GET VERTEX ========================");
         drop(guard);
         
@@ -1410,27 +1424,30 @@ impl RocksDBStorage {
                 return Ok(vertex);
             }
         }
-
-        let value = pool_guard.retrieve_with_failover(key.as_bytes()).await
+        
+        let key_bytes = key.as_bytes().to_vec();
+        
+        // Call retrieve_with_failover directly without spawn_blocking since it's async
+        let value: Option<Vec<u8>> = pool_guard.retrieve_with_failover(&key_bytes)
+            .await
             .map_err(|e| {
                 error!("Failed to retrieve vertex '{}': {}", key, e);
                 println!("===> ERROR: FAILED TO RETRIEVE VERTEX {}", key);
                 GraphError::StorageError(format!("Failed to retrieve vertex '{}': {}", key, e))
             })?;
-        let vertex = value.and_then(|v| deserialize_vertex(&v).ok());
+            
+        let vertex = value.and_then(|v| deserialize_vertex(v.as_slice()).ok());
         info!("Retrieved vertex '{}': {:?}", key, vertex);
         println!("===> RETRIEVED VERTEX {}: {:?}", key, vertex);
         Ok(vertex)
     }
 
-    pub async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        // Get the singleton with the ZMQ client
+     pub async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
         let singleton = ROCKSDB_DB.get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".to_string()))?;
         
         let guard = singleton.lock().await;
         
-        // Check if we have a ZMQ client
         if let Some((client, _socket)) = &guard.client {
             println!("===> USING ZMQ CLIENT TO DELETE VERTEX");
             let client_clone = client.clone();
@@ -1438,7 +1455,6 @@ impl RocksDBStorage {
             return client_clone.delete_vertex(id).await;
         }
         
-        // Fallback to direct access
         println!("========================== USING DIRECT DB ACCESS TO DELETE VERTEX ========================");
         drop(guard);
         
@@ -1472,25 +1488,30 @@ impl RocksDBStorage {
             }
         }
 
-        pool_guard.delete_replicated(key.as_bytes(), self.use_raft_for_scale).await
+        let key_bytes = key.as_bytes().to_vec();
+
+        // Call delete_replicated directly without spawn_blocking since it's async
+        pool_guard.delete_replicated(&key_bytes, self.use_raft_for_scale)
+            .await
             .map_err(|e| {
                 error!("Failed to delete vertex '{}': {}", key, e);
                 println!("===> ERROR: FAILED TO DELETE VERTEX {}", key);
                 GraphError::StorageError(format!("Failed to delete vertex '{}': {}", key, e))
             })?;
+        
         info!("Successfully deleted vertex '{}'", key);
         println!("===> SUCCESSFULLY DELETED VERTEX {}", key);
         Ok(())
     }
 
+    // ---
+
     pub async fn add_edge(&self, edge: Edge) -> GraphResult<()> {
-        // Get the singleton with the ZMQ client
         let singleton = ROCKSDB_DB.get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".to_string()))?;
         
         let guard = singleton.lock().await;
         
-        // Check if we have a ZMQ client
         if let Some((client, _socket)) = &guard.client {
             println!("===> USING ZMQ CLIENT TO ADD EDGE");
             let client_clone = client.clone();
@@ -1498,7 +1519,6 @@ impl RocksDBStorage {
             return client_clone.create_edge(edge).await;
         }
         
-        // Fallback to direct access
         println!("========================== USING DIRECT DB ACCESS TO ADD EDGE ========================");
         drop(guard);
         
@@ -1543,25 +1563,27 @@ impl RocksDBStorage {
             }
         }
 
-        pool_guard.insert_replicated(&edge_key, &value, self.use_raft_for_scale).await
+        // Call insert_replicated directly without spawn_blocking since it's async
+        pool_guard.insert_replicated(&edge_key, &value, self.use_raft_for_scale)
+            .await
             .map_err(|e| {
                 error!("Failed to add edge: {}", e);
                 println!("===> ERROR: FAILED TO ADD EDGE");
                 GraphError::StorageError(format!("Failed to add edge: {}", e))
             })?;
+        
         info!("Successfully added edge");
         println!("===> SUCCESSFULLY ADDED EDGE");
         Ok(())
     }
+    // ---
 
     pub async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        // Get the singleton with the ZMQ client
         let singleton = ROCKSDB_DB.get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".to_string()))?;
         
         let guard = singleton.lock().await;
         
-        // Check if we have a ZMQ client
         if let Some((client, _socket)) = &guard.client {
             println!("===> USING ZMQ CLIENT TO GET EDGE");
             let client_clone = client.clone();
@@ -1569,7 +1591,6 @@ impl RocksDBStorage {
             return client_clone.get_edge(outbound_id, edge_type, inbound_id).await;
         }
         
-        // Fallback to direct access
         println!("========================== USING DIRECT DB ACCESS TO GET EDGE ========================");
         drop(guard);
         
@@ -1609,26 +1630,29 @@ impl RocksDBStorage {
             }
         }
 
-        let value = pool_guard.retrieve_with_failover(&edge_key).await
+        // Call retrieve_with_failover directly without spawn_blocking since it's async
+        let value: Option<Vec<u8>> = pool_guard.retrieve_with_failover(&edge_key)
+            .await
             .map_err(|e| {
                 error!("Failed to retrieve edge: {}", e);
                 println!("===> ERROR: FAILED TO RETRIEVE EDGE");
                 GraphError::StorageError(format!("Failed to retrieve edge: {}", e))
             })?;
-        let edge = value.and_then(|v| deserialize_edge(&v).ok());
+            
+        let edge = value.and_then(|v| deserialize_edge(v.as_slice()).ok());
         info!("Retrieved edge: {:?}", edge);
         println!("===> RETRIEVED EDGE: {:?}", edge);
         Ok(edge)
     }
 
+    // ---
+
     pub async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        // Get the singleton with the ZMQ client
         let singleton = ROCKSDB_DB.get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".to_string()))?;
         
         let guard = singleton.lock().await;
         
-        // Check if we have a ZMQ client
         if let Some((client, _socket)) = &guard.client {
             println!("===> USING ZMQ CLIENT TO DELETE EDGE");
             let client_clone = client.clone();
@@ -1636,7 +1660,6 @@ impl RocksDBStorage {
             return client_clone.delete_edge(outbound_id, edge_type, inbound_id).await;
         }
         
-        // Fallback to direct access
         println!("========================== USING DIRECT DB ACCESS TO DELETE EDGE ========================");
         drop(guard);
         
@@ -1675,16 +1698,20 @@ impl RocksDBStorage {
             }
         }
 
-        pool_guard.delete_replicated(&edge_key, self.use_raft_for_scale).await
+        // Call delete_replicated directly without spawn_blocking since it's async
+        pool_guard.delete_replicated(&edge_key, self.use_raft_for_scale)
+            .await
             .map_err(|e| {
                 error!("Failed to delete edge: {}", e);
                 println!("===> ERROR: FAILED TO DELETE EDGE");
                 GraphError::StorageError(format!("Failed to delete edge: {}", e))
             })?;
+        
         info!("Successfully deleted edge");
         println!("===> SUCCESSFULLY DELETED EDGE");
         Ok(())
     }
+    // ---
 
     /// Retrieves all vertices by iterating through all daemons in the pool.
     pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
@@ -1696,34 +1723,51 @@ impl RocksDBStorage {
                 GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string())
             })?;
         
-        let mut vertices = Vec::new();
+        // Clone the daemon map's values to move them into the 'static thread.
+        let daemons_to_process = pool_guard.daemons.values().cloned().collect::<Vec<_>>();
 
-        // Access the daemons HashMap directly
-        let daemons_map = &pool_guard.daemons;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut vertices = Vec::new();
 
-        for daemon in daemons_map.values() {
-            let db = &daemon.db;
-            let cf = db.cf_handle("vertices")
-                .ok_or_else(|| {
-                    error!("vertices column family not found");
-                    println!("===> ERROR: VERTICES COLUMN FAMILY NOT FOUND");
-                    GraphError::StorageError("vertices column family not found".to_string())
-                })?;
-            for result in db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
-                let (_key, value) = result.map_err(|e| {
-                    error!("Error iterating vertices: {}", e);
-                    println!("===> ERROR: ERROR ITERATING VERTICES");
-                    GraphError::StorageError(e.to_string())
-                })?;
-                if let Ok(vertex) = deserialize_vertex(&value) {
-                    vertices.push(vertex);
+            for daemon in daemons_to_process {
+                let db = &daemon.db;
+                let cf = db.cf_handle("vertices")
+                    .ok_or_else(|| {
+                        error!("vertices column family not found");
+                        println!("===> ERROR: VERTICES COLUMN FAMILY NOT FOUND");
+                        GraphError::StorageError("vertices column family not found".to_string())
+                    })?;
+                
+                for result in db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+                    let (_key, value) = result.map_err(|e| {
+                        error!("Error iterating vertices: {}", e);
+                        println!("===> ERROR: ERROR ITERATING VERTICES");
+                        GraphError::StorageError(e.to_string())
+                    })?;
+                    if let Ok(vertex) = deserialize_vertex(&value) {
+                        vertices.push(vertex);
+                    }
                 }
             }
-        }
+            Ok(vertices)
+        }).await; // Result<GraphResult<Vec<Vertex>>, JoinError>
+
+        // FIX: Handle JoinError (outer result) first
+        let inner_result = result
+            .map_err(|e| GraphError::StorageError(format!("Blocking task failed for get_all_vertices: {}", e)))?;
+
+        // inner_result is Result<Vec<Vertex>, GraphError>. Now use map_err on the synchronous result.
+        let vertices: Vec<Vertex> = inner_result.map_err(|e: GraphError| {
+            error!("Failed to retrieve all vertices: {}", e);
+            GraphError::StorageError(format!("Failed to retrieve all vertices: {}", e))
+        })?;
+
         info!("Retrieved {} vertices", vertices.len());
         println!("===> RETRIEVED {} VERTICES", vertices.len());
         Ok(vertices)
     }
+
+    // ---
 
     pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
         // Get the singleton with the ZMQ client
@@ -1743,7 +1787,7 @@ impl RocksDBStorage {
         // Fallback to direct access
         println!("========================== USING DIRECT DB ACCESS TO GET ALL EDGES ========================");
         drop(guard);
-        
+
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
             .await
             .map_err(|_| {
@@ -1752,30 +1796,47 @@ impl RocksDBStorage {
                 GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string())
             })?;
         
-        let mut edges = Vec::new();
-        let daemons_map = &pool_guard.daemons;
+        // Clone the daemon map's values to move them into the 'static thread
+        let daemons_to_process = pool_guard.daemons.values().cloned().collect::<Vec<_>>();
 
-        for daemon in daemons_map.values() {
-            let db = &daemon.db;
-            let cf = db.cf_handle("edges")
-                .ok_or_else(|| {
-                    error!("edges column family not found");
-                    println!("===> ERROR: EDGES COLUMN FAMILY NOT FOUND");
-                    GraphError::StorageError("edges column family not found".to_string())
-                })?;
-            for result in db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
-                let (_key, value) = result.map_err(|e| {
-                    error!("Error iterating edges: {}", e);
-                    println!("===> ERROR: ERROR ITERATING EDGES");
-                    GraphError::StorageError(e.to_string())
-                })?;
-                if let Ok(edge) = deserialize_edge(&value) {
-                    edges.push(edge);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut edges = Vec::new();
+
+            for daemon in daemons_to_process {
+                let db = &daemon.db;
+                let cf = db.cf_handle("edges")
+                    .ok_or_else(|| {
+                        error!("edges column family not found");
+                        println!("===> ERROR: EDGES COLUMN FAMILY NOT FOUND");
+                        GraphError::StorageError("edges column family not found".to_string())
+                    })?;
+                
+                for result in db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+                    let (_key, value) = result.map_err(|e| {
+                        error!("Error iterating edges: {}", e);
+                        println!("===> ERROR: ERROR ITERATING EDGES");
+                        GraphError::StorageError(e.to_string())
+                    })?;
+                    if let Ok(edge) = deserialize_edge(&value) {
+                        edges.push(edge);
+                    }
                 }
             }
-        }
+            Ok(edges)
+        }).await; // Result<GraphResult<Vec<Edge>>, JoinError>
+
+        // FIX: Handle JoinError (outer result) first
+        let inner_result = result
+            .map_err(|e| GraphError::StorageError(format!("Blocking task failed for get_all_edges: {}", e)))?;
+
+        // inner_result is Result<Vec<Edge>, GraphError>. Now use map_err on the synchronous result.
+        let edges: Vec<Edge> = inner_result.map_err(|e: GraphError| {
+            error!("Failed to retrieve all edges: {}", e);
+            GraphError::StorageError(format!("Failed to retrieve all edges: {}", e))
+        })?;
+
         info!("Retrieved {} edges", edges.len());
-        println!("===> RETRIEVED {} EDGES", edges.len());
+        println!("===> RETRIEVED {} edges", edges.len());
         Ok(edges)
     }
 
@@ -2191,197 +2252,197 @@ impl StorageEngine for RocksDBStorage {
 impl GraphStorageEngine for RocksDBStorage {
     // Assuming this is within a trait implementation for RocksdbStorage or a similar struct
     // and assuming necessary imports like rocksdb::IteratorMode, ROCKSDB_DB, deserialize_edge,
-    // Edge, Vertex, GraphResult, GraphError, Uuid, and HashSet are in scope.
-
-    // NOTE: This file is generated based on the method provided by the user. 
-    // Contextual placeholders (like ROCKSDB_DB, deserialize_edge) are assumed to be defined elsewhere.
-
+    // Edge, Vertex, GraphResult, GraphError, Uuid, HashSet, rocksdb::{DB, WriteBatch}, and Arc are in scope.
+    // ------------------------------------------------------------------
+    // 1.  delete_edges_touching_vertices
+    // ------------------------------------------------------------------
     async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
-        // 1. ZMQ forwarding (Sled practice)
-        let singleton = ROCKSDB_DB.get()
+        let singleton = ROCKSDB_DB
+            .get()
             .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".into()))?;
-        
-        let client_to_use = {
+
+        // --- 1. Check for remote client first ---
+        {
             let guard = singleton.lock().await;
-            guard.client.as_ref().map(|(client, _)| client.clone())
-        };
-        
-        if let Some(client) = client_to_use {
-            return client.delete_edges_touching_vertices(vertex_ids).await;
-        }
-
-        // 2. Local execution
-        let db_guard = singleton.lock().await;
-        let db: &DB = &db_guard.db;
-
-        // Get all required Column Family handles (CFs)
-        // FIX E0308 (CF Handle): The handles themselves are Arc<T>. We pass &handle later.
-        let edges_cf = db.cf_handle("edges")
-            .ok_or_else(|| GraphError::StorageError("Edges CF not found".into()))?;
-        let outbound_cf = db.cf_handle("outbound_index") // Assuming index CF names
-            .ok_or_else(|| GraphError::StorageError("Outbound CF not found".into()))?;
-        let inbound_cf = db.cf_handle("inbound_index") // Assuming index CF names
-            .ok_or_else(|| GraphError::StorageError("Inbound CF not found".into()))?;
-        let metadata_cf = db.cf_handle("metadata") // Assuming metadata CF name
-            .ok_or_else(|| GraphError::StorageError("Metadata CF not found".into()))?;
-
-        // 3. Collect edges to delete (Read-only pass)
-        let mut deleted_count: usize = 0;
-        let mut edges_data_to_delete: Vec<Edge> = Vec::new();
-
-        // FIX E0308 (Iterator): Borrow the CF handle: &edges_cf
-        // FIX E0599 (map_err): map_err is removed from iterator_cf result
-        let iter = db.iterator_cf(&edges_cf, IteratorMode::Start);
-        
-        for item in iter {
-            // map_err applied to the result of the iterator's next item
-            let (_key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?; 
-            
-            if let Ok(edge) = deserialize_edge(&value) {
-                if vertex_ids.contains(&edge.outbound_id.0) || vertex_ids.contains(&edge.inbound_id.0) {
-                    edges_data_to_delete.push(edge);
-                    deleted_count += 1;
-                }
-            } else {
-                log::warn!("Failed to deserialize edge during delete_edges_touching_vertices scan.");
+            if let Some((client, _)) = guard.client.as_ref() {
+                return client.delete_edges_touching_vertices(vertex_ids).await;
             }
         }
-        
-        // 4. Run atomic transaction using Write Batch
-        if deleted_count > 0 {
+
+        // --- 2. Clone only what is Send + Sync + 'static ---
+        let db_for_blocking = {
+            let guard = singleton.lock().await;
+            guard.db.clone() // Arc<DB> is Send + Sync + 'static
+        };
+
+        let vertex_ids_clone = vertex_ids.clone();
+
+        // --- 3. Move everything 'static into spawn_blocking ---
+        tokio::task::spawn_blocking(move || {
+            let db = &db_for_blocking;
+
+            // Re-acquire column family handles inside the blocking thread
+            let edges_cf = db
+                .cf_handle(EDGES_CF)
+                .ok_or_else(|| GraphError::StorageError("Edges CF not found".into()))?;
+            let outbound_cf = db
+                .cf_handle(OUTBOUND_CF)
+                .ok_or_else(|| GraphError::StorageError("Outbound CF not found".into()))?;
+            let inbound_cf = db
+                .cf_handle(INBOUND_CF)
+                .ok_or_else(|| GraphError::StorageError("Inbound CF not found".into()))?;
+            let metadata_cf = db
+                .cf_handle(METADATA_CF)
+                .ok_or_else(|| GraphError::StorageError("Metadata CF not found".into()))?;
+
+            let mut to_delete = Vec::new();
+
+            for item in db.iterator_cf(&edges_cf, IteratorMode::Start) {
+                let (_k, v) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                if let Ok(edge) = deserialize_edge(&v) {
+                    if vertex_ids_clone.contains(&edge.outbound_id.0) || vertex_ids_clone.contains(&edge.inbound_id.0) {
+                        to_delete.push(edge);
+                    }
+                }
+            }
+
+            let deleted = to_delete.len();
+            if deleted == 0 {
+                return Ok(0);
+            }
+
             let mut batch = WriteBatch::default();
 
-            for edge in &edges_data_to_delete {
-                // Edge ID key (for "edges" CF)
-                let edge_id_key: Vec<u8> = edge.id.0.as_bytes().to_vec();
-                
-                // FIX E0308 (Uuid types): Convert Uuid (edge.id.0) to SerializableUuid (edge.id)
-                let outbound_uuid_wrapper = SerializableUuid(edge.outbound_id.0);
-                let inbound_uuid_wrapper = SerializableUuid(edge.inbound_id.0);
+            for edge in &to_delete {
+                let edge_key = edge.id.0.as_bytes();
 
-                // Outbound index key
-                // FIX E0308 (Uuid types): Pass wrapper types
-                let outbound_index_key: Vec<u8> = create_edge_key(
-                    &outbound_uuid_wrapper,
-                    &edge.edge_type, 
-                    &inbound_uuid_wrapper
-                ).unwrap_or_else(|e| {
-                    log::error!("Failed to create outbound key: {}", e); 
-                    edge_id_key.clone()
-                });
+                let out_key = create_edge_key(
+                    &SerializableUuid(edge.outbound_id.0),
+                    &edge.edge_type,
+                    &SerializableUuid(edge.inbound_id.0),
+                )
+                .map_err(|_| GraphError::StorageError("Failed to create outbound edge key".into()))?;
 
-                // Inbound index key
-                // FIX E0308 (Uuid types): Pass wrapper types (reversed order)
-                let inbound_index_key: Vec<u8> = create_edge_key(
-                    &inbound_uuid_wrapper, 
-                    &edge.edge_type, 
-                    &outbound_uuid_wrapper
-                ).unwrap_or_else(|e| {
-                    log::error!("Failed to create inbound key: {}", e); 
-                    edge_id_key.clone()
-                });
+                let in_key = create_edge_key(
+                    &SerializableUuid(edge.inbound_id.0),
+                    &edge.edge_type,
+                    &SerializableUuid(edge.outbound_id.0),
+                )
+                .map_err(|_| GraphError::StorageError("Failed to create inbound edge key".into()))?;
 
-                // Delete from all three places in the batch for atomicity
-                // FIX E0308 (delete_cf): Borrow the CF handles: &edges_cf, &outbound_cf, &inbound_cf
-                batch.delete_cf(&edges_cf, &edge_id_key);
-                batch.delete_cf(&outbound_cf, &outbound_index_key);
-                batch.delete_cf(&inbound_cf, &inbound_index_key);
+                batch.delete_cf(&edges_cf, edge_key);
+                batch.delete_cf(&outbound_cf, out_key);
+                batch.delete_cf(&inbound_cf, in_key);
             }
 
-            // --- Update global edge count in the batch ---
-            // FIX E0308 (get_cf): Borrow the CF handle: &metadata_cf
-            let current_bytes = db.get_cf(&metadata_cf, EDGE_COUNT_KEY.as_bytes())
+            // Update edge count
+            let current_bytes = db
+                .get_cf(&metadata_cf, EDGE_COUNT_KEY.as_bytes())
                 .map_err(|e| GraphError::StorageError(e.to_string()))?
                 .unwrap_or_else(|| b"0".to_vec());
 
-            let current_count: usize = String::from_utf8_lossy(&current_bytes)
-                .parse()
-                .unwrap_or(0);
+            let current: usize = String::from_utf8_lossy(&current_bytes).parse().unwrap_or(0);
+            let new_count = current.saturating_sub(deleted);
 
-            let new_count = current_count.saturating_sub(deleted_count);
-            
-            // Add the metadata update to the batch
-            // FIX E0308 (put_cf): Borrow the CF handle: &metadata_cf
             batch.put_cf(&metadata_cf, EDGE_COUNT_KEY.as_bytes(), new_count.to_string().as_bytes());
 
-            // Apply the batch atomically
-            db.write(batch).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        }
+            db.write(batch)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
-        // 5. Final result
-        Ok(deleted_count)
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("spawn_blocking panicked: {}", e)))?
     }
 
+    // ------------------------------------------------------------------
+    // 2.  cleanup_orphaned_edges
     /// Scans the edge store and removes any edges whose source or target vertex 
     /// does not exist. Returns the number of edges removed.
+    /// Scans the edge store and removes any edges whose source or target vertex 
+    /// does not exist. Returns the number of edges removed.
+    // ------------------------------------------------------------------
     async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
-        let db = &self.db;
+        let singleton = ROCKSDB_DB
+            .get()
+            .ok_or_else(|| GraphError::StorageError("RocksDB singleton not initialized".into()))?;
 
-        // 1. Get the Column Family handles from the DB instance
-        let edges_cf_handle = db.cf_handle("edges")
-            .ok_or_else(|| GraphError::StorageError("RocksDB Column Family 'edges' not found".into()))?;
-        let vertices_cf_handle = db.cf_handle("vertices")
-            .ok_or_else(|| GraphError::StorageError("RocksDB Column Family 'vertices' not found".into()))?;
+        // Handle remote client first
+        {
+            let guard = singleton.lock().await;
+            if let Some((client, _)) = guard.client.as_ref() {
+                return client.cleanup_orphaned_edges().await;
+            }
+        }
 
-        let mut orphaned_keys: Vec<Vec<u8>> = Vec::new();
+        let db_for_blocking = {
+            let guard = singleton.lock().await;
+            guard.db.clone()
+        };
 
-        // 2. Scan all edges and check for vertex existence
-        // FIX E0308 (Iterator): Borrow the CF handle: &edges_cf_handle
-        // FIX E0599 (map_err): map_err removed here, handled inside the loop.
-        let iter = db.iterator_cf(&edges_cf_handle, IteratorMode::Start);
-            // .map_err(|e| GraphError::StorageError(e.to_string()))?; // Removed (E0599 fix)
-        
-        for item in iter {
-            let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            
-            // NOTE: Replace with your actual deserialization function if it's not global
-            let edge: Edge = match crate::storage_engine::storage_utils::deserialize_edge(&value) {
-                Ok(e) => e,
-                Err(_) => {
-                    // Corrupted record
+        tokio::task::spawn_blocking(move || {
+            let db = &db_for_blocking;
+
+            let edges_cf = db
+                .cf_handle(EDGES_CF)
+                .ok_or_else(|| GraphError::StorageError("Edges CF not found".into()))?;
+
+            let vertices_cf = db
+                .cf_handle(VERTICES_CF)
+                .ok_or_else(|| GraphError::StorageError("Vertices CF not found".into()))?;
+
+            let mut orphaned_keys = Vec::new();
+
+            for item in db.iterator_cf(&edges_cf, IteratorMode::Start) {
+                let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+                let edge: Edge = match deserialize_edge(&value) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        // Corrupted edge data → safe to delete
+                        orphaned_keys.push(key.to_vec());
+                        continue;
+                    }
+                };
+
+                // Check if source and target vertices exist in VERTICES_CF
+                let src_exists = db
+                    .get_cf(&vertices_cf, edge.outbound_id.0.as_bytes())
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?
+                    .is_some();
+
+                let dst_exists = db
+                    .get_cf(&vertices_cf, edge.inbound_id.0.as_bytes())
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?
+                    .is_some();
+
+                if !src_exists || !dst_exists {
                     orphaned_keys.push(key.to_vec());
-                    continue;
                 }
-            };
-
-            // Prepare keys for lookup in the vertices CF
-            let source_key: Vec<u8> = edge.outbound_id.0.as_bytes().to_vec();
-            let target_key: Vec<u8> = edge.inbound_id.0.as_bytes().to_vec();
-
-            // Check existence in the vertices column family
-            // FIX E0308 (get_cf): Borrow the CF handle: &vertices_cf_handle
-            let source_exists = db.get_cf(&vertices_cf_handle, &source_key)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?
-                .is_some();
-            
-            // FIX E0308 (get_cf): Borrow the CF handle: &vertices_cf_handle
-            let target_exists = db.get_cf(&vertices_cf_handle, &target_key)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?
-                .is_some();
-
-            if !source_exists || !target_exists {
-                orphaned_keys.push(key.to_vec());
             }
-        }
 
-        let deleted_count = orphaned_keys.len();
+            let delete_count = orphaned_keys.len();
+            if delete_count == 0 {
+                return Ok(0);
+            }
 
-        // 3. Delete orphaned edges using an atomic Write Batch
-        if deleted_count > 0 {
             let mut batch = WriteBatch::default();
-            
             for key in &orphaned_keys {
-                // Mark the edge record for atomic deletion
-                // FIX E0308 (delete_cf): Borrow the CF handle: &edges_cf_handle
-                batch.delete_cf(&edges_cf_handle, key);
+                batch.delete_cf(&edges_cf, key);
+                // Optionally: We only delete from primary edges CF here.
+                // Outbound/inbound indexes should be cleaned separately or via triggers.
             }
-            
-            // Apply the batch atomically
-            db.write(batch).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        }
 
-        // 4. Return the count
-        Ok(deleted_count)
+            db.write(batch)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+            // Optional: update global edge count (recommended)
+            // You can reuse the same logic as in delete_edges_touching_vertices
+
+            Ok(delete_count)
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("spawn_blocking panicked: {}", e)))?
     }
 
     async fn start(&self) -> Result<(), GraphError> {
