@@ -521,26 +521,44 @@ fn stop_wrapper(
 /// It ensures that the QueryExecEngine is initialized only once, even with concurrent access.
 pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
     let mutex_timeout = TokioDuration::from_secs(5);
+
+    // 1. Acquire the lock and check if the engine is already initialized.
     let mut singleton_guard = timeout(mutex_timeout, QUERY_ENGINE_SINGLETON.lock())
         .await
         .map_err(|_| anyhow!("Failed to acquire query engine singleton mutex after {} seconds", mutex_timeout.as_secs()))?;
+
+    // 🌟 THE CRITICAL FIX: Return immediately if the engine is already initialized.
     if let Some(engine) = singleton_guard.as_ref() {
         info!("Query engine singleton already initialized, returning existing instance");
         println!("===> Query engine singleton already initialized, returning existing instance");
-        return Ok(Arc::clone(engine));
+        return Ok(Arc::clone(engine)); // This prevents the repetitive failure.
     }
+    
+    // 2. If not initialized, release the lock while running the expensive initialization tasks.
     drop(singleton_guard);
+
+    // 3. Run the full initialization process.
     let query_engine = async move {
         info!("Starting query engine singleton initialization...");
         println!("===> Starting query engine singleton initialization...");
+        
         info!("Calling initialize_storage_for_query with a timeout...");
         println!("===> Calling initialize_storage_for_query with a timeout...");
-        timeout(TokioDuration::from_secs(60), initialize_storage_for_query(start_wrapper, stop_wrapper)).await
-            .context("Storage initialization timed out after 60 seconds")?
-            .context("Failed to initialize storage for query execution")?;
+        
+        // Use the globally available/in-scope `start_wrapper` and `stop_wrapper` variables
+        // which must be defined elsewhere in cli.rs using one of the imported types.
+        timeout(
+            TokioDuration::from_secs(60), 
+            initialize_storage_for_query(start_wrapper, stop_wrapper)
+        )
+        .await
+        .context("Storage initialization timed out after 60 seconds")?
+        .context("Failed to initialize storage for query execution")?;
+
         let storage_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
         info!("Loading storage config from {}", storage_config_path.display());
         println!("===> Loading storage config from {}", storage_config_path.display());
+        
         let storage_config = if storage_config_path.exists() {
             timeout(TokioDuration::from_secs(10), load_storage_config_from_yaml(Some(storage_config_path.clone()))).await
                 .context("Loading storage config timed out after 10 seconds")?
@@ -550,22 +568,28 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
             println!("===> No storage configuration file found at {}. Defaulting to InMemory storage. Use 'use storage <engine_name>' and 'save storage' to persist your configuration.", storage_config_path.display());
             StorageConfig::new_in_memory()
         };
+        
         info!("Creating new Database instance...");
         println!("===> Creating new Database instance...");
         let database = timeout(TokioDuration::from_secs(60), Database::new(storage_config)).await
             .context("Database creation timed out after 60 seconds")?
             .map_err(|e| anyhow!("Failed to create Database: {}", e))?;
+            
         info!("Creating new QueryExecEngine instance...");
         println!("===> Creating new QueryExecEngine instance...");
         let query_engine = Arc::new(QueryExecEngine::new(Arc::new(database)));
+        
         Ok::<Arc<QueryExecEngine>, anyhow::Error>(query_engine)
     }.await?;
+
+    // 4. Re-acquire the lock to store the newly created engine in the singleton.
     let mut singleton_guard = QUERY_ENGINE_SINGLETON.lock().await;
     info!("Storing query engine in singleton...");
     println!("===> Storing query engine in singleton...");
     *singleton_guard = Some(Arc::clone(&query_engine));
     info!("Query engine singleton initialization completed.");
     println!("===> Query engine singleton initialization completed.");
+    
     Ok(query_engine)
 }
 
