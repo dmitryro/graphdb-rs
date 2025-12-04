@@ -49,7 +49,7 @@ use lib::storage_engine::sled_client::SledClient;
 use lib::storage_engine::rocksdb_client::RocksDBClient;
 use zmq::{Context as ZmqContext, Message};
 use base64::Engine;
-use graph_visualizing::visualizing::{GraphJson, JsonVertex, JsonEdge};
+use graph_visualizing::visualizing::{GraphJson, JsonVertex, JsonEdge, QueryResultWrapper};
 
 /// Converts a Cypher query result into GraphJson format for visualization
 fn convert_cypher_result_to_graph_json(result: &Value) -> Result<GraphJson> {
@@ -354,23 +354,37 @@ pub async fn handle_cypher_query_visualizing(
 
     eprintln!("[DEBUG] Raw result: {}", serde_json::to_string_pretty(&result).unwrap());
 
-    let graph_json: GraphJson = serde_json::from_value(result)
+    // Parse as QueryResultWrapper
+    use graph_visualizing::visualizing::QueryResultWrapper;
+    
+    let wrapper: QueryResultWrapper = serde_json::from_value(result)
         .map_err(|e| {
-            eprintln!("[DEBUG] Failed to parse as GraphJson: {}", e);
-            anyhow!("Result is not a valid graph structure: {e}")
+            eprintln!("[DEBUG] Failed to parse as QueryResultWrapper: {}", e);
+            anyhow!("Result is not a valid query result structure: {e}")
         })?;
 
-    eprintln!("[DEBUG] Parsed {} vertices", graph_json.vertices.len());
+    // Extract the first result row
+    let result_row = wrapper.results.into_iter().next()
+        .ok_or_else(|| anyhow!("No results returned from query"))?;
+
+    // Convert to GraphJson
+    use graph_visualizing::visualizing::GraphJson;
+    let graph_json = GraphJson {
+        vertices: result_row.vertices,
+        edges: result_row.edges,
+    };
+
+    eprintln!("[DEBUG] Parsed {} vertices and {} edges", graph_json.vertices.len(), graph_json.edges.len());
 
     if graph_json.vertices.is_empty() {
         println!("No vertices to visualize.");
         return Ok(());
     }
 
-    let json_str = serde_json::to_string(&graph_json).unwrap();
-    eprintln!("[DEBUG] About to call visualize_graph_from_json");
+    eprintln!("[DEBUG] About to call visualize_graph_from_graph_json");
 
-    graph_visualizing::visualizing::visualize_graph_from_json(&json_str)
+    // Call the direct function instead of serializing/deserializing
+    graph_visualizing::visualizing::visualize_graph_from_graph_json(graph_json)
         .map_err(|e| anyhow!("Graph visualization failed: {}", e))?;
 
     eprintln!("[DEBUG] Visualization completed");
