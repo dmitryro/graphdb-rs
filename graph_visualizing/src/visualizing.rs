@@ -16,19 +16,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use models::{Graph, Edge, Vertex, identifiers::SerializableUuid, Identifier, PropertyValue};
-use models::properties::SerializableFloat;
-
-// --- PropertyValue to String helper ---
-fn property_value_to_string(pv: &PropertyValue) -> String {
-    match pv {
-        PropertyValue::Boolean(b) => b.to_string(),
-        PropertyValue::Integer(i) => i.to_string(),
-        PropertyValue::Float(f) => f.0.to_string(),
-        PropertyValue::String(s) => s.clone(),
-        PropertyValue::Uuid(u) => u.0.to_string(),
-        PropertyValue::Byte(b) => b.to_string(),
-    }
-}
 
 /// JSON-compatible representation of a graph for import
 #[derive(Serialize, Deserialize, Debug)]
@@ -133,11 +120,23 @@ impl TryFrom<GraphJson> for Graph {
 struct PositionedVertex {
     id: Uuid,
     label: String,
+    display_name: String,
     x: u16,
     y: u16,
+    width: u16,
 }
 
-/// Improved layout algorithm using layered approach
+/// Get a human-readable display name for a vertex
+fn get_display_name(vertex: &Vertex) -> String {
+    if let Some(name) = vertex.properties.get("name") {
+        if let PropertyValue::String(s) = name {
+            return s.clone();
+        }
+    }
+    vertex.label.to_string()
+}
+
+/// Multi-level hierarchical layout centered on screen
 fn generate_layout(graph: &Graph) -> Vec<PositionedVertex> {
     let mut positions = Vec::new();
     let all_vertices: Vec<&Vertex> = graph.vertices.values().collect();
@@ -146,92 +145,87 @@ fn generate_layout(graph: &Graph) -> Vec<PositionedVertex> {
         return positions;
     }
 
-    // Build adjacency info
-    let mut out_degree: HashMap<Uuid, usize> = HashMap::new();
-    let mut in_degree: HashMap<Uuid, usize> = HashMap::new();
-    
-    for v in &all_vertices {
-        out_degree.insert(v.id.0, graph.outgoing_edges(&v.id.0).count());
-        in_degree.insert(v.id.0, graph.incoming_edges(&v.id.0).count());
-    }
-
-    // Find root nodes (nodes with no incoming edges or high out-degree)
-    let mut roots: Vec<&Vertex> = all_vertices.iter()
-        .filter(|v| *in_degree.get(&v.id.0).unwrap_or(&0) == 0)
+    // Find the Patient node as root
+    let root = all_vertices.iter()
+        .find(|v| v.label.to_string() == "Patient")
+        .or_else(|| {
+            all_vertices.iter()
+                .max_by_key(|v| graph.incoming_edges(&v.id.0).count())
+        })
         .copied()
-        .collect();
+        .unwrap_or(all_vertices[0]);
 
-    if roots.is_empty() {
-        // If no clear root, pick the vertex with highest out-degree
-        roots = vec![all_vertices.iter()
-            .max_by_key(|v| out_degree.get(&v.id.0).unwrap_or(&0))
-            .copied()
-            .unwrap()];
-    }
-
-    // Layer-based layout (BFS from roots)
-    let mut layers: Vec<Vec<Uuid>> = Vec::new();
+    let mut levels: Vec<Vec<&Vertex>> = Vec::new();
     let mut visited = HashSet::new();
-    let mut current_layer: Vec<Uuid> = roots.iter().map(|v| v.id.0).collect();
     
-    while !current_layer.is_empty() {
-        layers.push(current_layer.clone());
-        for id in &current_layer {
-            visited.insert(*id);
-        }
+    // Level 0: Root
+    levels.push(vec![root]);
+    visited.insert(root.id.0);
+
+    // BFS to build levels
+    let mut current_level = vec![root];
+    while !current_level.is_empty() {
+        let mut next_level = Vec::new();
         
-        let mut next_layer = Vec::new();
-        for id in &current_layer {
-            if let Some(v) = graph.vertices.get(id) {
-                for edge in graph.outgoing_edges(&v.id.0) {
-                    let target_id = edge.inbound_id.0;
-                    if !visited.contains(&target_id) && !next_layer.contains(&target_id) {
-                        next_layer.push(target_id);
+        for vertex in &current_level {
+            // Add children (outgoing edges)
+            for edge in graph.outgoing_edges(&vertex.id.0) {
+                if let Some(target) = graph.vertices.get(&edge.inbound_id.0) {
+                    if visited.insert(target.id.0) {
+                        next_level.push(target);
+                    }
+                }
+            }
+            
+            // Also check incoming edges to capture all connections
+            for edge in graph.incoming_edges(&vertex.id.0) {
+                if let Some(source) = graph.vertices.get(&edge.outbound_id.0) {
+                    if visited.insert(source.id.0) {
+                        next_level.push(source);
                     }
                 }
             }
         }
-        current_layer = next_layer;
-    }
-
-    // Add any remaining unvisited vertices
-    for v in &all_vertices {
-        if !visited.contains(&v.id.0) {
-            layers.push(vec![v.id.0]);
-            visited.insert(v.id.0);
+        
+        if !next_level.is_empty() {
+            levels.push(next_level.clone());
+            current_level = next_level;
+        } else {
+            break;
         }
     }
 
-    // Calculate positions with proper spacing
-    let vertical_spacing = 8u16;
-    let horizontal_spacing = 25u16;
-    let start_y = 3u16;
-    
-    for (layer_idx, layer) in layers.iter().enumerate() {
-        let y = start_y + (layer_idx as u16 * vertical_spacing);
-        let layer_width = (layer.len() as u16).saturating_sub(1) * horizontal_spacing;
-        let start_x = if layer_width > 0 { 10u16 } else { 40u16 };
+    // Position nodes level by level, centered horizontally
+    let y_spacing = 10u16; // Vertical space between levels
+    let x_spacing = 30u16; // Horizontal space between nodes
+    let center_x = 70u16;  // Screen center X
+    let start_y = 8u16;    // Start higher up for better centering
+
+    for (level_idx, level) in levels.iter().enumerate() {
+        let y = start_y + (level_idx as u16 * y_spacing);
         
-        for (node_idx, node_id) in layer.iter().enumerate() {
-            if let Some(v) = graph.vertices.get(node_id) {
-                let x = start_x + (node_idx as u16 * horizontal_spacing);
-                
-                let display_label = if let Some(name_prop) = v.properties.get("name") {
-                    match name_prop {
-                        PropertyValue::String(s) => s.clone(),
-                        _ => v.label.to_string(),
-                    }
-                } else {
-                    v.label.to_string()
-                };
-                
-                positions.push(PositionedVertex {
-                    id: *node_id,
-                    label: display_label,
-                    x,
-                    y,
-                });
-            }
+        // Calculate positions to center this level
+        let num_nodes = level.len() as u16;
+        let level_width = if num_nodes > 1 {
+            (num_nodes - 1) * x_spacing
+        } else {
+            0
+        };
+        
+        let start_x = center_x.saturating_sub(level_width / 2);
+        
+        for (node_idx, vertex) in level.iter().enumerate() {
+            let display = get_display_name(vertex);
+            let width = display.len().max(vertex.label.to_string().len()).max(12) as u16 + 4;
+            
+            positions.push(PositionedVertex {
+                id: vertex.id.0,
+                label: vertex.label.to_string(),
+                display_name: display,
+                x: start_x + (node_idx as u16 * x_spacing),
+                y,
+                width,
+            });
         }
     }
 
@@ -265,14 +259,12 @@ pub fn visualize_graph(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Initial layout and state
     let positions = generate_layout(graph);
     let mut offset_x = 0i16;
     let mut offset_y = 0i16;
@@ -285,123 +277,178 @@ pub fn visualize_graph(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> 
                 return;
             }
 
-            // Use almost full terminal size
-            let max_width = area.width.saturating_sub(4);
-            let max_height = area.height.saturating_sub(4);
-            let draw_area = Rect {
-                x: 2,
-                y: 2,
-                width: max_width,
-                height: max_height,
-            };
-
-            // Main visualization border
             frame.render_widget(
-                Paragraph::new("")
-                    .block(Block::default().borders(Borders::ALL).title("Graph Visualization (WASD: move, Q: quit)")),
-                draw_area,
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Medical Graph - WASD: pan | Q: quit"),
+                Rect { x: 0, y: 0, width: area.width, height: area.height },
             );
 
-            let draw_x = draw_area.x as i16;
-            let draw_y = draw_area.y as i16;
+            let inner = Rect {
+                x: 1,
+                y: 1,
+                width: area.width.saturating_sub(2),
+                height: area.height.saturating_sub(2),
+            };
 
-            // --- Draw Edges ---
+            // Draw edges with solid lines
             for edge in graph.edges.values() {
-                let source_pos = positions.iter()
-                    .find(|p| p.id == edge.outbound_id.0)
-                    .map(|p| (p.x as i16 + offset_x, p.y as i16 + offset_y));
-                let target_pos = positions.iter()
-                    .find(|p| p.id == edge.inbound_id.0)
-                    .map(|p| (p.x as i16 + offset_x, p.y as i16 + offset_y));
+                if let Some(src_pos) = positions.iter().find(|p| p.id == edge.outbound_id.0) {
+                    if let Some(tgt_pos) = positions.iter().find(|p| p.id == edge.inbound_id.0) {
+                        // Calculate connection points (center bottom of source, center top of target)
+                        let src_x = ((src_pos.x + src_pos.width / 2) as i16 + offset_x) as u16;
+                        let src_y = ((src_pos.y + 5) as i16 + offset_y) as u16; // Bottom of source box
+                        let tgt_x = ((tgt_pos.x + tgt_pos.width / 2) as i16 + offset_x) as u16;
+                        let tgt_y = (tgt_pos.y as i16 + offset_y - 1) as u16; // Just above target box
 
-                if let (Some((sx, sy)), Some((tx, ty))) = (source_pos, target_pos) {
-                    let screen_sx = (sx + draw_x) as u16;
-                    let screen_sy = (sy + draw_y) as u16;
-                    let screen_tx = (tx + draw_x) as u16;
-                    let screen_ty = (ty + draw_y) as u16;
+                        // Calculate midpoint
+                        let mid_y = (src_y + tgt_y) / 2;
 
-                    // Draw edge line between nodes
-                    if screen_sy < screen_ty {
-                        // Draw vertical connection
-                        for y in screen_sy + 1..screen_ty {
-                            if y > draw_area.y && y < draw_area.y + draw_area.height &&
-                               screen_sx > draw_area.x && screen_sx < draw_area.x + draw_area.width {
+                        // Draw vertical line from source down to midpoint
+                        for y in src_y..=mid_y {
+                            if y >= inner.y && y < inner.y + inner.height && 
+                               src_x >= inner.x && src_x < inner.x + inner.width {
                                 frame.render_widget(
-                                    Paragraph::new("│").style(Style::default().fg(Color::Yellow)),
-                                    Rect::new(screen_sx, y, 1, 1),
+                                    Paragraph::new("│").style(Style::default().fg(Color::Blue)),
+                                    Rect::new(src_x, y, 1, 1),
                                 );
                             }
                         }
-                        // Draw edge label
-                        let label_y = (screen_sy + screen_ty) / 2;
-                        if label_y > draw_area.y && label_y < draw_area.y + draw_area.height {
-                            let edge_label = format!("─{}→", edge.label);
+
+                        // Draw horizontal line at midpoint (if nodes are not vertically aligned)
+                        if src_x != tgt_x {
+                            let min_x = src_x.min(tgt_x);
+                            let max_x = src_x.max(tgt_x);
+                            for x in min_x..=max_x {
+                                if mid_y >= inner.y && mid_y < inner.y + inner.height &&
+                                   x >= inner.x && x < inner.x + inner.width {
+                                    frame.render_widget(
+                                        Paragraph::new("─").style(Style::default().fg(Color::Blue)),
+                                        Rect::new(x, mid_y, 1, 1),
+                                    );
+                                }
+                            }
+                        }
+
+                        // Draw vertical line from midpoint down to target
+                        for y in mid_y..=tgt_y {
+                            if y >= inner.y && y < inner.y + inner.height &&
+                               tgt_x >= inner.x && tgt_x < inner.x + inner.width {
+                                frame.render_widget(
+                                    Paragraph::new("│").style(Style::default().fg(Color::Blue)),
+                                    Rect::new(tgt_x, y, 1, 1),
+                                );
+                            }
+                        }
+
+                        // Draw arrow pointing down at target
+                        if tgt_y >= inner.y && tgt_y < inner.y + inner.height &&
+                           tgt_x >= inner.x && tgt_x < inner.x + inner.width {
                             frame.render_widget(
-                                Paragraph::new(edge_label.clone())
-                                    .style(Style::default().fg(Color::Cyan)),
-                                Rect::new(screen_sx + 2, label_y, edge_label.len() as u16, 1),
+                                Paragraph::new("▼").style(Style::default().fg(Color::Blue)),
+                                Rect::new(tgt_x, tgt_y, 1, 1),
                             );
                         }
-                    } else {
-                        // Draw horizontal connection
-                        let min_x = screen_sx.min(screen_tx);
-                        let max_x = screen_sx.max(screen_tx);
-                        if screen_sy > draw_area.y && screen_sy < draw_area.y + draw_area.height {
-                            let edge_label = format!("─{}→", edge.label);
-                            let width = (max_x - min_x).max(edge_label.len() as u16);
+
+                        // Draw edge label with clear background above midpoint
+                        let label = format!(" {} ", edge.label);
+                        let label_len = label.len() as u16;
+                        let label_x = src_x.saturating_sub(label_len / 2).max(inner.x + 2);
+                        let label_y = mid_y.saturating_sub(1);
+                        
+                        if label_y >= inner.y && label_y < inner.y + inner.height &&
+                           label_x >= inner.x && (label_x + label_len) < (inner.x + inner.width) {
+                            // Clear background for label
                             frame.render_widget(
-                                Paragraph::new(edge_label)
-                                    .style(Style::default().fg(Color::Cyan)),
-                                Rect::new(min_x, screen_sy, width, 1),
+                                Paragraph::new(" ".repeat(label_len as usize))
+                                    .style(Style::default().bg(Color::Black)),
+                                Rect::new(label_x, label_y, label_len, 1),
+                            );
+                            // Draw label on top
+                            frame.render_widget(
+                                Paragraph::new(label)
+                                    .style(Style::default()
+                                        .fg(Color::Yellow)
+                                        .bg(Color::Black)
+                                        .add_modifier(Modifier::BOLD)),
+                                Rect::new(label_x, label_y, label_len, 1),
                             );
                         }
                     }
                 }
             }
 
-            // --- Draw Vertices ---
+            // Draw vertices on top of edges
             for pos in &positions {
-                let screen_x = (pos.x as i16 + offset_x + draw_x) as u16;
-                let screen_y = (pos.y as i16 + offset_y + draw_y) as u16;
+                let x = (pos.x as i16 + offset_x) as u16;
+                let y = (pos.y as i16 + offset_y) as u16;
                 
-                if screen_x > draw_area.x && screen_x < draw_area.x + draw_area.width &&
-                   screen_y > draw_area.y && screen_y < draw_area.y + draw_area.height {
-                    
-                    let vertex_label = format!("┌─{}─┐", pos.label);
-                    let vertex_id = format!("│{}│", pos.id.simple());
-                    let vertex_bottom = "└─────┘";
-                    
-                    let width = vertex_label.len().max(vertex_id.len()).max(vertex_bottom.len()) as u16;
-                    
+                // Skip if completely out of bounds
+                if x + pos.width < inner.x || x >= inner.x + inner.width ||
+                   y + 5 < inner.y || y >= inner.y + inner.height {
+                    continue;
+                }
+
+                let color = match pos.label.as_str() {
+                    "Patient" => Color::Cyan,
+                    "Encounter" => Color::Green,
+                    "Medication" => Color::Magenta,
+                    "Diagnosis" => Color::Red,
+                    "Allergy" => Color::Yellow,
+                    _ => Color::White,
+                };
+
+                let padding = pos.width.saturating_sub(2) as usize;
+                let box_top = format!("╔{}╗", "═".repeat(padding));
+                let box_name = format!("║{:^width$}║", pos.display_name, width = padding);
+                let box_sep = format!("╟{}╢", "─".repeat(padding));
+                let box_label = format!("║{:^width$}║", pos.label, width = padding);
+                let box_bot = format!("╚{}╝", "═".repeat(padding));
+
+                let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+
+                if y >= inner.y && y < inner.y + inner.height {
                     frame.render_widget(
-                        Paragraph::new(vertex_label)
-                            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                        Rect::new(screen_x, screen_y, width, 1),
+                        Paragraph::new(box_top).style(style),
+                        Rect::new(x, y, pos.width, 1),
                     );
+                }
+                if y + 1 < inner.y + inner.height {
                     frame.render_widget(
-                        Paragraph::new(vertex_id)
-                            .style(Style::default().fg(Color::Green)),
-                        Rect::new(screen_x, screen_y + 1, width, 1),
+                        Paragraph::new(box_name).style(style),
+                        Rect::new(x, y + 1, pos.width, 1),
                     );
+                }
+                if y + 2 < inner.y + inner.height {
                     frame.render_widget(
-                        Paragraph::new(vertex_bottom)
-                            .style(Style::default().fg(Color::Green)),
-                        Rect::new(screen_x, screen_y + 2, width, 1),
+                        Paragraph::new(box_sep).style(Style::default().fg(color)),
+                        Rect::new(x, y + 2, pos.width, 1),
+                    );
+                }
+                if y + 3 < inner.y + inner.height {
+                    frame.render_widget(
+                        Paragraph::new(box_label).style(Style::default().fg(color)),
+                        Rect::new(x, y + 3, pos.width, 1),
+                    );
+                }
+                if y + 4 < inner.y + inner.height {
+                    frame.render_widget(
+                        Paragraph::new(box_bot).style(style),
+                        Rect::new(x, y + 4, pos.width, 1),
                     );
                 }
             }
         })?;
 
-        // --- Event Handling ---
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => running = false,
-                        KeyCode::Char('w') => offset_y = offset_y.saturating_add(3),
-                        KeyCode::Char('s') => offset_y = offset_y.saturating_sub(3),
-                        KeyCode::Char('a') => offset_x = offset_x.saturating_add(3),
-                        KeyCode::Char('d') => offset_x = offset_x.saturating_sub(3),
+                        KeyCode::Char('w') => offset_y = offset_y.saturating_add(2),
+                        KeyCode::Char('s') => offset_y = offset_y.saturating_sub(2),
+                        KeyCode::Char('a') => offset_x = offset_x.saturating_add(2),
+                        KeyCode::Char('d') => offset_x = offset_x.saturating_sub(2),
                         _ => {}
                     }
                 }
@@ -409,7 +456,6 @@ pub fn visualize_graph(graph: &Graph) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    // Terminal cleanup
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
@@ -440,59 +486,6 @@ mod tests {
         "#;
 
         let graph_json: GraphJson = serde_json::from_str(json).unwrap();
-        let graph = Graph::try_from(graph_json).unwrap();
-        assert_eq!(graph.vertices.len(), 2);
-        assert_eq!(graph.edges.len(), 1);
-    }
-    
-    #[test]
-    fn test_cypher_result_wrapper_parsing() {
-        let json = r#"{
-          "results": [
-            {
-              "vertices": [
-                {
-                  "id": "5de26827-3516-4676-9c48-96dbbf01bdf0",
-                  "label": "Patient",
-                  "properties": {
-                    "id": "12345",
-                    "name": "John Doe"
-                  }
-                },
-                {
-                  "id": "57c03bd2-043b-49c2-8c93-21431173bf5e",
-                  "label": "Encounter",
-                  "properties": {
-                    "type": "ED_TRIAGE"
-                  }
-                }
-              ],
-              "edges": [
-                {
-                  "id": "721f8fc0-6466-4f97-baaf-4b7690c99a3a",
-                  "outbound_id": "5de26827-3516-4676-9c48-96dbbf01bdf0",
-                  "inbound_id": "57c03bd2-043b-49c2-8c93-21431173bf5e",
-                  "label": "HAS_ENCOUNTER",
-                  "properties": {}
-                }
-              ],
-              "stats": {}
-            }
-          ]
-        }"#;
-
-        let wrapper: QueryResultWrapper = serde_json::from_str(json).unwrap();
-        assert_eq!(wrapper.results.len(), 1);
-
-        let result_row = wrapper.results.get(0).unwrap();
-        assert_eq!(result_row.vertices.len(), 2);
-        assert_eq!(result_row.edges.len(), 1);
-
-        let graph_json = GraphJson {
-            vertices: result_row.vertices.clone(),
-            edges: result_row.edges.clone(),
-        };
-
         let graph = Graph::try_from(graph_json).unwrap();
         assert_eq!(graph.vertices.len(), 2);
         assert_eq!(graph.edges.len(), 1);
