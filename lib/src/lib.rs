@@ -38,6 +38,7 @@ pub use daemon::*;
 pub use graph_indexing::*;
 pub use indexing::*;
 pub use graph_engine::*;
+pub use storage_engine::*;
 
 #[cfg(feature = "bench-suite")]
 extern crate test;
@@ -75,7 +76,7 @@ pub use crate::daemon_utils::{
     stop_process,
 };
 // Re-export from storage_engine/mod.rs (assuming it exists and re-exports these)
-pub use crate::storage_engine::{StorageEngine, GraphStorageEngine, SledStorage, log_lock_file_diagnostics};
+pub use crate::storage_engine::*;
 #[cfg(feature = "with-rocksdb")]
 pub use crate::config::RocksDBStorage; // Re-export the new RocksDB storage
 

@@ -18,6 +18,9 @@ pub struct Graph {
     pub out_edges: HashMap<Uuid, HashSet<Uuid>>,
     pub in_edges: HashMap<Uuid, HashSet<Uuid>>,
 
+
+// 🌟 ADDED: For tracking the total number of vertices.
+    pub vertex_count: usize,
     // 🌟 MISSING FIELD ADDED: For tracking the total number of edges.
     pub edge_count: usize,
 
@@ -35,6 +38,7 @@ impl Graph {
             in_edges: HashMap::new(),
             // 🌟 INITIALIZE MISSING FIELD
             edge_count: 0, 
+            vertex_count: 0,
             vertex_observers: Arc::new(RwLock::new(Vec::new())),
             edge_observers: Arc::new(RwLock::new(Vec::new())),
         }
@@ -62,7 +66,7 @@ impl Graph {
         let vertex_id = vertex.id.0;
         let vertex_ref = vertex.clone();
         self.vertices.insert(vertex_id, vertex);
-
+        self.vertex_count += 1;
         // Notify all vertex observers
         let observers = self.vertex_observers.clone();
         tokio::spawn(async move {

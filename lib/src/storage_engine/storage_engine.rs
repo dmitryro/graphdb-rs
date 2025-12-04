@@ -1631,7 +1631,7 @@ impl StorageEngineManager {
         .await
     }
 
-    async fn ensure_storage_daemon_running(port: u16) -> GraphResult<()> {
+    pub async fn ensure_storage_daemon_running(port: u16) -> GraphResult<()> {
         if is_storage_daemon_running(port).await {
             return Ok(());
         }

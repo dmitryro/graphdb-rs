@@ -2,6 +2,7 @@ pub mod query_types;
 pub mod query_parser;
 pub mod cypher_parser;
 pub mod graphql_parser;
+pub mod parser_zmq;
 pub mod sql_parser;
 pub mod utils;
 pub mod config;
@@ -18,3 +19,4 @@ pub use sql_parser::{
 pub use graphql_parser::{
 
 };
+pub use parser_zmq::*;

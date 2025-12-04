@@ -1,6 +1,6 @@
 // graph_engine/src/graph_service.rs
 //! Global singleton GraphService — fully persistent using lib's StorageEngine + GraphError
-
+use std::collections::{ HashSet, HashMap };
 use crate::graph_engine::medical::*;
 use crate::storage_engine::{StorageEngine, GraphOp};
 use models::medical::*;
@@ -157,6 +157,45 @@ impl GraphService {
             // Note: The E0609 error for edge_count is resolved because you confirmed
             // this field was added to the Graph model in the previous step.
             graph.edge_count = graph.edge_count.saturating_sub(1);
+        }
+
+        Ok(())
+    }
+
+    /// Asynchronously removes a single vertex from the in-memory graph structure and cleans up its associated edges.
+    /// This requires acquiring a write lock on the in-memory graph.
+    pub async fn delete_vertex_from_memory(&self, vertex_id: Uuid) -> Result<(), GraphError> {
+        // Acquire the write lock on the in-memory graph
+        let mut graph = self.graph.write().await;
+        
+        // 1. Remove the vertex from the main vertices map
+        if graph.vertices.remove(&vertex_id).is_some() {
+            // Vertex was present, now clean up associated edges
+            
+            // 2. Collect IDs of edges to be removed
+            let mut edges_to_remove = HashSet::new();
+
+            // Remove from outbound index and collect edge IDs
+            if let Some(out_edges) = graph.out_edges.remove(&vertex_id) {
+                edges_to_remove.extend(out_edges);
+            }
+
+            // Remove from inbound index and collect edge IDs
+            if let Some(in_edges) = graph.in_edges.remove(&vertex_id) {
+                edges_to_remove.extend(in_edges);
+            }
+
+            // 3. Remove edges from the main edges map and update edge count
+            for edge_id in edges_to_remove.iter() {
+                if graph.edges.remove(edge_id).is_some() {
+                    // Decrement edge count for each removed edge
+                    graph.edge_count = graph.edge_count.saturating_sub(1);
+                }
+            }
+            
+            // 4. Decrement the in-memory vertex count
+            // FIX: This now uses the newly added `vertex_count` field.
+            graph.vertex_count = graph.vertex_count.saturating_sub(1);
         }
 
         Ok(())
