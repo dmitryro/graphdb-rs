@@ -24,7 +24,7 @@ use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts};
 use tokio::sync::Mutex;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{ HashMap, HashSet };
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -89,6 +89,16 @@ impl StorageEngine for MySQLStorage {
 
 #[async_trait]
 impl GraphStorageEngine for MySQLStorage {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -25,7 +25,7 @@ use crate::cli::handlers_utils::{parse_show_command};
 pub use lib::config::{StorageEngineType};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 
-struct SharedState {
+pub struct SharedState {
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
@@ -145,7 +145,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     let top_level_commands = vec![
         "start", "stop", "status", "auth", "authenticate", "register", "version", "health",
         "reload", "restart", "clear", "help", "exit", "daemon", "rest", "storage", "use",
-        "quit", "q", "clean", "save", "show", "kv", "query", "exec", "migrate", "visualize",
+        "quit", "q", "clean", "cleanup", "save", "show", "kv", "query", "exec", "migrate", 
+        "visualize",
         // NEW: Add graph and index for tab-completion & fuzzy help
         "graph", "index",
         // === NEW CLINICAL COMMANDS ===
@@ -1604,6 +1605,173 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 })
             }
         }
+        // === NEW: Cleanup Command ===
+        "cleanup" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: cleanup [storage <engine> | logs | temporary-files | all] [--force] [--days-retention <days>]");
+                CommandType::Unknown
+            } else {
+                match remaining_args[0].to_lowercase().as_str() {
+                    // --- STORAGE Cleanup ---
+                    "storage" => {
+                        if remaining_args.len() < 2 {
+                            eprintln!("Usage: cleanup storage <engine> [--force]");
+                            CommandType::Unknown
+                        } else {
+                            let engine_str = remaining_args[1].clone();
+                            
+                            // Attempt to parse the StorageEngineType
+                            let engine_type_parsed = match engine_str.to_lowercase().as_str() {
+                                "sled" => Some(StorageEngineType::Sled),
+                                "rocksdb" => Some(StorageEngineType::RocksDB),
+                                "inmemory" => Some(StorageEngineType::InMemory),
+                                _ => {
+                                    eprintln!("Error: Unknown storage engine '{}'.", engine_str);
+                                    None
+                                }
+                            };
+                            
+                            if engine_type_parsed.is_none() {
+                                CommandType::Unknown
+                            } else {
+                                let mut force = false;
+                                let mut _i = 2;
+                                while _i < remaining_args.len() {
+                                    match remaining_args[_i].to_lowercase().as_str() {
+                                        "--force" | "-f" => {
+                                            force = true;
+                                            _i += 1;
+                                        }
+                                        _ => {
+                                            eprintln!("Warning: Unknown argument for 'cleanup storage': {}", remaining_args[_i]);
+                                            _i += 1;
+                                        }
+                                    }
+                                }
+
+                                CommandType::Cleanup(
+                                    CleanupCommand::Storage {
+                                        engine: engine_type_parsed.unwrap(),
+                                        force,
+                                    }
+                                )
+                            }
+                        }
+                    },
+                    // --- LOGS Cleanup ---
+                    "logs" => {
+                        let mut days_retention: i32 = 7;
+                        let mut force = false;
+                        let mut _i = 1;
+                        while _i < remaining_args.len() {
+                            match remaining_args[_i].to_lowercase().as_str() {
+                                "--force" | "-f" => {
+                                    force = true;
+                                    _i += 1;
+                                }
+                                "--days-retention" => {
+                                    if _i + 1 < remaining_args.len() {
+                                        match remaining_args[_i + 1].parse::<i32>() {
+                                            Ok(days) => {
+                                                days_retention = days;
+                                                _i += 2;
+                                            }
+                                            Err(_) => {
+                                                eprintln!("Error: '--days-retention' value must be an integer.");
+                                                return (CommandType::Unknown, remaining_args.clone());
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!("Warning: Flag '--days-retention' requires a value.");
+                                        _i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'cleanup logs': {}", remaining_args[_i]);
+                                    _i += 1;
+                                }
+                            }
+                        }
+
+                        CommandType::Cleanup(
+                            CleanupCommand::Logs {
+                                days_retention,
+                                force,
+                            }
+                        )
+                    },
+                    "graph" => {
+                        CommandType::Cleanup(
+                            CleanupCommand::Graph
+                        )
+                    },
+                    // --- TEMPORARY-FILES Cleanup ---
+                    "temporary-files" | "temp" | "tmp" => {
+                        let mut _i = 1;
+                        while _i < remaining_args.len() {
+                            match remaining_args[_i].to_lowercase().as_str() {
+                                "--force" | "-f" => {
+                                    _i += 1;
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'cleanup temporary-files': {}", remaining_args[_i]);
+                                    _i += 1;
+                                }
+                            }
+                        }
+
+                        CommandType::Cleanup(CleanupCommand::TemporaryFiles)
+                    },
+                    // --- ALL Cleanup ---
+                    "all" => {
+                        let mut days_retention: i32 = 7;
+                        let mut force = false;
+                        let mut _i = 1;
+                        while _i < remaining_args.len() {
+                            match remaining_args[_i].to_lowercase().as_str() {
+                                "--force" | "-f" => {
+                                    force = true;
+                                    _i += 1;
+                                }
+                                "--days-retention" => {
+                                    if _i + 1 < remaining_args.len() {
+                                        match remaining_args[_i + 1].parse::<i32>() {
+                                            Ok(days) => {
+                                                days_retention = days;
+                                                _i += 2;
+                                            }
+                                            Err(_) => {
+                                                eprintln!("Error: '--days-retention' value must be an integer.");
+                                                return (CommandType::Unknown, remaining_args.clone());
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!("Warning: Flag '--days-retention' requires a value.");
+                                        _i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'cleanup all': {}", remaining_args[_i]);
+                                    _i += 1;
+                                }
+                            }
+                        }
+
+                        CommandType::Cleanup(
+                            CleanupCommand::All {
+                                days_retention,
+                                force,
+                            }
+                        )
+                    },
+                    _ => {
+                        eprintln!("Error: Unknown cleanup subcommand '{}'.", remaining_args[0]);
+                        eprintln!("Usage: cleanup [storage <engine> | logs | temporary-files | all] [--force] [--days-retention <days>]");
+                        CommandType::Unknown
+                    }
+                }
+            }
+        },
         // === NEW: Graph Domain Commands ===
         "graph" => {
             if remaining_args.is_empty() {
@@ -6662,6 +6830,10 @@ pub async fn handle_interactive_command(
             } else {
                 crate::cli::help_display::print_help_clap_generated();
             }
+            Ok(())
+        }
+        CommandType::Cleanup(action) => {
+            handlers::handle_cleanup_command_interactive(action).await;
             Ok(())
         }
         CommandType::SaveStorage => {

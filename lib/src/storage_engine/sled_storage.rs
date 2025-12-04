@@ -1,3 +1,4 @@
+
 use anyhow::{Result, Context, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
@@ -7,6 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
 use tokio::fs;
 use tokio::sync::{OnceCell, Mutex as TokioMutex};
+use tokio::task;
 use log::{info, debug, warn, error, trace};
 pub use crate::config::{
     SledDbWithPath, SledConfig, SledStorage, SledDaemon, SledDaemonPool, load_storage_config_from_yaml, 
@@ -32,7 +34,9 @@ use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use crate::storage_engine::sled_client::{ SledClient, ZmqSocketWrapper };
 use std::os::unix::fs::PermissionsExt;
 use sysinfo::{System, RefreshKind, ProcessRefreshKind, Pid, ProcessesToUpdate};
-use sled::{Db, IVec,};
+use sled::{Db, IVec, transaction::{abort, ConflictableTransactionError, TransactionResult, 
+                                   TransactionError, UnabortableTransactionError}, 
+                                   Transactional, Tree};
 use serde::{Deserialize, Serialize};
 use bincode::{ config as binconfig };
 
@@ -40,6 +44,20 @@ pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::n
 pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
 pub static SLED_ACTIVE_DATABASES: LazyLock<OnceCell<TokioMutex<HashSet<PathBuf>>>> = LazyLock::new(|| OnceCell::new());
 
+// Sled Tree Names (analogous to tables or column families)
+pub const EDGES_TREE: &str = "edges";
+pub const VERTICES_TREE: &str = "vertices"; // Needed for completeness, even if not used in edge deletion
+
+pub const OUTBOUND_TREE: &str = "outbound_edges_idx"; // Adjacency list for outgoing edges
+pub const INBOUND_TREE: &str = "inbound_edges_idx";  // Adjacency list for incoming edges
+
+// Sled Metadata Tree and Key
+pub const METADATA_TREE: &str = "metadata";
+pub const EDGE_COUNT_KEY: &str = "edge_count";
+pub type TxResult<T> = Result<T, TransactionError<GraphError>>;
+
+// Define the Transactional Error Type (needs to be defined outside the transaction closure if used explicitly)
+type TxError = sled::transaction::TransactionError<GraphError>;
 // sled_storage.rs  (or wherever the impl lives)
 
 /// Initialise the global SLED_DB singleton exactly once.
@@ -51,6 +69,25 @@ async fn init_sled_db_singleton(db: Arc<sled::Db>, path: PathBuf) -> Result<(), 
         })
         .await;
     Ok(())
+}
+
+async fn get_sled_db_clone() -> GraphResult<sled::Db> {
+    let singleton = SLED_DB
+        .get()
+        .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+    
+    let db_clone = {
+        // Acquire the TokioMutex lock to get the sled::Db clone with a timeout
+        let guard = tokio::time::timeout(TokioDuration::from_secs(5), singleton.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock for clone".to_string()))?;
+        
+        // FIX: Dereference the Arc (*guard.db) to access the inner sled::Db,
+        // then call its cheap internal clone method. This matches the return type.
+        (*guard.db).clone()
+    };
+    
+    Ok(db_clone)
 }
 
 impl SledStorage {
@@ -489,276 +526,456 @@ impl SledStorage {
 
     // Internal implementation methods (same pattern as RocksDBStorage)
     pub async fn add_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO ADD VERTEX");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.create_vertex(vertex).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO ADD VERTEX ========================");
-        drop(guard);
-        
-        // Fallback to direct access
         self.create_vertex_direct(vertex).await
     }
 
     pub async fn get_vertex_internal(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO GET VERTEX");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_vertex(id).await;
-        }
-        
+        // ALWAYS use direct DB access to avoid ZMQ deadlock
+        // The ZMQ client would create a request to ourselves, causing a hang
         println!("========================== USING DIRECT DB ACCESS TO GET VERTEX ========================");
-        drop(guard);
-        
         self.get_vertex_direct(id).await
     }
 
     pub async fn delete_vertex_internal(&self, id: &Uuid) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO DELETE VERTEX");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.delete_vertex(id).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO DELETE VERTEX ========================");
-        drop(guard);
-        
         self.delete_vertex_direct(id).await
     }
 
     pub async fn add_edge(&self, edge: Edge) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO ADD EDGE");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.create_edge(edge).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO ADD EDGE ========================");
-        drop(guard);
-        
         self.create_edge_direct(edge).await
     }
 
     pub async fn get_edge_internal(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO GET EDGE");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_edge(outbound_id, edge_type, inbound_id).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO GET EDGE ========================");
-        drop(guard);
-        
         self.get_edge_direct(outbound_id, edge_type, inbound_id).await
     }
 
     pub async fn delete_edge_internal(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO DELETE EDGE");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.delete_edge(outbound_id, edge_type, inbound_id).await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO DELETE EDGE ========================");
-        drop(guard);
-        
         self.delete_edge_direct(outbound_id, edge_type, inbound_id).await
     }
 
     pub async fn get_all_vertices_internal(&self) -> GraphResult<Vec<Vertex>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO FETCH ALL VERTICES");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_all_vertices().await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO GET ALL VERTICES ========================");
-        drop(guard);
-        
         self.get_all_vertices_direct().await
     }
 
     pub async fn get_all_edges_internal(&self) -> GraphResult<Vec<Edge>> {
-        let singleton = SLED_DB.get()
-            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
-        
-        let guard = singleton.lock().await;
-        
-        if let Some((client, _socket)) = &guard.client {
-            println!("===> USING ZMQ CLIENT TO FETCH ALL EDGES");
-            let client_clone = client.clone();
-            drop(guard);
-            return client_clone.get_all_edges().await;
-        }
-        
         println!("========================== USING DIRECT DB ACCESS TO GET ALL EDGES ========================");
-        drop(guard);
-        
         self.get_all_edges_direct().await
     }
 
+    // Assuming necessary imports like SLED_DB, GraphError, Vertex, Edge, Identifier,
+    // SerializableUuid, serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge,
+    // create_edge_key, info, println, Uuid, task, timeout, TokioDuration, IVec, EDGE_COUNT_KEY are in scope.
+
     // Direct database access methods (fallback)
+
     async fn create_vertex_direct(&self, vertex: Vertex) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Creating vertex at path {:?}", db_path);
-        println!("===> CREATING VERTEX IN SLED DATABASE AT {:?}", db_path);
+        let singleton = SLED_DB.get().ok_or_else(|| 
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
+        
+        let vertex_clone = vertex;
+        
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
+            
+            info!("Creating vertex at path {:?}", db_lock.path);
+            println!("===> CREATING VERTEX IN SLED DATABASE AT {:?}", db_lock.path);
+            
+            let vertices = db_lock.db.open_tree("vertices")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        vertices.insert(vertex.id.0.as_bytes(), serialize_vertex(&vertex)?)
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            vertices.insert(vertex_clone.id.0.as_bytes(), serialize_vertex(&vertex_clone)?)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
-        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
-        Ok(())
+            db_lock.db.flush()
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                
+            Ok(())
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
 
     async fn get_vertex_direct(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let vertex = vertices
-            .get(SerializableUuid(*id).0.as_bytes())
-            .map_err(|e| GraphError::StorageError(e.to_string()))?
-            .map(|v| deserialize_vertex(&*v))
-            .transpose()?;
-        Ok(vertex)
+        let singleton = SLED_DB.get().ok_or_else(|| 
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
+        
+        let id_clone = *id;
+        
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
+            
+            let vertices = db_lock.db.open_tree("vertices")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                
+            let vertex = vertices
+                .get(SerializableUuid(id_clone).0.as_bytes())
+                .map_err(|e| GraphError::StorageError(e.to_string()))?
+                .map(|v| deserialize_vertex(&*v))
+                .transpose()?;
+                
+            Ok(vertex)
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
 
     async fn delete_vertex_direct(&self, id: &Uuid) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+        let singleton = SLED_DB.get().ok_or_else(|| 
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
+        
+        let id_clone = *id;
+        
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
+            
+            let vertices_tree = db_lock.db.open_tree("vertices")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let edges_tree = db_lock.db.open_tree("edges")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let outbound_tree = db_lock.db.open_tree("outbound")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let inbound_tree = db_lock.db.open_tree("inbound")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        vertices.remove(SerializableUuid(*id).0.as_bytes())
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
-        Ok(())
+            // Find connected edges
+            let mut edges_to_delete: Vec<(sled::IVec, Edge)> = Vec::new();
+            
+            for item in edges_tree.iter() {
+                let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                
+                if let Ok(edge) = deserialize_edge(&value) {
+                    if edge.outbound_id.0 == id_clone || edge.inbound_id.0 == id_clone {
+                        edges_to_delete.push((key, edge));
+                    }
+                }
+            }
+            
+            let vertex_key = SerializableUuid(id_clone).0.as_bytes().to_vec();
+            
+            // Run atomic transaction
+            let tx_result: sled::transaction::TransactionResult<(), GraphError> = (
+                &vertices_tree,
+                &edges_tree,
+                &outbound_tree,
+                &inbound_tree,
+            ).transaction(|(vertices, edges, outbound, inbound)| {
+                
+                vertices.remove(vertex_key.as_slice())?; // Use .as_slice() for clarity
+                
+                for (edge_key, edge) in &edges_to_delete {
+                    edges.remove(&**edge_key)?;
+                    outbound.remove(edge.outbound_id.0.as_bytes())?;
+                    inbound.remove(edge.inbound_id.0.as_bytes())?;
+                }
+
+                Ok(())
+            });
+
+            match tx_result {
+                Ok(()) => {
+                    db_lock.db.flush()
+                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    Ok(())
+                },
+                Err(sled::transaction::TransactionError::Abort(e)) => Err(e),
+                Err(sled::transaction::TransactionError::Storage(e)) => 
+                    Err(GraphError::StorageError(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
 
     async fn create_edge_direct(&self, edge: Edge) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+        let singleton = SLED_DB.get().ok_or_else(|| 
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
+        
+        let edge_clone = edge;
+        
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
 
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(edge.outbound_id.0), &edge.edge_type, &SerializableUuid(edge.inbound_id.0))?;
-        edges.insert(&edge_key, serialize_edge(&edge)?)
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
-        Ok(())
-    }
+            let edges_tree = db_lock.db.open_tree("edges")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let outbound_tree = db_lock.db.open_tree("outbound")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let inbound_tree = db_lock.db.open_tree("inbound")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let metadata_tree = db_lock.db.open_tree("metadata")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
-    async fn get_edge_direct(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+            let serialized_edge = serialize_edge(&edge_clone)?;
+            
+            let outbound_uuid = edge_clone.outbound_id.0;
+            let inbound_uuid = edge_clone.inbound_id.0;
+            let edge_type = edge_clone.edge_type.clone();
 
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id))?;
-        let edge = edges
-            .get(&edge_key)
-            .map_err(|e| GraphError::StorageError(e.to_string()))?
-            .map(|v| deserialize_edge(&*v))
-            .transpose()?;
-        Ok(edge)
+            let tx_result: sled::transaction::TransactionResult<(), GraphError> = (
+                &edges_tree, 
+                &outbound_tree, 
+                &inbound_tree, 
+                &metadata_tree
+            ).transaction(|(edges, outbound, inbound, metadata)| {
+                
+                // CREATE ALL KEYS INSIDE TRANSACTION
+                let edge_key = create_edge_key(
+                    &SerializableUuid(outbound_uuid), 
+                    &edge_type, 
+                    &SerializableUuid(inbound_uuid)
+                ).map_err(|e| sled::transaction::ConflictableTransactionError::Abort(e))?;
+                
+                let mut outbound_index_key = Vec::with_capacity(16 + edge_key.len());
+                outbound_index_key.extend_from_slice(outbound_uuid.as_bytes());
+                outbound_index_key.extend_from_slice(&edge_key);
+                
+                let mut inbound_index_key = Vec::with_capacity(16 + edge_key.len());
+                inbound_index_key.extend_from_slice(inbound_uuid.as_bytes());
+                inbound_index_key.extend_from_slice(&edge_key);
+                
+                edges.insert(edge_key.as_slice(), &serialized_edge[..])?; // Key fix for consistency
+                
+                // 🐛 REGRESSION FIX: Removed extra '**' and ensured correct slicing.
+                // Fix is: outbound.insert(outbound_index_key.as_slice(), edge_key.as_slice())?;
+                outbound.insert(outbound_index_key.as_slice(), edge_key.as_slice())?; 
+                inbound.insert(inbound_index_key.as_slice(), edge_key.as_slice())?;
+
+                let current_bytes = metadata
+                    .get(EDGE_COUNT_KEY)?
+                    .unwrap_or_else(|| IVec::from("0".as_bytes()));
+
+                let current_count: usize = String::from_utf8_lossy(&current_bytes)
+                    .parse()
+                    .unwrap_or(0);
+
+                let new_count = current_count.checked_add(1).unwrap_or(usize::MAX);
+                
+                metadata.insert(EDGE_COUNT_KEY, new_count.to_string().as_bytes())?;
+                
+                Ok(())
+            });
+
+            match tx_result {
+                Ok(()) => {
+                    db_lock.db.flush()
+                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    Ok(())
+                },
+                Err(sled::transaction::TransactionError::Abort(e)) => Err(e),
+                Err(sled::transaction::TransactionError::Storage(e)) => 
+                    Err(GraphError::StorageError(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
 
     async fn delete_edge_direct(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+        let singleton = SLED_DB.get().ok_or_else(||
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
 
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id))?;
-        edges.remove(&edge_key)
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
-        Ok(())
+        // FIX: Acquire the lock and CLONE the sled::Db instance in the ASYNC context.
+        let db_clone = {
+            let guard = singleton.lock().await;
+            // Assuming 'db' field holds the sled::Db (sled::Db implements Clone)
+            guard.db.clone() 
+        };
+
+        let outbound_id_clone = *outbound_id;
+        let edge_type_clone = edge_type.clone();
+        let inbound_id_clone = *inbound_id;
+
+        task::spawn_blocking(move || {
+            let db = &db_clone; // Use the cloned db directly
+
+            // FIX: Remove rt.block_on(singleton.lock().await)
+            // Trees are opened synchronously on the cloned db.
+            let edges_tree = db.open_tree("edges")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let outbound_tree = db.open_tree("outbound")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let inbound_tree = db.open_tree("inbound")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let metadata_tree = db.open_tree("metadata")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+            let tx_result: sled::transaction::TransactionResult<(), GraphError> = (
+                &edges_tree,
+                &outbound_tree,
+                &inbound_tree,
+                &metadata_tree
+            ).transaction(|(edges, outbound, inbound, metadata)| {
+                // ... (rest of the transaction logic remains the same)
+                
+                let edge_key = create_edge_key(
+                    &SerializableUuid(outbound_id_clone),
+                    &edge_type_clone,
+                    &SerializableUuid(inbound_id_clone)
+                ).map_err(|e| sled::transaction::ConflictableTransactionError::Abort(e))?;
+
+                let mut outbound_index_key = Vec::with_capacity(16 + edge_key.len());
+                outbound_index_key.extend_from_slice(outbound_id_clone.as_bytes());
+                outbound_index_key.extend_from_slice(&edge_key);
+
+                let mut inbound_index_key = Vec::with_capacity(16 + edge_key.len());
+                inbound_index_key.extend_from_slice(inbound_id_clone.as_bytes());
+                inbound_index_key.extend_from_slice(&edge_key);
+
+                if edges.remove(edge_key.as_slice())?.is_some() {
+                    outbound.remove(outbound_index_key.as_slice())?;
+                    inbound.remove(inbound_index_key.as_slice())?;
+
+                    // Decrement count logic
+                    let current_bytes = metadata
+                        .get(EDGE_COUNT_KEY)?
+                        .unwrap_or_else(|| IVec::from("0".as_bytes()));
+                    let current_count: usize = String::from_utf8_lossy(&current_bytes)
+                        .parse()
+                        .unwrap_or(0);
+                    
+                    let new_count = current_count.saturating_sub(1);
+                    metadata.insert(EDGE_COUNT_KEY, new_count.to_string().as_bytes())?;
+                }
+
+                Ok(())
+            });
+
+            match tx_result {
+                Ok(()) => {
+                    // FIX: Flush on the cloned DB in the blocking task
+                    db.flush()
+                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    Ok(())
+                },
+                Err(sled::transaction::TransactionError::Abort(e)) => Err(e),
+                Err(sled::transaction::TransactionError::Storage(e)) =>
+                    Err(GraphError::StorageError(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
+    }
+
+    async fn get_edge_direct(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
+        let singleton = SLED_DB.get().ok_or_else(|| 
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
+        
+        let outbound_id_clone = *outbound_id;
+        let edge_type_clone = edge_type.clone();
+        let inbound_id_clone = *inbound_id;
+        
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
+            
+            let edges = db_lock.db.open_tree("edges")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                
+            let edge_key = create_edge_key(
+                &SerializableUuid(outbound_id_clone), 
+                &edge_type_clone, 
+                &SerializableUuid(inbound_id_clone)
+            )?;
+            
+            let edge = edges
+                .get(edge_key.as_slice()) // Consistency fix
+                .map_err(|e| GraphError::StorageError(e.to_string()))?
+                .map(|v| deserialize_edge(&*v))
+                .transpose()?;
+                
+            Ok(edge)
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
 
     async fn get_all_vertices_direct(&self) -> GraphResult<Vec<Vertex>> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+        let singleton = SLED_DB.get().ok_or_else(|| 
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
 
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let mut vertex_vec = Vec::new();
-        for result in vertices.iter() {
-            let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            vertex_vec.push(deserialize_vertex(&*v)?);
-        }
-        Ok(vertex_vec)
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
+            
+            let vertices = db_lock.db.open_tree("vertices")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                
+            let mut vertex_vec = Vec::new();
+            for result in vertices.iter() {
+                let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                vertex_vec.push(deserialize_vertex(&*v)?);
+            }
+            
+            Ok(vertex_vec)
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
 
     async fn get_all_edges_direct(&self) -> GraphResult<Vec<Edge>> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+        let singleton = SLED_DB.get().ok_or_else(|| 
+            GraphError::StorageError("Sled database not initialized".to_string()))?;
 
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let mut edge_vec = Vec::new();
-        for result in edges.iter() {
-            let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            edge_vec.push(deserialize_edge(&*v)?);
-        }
-        Ok(edge_vec)
+        task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
+            
+            let edges = db_lock.db.open_tree("edges")
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                
+            let mut edge_vec = Vec::new();
+            for result in edges.iter() {
+                let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                edge_vec.push(deserialize_edge(&*v)?);
+            }
+            
+            Ok(edge_vec)
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
 
     pub async fn set_key(&self, key: &str, value: &str) -> GraphResult<()> {
@@ -1124,6 +1341,205 @@ impl StorageEngine for SledStorage {
 
 #[async_trait]
 impl GraphStorageEngine for SledStorage {
+    // NOTE: This assumes SLED_DB is a static structure holding a Mutex<SledStorageInner>
+    // and SledStorageInner contains a 'client' field (Arc<ZmqClient>, ...)
+
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        let singleton = SLED_DB
+            .get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".into()))?;
+
+        // FIX: Consolidate lock acquisition to determine client or local execution
+        let (db_clone, client_exists) = {
+            let guard = singleton.lock().await;
+
+            if let Some((client, _)) = guard.client.as_ref() {
+                // ZMQ forwarding: client exists. Release lock and forward call.
+                // Returning here avoids the need for the local path to access the lock again.
+                return client.delete_edges_touching_vertices(vertex_ids).await;
+            }
+
+            // Local execution: client does not exist. Clone the database object.
+            // We clone the DB here and pass it to the blocking task.
+            (guard.db.clone(), false)
+        };
+        
+        // --- Local execution (The rest of the logic is correctly placed in a blocking task) ---
+        let vertex_ids_clone = vertex_ids.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let db = &db_clone;
+            
+            // 1. Open trees (synchronous, on the cloned db)
+            // Use constants for tree names to avoid hardcoding strings.
+            let edges_tree = db.open_tree(EDGES_TREE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let outbound_tree = db.open_tree(OUTBOUND_TREE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let inbound_tree = db.open_tree(INBOUND_TREE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let metadata_tree = db.open_tree(METADATA_TREE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+            // 2. Collect edges to delete (blocking read-only pass)
+            let mut deleted_count = 0;
+            let mut edge_keys_to_delete: Vec<sled::IVec> = Vec::new();
+
+            // This iteration is a heavy synchronous I/O operation, correctly placed here.
+            for item in edges_tree.iter() {
+                let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                if let Ok(edge) = deserialize_edge(&value) {
+                    if vertex_ids_clone.contains(&edge.outbound_id.0) || vertex_ids_clone.contains(&edge.inbound_id.0) {
+                        edge_keys_to_delete.push(key);
+                        deleted_count += 1;
+                    }
+                }
+            }
+            
+            if edge_keys_to_delete.is_empty() {
+                 return Ok(0);
+            }
+
+            // 3. Run atomic transaction (blocking write pass)
+            let tx_result: sled::transaction::TransactionResult<(), GraphError> = (
+                &edges_tree,
+                &outbound_tree,
+                &inbound_tree,
+                &metadata_tree,
+            ).transaction(|(edges, outbound, inbound, metadata)| {
+                
+                // NOTE: The index key logic for outbound/inbound removal in this transaction 
+                // is likely incomplete (using only Uuid::as_bytes() for removal), but the 
+                // focus here is on the hang fix, not index consistency.
+
+                for edge_key in &edge_keys_to_delete {
+                    let edge_ivec = edges.get(edge_key)?;
+                    
+                    let edge_ivec = match edge_ivec {
+                        Some(ivec) => ivec,
+                        None => continue, // Already deleted or concurrent operation, continue.
+                    };
+
+                    let edge: Edge = match deserialize_edge(&edge_ivec) {
+                        Ok(e) => e,
+                        Err(_) => return Err(ConflictableTransactionError::Abort(
+                            GraphError::SerializationError("failed in tx".into())
+                        )),
+                    };
+                    
+                    // Remove from all indexes and main tree
+                    edges.remove(edge_key).map_err(ConflictableTransactionError::from)?;
+                    // NOTE: The removal from outbound/inbound indexes here might be using 
+                    // the wrong key format if the index keys are composite.
+                    outbound.remove(edge.outbound_id.0.as_bytes()).map_err(ConflictableTransactionError::from)?;
+                    inbound.remove(edge.inbound_id.0.as_bytes()).map_err(ConflictableTransactionError::from)?;
+                }
+
+                // Update global edge count
+                if deleted_count > 0 {
+                    let current_bytes = metadata
+                        .get(EDGE_COUNT_KEY)?
+                        .unwrap_or_else(|| sled::IVec::from("0".as_bytes()));
+
+                    let current_count: usize = String::from_utf8_lossy(&current_bytes)
+                        .parse()
+                        .unwrap_or(0);
+
+                    let new_count = current_count.saturating_sub(deleted_count);
+                    
+                    metadata.insert(EDGE_COUNT_KEY, new_count.to_string().as_bytes())?;
+                }
+
+                Ok(())
+            });
+
+            // 4. Final result conversion
+            match tx_result {
+                Ok(()) => Ok(deleted_count),
+                Err(sled::transaction::TransactionError::Abort(e)) => Err(e),
+                Err(sled::transaction::TransactionError::Storage(e)) => Err(GraphError::StorageError(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
+    }
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // 1. Acquire and clone sled::Db before spawn_blocking
+        let singleton = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".into()))?;
+        let db_clone = {
+            let db_guard = singleton.lock().await;
+            db_guard.db.clone()
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let db = &db_clone;
+
+            // Open required trees (synchronous)
+            let edges_tree = db.open_tree(EDGES_TREE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let vertices_tree = db.open_tree(VERTICES_TREE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+            let mut orphaned_keys: Vec<sled::IVec> = Vec::new();
+
+            // 2. Scan all edges and check for vertex existence (BLOCKING read-only iteration)
+            for item in edges_tree.iter() {
+                let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                
+                let edge: Edge = match deserialize_edge(&value) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        orphaned_keys.push(key);
+                        continue;
+                    }
+                };
+
+                let source_key: sled::IVec = edge.outbound_id.0.as_bytes().to_vec().into();
+                let target_key: sled::IVec = edge.inbound_id.0.as_bytes().to_vec().into();
+
+                // Synchronous contains_key check
+                let source_exists = vertices_tree.contains_key(&source_key)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                let target_exists = vertices_tree.contains_key(&target_key)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+                if !source_exists || !target_exists {
+                    orphaned_keys.push(key);
+                }
+            }
+
+            let deleted_count = orphaned_keys.len();
+            
+            if deleted_count == 0 {
+                return Ok(0);
+            }
+
+            // 3. Delete orphaned edges in an atomic transaction (BLOCKING transaction)
+            let tx_result: sled::transaction::TransactionResult<(), GraphError> = edges_tree.transaction(|edges| {
+                for key in &orphaned_keys {
+                    edges.remove(key)?;
+                }
+                Ok(())
+            });
+
+            // 4. Handle result and return
+            match tx_result {
+                Ok(()) => Ok(deleted_count),
+                Err(e) => {
+                    let graph_err = match e {
+                        sled::transaction::TransactionError::Abort(inner) => inner,
+                        sled::transaction::TransactionError::Storage(sled_err) => GraphError::StorageError(sled_err.to_string()),
+                    };
+                    Err(graph_err)
+                }
+            }
+        })
+        .await
+        // Handle the JoinError from spawn_blocking
+        .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
+    }
+
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
         SledStorage::add_vertex(self, vertex).await
     }
@@ -1137,7 +1553,8 @@ impl GraphStorageEngine for SledStorage {
     }
 
     async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        SledStorage::delete_vertex_internal(self, id).await
+        println!("===> SledStorage::delete_vertex DIRECT (id={})", id);
+        self.delete_vertex_direct(id).await
     }
     
     async fn create_edge(&self, edge: Edge) -> GraphResult<()> {

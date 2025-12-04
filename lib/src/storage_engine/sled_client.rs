@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::{HashSet};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1566,6 +1567,16 @@ impl GraphStorageEngine for SledClient {
         Ok(())
     }
 
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+    
     async fn stop(&self) -> GraphResult<()> {
         info!("Stopping SledClient");
         let port = match &self.mode {

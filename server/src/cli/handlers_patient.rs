@@ -1,5 +1,5 @@
 // handlers_medical.rs
-use crate::graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use crate::medical_knowledge::patient_service::PatientService;
 use crate::models::medical::{Patient, Problem, Prescription, Allergy, Referral};
 use crate::commands::{PatientCommand, JourneyFormat, AlertFormat, AlertSeverity};

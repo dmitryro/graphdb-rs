@@ -3,7 +3,7 @@
 //! Handles patient creation, viewing, searching, timeline, problems, meds, care gaps, allergies, referrals, drug alerts
 
 use std::collections::{ HashMap };
-use graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use models::medical::{Patient, Problem, Prescription, Allergy, Referral};
 use lib::commands::{PatientCommand, JourneyFormat, AlertFormat, AlertSeverity};
 use std::sync::Arc;

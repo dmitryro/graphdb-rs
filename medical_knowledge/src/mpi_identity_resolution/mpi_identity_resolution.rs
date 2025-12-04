@@ -2,7 +2,7 @@
 //! MPI Identity Resolution — Real-time, probabilistic patient matching
 //! Global singleton with blocking + scoring + auto-merge
 
-use graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use models::medical::*;
 use models::{ Graph, Identifier, Edge, Vertex, ToVertex };  // Add ToVertex here
 use std::collections::{HashMap, HashSet};
