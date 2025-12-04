@@ -7,7 +7,7 @@
 //! • Analytics & population health
 //! • Developers building healthcare applications
 //!
-//! It is built on top of `graph_engine` and `models` — pure domain logic, no storage.
+//! It is built on top of `lib::graph_engine` and `models` — pure domain logic, no storage.
 
 // medical_knowledge/src/clinical_encounters/mod.rs
 pub mod clinical_encounters;

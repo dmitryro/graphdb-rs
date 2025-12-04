@@ -51,6 +51,7 @@ use crate::cli::handlers_queries::{
     handle_cypher_query,
     handle_sql_query,
     handle_graphql_query,
+    handle_cleanup_command,
 };
 
 use crate::cli::handlers_visualizing::{
@@ -300,6 +301,10 @@ pub enum Commands {
     /// Full-text search and index management
     #[clap(subcommand)]
     Index(IndexAction),
+
+    // Cleanup Command
+    #[clap(subcommand)]
+    Cleanup(CleanupCommand),
 
     // =========================================================================
     // PATIENT MANAGEMENT
@@ -1146,6 +1151,11 @@ pub async fn run_single_command(
                 storage_daemon_port_arc.clone(),
             ).await?;
         }
+        // === NEW: Cleanup Command (Routed to ZMQ handler) ===
+        Commands::Cleanup(action) => {
+            let query_engine = get_query_engine_singleton().await?;
+            handle_cleanup_command(action).await?;
+        }
         // === NEW: Graph Domain Commands ===
         Commands::Graph(action) => {
             info!("Executing graph domain command: {:?}", action);
@@ -1153,7 +1163,6 @@ pub async fn run_single_command(
             let engine = get_query_engine_singleton().await?;
             handle_graph_command(engine, action).await?;
         }
-
         // === NEW: Index & Full-Text Search Commands ===
         // === NEW: Index & Full-Text Search Commands ===
         // === Index & Full-Text Search Commands ===

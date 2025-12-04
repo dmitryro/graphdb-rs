@@ -569,7 +569,7 @@ impl SledStorage {
 
     // Assuming necessary imports like SLED_DB, GraphError, Vertex, Edge, Identifier,
     // SerializableUuid, serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge,
-    // create_edge_key, info, println, Uuid, task, timeout, TokioDuration, IVec, EDGE_COUNT_KEY are in scope.
+    // create_edge_key, info, println, Uuid are in scope.
 
     // Direct database access methods (fallback)
 
@@ -683,7 +683,7 @@ impl SledStorage {
                 &inbound_tree,
             ).transaction(|(vertices, edges, outbound, inbound)| {
                 
-                vertices.remove(vertex_key.as_slice())?; // Use .as_slice() for clarity
+                vertices.remove(&vertex_key[..])?;
                 
                 for (edge_key, edge) in &edges_to_delete {
                     edges.remove(&**edge_key)?;
@@ -761,12 +761,9 @@ impl SledStorage {
                 inbound_index_key.extend_from_slice(inbound_uuid.as_bytes());
                 inbound_index_key.extend_from_slice(&edge_key);
                 
-                edges.insert(edge_key.as_slice(), &serialized_edge[..])?; // Key fix for consistency
-                
-                // 🐛 REGRESSION FIX: Removed extra '**' and ensured correct slicing.
-                // Fix is: outbound.insert(outbound_index_key.as_slice(), edge_key.as_slice())?;
-                outbound.insert(outbound_index_key.as_slice(), edge_key.as_slice())?; 
-                inbound.insert(inbound_index_key.as_slice(), edge_key.as_slice())?;
+                edges.insert(&edge_key[..], &serialized_edge[..])?;
+                outbound.insert(&outbound_index_key[..], &edge_key[..])?;
+                inbound.insert(&inbound_index_key[..], &edge_key[..])?;
 
                 let current_bytes = metadata
                     .get(EDGE_COUNT_KEY)?
@@ -799,84 +796,81 @@ impl SledStorage {
     }
 
     async fn delete_edge_direct(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let singleton = SLED_DB.get().ok_or_else(||
+        let singleton = SLED_DB.get().ok_or_else(|| 
             GraphError::StorageError("Sled database not initialized".to_string()))?;
-
-        // FIX: Acquire the lock and CLONE the sled::Db instance in the ASYNC context.
-        let db_clone = {
-            let guard = singleton.lock().await;
-            // Assuming 'db' field holds the sled::Db (sled::Db implements Clone)
-            guard.db.clone() 
-        };
 
         let outbound_id_clone = *outbound_id;
         let edge_type_clone = edge_type.clone();
         let inbound_id_clone = *inbound_id;
 
         task::spawn_blocking(move || {
-            let db = &db_clone; // Use the cloned db directly
-
-            // FIX: Remove rt.block_on(singleton.lock().await)
-            // Trees are opened synchronously on the cloned db.
-            let edges_tree = db.open_tree("edges")
+            let rt = tokio::runtime::Handle::current();
+            
+            let db_lock = rt.block_on(async {
+                timeout(TokioDuration::from_secs(5), singleton.lock())
+                    .await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))
+            })?;
+            
+            let edges_tree = db_lock.db.open_tree("edges")
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let outbound_tree = db.open_tree("outbound")
+            let outbound_tree = db_lock.db.open_tree("outbound")
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let inbound_tree = db.open_tree("inbound")
+            let inbound_tree = db_lock.db.open_tree("inbound")
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let metadata_tree = db.open_tree("metadata")
+            let metadata_tree = db_lock.db.open_tree("metadata")
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
             let tx_result: sled::transaction::TransactionResult<(), GraphError> = (
-                &edges_tree,
-                &outbound_tree,
-                &inbound_tree,
+                &edges_tree, 
+                &outbound_tree, 
+                &inbound_tree, 
                 &metadata_tree
             ).transaction(|(edges, outbound, inbound, metadata)| {
-                // ... (rest of the transaction logic remains the same)
                 
+                // CREATE KEYS INSIDE TRANSACTION
                 let edge_key = create_edge_key(
-                    &SerializableUuid(outbound_id_clone),
-                    &edge_type_clone,
+                    &SerializableUuid(outbound_id_clone), 
+                    &edge_type_clone, 
                     &SerializableUuid(inbound_id_clone)
                 ).map_err(|e| sled::transaction::ConflictableTransactionError::Abort(e))?;
-
+                
                 let mut outbound_index_key = Vec::with_capacity(16 + edge_key.len());
                 outbound_index_key.extend_from_slice(outbound_id_clone.as_bytes());
                 outbound_index_key.extend_from_slice(&edge_key);
-
+                
                 let mut inbound_index_key = Vec::with_capacity(16 + edge_key.len());
                 inbound_index_key.extend_from_slice(inbound_id_clone.as_bytes());
                 inbound_index_key.extend_from_slice(&edge_key);
+                
+                if edges.remove(&edge_key[..])?.is_some() {
+                    outbound.remove(&outbound_index_key[..])?;
+                    inbound.remove(&inbound_index_key[..])?;
 
-                if edges.remove(edge_key.as_slice())?.is_some() {
-                    outbound.remove(outbound_index_key.as_slice())?;
-                    inbound.remove(inbound_index_key.as_slice())?;
-
-                    // Decrement count logic
                     let current_bytes = metadata
                         .get(EDGE_COUNT_KEY)?
                         .unwrap_or_else(|| IVec::from("0".as_bytes()));
+
                     let current_count: usize = String::from_utf8_lossy(&current_bytes)
                         .parse()
                         .unwrap_or(0);
-                    
+
                     let new_count = current_count.saturating_sub(1);
+                    
                     metadata.insert(EDGE_COUNT_KEY, new_count.to_string().as_bytes())?;
                 }
-
+                
                 Ok(())
             });
 
             match tx_result {
                 Ok(()) => {
-                    // FIX: Flush on the cloned DB in the blocking task
-                    db.flush()
+                    db_lock.db.flush()
                         .map_err(|e| GraphError::StorageError(e.to_string()))?;
                     Ok(())
                 },
                 Err(sled::transaction::TransactionError::Abort(e)) => Err(e),
-                Err(sled::transaction::TransactionError::Storage(e)) =>
+                Err(sled::transaction::TransactionError::Storage(e)) => 
                     Err(GraphError::StorageError(e.to_string())),
             }
         })
@@ -911,7 +905,7 @@ impl SledStorage {
             )?;
             
             let edge = edges
-                .get(edge_key.as_slice()) // Consistency fix
+                .get(&edge_key)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?
                 .map(|v| deserialize_edge(&*v))
                 .transpose()?;
@@ -1345,33 +1339,31 @@ impl GraphStorageEngine for SledStorage {
     // and SledStorageInner contains a 'client' field (Arc<ZmqClient>, ...)
 
     async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // --- ZMQ forwarding (unchanged) ---
         let singleton = SLED_DB
             .get()
             .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".into()))?;
 
-        // FIX: Consolidate lock acquisition to determine client or local execution
-        let (db_clone, client_exists) = {
+        {
             let guard = singleton.lock().await;
-
             if let Some((client, _)) = guard.client.as_ref() {
-                // ZMQ forwarding: client exists. Release lock and forward call.
-                // Returning here avoids the need for the local path to access the lock again.
                 return client.delete_edges_touching_vertices(vertex_ids).await;
             }
+        }
 
-            // Local execution: client does not exist. Clone the database object.
-            // We clone the DB here and pass it to the blocking task.
-            (guard.db.clone(), false)
-        };
+        // --- Local execution (FIX: Move all synchronous I/O into spawn_blocking) ---
         
-        // --- Local execution (The rest of the logic is correctly placed in a blocking task) ---
+        // Clone sled::Db and vertex_ids before moving into the blocking task
+        let db_clone = {
+            let guard = singleton.lock().await;
+            guard.db.clone() // sled::Db implements Clone (Arc increment)
+        };
         let vertex_ids_clone = vertex_ids.clone();
 
         tokio::task::spawn_blocking(move || {
             let db = &db_clone;
             
-            // 1. Open trees (synchronous, on the cloned db)
-            // Use constants for tree names to avoid hardcoding strings.
+            // 1. Open trees (synchronous)
             let edges_tree = db.open_tree(EDGES_TREE)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
             let outbound_tree = db.open_tree(OUTBOUND_TREE)
@@ -1385,7 +1377,6 @@ impl GraphStorageEngine for SledStorage {
             let mut deleted_count = 0;
             let mut edge_keys_to_delete: Vec<sled::IVec> = Vec::new();
 
-            // This iteration is a heavy synchronous I/O operation, correctly placed here.
             for item in edges_tree.iter() {
                 let (key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
                 if let Ok(edge) = deserialize_edge(&value) {
@@ -1408,16 +1399,22 @@ impl GraphStorageEngine for SledStorage {
                 &metadata_tree,
             ).transaction(|(edges, outbound, inbound, metadata)| {
                 
-                // NOTE: The index key logic for outbound/inbound removal in this transaction 
-                // is likely incomplete (using only Uuid::as_bytes() for removal), but the 
-                // focus here is on the hang fix, not index consistency.
-
                 for edge_key in &edge_keys_to_delete {
+                    // Get and deserialize edge (unchanged logic)
                     let edge_ivec = edges.get(edge_key)?;
                     
                     let edge_ivec = match edge_ivec {
                         Some(ivec) => ivec,
-                        None => continue, // Already deleted or concurrent operation, continue.
+                        None => {
+                            let key_bytes: &[u8] = edge_key.as_ref();
+                            let key_uuid_option = key_bytes.try_into().ok().map(|bytes| Uuid::from_bytes(bytes));
+                            let id_string = key_uuid_option.map(|u| u.to_string()).unwrap_or_else(|| format!("Invalid key bytes: {:?}", key_bytes));
+                            let identifier = unsafe { Identifier::new_unchecked(id_string) };
+
+                            return Err(ConflictableTransactionError::Abort(
+                                GraphError::NotFound(identifier)
+                            ));
+                        }
                     };
 
                     let edge: Edge = match deserialize_edge(&edge_ivec) {
@@ -1426,11 +1423,9 @@ impl GraphStorageEngine for SledStorage {
                             GraphError::SerializationError("failed in tx".into())
                         )),
                     };
-                    
-                    // Remove from all indexes and main tree
+
+                    // Remove from all indexes
                     edges.remove(edge_key).map_err(ConflictableTransactionError::from)?;
-                    // NOTE: The removal from outbound/inbound indexes here might be using 
-                    // the wrong key format if the index keys are composite.
                     outbound.remove(edge.outbound_id.0.as_bytes()).map_err(ConflictableTransactionError::from)?;
                     inbound.remove(edge.inbound_id.0.as_bytes()).map_err(ConflictableTransactionError::from)?;
                 }
@@ -1461,8 +1456,10 @@ impl GraphStorageEngine for SledStorage {
             }
         })
         .await
+        // Handle the JoinError from spawn_blocking
         .map_err(|e| GraphError::StorageError(format!("Failed to execute blocking task: {}", e)))?
     }
+
 
     async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
         // 1. Acquire and clone sled::Db before spawn_blocking

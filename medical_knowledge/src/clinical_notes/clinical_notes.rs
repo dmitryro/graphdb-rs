@@ -1,7 +1,7 @@
 // medical_knowledge/src/clinical_notes/clinical_notes.rs
 //! Clinical Notes — Global singleton, real-time note management using GraphService
 
-use graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use models::medical::*;
 use models::edges::Edge;
 use models::identifiers::Identifier;

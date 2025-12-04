@@ -107,6 +107,8 @@ pub use handlers_queries::{
     handle_cypher_query,
     handle_sql_query,
     handle_graphql_query,
+    handle_cleanup_command_interactive,
+    handle_cleanup_command,
 };
 
 pub use handlers_index::{

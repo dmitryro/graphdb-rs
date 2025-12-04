@@ -59,7 +59,7 @@ impl TryFrom<GraphJson> for Graph {
     fn try_from(json: GraphJson) -> Result<Self, Self::Error> {
         let mut graph = Graph::new();
         let mut id_map: HashMap<String, Uuid> = HashMap::new();
-
+        println!("===> The Graph JSON is {:?}", json);
         for v in json.vertices {
             let uuid = Uuid::parse_str(&v.id).map_err(|e| format!("Invalid vertex ID: {}", e))?;
             id_map.insert(v.id.clone(), uuid);

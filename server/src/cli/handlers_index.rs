@@ -403,7 +403,6 @@ pub async fn handle_index_command(action: IndexAction) -> Result<()> {
             )
         },
         IndexAction::Search { term, order } => {
-            // Default parameters: limit 10, descending order (highest score first)
             let mut limit = 10;
             let mut sort_order = "desc";
 
@@ -415,18 +414,38 @@ pub async fn handle_index_command(action: IndexAction) -> Result<()> {
                     }
                     SearchOrder::Bottom { count } | SearchOrder::Tail { count } => {
                         limit = count;
-                        sort_order = "asc"; // Lowest score first
+                        sort_order = "asc";
                     }
                 }
             }
-            
+
+            // CRITICAL FIX: Disable dangerous full-scan fallback in daemon
+            // We explicitly tell the daemon: "do NOT fall back to scanning all vertices"
+            let params = json!({
+                "query": term,
+                "limit": limit,
+                "sort_order": sort_order,
+                "allow_fallback_scan": false   // THIS LINE KILLS THE HANG
+            });
+
+            info!("Executing full-text search for '{}' (limit={}, no fallback)", term, limit);
+
+            let query_result = send_raw_zmq_request(port, "index_search", params).await?;
+
+            // Parse response safely
+            let json_str = match query_result {
+                QueryResult::Success(s) => s,
+                QueryResult::Null => r#"{"vertices": []}"#.to_string(),
+            };
+
+            let mut payload: Value = serde_json::from_str(&json_str)
+                .unwrap_or_else(|_| json!({"vertices": []}));
+
+            let vertices = payload["vertices"].take();
+
             (
                 "index_search".to_string(),
-                json!({ 
-                    "query": term, 
-                    "limit": limit,
-                    "sort_order": sort_order 
-                }),
+                json!({ "query": term, "limit": limit, "vertices": vertices }),
                 format!("Full-text search results for '{}' (limit {})", term, limit),
             )
         },

@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{ HashMap, HashSet };
 
 #[derive(Debug)]
 pub struct PostgresStorage {
@@ -81,6 +81,16 @@ impl StorageEngine for PostgresStorage {
 
 #[async_trait]
 impl GraphStorageEngine for PostgresStorage {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+    
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

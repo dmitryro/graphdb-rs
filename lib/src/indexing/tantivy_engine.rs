@@ -1,3 +1,4 @@
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::path::{ PathBuf, Path };
@@ -10,6 +11,7 @@ use sled::Db;
 use rocksdb::DB;
 use log::{info, debug, warn, error, trace};
 use regex::Regex;
+use uuid::Uuid;
 
 pub type IndexResult<T> = Result<T, crate::indexing::backend::IndexingError>;
 use crate::indexing::backend::{IndexingBackend, Document, IndexingError};
@@ -410,7 +412,7 @@ impl IndexingBackend for TantivyIndexingEngine {
         self.manager.commit().await
             .map_err(|e| IndexingError::Other(e.to_string()))?;
 
-        // ---------- 1.  Tantivy part (unchanged) ----------
+        // ---------- 1. Tantivy search — get matching node_ids ----------
         let top_docs_with_ids: Vec<(f32, i64)> = {
             let searcher = self.manager.searcher.read().unwrap();
             let query_parser = QueryParser::for_index(&self.manager.index, vec![self.manager.fulltext_content_field]);
@@ -418,110 +420,134 @@ impl IndexingBackend for TantivyIndexingEngine {
                 .map_err(|e| IndexingError::Other(format!("Query parse error: {}", e)))?;
             let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(limit))?;
             println!("===========> Found {} matching documents", top_docs.len());
+
             let mut results = Vec::new();
             for (score, doc_address) in top_docs {
-                let retrieved_doc: TantivyDocument = searcher.doc(doc_address)
+                let retrieved_doc: tantivy::TantivyDocument = searcher.doc(doc_address)
                     .map_err(|e| IndexingError::TantivyError(e))?;
+
                 if let Some(node_id) = retrieved_doc.get_first(self.manager.node_id_field)
                     .and_then(|v| v.as_i64()) {
-                    println!("===========> Found indexed node_id: {}", node_id);
+                    println!("===========> Found node_id in index: {}", node_id);
                     results.push((score, node_id));
                 }
             }
             results
         };
 
-        // ---------- 2.  Fetch vertices (unchanged) ----------
-        println!("===========> Extracted {} node IDs from search results", top_docs_with_ids.len());
-        println!("===========> Fetching vertices from storage daemon via ZMQ");
-        let registry = get_global_storage_registry().await;
-        let guard = registry.read().await;
-        let storage = guard.values().next()
-            .ok_or_else(|| IndexingError::Other("No storage engine available".into()))?
-            .clone();
-        let all_vertices = storage.get_all_vertices().await
-            .map_err(|e| IndexingError::Other(format!("Failed to fetch vertices: {}", e)))?;
-        println!("===========> Fetched {} vertices from storage daemon", all_vertices.len());
-
-        let mut vertex_map: HashMap<i64, JsonValue> = HashMap::new();
-        for vertex in all_vertices {
-            let v_json: JsonValue = serde_json::to_value(&vertex)
-                .map_err(|e| IndexingError::Other(format!("vertex serialise failed: {}", e)))?;
-            let node_id = if let Some(id_str) = v_json.get("id").and_then(|v| v.as_str()) {
-                if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                    uuid.as_u128() as i64
-                } else {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    id_str.hash(&mut hasher);
-                    hasher.finish() as i64
-                }
-            } else if let Some(n) = v_json.get("id").and_then(|v| v.as_i64()) {
-                n
-            } else {
-                continue;
-            };
-            if vertex_map.len() < 5 {
-                println!("===========> Mapping vertex ID '{}' -> node_id: {}",
-                    v_json.get("id").and_then(|v| v.as_str()).unwrap_or("unknown"), node_id);
-            }
-            vertex_map.insert(node_id, v_json);
+        // ---------- 2. INSTANT EMPTY RESULT IF NO HITS ----------
+        if top_docs_with_ids.is_empty() {
+            println!("===========> No indexed matches — returning empty result instantly");
+            return Ok(json!({
+                "status": "success",
+                "results": [],
+                "query": query,
+                "limit": limit,
+            }).to_string());
         }
 
-        // ---------- 3.  PARSE QUERY WITH REGEX ----------
-        let mut filters: Vec<(String, String, f64)> = Vec::new();
-        let mut text_tokens = Vec::new();
+        // ---------- 3. Fetch ONLY needed vertices using DIRECT DB ACCESS ----------
+        println!("===========> Fetching {} vertices using DIRECT DB access to avoid deadlock", top_docs_with_ids.len());
+        
+        let mut vertex_map: HashMap<i64, JsonValue> = HashMap::new();
 
-        // 3a.  pull out every filter
+        match &self.handles {
+            TantivyEngineHandles::Sled(db) => {
+                let vertices_tree = db.open_tree("vertices")
+                    .map_err(|e| IndexingError::Other(format!("Failed to open vertices tree: {}", e)))?;
+                
+                println!("===========> Scanning {} total vertices in Sled", vertices_tree.len());
+                
+                // SCAN ALL VERTICES and hash their UUIDs to match indexed i64 values
+                for item in vertices_tree.iter() {
+                    if let Ok((key, value)) = item {
+                        if let Ok(vertex) = deserialize_vertex(&value) {
+                            // Hash the UUID to get the same i64 used during indexing
+                            let hashed_id = vertex.id.0.as_u128() as i64;
+                            
+                            // Check if this vertex matches any of our search hits
+                            if top_docs_with_ids.iter().any(|(_, node_id)| *node_id == hashed_id) {
+                                println!("===========> Matched vertex UUID {} -> hashed {}", vertex.id.0, hashed_id);
+                                if let Ok(json_val) = serde_json::to_value(&vertex) {
+                                    vertex_map.insert(hashed_id, json_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            TantivyEngineHandles::RocksDB(db) => {
+                let vertices_cf = db.cf_handle("vertices")
+                    .ok_or_else(|| IndexingError::Other("vertices column family not found".into()))?;
+                
+                // SCAN ALL VERTICES
+                let iter = db.iterator_cf(&vertices_cf, rocksdb::IteratorMode::Start);
+                
+                for item in iter {
+                    if let Ok((key, value)) = item {
+                        if let Ok(vertex) = deserialize_vertex(&value) {
+                            // Hash the UUID to get the same i64 used during indexing
+                            let hashed_id = vertex.id.0.as_u128() as i64;
+                            
+                            // Check if this vertex matches any of our search hits
+                            if top_docs_with_ids.iter().any(|(_, node_id)| *node_id == hashed_id) {
+                                println!("===========> Matched vertex UUID {} -> hashed {}", vertex.id.0, hashed_id);
+                                if let Ok(json_val) = serde_json::to_value(&vertex) {
+                                    vertex_map.insert(hashed_id, json_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {
+                return Err(IndexingError::Other("Unsupported storage engine for direct access".into()));
+            }
+        }
+
+        println!("===========> Fetched {} needed vertices using DIRECT DB access", vertex_map.len());
+
+        // ---------- 4. Parse filters from query ----------
+        let mut filters: Vec<(String, String, f64)> = Vec::new();
+
         for m in FILTER_RE.captures_iter(query) {
             let field = m.name("field").unwrap().as_str().to_string();
             let op = m.name("op").unwrap().as_str()
-                .replace("=<", "<=")   // normalise reversed symbols
-                .replace("=>", ">=");
+                .replace("=<", "<=").replace("=>", ">=");
             let val: f64 = m.name("val").unwrap().as_str().parse()
-                .map_err(|_| IndexingError::Other("invalid numeric filter value".into()))?;
+                .map_err(|_| IndexingError::Other("invalid numeric filter".into()))?;
             filters.push((field, op, val));
         }
 
-        // 3b.  remove the matched parts and keep the rest as free text
-        let remainder = FILTER_RE.replace_all(query, " ");
-        for tok in remainder.split_whitespace() {
-            if !tok.is_empty() {
-                text_tokens.push(tok.to_string());
-            }
-        }
-
-        println!("===========> Parsed {} filter conditions: {:?}", filters.len(), filters);
-        println!("===========> Text search terms: {:?}", text_tokens);
-
-        // ---------- 4.  FILTER & BUILD RESPONSE (unchanged) ----------
+        // ---------- 5. Apply filters and build final results ----------
         let mut results: Vec<JsonValue> = Vec::new();
+
         for (score, node_id) in top_docs_with_ids {
             if let Some(vertex) = vertex_map.get(&node_id) {
                 let mut passes = true;
+
                 if let Some(props) = vertex.get("properties").and_then(|p| p.as_object()) {
                     for (field, op, threshold) in &filters {
-                        let num_val = props
-                            .get(field)
+                        let num_val = props.get(field)
                             .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
 
-                        let Some(val) = num_val else {
+                        if let Some(val) = num_val {
+                            passes &= match op.as_str() {
+                                ">"  => val >  *threshold,
+                                ">=" => val >= *threshold,
+                                "<"  => val <  *threshold,
+                                "<=" => val <= *threshold,
+                                "==" | "===" => (val - threshold).abs() < f64::EPSILON,
+                                "!=" | "!==" => (val - threshold).abs() >= f64::EPSILON,
+                                _ => true,
+                            };
+                        } else {
                             passes = false;
                             break;
-                        };
-
-                        passes &= match op.as_str() {
-                            ">"  => val >  *threshold,
-                            ">=" => val >= *threshold,
-                            "<"  => val <  *threshold,
-                            "<=" => val <= *threshold,
-                            "==" | "===" => (val - threshold).abs() < f64::EPSILON,
-                            "!=" | "!==" => (val - threshold).abs() >= f64::EPSILON, // <- NEW
-                            _    => true,
-                        };
+                        }
                     }
                 }
+
                 if passes {
                     results.push(json!({ "score": score, "vertex": vertex }));
                 }
@@ -529,6 +555,7 @@ impl IndexingBackend for TantivyIndexingEngine {
         }
 
         println!("===========> Returning {} enriched results after filtering", results.len());
+
         Ok(json!({
             "status": "success",
             "results": results,
@@ -542,63 +569,61 @@ impl IndexingBackend for TantivyIndexingEngine {
         info!("Starting full engine-agnostic rebuild of full-text indexes");
         println!("===========> Starting full engine-agnostic rebuild with {} vertices", all_vertices.len());
         let vertex_count = all_vertices.len();
-        
-        // 4. Clear Index
+
+        // 1.  wipe existing index
         {
             let mut writer = self.manager.writer.lock().await;
             writer.delete_all_documents()
-                .map_err(|e| IndexingError::TantivyError(e))?;
-            writer.commit().map_err(|e| IndexingError::TantivyError(e))?;
+                .map_err(IndexingError::TantivyError)?;
+            writer.commit()
+                .map_err(IndexingError::TantivyError)?;
         }
-        
-        // 5. Retrieve Metadata
-        let fulltext_indexes = self.retrieve_all_metadata(IndexType::FullText)
+
+        // 2.  load full-text definitions
+        let fulltext_indexes = self
+            .retrieve_all_metadata(IndexType::FullText)
             .map_err(|e| IndexingError::Other(e.to_string()))?;
         println!("===========> Found {} fulltext indexes", fulltext_indexes.len());
-        for (i, meta) in fulltext_indexes.iter().enumerate() {
-            println!("===========> Index {}: labels={:?}, properties={:?}", i, meta.labels, meta.properties);
-        }
-        
-        // 6. Index Vertices
+
+        // 3.  re-index every supplied vertex
         let mut writer = self.manager.writer.lock().await;
-        
+
         for vertex in all_vertices {
-            // Revert back to i64
-            let node_id = vertex.id.0.as_u128() as i64;
-            let vertex_label = &vertex.label;
-            let mut content = String::new();
-            
+            let node_id        = vertex.id.0.as_u128() as i64;
+            let vertex_label   = &vertex.label;
+            let mut content    = String::new();
+
             for meta in &fulltext_indexes {
-                let matches = meta.labels.is_empty() || 
-                    meta.labels.iter().any(|l| l.as_ref() as &str == vertex_label.as_ref() as &str);
-                
+                let matches = meta.labels.is_empty()
+                    || meta.labels.iter().any(|l| AsRef::<str>::as_ref(l) == vertex_label.as_ref());
+
                 if matches {
                     for prop in &meta.properties {
-                        if let Some(val) = vertex.properties.get(prop) {
-                            if let Some(s) = val.as_str() {
-                                content.push_str(s);
-                                content.push(' ');
-                            }
+                        if let Some(s) = vertex.properties.get(prop)
+                                                  .and_then(|v| v.as_str()) {
+                            content.push_str(s);
+                            content.push(' ');
                         }
                     }
                 }
             }
-            
+
             if !content.is_empty() {
                 let mut doc = TantivyDocument::new();
-                // Revert back to i64
                 doc.add_i64(self.manager.node_id_field, node_id);
                 doc.add_text(self.manager.fulltext_content_field, content.trim());
-                writer.add_document(doc).map_err(|e| IndexingError::TantivyError(e))?;
+                writer.add_document(doc)
+                    .map_err(IndexingError::TantivyError)?;
             }
         }
-        
-        writer.commit().map_err(|e| IndexingError::TantivyError(e))?;
+
+        writer.commit()
+            .map_err(IndexingError::TantivyError)?;
         drop(writer);
-        
+
         self.manager.reload_searcher()
             .map_err(|e| IndexingError::Other(e.to_string()))?;
-        
+
         Ok(format!("Full-text index rebuilt: {} documents indexed", vertex_count))
     }
 

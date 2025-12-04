@@ -1,7 +1,7 @@
 // medical_knowledge/src/drug_interaction_knowledge/drug_interaction_knowledge.rs
 //! Drug Interaction Knowledge — Global singleton, real-time, high-performance
 
-use graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use models::{ ToVertex, Graph, Vertex, Edge };  // ← THIS WAS MISSING
 use models::medical::*;
 use std::collections::{HashMap, HashSet};

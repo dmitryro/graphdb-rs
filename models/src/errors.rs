@@ -55,6 +55,8 @@ pub enum GraphError {
     InvalidData(String),
     #[error("An internal error occurred: {0}")]
     InternalError(String),
+    #[error("An evaluation error occured:  {0}")]
+    EvaluationError(String),
     #[error("entity with identifier {0} was not found")]
     NotFound(Identifier),
     #[error("Validation error: {0}")]
