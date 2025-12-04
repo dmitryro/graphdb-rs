@@ -1,7 +1,7 @@
 // medical_knowledge/src/clinical_encounters/clinical_encounters.rs
 //! Clinical Encounters — Global singleton, real-time clinical intelligence using GraphService
 
-use graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use models::medical::*;
 use models::edges::Edge;
 use models::identifiers::Identifier;

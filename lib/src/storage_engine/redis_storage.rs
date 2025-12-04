@@ -6,7 +6,7 @@
 // Added: 2025-08-13 - Added close and as_any methods
 // Fixed: 2025-08-13 - Used GraphError and &[u8] for key-value operations
 // NOTE: Uses Redis SET/GET/DEL for key-value operations and separate namespaces (e.g., "vertex:", "edge:") for graph operations
-
+use std::collections::{ HashSet };
 use async_trait::async_trait;
 use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngine};
 use models::{Edge, Identifier, Vertex};
@@ -77,6 +77,16 @@ impl StorageEngine for RedisStorage {
 
 #[async_trait]
 impl GraphStorageEngine for RedisStorage {
+    async fn delete_edges_touching_vertices(&self, vertex_ids: &HashSet<Uuid>) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
+    async fn cleanup_orphaned_edges(&self) -> GraphResult<usize> {
+        // TODO: implement it.
+        Ok(0)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

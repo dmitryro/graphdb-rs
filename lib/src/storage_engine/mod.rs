@@ -66,14 +66,8 @@ pub use inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
 pub mod sled_storage;
 #[cfg(feature = "with-sled")]
 pub use crate::config::{ SledStorage, SledDaemonPool };
-#[cfg(feature = "with-sled")]
-pub use storage_engine::{
-    AsyncStorageEngineManager, GraphStorageEngine, StorageEngine, 
-    SurrealdbGraphStorage,
-    StorageEngineManager, emergency_cleanup_storage_engine_manager, init_storage_engine_manager, 
-    GLOBAL_STORAGE_ENGINE_MANAGER, recover_sled, log_lock_file_diagnostics, lock_file_exists,
-    GraphOp, get_global_storage_registry,
-};
+
+pub use storage_engine::*;
 pub use storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 
 // Correctly re-export storage engines under feature flags
@@ -96,7 +90,7 @@ pub use edge::*;
 pub use types::*;
 pub use errors::*;
 pub use rocksdb_client::*;
-
+pub use storage_engine::*;
 /// Creates a storage engine instance based on the provided configuration.
 ///
 /// Uses Sled as the default storage engine (as per StorageConfig::default).

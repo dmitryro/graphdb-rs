@@ -1,7 +1,7 @@
 // medical_knowledge/src/patient_journey/patient_journey.rs
 //! Patient Journey Intelligence — Real-time, longitudinal care pathways
 
-use graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use models::medical::*;
 use models::vertices::Vertex;
 use models::edges::Edge;

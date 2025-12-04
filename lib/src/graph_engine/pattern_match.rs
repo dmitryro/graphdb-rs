@@ -1,9 +1,10 @@
 // lib/src/engine/pattern_match.rs
-
+use serde_json::Value;
+use std::collections::HashMap;
 use models::vertices::Vertex;
 use models::edges::Edge; // Corrected import for Edge from models
 use models::identifiers::Identifier;
-use models::properties::PropertyValue; // Explicitly import PropertyValue
+use models::properties::{ PropertyValue, SerializableFloat }; 
 
 pub enum Pattern {
     VertexType(String),
@@ -60,4 +61,36 @@ impl Pattern {
             Pattern::VertexType(_) => false,
         }
     }
+}
+
+// Helper function to match a Vertex against a NodePattern (label, properties)
+// Note: This assumes NodePattern is (Option<String> var, Option<String> label, HashMap<String, Value> properties)
+pub fn node_matches_constraints(
+    vertex: &Vertex,
+    label_opt: &Option<String>,
+    properties: &HashMap<String, Value>,
+) -> bool {
+    // 1. Check Label Match
+    let label_matches = label_opt.as_ref().map_or(true, |l| {
+        vertex.label.as_ref() == l.as_str()
+    });
+    
+    if !label_matches { return false; }
+
+    // 2. Check Property Match
+    properties.iter().all(|(k, v)| {
+        vertex.properties.get(k).map_or(false, |prop_val| {
+            // Compare the JSON Value from the query against the PropertyValue from the Vertex
+            match (v, prop_val) {
+                // Handle String comparison (e.g., id: "12345")
+                (Value::String(val_str), PropertyValue::String(prop_str)) => val_str == prop_str,
+                // Handle Number comparison (assuming float/double)
+                (Value::Number(val_num), PropertyValue::Float(SerializableFloat(prop_f))) => {
+                    val_num.as_f64().map_or(false, |val_f| val_f == *prop_f)
+                },
+                // Add Integer/Boolean handling here if necessary
+                _ => false,
+            }
+        })
+    })
 }

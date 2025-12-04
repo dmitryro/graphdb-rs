@@ -1,4 +1,3 @@
-// src/graph.rs
 //! Core in-memory graph with real-time observer callbacks
 //! Used by medical_knowledge for instant clinical intelligence
 
@@ -19,6 +18,12 @@ pub struct Graph {
     pub out_edges: HashMap<Uuid, HashSet<Uuid>>,
     pub in_edges: HashMap<Uuid, HashSet<Uuid>>,
 
+
+// 🌟 ADDED: For tracking the total number of vertices.
+    pub vertex_count: usize,
+    // 🌟 MISSING FIELD ADDED: For tracking the total number of edges.
+    pub edge_count: usize,
+
     // Observers — medical_knowledge will register here
     vertex_observers: Arc<RwLock<Vec<VertexObserver>>>,
     edge_observers: Arc<RwLock<Vec<EdgeObserver>>>,
@@ -31,13 +36,17 @@ impl Graph {
             edges: HashMap::new(),
             out_edges: HashMap::new(),
             in_edges: HashMap::new(),
+            // 🌟 INITIALIZE MISSING FIELD
+            edge_count: 0, 
+            vertex_count: 0,
             vertex_observers: Arc::new(RwLock::new(Vec::new())),
             edge_observers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     /// Register a vertex observer (called on every vertex addition)
-    pub async fn on_vertex_added<F>(&mut self, callback: F)
+    // FIX E0599: Changed from &mut self to &self to allow calling on RwLockWriteGuard.
+    pub async fn on_vertex_added<F>(&self, callback: F)
     where
         F: Fn(&Vertex) + Send + Sync + 'static,
     {
@@ -45,7 +54,8 @@ impl Graph {
     }
 
     /// Register an edge observer (called on every edge addition)
-    pub async fn on_edge_added<F>(&mut self, callback: F)
+    // FIX E0599: Changed from &mut self to &self to allow calling on RwLockWriteGuard.
+    pub async fn on_edge_added<F>(&self, callback: F)
     where
         F: Fn(&Edge) + Send + Sync + 'static,
     {
@@ -56,7 +66,7 @@ impl Graph {
         let vertex_id = vertex.id.0;
         let vertex_ref = vertex.clone();
         self.vertices.insert(vertex_id, vertex);
-
+        self.vertex_count += 1;
         // Notify all vertex observers
         let observers = self.vertex_observers.clone();
         tokio::spawn(async move {
@@ -75,6 +85,9 @@ impl Graph {
         self.edges.insert(edge_id, edge);
         self.out_edges.entry(from).or_default().insert(edge_id);
         self.in_edges.entry(to).or_default().insert(edge_id);
+
+        // 🌟 MAINTAIN MISSING FIELD
+        self.edge_count += 1; 
 
         // Notify all edge observers
         let observers = self.edge_observers.clone();

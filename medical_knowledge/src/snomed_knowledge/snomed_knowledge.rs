@@ -2,7 +2,7 @@
 //! SNOMED-CT + ICD-10 + CPT Knowledge Service
 //! Real-time code validation, hierarchy, mapping, and clinical intelligence
 
-use graph_engine::graph_service::GraphService;
+use lib::graph_engine::graph_service::GraphService;
 use models::medical::*;
 use models::vertices::Vertex;
 use std::collections::{HashMap, HashSet};

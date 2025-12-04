@@ -149,6 +149,16 @@ impl Identifier {
         Ok(Self(SerializableInternString(Intern::new(value))))
     }
 
+    /// Creates an Identifier from a UUID.
+    /// This uses the UUID's display string and validates it against the Identifier's length constraints.
+    pub fn from_uuid(uuid: Uuid) -> ValidationResult<Self> {
+        // Convert the UUID to its canonical string representation (e.g., "01234567-89ab-cdef-0123-456789abcdef")
+        let uuid_string = uuid.to_string();
+        
+        // Use the existing validation logic
+        Self::new(uuid_string)
+    }
+
     #[allow(unsafe_code)]
     pub unsafe fn new_unchecked(value: String) -> Self {
         Self(SerializableInternString(Intern::new(value)))
