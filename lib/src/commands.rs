@@ -269,6 +269,14 @@ pub enum CommandType {
     Nursing(NursingCommand),
     Education(EducationCommand),
     DischargePlanning(DischargePlanningCommand),
+
+    // =========================================================================
+    // EMERGENCY, TIMING, SCHEDULING, RESUS
+    // =========================================================================
+    Emerg(EmergCommand),
+    Timing(TimingCommand),
+    Schedule(ScheduleCommand),
+    Resus(ResusCommand)
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -2648,6 +2656,159 @@ pub enum EducationCommand {
 }
 
 // =========================================================================
+// Schedule Command
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ScheduleCommand {
+    /// Books a new appointment, test, or resource (e.g., room, equipment).
+    Book {
+        patient_id: String,
+        appointment_type: String,
+        provider_id: Option<String>,
+        facility_id: Option<String>,
+        time: String,
+        duration_minutes: u32,
+        notes: Option<String>,
+    },
+    /// Cancels an existing scheduled item.
+    Cancel {
+        schedule_id: String,
+        reason: String,
+    },
+    /// Moves an existing scheduled item.
+    Reschedule {
+        schedule_id: String,
+        new_time: String,
+        new_provider_id: Option<String>,
+        notes: Option<String>,
+    },
+    /// Queries scheduled items based on criteria.
+    Query {
+        patient_id: Option<String>,
+        provider_id: Option<String>,
+        facility_id: Option<String>,
+        from_time: Option<String>,
+        to_time: Option<String>,
+    },
+    /// Finds available time slots for a resource.
+    Available {
+        provider_id: String,
+        appointment_type: Option<String>,
+        start_time: Option<String>,
+        lookahead_days: u32,
+    },
+}
+
+// =========================================================================
+// Timing
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum TimingCommand {
+    /// Starts a clinical timer for a procedure or infusion.
+    Start {
+        encounter_id: String,
+        event_name: String,
+        start_time: Option<String>,
+    },
+    /// Stops a previously started timer.
+    Stop {
+        timer_id: String,
+        stop_time: Option<String>,
+        result: String, // e.g., "Completed", "Interrupted", "Adverse Event"
+    },
+    /// Marks a specific time point during an encounter.
+    Mark {
+        encounter_id: String,
+        milestone_name: String,
+        time: Option<String>,
+    },
+    /// Sets or updates a due time for an ordered task.
+    Due {
+        order_id: String,
+        due_time: String,
+        notes: Option<String>,
+    },
+}
+
+// =========================================================================
+// Emergencies
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum EmergCommand {
+    /// Initiates a clinical emergency protocol (e.g., Sepsis, Trauma, Stroke).
+    Alert {
+        patient_id: String,
+        protocol_name: String,
+        location: String,
+        severity: String,
+        notes: Option<String>,
+    },
+    /// Records a specific step completed in an ongoing emergency protocol.
+    Protocol {
+        alert_id: String,
+        step_name: String,
+        status: String, // e.g., "Initiated", "Completed", "Failed"
+        time: Option<String>,
+    },
+    /// Updates the overall status of the emergency.
+    Status {
+        alert_id: String,
+        status: String,
+        severity: Option<String>,
+    },
+    /// Assigns a role to a user during an emergency response.
+    Team {
+        alert_id: String,
+        user_id: String,
+        role: String,
+    },
+}
+
+// =========================================================================
+// RESUS
+// =========================================================================
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ResusCommand {
+    /// Initiates a resuscitation (Code Blue) event and starts the timer.
+    Code {
+        patient_id: String,
+        location: String,
+        initial_rhythm: String,
+        time: Option<String>,
+    },
+    /// Records administration of a code medication.
+    Drug {
+        code_id: String,
+        drug_name: String,
+        dose: String,
+        route: String,
+        time: Option<String>,
+    },
+    /// Records a defibrillation or cardioversion event.
+    Shock {
+        code_id: String,
+        energy_joules: u32,
+        rhythm_pre: String,
+        rhythm_post: String,
+        time: Option<String>,
+    },
+    /// Records critical non-drug/non-shock intervention (e.g., intubation).
+    Intervention {
+        code_id: String,
+        action_name: String,
+        success: bool,
+        notes: Option<String>,
+        time: Option<String>,
+    },
+    /// Records the termination of the resuscitation event.
+    Stop {
+        code_id: String,
+        outcome: String, // e.g., "ROSC Achieved", "Pronounced Dead", "Transferred"
+        time: Option<String>,
+    },
+}
+
+// =========================================================================
 // DISCHARGE PLANNING
 // =========================================================================
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -3079,6 +3240,17 @@ pub enum Commands {
     #[clap(subcommand)]
     DischargePlanning(DischargePlanningCommand),
 
+    // =========================================================================
+    // EMERGENCY, TIMING, SCHEDULING, RESUS
+    // =========================================================================
+    #[clap(subcommand)]
+    Emerg(EmergCommand),
+    #[clap(subcommand)]
+    Timing(TimingCommand),
+    #[clap(subcommand)]
+    Shcedule(ScheduleCommand),
+    #[clap(subcommand)]
+    Resus(ResusCommand)
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -3672,6 +3844,7 @@ pub fn get_command_string(command: &CommandType) -> String {
         CommandType::Disposition(_) => "disposition".to_string(),
         CommandType::Dosing(_) => "dosing".to_string(),
         CommandType::Drug(_) => "drug".to_string(),
+        CommandType::Emerg(_) => "emerg".to_string(), 
         CommandType::Encounter(_) => "encounter".to_string(),
         CommandType::Education(_) => "education".to_string(),
         CommandType::Export(_) => "export".to_string(),
@@ -3698,7 +3871,10 @@ pub fn get_command_string(command: &CommandType) -> String {
         CommandType::Radiation(_) => "radiation".to_string(),
         CommandType::Referral(_) => "referral".to_string(),
         CommandType::Research(_) => "research".to_string(),
+        CommandType::Resus(_) => "resus".to_string(), 
+        CommandType::Schedule(_) => "schedule".to_string(),
         CommandType::Surgery(_) => "surgery".to_string(),
+        CommandType::Timing(_) => "timing".to_string(),
         CommandType::Triage(_) => "triage".to_string(),
         CommandType::Vitals(_) => "vitals".to_string(),
     }
