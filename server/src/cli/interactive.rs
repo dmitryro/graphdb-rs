@@ -4,7 +4,9 @@ use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, history::DefaultHistory};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::time::{ Duration as TokioDuration };
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tokio::task::JoinHandle;
 use std::process;
 use std::path::PathBuf;
@@ -14,14 +16,20 @@ use shlex;
 use log::{info, error, warn, debug};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use whoami;
 use crate::cli::cli::{CliArgs, get_query_engine_singleton};
 use lib::commands::*;
+use lib::history::history_types::{HistoryMetadata, HistoryStatus};
+use lib::history::history_service::GLOBAL_HISTORY_SERVICE;
 use crate::cli::handlers;
 use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
     print_help_clap_generated, print_filtered_help_clap_generated
 };
-use crate::cli::handlers_utils::{parse_show_command};
+use crate::cli::handlers_history::{
+    self,
+};
+use crate::cli::handlers_utils::{parse_show_command, get_current_time_nanos};
 pub use lib::config::{StorageEngineType};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 
@@ -6472,6 +6480,244 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 _ => CommandType::Unknown,
             }
         },
+        "history" => {
+            // Use a reference to the remaining arguments
+            let args = &remaining_args;
+
+            // Default subcommand is 'list' (covers the "no arguments" case)
+            let mut subcommand = "list".to_string();
+            let mut args_start_index = 0;
+
+            // --- State Initialization ---
+            let mut user: Option<String> = None;
+            let mut status: Option<HistoryStatusFilter> = None;
+            let mut limit: Option<usize> = None; // User-provided limit (Option<usize>)
+            let mut since: Option<String> = None;
+            let mut until: Option<String> = None;
+            let mut command_type: Option<String> = None;
+
+            let mut output_format = HistoryOutputFormat::Table;
+            let mut verbose = false;
+            let mut full_command = false;
+            let mut raw = false;
+            // FIX: Use Option<HistorySortField> for parsing, then unwrap later
+            let mut sort_by: Option<HistorySortField> = None; 
+
+            let mut keyword: Option<String> = None;
+            let mut force_clear = false;
+            let mut stats_by = "user".to_string();
+            let mut window_duration: Option<String> = None;
+            let mut window_before: Option<String> = None;
+            let mut window_interval: Option<String> = None;
+
+            let mut fail_only = false;
+            let mut successful_only = false;
+
+            // Check for explicit subcommand and determine args_start_index
+            if !args.is_empty() {
+                let first_arg = args[0].to_lowercase();
+                match first_arg.as_str() {
+                    "list" | "top" | "tail" | "window" | "search" | "clear" | "stats" => {
+                        subcommand = first_arg;
+                        args_start_index = 1;
+                    }
+                    _ => { 
+                        if first_arg.starts_with('-') {
+                            args_start_index = 0;
+                        } else {
+                            // Positional argument, assume implicit 'search'
+                            subcommand = "search".to_string();
+                            args_start_index = 0; 
+                        }
+                    }
+                }
+            }
+            
+            // --- Argument Parsing Loop ---
+            let mut i = args_start_index;
+            while i < args.len() {
+                let arg = args[i].to_lowercase();
+                let current_arg = args[i].clone();
+
+                match arg.as_str() {
+                    // ... (Argument parsing logic remains the same) ...
+
+                    "--user" | "-u" => {
+                        if i + 1 < args.len() { user = Some(args[i + 1].clone()); i += 2; } 
+                        else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--status" => {
+                        if i + 1 < args.len() {
+                            status = match args[i + 1].to_lowercase().as_str() {
+                                "success" => Some(HistoryStatusFilter::Success),
+                                "fail" => Some(HistoryStatusFilter::Fail),
+                                "timeout" => Some(HistoryStatusFilter::Timeout),
+                                _ => { eprintln!("Warning: Invalid status value. Using no status filter."); None }
+                            };
+                            i += 2;
+                        } else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--limit" | "-n" => {
+                        if i + 1 < args.len() {
+                            limit = args[i + 1].parse::<usize>().ok();
+                            if limit.is_none() { eprintln!("Warning: Flag '{}' value must be an integer.", current_arg); }
+                            i += 2;
+                        } else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--since" => {
+                        if i + 1 < args.len() { since = Some(args[i + 1].clone()); i += 2; } 
+                        else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--until" => {
+                        if i + 1 < args.len() { until = Some(args[i + 1].clone()); i += 2; } 
+                        else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--command-type" => {
+                        if i + 1 < args.len() { command_type = Some(args[i + 1].clone()); i += 2; }
+                        else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--display" | "-d" => {
+                        if i + 1 < args.len() {
+                            output_format = match args[i + 1].to_lowercase().as_str() {
+                                "json" => HistoryOutputFormat::Json,
+                                "csv" => HistoryOutputFormat::Csv,
+                                "table" => HistoryOutputFormat::Table,
+                                _ => { eprintln!("Warning: Invalid display format. Using 'table'."); HistoryOutputFormat::Table }
+                            };
+                            i += 2;
+                        } else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--verbose" | "-v" => { verbose = true; i += 1; }
+                    "--full-command" => { full_command = true; i += 1; }
+                    "--raw" => { raw = true; i += 1; }
+                    "--sort-by" => { 
+                        if i + 1 < args.len() { 
+                            sort_by = match args[i + 1].to_lowercase().as_str() {
+                                "id" => Some(HistorySortField::Id), 
+                                "time" => Some(HistorySortField::Time),
+                                "duration" => Some(HistorySortField::Duration),
+                                "status" => Some(HistorySortField::Status),
+                                _ => { 
+                                    eprintln!("Warning: Invalid sort field. Use 'id', 'time', 'duration', or 'status'. Defaulting to 'time'."); 
+                                    None 
+                                }
+                            };
+                            i += 2; 
+                        } else { eprintln!("Warning: Flag '{}' requires a value.", current_arg); i += 1; }
+                    }
+                    "--fail-only" => { fail_only = true; i += 1; }
+                    "--success-only" => { successful_only = true; i += 1; }
+                    "--duration" => {
+                        if subcommand == "window" && i + 1 < args.len() { window_duration = Some(args[i + 1].clone()); i += 2; } 
+                        else { eprintln!("Warning: Flag '{}' is generally used for 'history window'.", current_arg); i += 1; }
+                    }
+                    "--before" => {
+                        if subcommand == "window" && i + 1 < args.len() { window_before = Some(args[i + 1].clone()); i += 2; } 
+                        else { eprintln!("Warning: Flag '{}' is generally used for 'history window'.", current_arg); i += 1; }
+                    }
+                    "--interval" => { 
+                        if subcommand == "window" && i + 1 < args.len() { window_interval = Some(args[i + 1].clone()); i += 2; }
+                        else { eprintln!("Warning: Flag '{}' is generally used for 'history window'.", current_arg); i += 1; }
+                    }
+                    "--force" => {
+                        if subcommand == "clear" { force_clear = true; i += 1; } 
+                        else { eprintln!("Warning: Flag '{}' is only valid for 'history clear'.", current_arg); i += 1; }
+                    }
+                    "--by" => {
+                        if subcommand == "stats" && i + 1 < args.len() { stats_by = args[i + 1].to_lowercase(); i += 2; } 
+                        else { eprintln!("Warning: Flag '{}' is only valid for 'history stats'.", current_arg); i += 1; }
+                    }
+                    _ => {
+                        if keyword.is_none() {
+                            keyword = Some(current_arg);
+                            if subcommand == "list" {
+                                subcommand = "search".to_string();
+                            }
+                            i += 1;
+                        } else {
+                            eprintln!("Warning: Unknown or misplaced argument for 'history': {}", current_arg);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+
+            // --- Final Struct Construction ---
+            
+            // FIX: Calculate the final limit. If no limit is provided for 'list' or 'search', use usize::MAX.
+            let final_limit = if limit.is_none() && (subcommand.as_str() == "list" || subcommand.as_str() == "search") {
+                std::usize::MAX
+            } else {
+                // Use the provided limit, or 0 for other cases (Top/Tail use 'n' field primarily)
+                limit.unwrap_or(0) 
+            };
+
+            let display_args = HistoryDisplayArgs { 
+                format: output_format, 
+                verbose, 
+                full_command,
+                raw,
+                // Unwrap Option<HistorySortField> to HistorySortField, defaulting to Time.
+                sort_by: sort_by.unwrap_or(HistorySortField::Time), 
+            };
+            
+            let filters = HistoryFilterArgs {
+                user: user.clone(),
+                status,
+                limit: final_limit, // <-- CORRECTED: now defaults to usize::MAX for 'history' (list)
+                since,
+                until,
+                command_type, 
+                display: display_args,
+            };
+
+            let history_command = match subcommand.as_str() {
+                "list" => HistoryCommand::List(HistoryListArgs { filters }),
+                "top" => HistoryCommand::Top(HistoryTopTailArgs { 
+                    // 'n' is the canonical limit for top/tail, defaulting to 10
+                    n: limit.unwrap_or(10), 
+                    filters,
+                    fail_only,
+                    successful_only,
+                }),
+                "tail" => HistoryCommand::Tail(HistoryTopTailArgs { 
+                    n: limit.unwrap_or(10),
+                    filters,
+                    fail_only,
+                    successful_only,
+                }),
+                "window" => {
+                    let duration = window_duration.unwrap_or_else(|| {
+                        eprintln!("Warning: 'history window' requires a --duration. Using '1h'.");
+                        "1h".to_string()
+                    });
+                    HistoryCommand::Window(HistoryWindowArgs { 
+                        duration, 
+                        before: window_before, 
+                        interval: window_interval,
+                        filters,
+                    })
+                }
+                "search" => {
+                    let keyword_str = keyword.unwrap_or_else(|| {
+                        eprintln!("Error: 'history search' requires a keyword. Falling back to empty search.");
+                        "".to_string() 
+                    });
+                    HistoryCommand::Search { keyword: keyword_str, filters }
+                }
+                "clear" => HistoryCommand::Clear { user, force: force_clear },
+                "stats" => HistoryCommand::Stats { by: stats_by, user },
+                _ => {
+                    eprintln!("Error: Unknown history subcommand: {}", subcommand);
+                    HistoryCommand::List(HistoryListArgs { filters })
+                }
+            };
+
+            // Return the final command type
+            CommandType::History {
+                action: Some(history_command),
+            }
+        }
         _ => CommandType::Unknown,
     };
 
@@ -6501,6 +6747,14 @@ pub async fn handle_interactive_command(
     command: CommandType,
     state: &SharedState,
 ) -> Result<()> {
+    // 1. CAPTURE START METADATA
+    let start_time_nanos = get_current_time_nanos();
+    let command_string = get_command_string(&command);
+    let user = handlers::get_current_user().await.unwrap_or_else(|_| "cli_user".to_string());
+    
+    // FIX: Check if this is a history command BEFORE matching (before command is moved)
+    let is_history_command = matches!(command, CommandType::History { .. });
+    
     async fn ensure_query_engine(state: &SharedState) -> Result<Arc<QueryExecEngine>> {
         let mut guard = state.query_engine.lock().await;
         if let Some(engine) = guard.as_ref() {
@@ -6511,8 +6765,9 @@ pub async fn handle_interactive_command(
             Ok(engine)
         }
     }
-    // === All other CLI commands (unchanged) ===
-    match command {
+    
+    // === All CLI commands ===
+    let result: Result<()> = match command {
         CommandType::Daemon(daemon_cmd) => {
             handlers::handle_daemon_command_interactive(daemon_cmd, state.daemon_handles.clone()).await
         }
@@ -6836,6 +7091,34 @@ pub async fn handle_interactive_command(
             handlers::handle_cleanup_command_interactive(action).await;
             Ok(())
         }
+        CommandType::History { action } => {
+            // The history command is executed via a dedicated handler.
+            // The handler is responsible for interacting with the History Service,
+            // which manages the retrieval, searching, and clearing of command history.
+            
+            // Default to List if no subcommand provided
+            let history_action = action.unwrap_or_else(|| {
+                HistoryCommand::List(HistoryListArgs {
+                    filters: HistoryFilterArgs {
+                        user: None,
+                        since: None,
+                        until: None,
+                        command_type: None,
+                        status: None,
+                        limit: usize::MAX, // FIX: Set limit to MAX to retrieve all records when 'history' is run without arguments.
+                        display: HistoryDisplayArgs {
+                            full_command: false,
+                            verbose: false,
+                            sort_by: HistorySortField::Time,
+                            format: HistoryOutputFormat::Table,
+                            raw: false,
+                        },
+                    },
+                })
+            });
+            
+            handlers::handle_history_command_interactive(history_action).await
+        }
         CommandType::SaveStorage => {
             handlers::handle_save_storage().await;
             Ok(())
@@ -7158,7 +7441,44 @@ pub async fn handle_interactive_command(
         CommandType::DischargePlanning(command) => {
             Ok(())
         }
+    };
+    
+    // 3. CAPTURE END METADATA AND REGISTER HISTORY
+    let end_time_nanos = get_current_time_nanos();
+    
+    let status = match result.as_ref() {
+        Ok(_) => HistoryStatus::Success,
+        Err(_) => HistoryStatus::Failure,
+    };
+    
+    let error_message = match result.as_ref() {
+        Err(e) => Some(format!("{}", e)),
+        Ok(_) => None,
+    };
+    
+    let metadata = HistoryMetadata {
+        id: 0, // Repository assigns this.
+        user,
+        command: command_string,
+        start_time_nanos,
+        end_time_nanos,
+        status,
+        service_type: "cli".to_string(),
+        port: None, 
+        error_message,
+    };
+    
+    // 4. Non-disruptive final registration call
+    // FIX: Use the pre-captured flag instead of matching on the moved value
+    if !is_history_command {
+        if let Err(e) = handlers::save_history_metadata(metadata).await {
+            // Log the failure but do not return an error, allowing the primary command result to propagate.
+            log::error!("Failed to save history metadata: {}", e);
+        }
     }
+    
+    // 5. RETURN THE ORIGINAL COMMAND RESULT
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

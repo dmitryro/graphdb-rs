@@ -9,6 +9,7 @@ pub mod graph_evolution;
 pub mod graph_indexing;
 pub mod network_interfaces;
 pub mod plugin_system;
+pub mod history;
 pub mod database;
 pub mod memory; // Now contains InMemoryGraphStorage
 pub mod errors;
@@ -35,6 +36,7 @@ pub use models::queries::{Query, QueryOutputValue};
 pub use models::medical::{Login, User};
 pub use commands::*;
 pub use daemon::*;
+pub use history::*;
 pub use graph_indexing::*;
 pub use indexing::*;
 pub use graph_engine::*;

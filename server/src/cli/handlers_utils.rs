@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use std::collections::HashMap;
 use std::fs;
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 use log::{info, error, warn, debug};
 use tokio::time::{sleep, Duration as TokioDuration};
 use serde_json::{self, Value};
@@ -660,4 +661,13 @@ pub fn get_current_storage_port_sync() -> u16 {
     
     let _ = CACHED_PORT.set(port);
     port
+}
+
+/// Retrieves the current system time as nanoseconds since the UNIX epoch.
+/// This is necessary because HistoryMetadata uses absolute nanosecond timestamps (u64).
+pub fn get_current_time_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| TokioDuration::from_secs(0))
+        .as_nanos() as u64
 }
