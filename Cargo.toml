@@ -22,6 +22,9 @@ members = [
     "compliance_service", 
     "indexing_service",
     "logging_service", 
-    "graph_visualizing", "medical_knowledge", "driver", 
+    "graph_visualizing", 
+    "medical_knowledge", 
+    "driver", 
+    "history_service", 
 ]
 

@@ -157,6 +157,13 @@ pub enum CommandType {
     Index(IndexAction),
     
     // =========================================================================
+    // COMMAND HISTORY
+    // =========================================================================
+    History {
+        action: Option<HistoryCommand>,
+    },
+
+    // =========================================================================
     // PATIENT MANAGEMENT
     // =========================================================================
     Patient(PatientCommand),
@@ -296,6 +303,203 @@ pub enum CleanupCommand {
         force: bool,
     },
     Graph, 
+}
+
+// =========================================================================
+// History Command
+// =========================================================================
+/// Command history and auditing for executed commands and queries.
+// =========================================================================
+// History Command
+// =========================================================================
+/// Command history and auditing for executed commands and queries.
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum HistoryCommand {
+    /// Lists command history (default action, equivalent to 'list').
+    #[command(name = "list")]
+    List(HistoryListArgs),
+
+    /// Shows the N most recent commands (Top/Head).
+    #[clap(alias = "head")]
+    Top(HistoryTopTailArgs),
+
+    /// Shows the N oldest commands (Bottom/Tail).
+    #[clap(alias = "bottom")]
+    Tail(HistoryTopTailArgs),
+
+    /// Shows commands executed within a specific time window.
+    Window(HistoryWindowArgs),
+
+    /// Filters history based on keywords in the command content.
+    Search {
+        /// The keyword or command fragment to search for.
+        #[arg(value_name = "KEYWORD")]
+        keyword: String,
+        
+        /// Inherits all HistoryFilterArgs.
+        #[clap(flatten)]
+        filters: HistoryFilterArgs,
+    },
+
+    /// Clears command history for a user or all history (DANGEROUS).
+    Clear {
+        /// Specify user history to clear. Defaults to current user. Use 'ALL' to clear all history.
+        #[clap(long, short = 'u', value_name = "USERNAME")]
+        user: Option<String>,
+        
+        /// Force clear without confirmation.
+        #[clap(long)]
+        force: bool,
+    },
+
+    /// Displays summary statistics about command execution.
+    Stats {
+        /// Group and count statistics by a specific field (e.g., 'user', 'type', 'status').
+        #[clap(long, short = 'b', value_name = "FIELD", default_value = "user")]
+        by: String,
+        
+        /// Show stats for a specific user.
+        #[clap(long, short = 'u', value_name = "USERNAME")]
+        user: Option<String>,
+    },
+}
+
+// --- Argument Structs for Reusability and Flags (Same as before) ---
+
+/// Filters for the status of a command execution.
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum HistoryStatusFilter {
+    /// Command execution was successful.
+    Success,
+    /// Command execution failed (error occurred).
+    Fail,
+    /// Command execution timed out.
+    Timeout,
+}
+
+/// Fields to sort the history results by.
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum HistorySortField {
+    /// Sort by execution time (most recent first).
+    Time,
+    /// Sort by the user who ran the command.
+    User,
+    /// Sort by the duration of the command execution.
+    Duration,
+    Id,
+    Status,
+}
+
+/// Output format for the history results.
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+pub enum HistoryOutputFormat {
+    /// Plain text table (default for CLI).
+    Table,
+    /// JSON output format.
+    Json,
+    /// Comma-separated values format.
+    Csv,
+}
+
+/// Group of arguments for filtering history records.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct HistoryFilterArgs {
+    /// Filter by a specific user. Use 'ALL' to see history for all users.
+    #[clap(long, short = 'u', value_name = "USERNAME")]
+    pub user: Option<String>,
+    
+    /// Filter by start time (e.g., '2025-12-01T10:00:00Z' or '3h ago').
+    #[clap(long, value_name = "TIMESTAMP")]
+    pub since: Option<String>,
+    
+    /// Filter by end time.
+    #[clap(long, value_name = "TIMESTAMP")]
+    pub until: Option<String>,
+    
+    /// Filter by command type (e.g., 'query', 'daemon', 'config', 'graph').
+    #[clap(long, short = 't', value_name = "TYPE")]
+    pub command_type: Option<String>,
+    
+    /// Filter by command execution result.
+    #[clap(long, short = 's', value_enum)]
+    pub status: Option<HistoryStatusFilter>,
+
+    /// Limit the number of results returned (Default: 100).
+    #[clap(long, short = 'n', default_value = "100")]
+    pub limit: usize,
+    
+    /// Inherits display flags.
+    #[clap(flatten)]
+    pub display: HistoryDisplayArgs,
+}
+
+/// Group of arguments for controlling history output display.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct HistoryDisplayArgs {
+    /// Show the entire command/query instead of truncating it.
+    #[clap(long, short = 'f')]
+    pub full_command: bool,
+    
+    /// Include extra metadata (duration, client IP, etc.).
+    #[clap(long, short = 'v')]
+    pub verbose: bool,
+    
+    /// Sort the results by a specific field (e.g., 'time', 'user', 'duration').
+    #[clap(long, value_enum, default_value = "time")]
+    pub sort_by: HistorySortField,
+    
+    /// Output format ('table', 'json', 'csv').
+    #[clap(long, short = 'o', value_enum, default_value = "table")]
+    pub format: HistoryOutputFormat,
+    
+    /// Display the raw command string without sanitization.
+    #[clap(long)]
+    pub raw: bool,
+}
+
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct HistoryListArgs {
+    /// Inherits all filtering and display flags.
+    #[clap(flatten)]
+    pub filters: HistoryFilterArgs,
+}
+
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct HistoryTopTailArgs {
+    /// The number of records to show (N). Defaults to 10.
+    #[arg(value_name = "N", default_value = "10")]
+    pub n: usize,
+    
+    /// Filter to show only commands that failed (for 'top').
+    #[clap(long, conflicts_with = "successful_only")]
+    pub fail_only: bool,
+    
+    /// Filter to show only commands that succeeded (for 'tail').
+    #[clap(long, conflicts_with = "fail_only")]
+    pub successful_only: bool,
+    
+    /// Inherits general filtering and display flags.
+    #[clap(flatten)]
+    pub filters: HistoryFilterArgs,
+}
+
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct HistoryWindowArgs {
+    /// The duration window relative to the present (e.g., '1h', '30m', '7d').
+    #[arg(value_name = "DURATION")]
+    pub duration: String,
+    
+    /// Look backward from a specific point in time (e.g., '3d' starts the window 3 days ago).
+    #[clap(long, value_name = "BACK_DURATION")]
+    pub before: Option<String>,
+    
+    /// Groups results and shows execution metrics per time interval (e.g., '1h').
+    #[clap(long, short = 'i', value_name = "INTERVAL_DURATION")]
+    pub interval: Option<String>,
+    
+    /// Inherits general filtering and display flags.
+    #[clap(flatten)]
+    pub filters: HistoryFilterArgs,
 }
 
 // =========================================================================
@@ -2716,6 +2920,12 @@ pub enum Commands {
     #[clap(subcommand)]
     Index(IndexAction),
 
+    // THE HISTORY COMMAND H
+    History {
+        #[clap(subcommand)]
+        action: Option<HistoryCommand>,
+    },
+
     #[clap(subcommand)]
     Cleanup(CleanupCommand), // <--- ADDED
     // =========================================================================
@@ -3372,4 +3582,124 @@ pub enum UseAction {
         #[clap(long, default_value = "true")]
         enable: bool,
     },
+}
+
+pub fn get_command_string(command: &CommandType) -> String {
+    match command {
+        // Daemon, Rest, Storage Commands
+        CommandType::Daemon(_) => "daemon".to_string(),
+        CommandType::Rest(_) => "rest".to_string(),
+        CommandType::Storage(_) => "storage".to_string(),
+        
+        // Use Commands
+        CommandType::UseStorage { .. } => "use storage".to_string(),
+        CommandType::UsePlugin { .. } => "use plugin".to_string(),
+        
+        // Save Commands
+        CommandType::SaveStorage => "save storage".to_string(),
+        CommandType::SaveConfig => "save config".to_string(),
+        
+        // Start Commands
+        CommandType::StartRest { .. } => "start rest".to_string(),
+        CommandType::StartStorage { .. } => "start storage".to_string(),
+        CommandType::StartDaemon { .. } => "start daemon".to_string(),
+        CommandType::StartAll { .. } => "start all".to_string(),
+        
+        // Stop Commands
+        CommandType::StopAll => "stop all".to_string(),
+        CommandType::StopRest(_) => "stop rest".to_string(),
+        CommandType::StopDaemon(_) => "stop daemon".to_string(),
+        CommandType::StopStorage(_) => "stop storage".to_string(),
+        
+        // Status Commands
+        CommandType::StatusSummary => "status summary".to_string(),
+        CommandType::StatusDaemon(_) => "status daemon".to_string(),
+        CommandType::StatusStorage(_) => "status storage".to_string(),
+        CommandType::StatusCluster => "status cluster".to_string(),
+        CommandType::StatusRaft(_) => "status raft".to_string(),
+        
+        // Authentication Commands
+        CommandType::Auth { .. } => "auth".to_string(),
+        CommandType::Authenticate { .. } => "authenticate".to_string(),
+        CommandType::RegisterUser { .. } => "register user".to_string(),
+        
+        // General Info / Utility Commands
+        CommandType::Version => "version".to_string(),
+        CommandType::Health => "health".to_string(),
+        CommandType::Clear => "clear".to_string(),
+        CommandType::Cleanup(_) => "cleanup".to_string(),
+        CommandType::Help(_) => "help".to_string(),
+        CommandType::Exit => "exit".to_string(),
+        CommandType::Unknown => "unknown".to_string(),
+
+        // Reload Commands
+        CommandType::ReloadAll => "reload all".to_string(),
+        CommandType::ReloadRest => "reload rest".to_string(),
+        CommandType::ReloadStorage => "reload storage".to_string(),
+        CommandType::ReloadDaemon(_) => "reload daemon".to_string(),
+        CommandType::ReloadCluster => "reload cluster".to_string(),
+        
+        // Restart Commands
+        CommandType::RestartAll { .. } => "restart all".to_string(),
+        CommandType::RestartRest { .. } => "restart rest".to_string(),
+        CommandType::RestartStorage { .. } => "restart storage".to_string(),
+        CommandType::RestartDaemon { .. } => "restart daemon".to_string(),
+        CommandType::RestartCluster => "restart cluster".to_string(),
+        
+        // Other Core Commands
+        CommandType::Show(_) => "show".to_string(),
+        CommandType::Kv { .. } => "kv".to_string(),
+        CommandType::Migrate(_) => "migrate".to_string(),
+        CommandType::Query { .. } => "query".to_string(),
+        CommandType::Visualize { .. } => "visualize".to_string(),
+        CommandType::Graph(_) => "graph".to_string(),
+        CommandType::Index(_) => "index".to_string(),
+        CommandType::History { .. } => "history".to_string(),
+        
+        // Medical Commands (Alphabetical by root command)
+        CommandType::Access(_) => "access".to_string(),
+        CommandType::Alert(_) => "alert".to_string(),
+        CommandType::Allergy(_) => "allergy".to_string(),
+        CommandType::Analytics(_) => "analytics".to_string(),
+        CommandType::Appointment(_) => "appointment".to_string(),
+        CommandType::Audit(_) => "audit".to_string(),
+        CommandType::Chemo(_) => "chemo".to_string(),
+        CommandType::ClinicalTrial(_) => "clinical trial".to_string(),
+        CommandType::Compliance(_) => "compliance".to_string(),
+        CommandType::Diagnosis(_) => "diagnosis".to_string(),
+        CommandType::Discharge(_) => "discharge".to_string(),
+        CommandType::DischargePlanning(_) => "discharge planning".to_string(),
+        CommandType::Disposition(_) => "disposition".to_string(),
+        CommandType::Dosing(_) => "dosing".to_string(),
+        CommandType::Drug(_) => "drug".to_string(),
+        CommandType::Encounter(_) => "encounter".to_string(),
+        CommandType::Education(_) => "education".to_string(),
+        CommandType::Export(_) => "export".to_string(),
+        CommandType::Facility(_) => "facility".to_string(),
+        CommandType::Financial(_) => "financial".to_string(),
+        CommandType::Imaging(_) => "imaging".to_string(),
+        CommandType::Incident(_) => "incident".to_string(),
+        CommandType::Lab(_) => "lab".to_string(),
+        CommandType::Microbiology(_) => "microbiology".to_string(),
+        CommandType::Metrics(_) => "metrics".to_string(),
+        CommandType::Ml(_) => "ml".to_string(),
+        CommandType::Model(_) => "model".to_string(),
+        CommandType::Note(_) => "note".to_string(),
+        CommandType::Nursing(_) => "nursing".to_string(),
+        CommandType::Observation(_) => "observation".to_string(),
+        CommandType::Order(_) => "order".to_string(),
+        CommandType::Pathology(_) => "pathology".to_string(),
+        CommandType::Patient(_) => "patient".to_string(),
+        CommandType::Population(_) => "population".to_string(),
+        CommandType::Prescription(_) => "prescription".to_string(),
+        CommandType::Problem(_) => "problem".to_string(),
+        CommandType::Procedure(_) => "procedure".to_string(),
+        CommandType::Quality(_) => "quality".to_string(),
+        CommandType::Radiation(_) => "radiation".to_string(),
+        CommandType::Referral(_) => "referral".to_string(),
+        CommandType::Research(_) => "research".to_string(),
+        CommandType::Surgery(_) => "surgery".to_string(),
+        CommandType::Triage(_) => "triage".to_string(),
+        CommandType::Vitals(_) => "vitals".to_string(),
+    }
 }
