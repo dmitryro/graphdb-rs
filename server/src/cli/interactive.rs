@@ -6480,6 +6480,922 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 _ => CommandType::Unknown,
             }
         },
+        "emerg" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: emerg <alert|protocol|status|team> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "alert" => {
+                    let mut patient_id = None;
+                    let mut protocol_name = None;
+                    let mut location = None;
+                    let mut severity = None;
+                    let mut notes = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--protocol-name" => {
+                                if i + 1 < remaining_args.len() {
+                                    protocol_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--location" => {
+                                if i + 1 < remaining_args.len() {
+                                    location = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--severity" => {
+                                if i + 1 < remaining_args.len() {
+                                    severity = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if patient_id.is_none() {
+                                    patient_id = Some(remaining_args[i].clone());
+                                } else if protocol_name.is_none() {
+                                    protocol_name = Some(remaining_args[i].clone());
+                                } else if location.is_none() {
+                                    location = Some(remaining_args[i].clone());
+                                } else if severity.is_none() {
+                                    severity = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Emerg(EmergCommand::Alert {
+                        patient_id: patient_id.unwrap_or_default(),
+                        protocol_name: protocol_name.unwrap_or_default(),
+                        location: location.unwrap_or_default(),
+                        severity: severity.unwrap_or_default(),
+                        notes,
+                    })
+                }
+                "protocol" => {
+                    let mut alert_id = None;
+                    let mut step_name = None;
+                    let mut status = None;
+                    let mut time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--alert-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    alert_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--step-name" => {
+                                if i + 1 < remaining_args.len() {
+                                    step_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--status" => {
+                                if i + 1 < remaining_args.len() {
+                                    status = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if alert_id.is_none() {
+                                    alert_id = Some(remaining_args[i].clone());
+                                } else if step_name.is_none() {
+                                    step_name = Some(remaining_args[i].clone());
+                                } else if status.is_none() {
+                                    status = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Emerg(EmergCommand::Protocol {
+                        alert_id: alert_id.unwrap_or_default(),
+                        step_name: step_name.unwrap_or_default(),
+                        status: status.unwrap_or_default(),
+                        time,
+                    })
+                }
+                "status" => {
+                    let mut alert_id = None;
+                    let mut status = None;
+                    let mut severity = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--alert-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    alert_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--status" => {
+                                if i + 1 < remaining_args.len() {
+                                    status = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--severity" => {
+                                if i + 1 < remaining_args.len() {
+                                    severity = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if alert_id.is_none() {
+                                    alert_id = Some(remaining_args[i].clone());
+                                } else if status.is_none() {
+                                    status = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Emerg(EmergCommand::Status {
+                        alert_id: alert_id.unwrap_or_default(),
+                        status: status.unwrap_or_default(),
+                        severity,
+                    })
+                }
+                "team" => {
+                    let mut alert_id = None;
+                    let mut user_id = None;
+                    let mut role = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--alert-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    alert_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--user-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    user_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--role" => {
+                                if i + 1 < remaining_args.len() {
+                                    role = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if alert_id.is_none() {
+                                    alert_id = Some(remaining_args[i].clone());
+                                } else if user_id.is_none() {
+                                    user_id = Some(remaining_args[i].clone());
+                                } else if role.is_none() {
+                                    role = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Emerg(EmergCommand::Team {
+                        alert_id: alert_id.unwrap_or_default(),
+                        user_id: user_id.unwrap_or_default(),
+                        role: role.unwrap_or_default(),
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        }
+
+        "timing" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: timing <start|stop|mark|due> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "start" => {
+                    let mut encounter_id = None;
+                    let mut event_name = None;
+                    let mut start_time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--encounter-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--event-name" => {
+                                if i + 1 < remaining_args.len() {
+                                    event_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--start-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    start_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if encounter_id.is_none() {
+                                    encounter_id = Some(remaining_args[i].clone());
+                                } else if event_name.is_none() {
+                                    event_name = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Timing(TimingCommand::Start {
+                        encounter_id: encounter_id.unwrap_or_default(),
+                        event_name: event_name.unwrap_or_default(),
+                        start_time,
+                    })
+                }
+                "stop" => {
+                    let mut timer_id = None;
+                    let mut stop_time = None;
+                    let mut result = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--timer-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    timer_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--stop-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    stop_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--result" => {
+                                if i + 1 < remaining_args.len() {
+                                    result = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if timer_id.is_none() {
+                                    timer_id = Some(remaining_args[i].clone());
+                                } else if result.is_none() {
+                                    result = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Timing(TimingCommand::Stop {
+                        timer_id: timer_id.unwrap_or_default(),
+                        stop_time,
+                        result: result.unwrap_or_default(),
+                    })
+                }
+                "mark" => {
+                    let mut encounter_id = None;
+                    let mut milestone_name = None;
+                    let mut time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--encounter-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    encounter_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--milestone-name" | "--milestone" => {
+                                if i + 1 < remaining_args.len() {
+                                    milestone_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if encounter_id.is_none() {
+                                    encounter_id = Some(remaining_args[i].clone());
+                                } else if milestone_name.is_none() {
+                                    milestone_name = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Timing(TimingCommand::Mark {
+                        encounter_id: encounter_id.unwrap_or_default(),
+                        milestone_name: milestone_name.unwrap_or_default(),
+                        time,
+                    })
+                }
+                "due" => {
+                    let mut order_id = None;
+                    let mut due_time = None;
+                    let mut notes = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--order-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    order_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--due-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    due_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if order_id.is_none() {
+                                    order_id = Some(remaining_args[i].clone());
+                                } else if due_time.is_none() {
+                                    due_time = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Timing(TimingCommand::Due {
+                        order_id: order_id.unwrap_or_default(),
+                        due_time: due_time.unwrap_or_default(),
+                        notes,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        }
+
+        "schedule" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: schedule <book|cancel|reschedule|query|available> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "book" => {
+                    let mut patient_id = None;
+                    let mut appointment_type = None;
+                    let mut provider_id = None;
+                    let mut facility_id = None;
+                    let mut time = None;
+                    let mut duration_minutes = None;
+                    let mut notes = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--appointment-type" | "--type" => {
+                                if i + 1 < remaining_args.len() {
+                                    appointment_type = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--provider-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    provider_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--facility-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    facility_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--duration" | "--duration-minutes" => {
+                                if i + 1 < remaining_args.len() {
+                                    duration_minutes = remaining_args[i + 1].parse::<u32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if patient_id.is_none() {
+                                    patient_id = Some(remaining_args[i].clone());
+                                } else if appointment_type.is_none() {
+                                    appointment_type = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Schedule(ScheduleCommand::Book {
+                        patient_id: patient_id.unwrap_or_default(),
+                        appointment_type: appointment_type.unwrap_or_default(),
+                        provider_id,
+                        facility_id,
+                        time: time.unwrap_or_default(),
+                        duration_minutes: duration_minutes.unwrap_or(30),
+                        notes,
+                    })
+                }
+                "cancel" => {
+                    let mut schedule_id = None;
+                    let mut reason = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--schedule-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    schedule_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--reason" => {
+                                if i + 1 < remaining_args.len() {
+                                    reason = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if schedule_id.is_none() {
+                                    schedule_id = Some(remaining_args[i].clone());
+                                } else if reason.is_none() {
+                                    reason = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Schedule(ScheduleCommand::Cancel {
+                        schedule_id: schedule_id.unwrap_or_default(),
+                        reason: reason.unwrap_or_default(),
+                    })
+                }
+                "reschedule" => {
+                    let mut schedule_id = None;
+                    let mut new_time = None;
+                    let mut new_provider_id = None;
+                    let mut notes = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--schedule-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    schedule_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--new-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    new_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--new-provider-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    new_provider_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if schedule_id.is_none() {
+                                    schedule_id = Some(remaining_args[i].clone());
+                                } else if new_time.is_none() {
+                                    new_time = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Schedule(ScheduleCommand::Reschedule {
+                        schedule_id: schedule_id.unwrap_or_default(),
+                        new_time: new_time.unwrap_or_default(),
+                        new_provider_id,
+                        notes,
+                    })
+                }
+                "query" => {
+                    let mut patient_id = None;
+                    let mut provider_id = None;
+                    let mut facility_id = None;
+                    let mut from_time = None;
+                    let mut to_time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--provider-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    provider_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--facility-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    facility_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--from-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    from_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--to-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    to_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    CommandType::Schedule(ScheduleCommand::Query {
+                        patient_id,
+                        provider_id,
+                        facility_id,
+                        from_time,
+                        to_time,
+                    })
+                }
+                "available" => {
+                    let mut provider_id = None;
+                    let mut appointment_type = None;
+                    let mut start_time = None;
+                    let mut lookahead_days = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--provider-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    provider_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--appointment-type" | "--type" => {
+                                if i + 1 < remaining_args.len() {
+                                    appointment_type = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--start-time" => {
+                                if i + 1 < remaining_args.len() {
+                                    start_time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--lookahead" | "--lookahead-days" => {
+                                if i + 1 < remaining_args.len() {
+                                    lookahead_days = remaining_args[i + 1].parse::<u32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if provider_id.is_none() {
+                                    provider_id = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Schedule(ScheduleCommand::Available {
+                        provider_id: provider_id.unwrap_or_default(),
+                        appointment_type,
+                        start_time,
+                        lookahead_days: lookahead_days.unwrap_or(7),
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        }
+
+        "resus" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: resus <code|drug|shock|intervention|stop> [args...]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            match remaining_args[0].to_lowercase().as_str() {
+                "code" => {
+                    let mut patient_id = None;
+                    let mut location = None;
+                    let mut initial_rhythm = None;
+                    let mut time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--patient-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    patient_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--location" => {
+                                if i + 1 < remaining_args.len() {
+                                    location = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--initial-rhythm" | "--rhythm" => {
+                                if i + 1 < remaining_args.len() {
+                                    initial_rhythm = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if patient_id.is_none() {
+                                    patient_id = Some(remaining_args[i].clone());
+                                } else if location.is_none() {
+                                    location = Some(remaining_args[i].clone());
+                                } else if initial_rhythm.is_none() {
+                                    initial_rhythm = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Resus(ResusCommand::Code {
+                        patient_id: patient_id.unwrap_or_default(),
+                        location: location.unwrap_or_default(),
+                        initial_rhythm: initial_rhythm.unwrap_or_default(),
+                        time,
+                    })
+                }
+                "drug" => {
+                    let mut code_id = None;
+                    let mut drug_name = None;
+                    let mut dose = None;
+                    let mut route = None;
+                    let mut time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--code-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    code_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--drug-name" | "--drug" => {
+                                if i + 1 < remaining_args.len() {
+                                    drug_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--dose" => {
+                                if i + 1 < remaining_args.len() {
+                                    dose = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--route" => {
+                                if i + 1 < remaining_args.len() {
+                                    route = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if code_id.is_none() {
+                                    code_id = Some(remaining_args[i].clone());
+                                } else if drug_name.is_none() {
+                                    drug_name = Some(remaining_args[i].clone());
+                                } else if dose.is_none() {
+                                    dose = Some(remaining_args[i].clone());
+                                } else if route.is_none() {
+                                    route = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Resus(ResusCommand::Drug {
+                        code_id: code_id.unwrap_or_default(),
+                        drug_name: drug_name.unwrap_or_default(),
+                        dose: dose.unwrap_or_default(),
+                        route: route.unwrap_or_default(),
+                        time,
+                    })
+                }
+                "shock" => {
+                    let mut code_id = None;
+                    let mut energy_joules = None;
+                    let mut rhythm_pre = None;
+                    let mut rhythm_post = None;
+                    let mut time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--code-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    code_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--energy-joules" | "--energy" => {
+                                if i + 1 < remaining_args.len() {
+                                    energy_joules = remaining_args[i + 1].parse::<u32>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--rhythm-pre" => {
+                                if i + 1 < remaining_args.len() {
+                                    rhythm_pre = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--rhythm-post" => {
+                                if i + 1 < remaining_args.len() {
+                                    rhythm_post = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if code_id.is_none() {
+                                    code_id = Some(remaining_args[i].clone());
+                                } else if energy_joules.is_none() {
+                                    energy_joules = remaining_args[i].parse::<u32>().ok();
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Resus(ResusCommand::Shock {
+                        code_id: code_id.unwrap_or_default(),
+                        energy_joules: energy_joules.unwrap_or(200),
+                        rhythm_pre: rhythm_pre.unwrap_or_default(),
+                        rhythm_post: rhythm_post.unwrap_or_default(),
+                        time,
+                    })
+                }
+                "intervention" => {
+                    let mut code_id = None;
+                    let mut action_name = None;
+                    let mut success = false;
+                    let mut notes = None;
+                    let mut time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--code-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    code_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--action-name" | "--action" => {
+                                if i + 1 < remaining_args.len() {
+                                    action_name = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--success" => {
+                                success = true;
+                                i += 1;
+                            }
+                            "--notes" => {
+                                if i + 1 < remaining_args.len() {
+                                    notes = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if code_id.is_none() {
+                                    code_id = Some(remaining_args[i].clone());
+                                } else if action_name.is_none() {
+                                    action_name = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Resus(ResusCommand::Intervention {
+                        code_id: code_id.unwrap_or_default(),
+                        action_name: action_name.unwrap_or_default(),
+                        success,
+                        notes,
+                        time,
+                    })
+                }
+                "stop" => {
+                    let mut code_id = None;
+                    let mut outcome = None;
+                    let mut time = None;
+                    let mut i = 1;
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--code-id" => {
+                                if i + 1 < remaining_args.len() {
+                                    code_id = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--outcome" => {
+                                if i + 1 < remaining_args.len() {
+                                    outcome = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            "--time" => {
+                                if i + 1 < remaining_args.len() {
+                                    time = Some(remaining_args[i + 1].clone());
+                                    i += 2;
+                                } else { i += 1; }
+                            }
+                            _ => {
+                                if code_id.is_none() {
+                                    code_id = Some(remaining_args[i].clone());
+                                } else if outcome.is_none() {
+                                    outcome = Some(remaining_args[i].clone());
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    CommandType::Resus(ResusCommand::Stop {
+                        code_id: code_id.unwrap_or_default(),
+                        outcome: outcome.unwrap_or_default(),
+                        time,
+                    })
+                }
+                _ => CommandType::Unknown,
+            }
+        }
         "history" => {
             // Use a reference to the remaining arguments
             let args = &remaining_args;
@@ -7439,6 +8355,22 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::DischargePlanning(command) => {
+            Ok(())
+        }
+        CommandType::Emerg(command) => {
+            crate::cli::handlers_medical::handle_emerg_command(command).await?;
+            Ok(())
+        }
+        CommandType::Timing(command) => {
+            crate::cli::handlers_medical::handle_timing_command(command).await?;
+            Ok(())
+        }
+        CommandType::Schedule(command) => {
+            crate::cli::handlers_medical::handle_schedule_command(command).await?;
+            Ok(())
+        }
+        CommandType::Resus(command) => {
+            crate::cli::handlers_medical::handle_resus_command(command).await?;
             Ok(())
         }
     };
