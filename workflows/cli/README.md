@@ -1,5 +1,4 @@
 # GraphDB CLI Command Reference
-[![Build Status](https://github.com/dmitryro/graphdb/actions/workflows/ci.yaml/badge.svg)](https://github.com/dmitryro/graphdb/actions/workflows/ci.yaml)
 [![Rust](https://img.shields.io/badge/Rust-CLI-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Documentation](https://img.shields.io/badge/Commands-Detailed-blue)](./COMMANDS.md)
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
