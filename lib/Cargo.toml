@@ -1,7 +1,7 @@
 [package]
 name = "lib"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 # Updated SurrealDB with proper features
@@ -110,6 +110,7 @@ zmq = "0.10.0"
 lz4_flex = "0.11.5"
 hex = "0.4.3"
 wal-rs = "1.0.2"
+whoami = "1.6.1"
 
 [features]
 default = ["with-rocksdb", "with-sled", "with-tikv", "with-surrealkv",]

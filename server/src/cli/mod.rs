@@ -8,12 +8,14 @@ pub mod daemon_management;
 pub mod handlers;
 pub mod help_display;
 pub mod interactive;
+pub mod handlers_user;
 pub mod handlers_utils;
 pub mod handlers_main;
 pub mod handlers_storage;
 pub mod handlers_rest;
 pub mod handlers_all;
 pub mod handlers_queries;
+pub mod handlers_history;
 pub mod handlers_index;
 pub mod handlers_graph;
 pub mod handlers_visualizing;
@@ -115,6 +117,14 @@ pub use handlers_index::{
     handle_index_command,
     initialize_storage_for_index,
 };
+
+pub use handlers_history::{
+    handle_history_command,
+    handle_history_command_interactive,
+    save_history_metadata,
+};
+
+pub use handlers_user::*;
 
 pub use handlers_graph::{
     handle_graph_command,

@@ -65,7 +65,7 @@ impl DaemonMetadata {
 }
 
 #[derive(Clone)]
-struct ImprovedSledPool {
+pub struct ImprovedSledPool {
     db: Arc<Db>,
     _semaphore: Arc<Semaphore>,
 }

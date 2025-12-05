@@ -17,6 +17,8 @@ use log::{info, debug, warn, error};
 use models::errors::GraphError;
 use tokio::time::{timeout, Duration as TokioDuration};
 use std::future::Future;
+use chrono::Utc; 
+use whoami;
 // Import modules
 use lib::commands::*;
 use lib::config::{
@@ -42,6 +44,7 @@ use crate::cli::handlers_utils::{
     StopStorageFn,
     adapt_start_storage,
     adapt_stop_storage,
+    get_current_time_nanos,
 };
 
 use crate::cli::help_display as help_display_mod;
@@ -53,7 +56,10 @@ use crate::cli::handlers_queries::{
     handle_graphql_query,
     handle_cleanup_command,
 };
-
+use crate::cli::handlers_history::{
+    self,
+    handle_history_command,
+};
 use crate::cli::handlers_visualizing::{
     self,
     handle_cypher_query_visualizing,
@@ -68,6 +74,9 @@ use lib::query_parser::config::KeyValueStore;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::query_exec_engine::QueryExecEngine;
 use lib::storage_engine::storage_engine::{StorageEngineManager, AsyncStorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
+use lib::history::{HistoryMetadata, HistoryStatus, GLOBAL_HISTORY_SERVICE};
+use crate::cli::handlers_user::{ get_current_user };
+use crate::cli::handlers_history::{ save_history_metadata };
 
 /// Detect query language from query content (auto-detection)
 fn detect_query_language(query: &str) -> &'static str {
@@ -305,6 +314,14 @@ pub enum Commands {
     // Cleanup Command
     #[clap(subcommand)]
     Cleanup(CleanupCommand),
+
+    // =========================================================================
+    // Command History
+    // =========================================================================
+    History {
+        #[clap(subcommand)]
+        action: Option<HistoryCommand>,
+    },
 
     // =========================================================================
     // PATIENT MANAGEMENT
@@ -593,6 +610,9 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
     Ok(query_engine)
 }
 
+// File: server/src/cli/cli.rs
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_single_command(
     command: Commands,
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
@@ -603,37 +623,34 @@ pub async fn run_single_command(
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
+    
+    // FIX 1: Ensure the correct, unqualified name is used for the static import initialization.
+    GLOBAL_HISTORY_SERVICE.get().await; 
+
+    // --- START: HISTORY METADATA & CONTROL SETUP ---
+    let start_time_nanos = get_current_time_nanos(); 
+    let command_string = format!("{:?}", command);
+    let user = get_current_user().await.unwrap_or_else(|_| "cli_user".to_string());
+    let is_history_command = matches!(command, Commands::History { .. });
+    // --- END: HISTORY METADATA & CONTROL SETUP ---
+
     let is_interactive = matches!(command, Commands::Interactive) || env::var("GRAPHDB_CLI_INTERACTIVE").as_deref() == Ok("1");
-    let mut env_var_set = false;
+    let mut env_var_set = false; 
+    let result: Result<()>; 
+
     if is_interactive && env::var("GRAPHDB_CLI_INTERACTIVE").is_err() {
         debug!("Setting GRAPHDB_CLI_INTERACTIVE=1 for command: {:?}", command);
-        println!("===> Set GRAPHDB_CLI_INTERACTIVE=1 for command: {:?}", command);
-        unsafe { env::set_var("GRAPHDB_CLI_INTERACTIVE", "1"); }
+        // Ensure the environment variable modification is wrapped in unsafe.
+        unsafe {
+            env::set_var("GRAPHDB_CLI_INTERACTIVE", "1");
+        }
         env_var_set = true;
     }
-    info!("Running command: {:?}", command);
-    println!("===> Running command: {:?}", command);
 
-    // === AUTO-CONVERT: visualize "..." → Visualize subcommand (NO RECURSION) ===
-    // === AUTO-CONVERT: visualize "..." → Visualize subcommand ===
-    if let Commands::Query { query: positional_query, language: _ } = &command {
-        let raw = positional_query.trim();
-        if raw.to_lowercase().starts_with("visualize ") {
-            let inner_query = raw["visualize ".len()..].trim();
-            // Strip outer quotes if present
-            let cleaned_query = inner_query
-                .strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
-                .or_else(|| inner_query.strip_prefix('"').and_then(|s| s.strip_suffix('"')));
-            let query_to_use = cleaned_query.unwrap_or(inner_query).to_string();
-            info!("Auto-converted positional 'visualize' to Visualize subcommand");
-            println!("Visualizing: {}", query_to_use);
-            let query_engine = get_query_engine_singleton().await?;
-            let query_to_execute = sanitize_cypher_query(&query_to_use);
-            return handlers_visualizing::handle_cypher_query_visualizing(query_engine, query_to_execute).await;
-        }
-    }
-
-    match command {
+    debug!("===> Running command: {:?}", command);
+   
+    // Capture the execution result
+    result = match command {
         Commands::Start {
             port: top_port,
             cluster: top_cluster,
@@ -750,6 +767,7 @@ pub async fn run_single_command(
                         storage_daemon_port_arc.clone(),
                     )
                     .await?;
+                    Ok(())
                 }
                 StartAction::Daemon {
                     port,
@@ -767,6 +785,7 @@ pub async fn run_single_command(
                         daemon_handles.clone(),
                     )
                     .await?;
+                    Ok(())
                 }
                 StartAction::Rest { port: rest_start_port, cluster: rest_start_cluster, rest_port, rest_cluster } => {
                     handlers_mod::handle_rest_command_interactive(
@@ -775,6 +794,7 @@ pub async fn run_single_command(
                         rest_api_handle.clone(),
                         rest_api_port_arc.clone(),
                     ).await?;
+                    Ok(())
                 }
                 StartAction::Storage {
                     port,
@@ -796,11 +816,13 @@ pub async fn run_single_command(
                         storage_daemon_port_arc.clone(),
                     )
                     .await?;
+                    Ok(())
                 }
             }
         }
         Commands::Stop(stop_args) => {
             handlers_mod::handle_stop_command(stop_args).await?;
+            Ok(())
         }
         Commands::Status(status_args) => {
             handlers_mod::handle_status_command(
@@ -809,27 +831,29 @@ pub async fn run_single_command(
                 storage_daemon_port_arc.clone(),
             )
             .await?;
+            Ok(())
         }
-        Commands::Use(action) => {
-            match action {
-                UseAction::Storage { engine, permanent, migrate } => {
-                    handlers_mod::handle_use_storage_command(engine, permanent, migrate).await?;
-                }
-                UseAction::Plugin { enable } => {
-                    let mut config = load_cli_config().await?;
-                    config.enable_plugins = enable;
-                    config.save()?;
-                    println!("Plugins {}", if enable { "enabled" } else { "disabled" });
-                    handlers_mod::handle_show_plugins_command().await?;
-                }
+        Commands::Use(action) => match action {
+            UseAction::Storage { engine, permanent, migrate } => {
+                handlers_mod::handle_use_storage_command(engine, permanent, migrate).await?;
+                Ok(())
             }
-        }
+            UseAction::Plugin { enable } => {
+                let mut config = load_cli_config().await?;
+                config.enable_plugins = enable;
+                config.save()?;
+                println!("Plugins {}", if enable { "enabled" } else { "disabled" });
+                handlers_mod::handle_show_plugins_command().await?;
+                Ok(())
+            }
+        },
         Commands::Save(action) => {
             let mut config = load_cli_config().await?;
             match action {
                 SaveAction::Configuration => {
                     config.save()?;
                     println!("CLI configuration saved persistently");
+                    Ok(())
                 }
                 SaveAction::Storage => {
                     if let Some(engine) = config.storage.storage_engine_type.clone() {
@@ -900,11 +924,13 @@ pub async fn run_single_command(
                     } else {
                         println!("No storage engine configured; nothing to save");
                     }
+                    Ok(())
                 }
             }
         }
         Commands::Reload(reload_args) => {
             handlers_mod::handle_reload_command_interactive(reload_args).await?;
+            Ok(())
         }
         Commands::Restart(restart_args) => {
             handlers_mod::handle_restart_command_interactive(
@@ -918,13 +944,16 @@ pub async fn run_single_command(
                 storage_daemon_port_arc.clone(),
             )
             .await?;
+            Ok(())
         }
         Commands::Storage(storage_action) => {
             handlers_mod::handle_storage_command(storage_action).await?;
+            Ok(())
         }
         Commands::Daemon(daemon_cmd) => {
             handlers_mod::handle_daemon_command_interactive(daemon_cmd, daemon_handles.clone())
                 .await?;
+            Ok(())
         }
         Commands::Rest(rest_cmd) => {
             handlers_mod::handle_rest_command_interactive(
@@ -934,8 +963,9 @@ pub async fn run_single_command(
                 rest_api_port_arc.clone(),
             )
             .await?;
+            Ok(())
         }
-        Commands::Interactive => {}
+        Commands::Interactive => Ok(()),
         Commands::Help(help_args) => {
             let mut cmd = CliArgs::command();
             if let Some(command_filter) = help_args.filter_command {
@@ -946,53 +976,69 @@ pub async fn run_single_command(
             } else {
                 help_display_mod::print_help_clap_generated();
             }
+            Ok(())
         }
-        Commands::Auth { username, password } | Commands::Authenticate { username, password } => {
+        Commands::Auth { username, password } => {
             handlers_mod::authenticate_user(username, password).await;
+            Ok(())
+        }
+        Commands::Authenticate { username, password } => {
+            handlers_mod::authenticate_user(username, password).await;
+            Ok(())
         }
         Commands::Register { username, password } => {
             handlers_mod::register_user(username, password).await;
+            Ok(())
         }
         Commands::Version => {
             handlers_mod::display_rest_api_version().await;
+            Ok(())
         }
         Commands::Health => {
             handlers_mod::display_rest_api_health().await;
+            Ok(())
         }
         Commands::Clear => {
             handlers_mod::clear_terminal_screen().await?;
             handlers_mod::print_welcome_screen();
+            Ok(())
         }
-        Commands::Exit | Commands::Quit => {
+        Commands::Exit => {
             println!("Exiting CLI. Goodbye!");
             process::exit(0);
         }
-        Commands::Show { action } => {
-            match action {
-                ShowAction::Storage => {
-                    handlers_mod::handle_show_storage_command().await?;
-                }
-                ShowAction::Plugins => {
-                    handlers_mod::handle_show_plugins_command().await?;
-                }
-                ShowAction::Config { config_type } => {
-                    match config_type {
-                        ConfigAction::All => {
-                            handlers_mod::handle_show_all_config_command().await?;
-                        }
-                        ConfigAction::Rest => {
-                            handlers_mod::handle_show_rest_config_command().await?;
-                        }
-                        ConfigAction::Storage => {
-                            handlers_mod::handle_show_storage_config_command().await?;
-                        }
-                        ConfigAction::Main => {
-                            handlers_mod::handle_show_main_config_command().await?;
-                        }
-                    }
-                }
-            }
+        Commands::Quit => {
+            println!("Exiting CLI. Goodbye!");
+            process::exit(0);
         }
+        Commands::Show { action } => match action {
+            ShowAction::Storage => {
+                handlers_mod::handle_show_storage_command().await?;
+                Ok(())
+            }
+            ShowAction::Plugins => {
+                handlers_mod::handle_show_plugins_command().await?;
+                Ok(())
+            }
+            ShowAction::Config { config_type } => match config_type {
+                ConfigAction::All => {
+                    handlers_mod::handle_show_all_config_command().await?;
+                    Ok(())
+                }
+                ConfigAction::Rest => {
+                    handlers_mod::handle_show_rest_config_command().await?;
+                    Ok(())
+                }
+                ConfigAction::Storage => {
+                    handlers_mod::handle_show_storage_config_command().await?;
+                    Ok(())
+                }
+                ConfigAction::Main => {
+                    handlers_mod::handle_show_main_config_command().await?;
+                    Ok(())
+                }
+            },
+        },
         Commands::Query { query, language } => {
             let raw_query = query.trim().to_string();
             let detected_lang = if language.is_none() {
@@ -1000,19 +1046,16 @@ pub async fn run_single_command(
             } else {
                 ""
             };
-
             let effective_lang = language
                 .as_deref()
                 .unwrap_or(detected_lang)
                 .trim()
                 .to_lowercase();
-
             let query_to_execute = if effective_lang == "cypher" {
                 sanitize_cypher_query(&raw_query)
             } else {
                 raw_query.clone()
             };
-
             info!(
                 "Executing query: '{}', language: {} (detected: {}, explicit: {:?})",
                 query_to_execute, effective_lang, detected_lang, language
@@ -1021,9 +1064,7 @@ pub async fn run_single_command(
                 "===> Executing query: '{}', language: {}",
                 query_to_execute, effective_lang
             );
-
             let query_engine = get_query_engine_singleton().await?;
-
             match effective_lang.as_str() {
                 "cypher" => handle_cypher_query(query_engine, query_to_execute).await?,
                 "sql" => handle_sql_query(query_engine, query_to_execute).await?,
@@ -1040,8 +1081,8 @@ pub async fn run_single_command(
                     ));
                 }
             }
+            Ok(())
         }
-
         Commands::Visualize { query, language } => {
             let raw_query = query.trim().to_string();
             let detected_lang = if language.is_none() {
@@ -1059,7 +1100,6 @@ pub async fn run_single_command(
             } else {
                 raw_query.clone()
             };
-
             info!(
                 "Executing visualization query: '{}', language: {} (detected: {}, explicit: {:?})",
                 query_to_execute, effective_lang, detected_lang, language
@@ -1068,9 +1108,7 @@ pub async fn run_single_command(
                 "Executing visualization: '{}', language: {}",
                 query_to_execute, effective_lang
             );
-
             let query_engine = get_query_engine_singleton().await?;
-
             match effective_lang.as_str() {
                 "cypher" => {
                     handlers_visualizing::handle_cypher_query_visualizing(query_engine, query_to_execute).await?
@@ -1093,6 +1131,7 @@ pub async fn run_single_command(
                     ));
                 }
             }
+            Ok(())
         }
         Commands::Kv { operation, key, value } => {
             info!("Executing KV command: operation={}, key={:?}, value={:?}", operation, key, value);
@@ -1137,24 +1176,28 @@ pub async fn run_single_command(
                     return Err(anyhow!("{}", e));
                 }
             }
+            Ok(())
         }
         Commands::Set { key, value } => {
             info!("Executing Set command: key={}, value={}", key, value);
             println!("===> Executing Set command: key={}, value={}", key, value);
             let query_engine = get_query_engine_singleton().await?;
             handlers_mod::handle_kv_command(query_engine, "set".to_string(), key, Some(value)).await?;
+            Ok(())
         }
         Commands::Get { key } => {
             info!("Executing Get command: key={}", key);
             println!("===> Executing Get command: key={}", key);
             let query_engine = get_query_engine_singleton().await?;
             handlers_mod::handle_kv_command(query_engine, "get".to_string(), key, None).await?;
+            Ok(())
         }
         Commands::Delete { key } => {
             info!("Executing Delete command: key={}", key);
             println!("===> Executing Delete command: key={}", key);
             let query_engine = get_query_engine_singleton().await?;
             handlers_mod::handle_kv_command(query_engine, "delete".to_string(), key, None).await?;
+            Ok(())
         }
         Commands::Migrate(action) => {
             let from_engine = action.from
@@ -1174,184 +1217,247 @@ pub async fn run_single_command(
                 storage_daemon_handle.clone(),
                 storage_daemon_port_arc.clone(),
             ).await?;
+            Ok(())
         }
-        // === NEW: Cleanup Command (Routed to ZMQ handler) ===
         Commands::Cleanup(action) => {
             let query_engine = get_query_engine_singleton().await?;
             handle_cleanup_command(action).await?;
+            Ok(())
         }
-        // === NEW: Graph Domain Commands ===
         Commands::Graph(action) => {
             info!("Executing graph domain command: {:?}", action);
             println!("===> Executing graph domain command: {:?}", action);
             let engine = get_query_engine_singleton().await?;
             handle_graph_command(engine, action).await?;
+            Ok(())
         }
-        // === NEW: Index & Full-Text Search Commands ===
-        // === NEW: Index & Full-Text Search Commands ===
-        // === Index & Full-Text Search Commands ===
-        // === Index & Full-Text Search Commands ===
         Commands::Index(action) => {
             info!("Executing index command: {:?}", action);
             println!("===> Executing index command: {:?}", action);
-
-            // 1. Ensure a Storage Daemon is running, initializing the client internally.
-            // NOTE: The function is called without arguments, keeping the cli.rs contract intact.
             let daemon_port = handlers_index::initialize_storage_for_index()
                 .await
                 .context("Indexing command requires a running and healthy storage daemon.")?;
-            
-            // 2. Execute the command handler.
+           
             handlers_index::handle_index_command(action).await?;
-
             info!("Index command executed successfully on port {}", daemon_port);
             println!("===> Index command completed successfully.");
+            Ok(())
+        }
+        Commands::History { action } => {
+            info!("Executing History command: {:?}", action);
+            println!("===> Executing History command: {:?}", action);
+           
+            let history_action = action.unwrap_or_else(|| {
+                HistoryCommand::List(HistoryListArgs {
+                    filters: HistoryFilterArgs {
+                        user: None,
+                        since: None,
+                        until: None,
+                        command_type: None,
+                        status: None,
+                        limit: usize::MAX,
+                        display: HistoryDisplayArgs {
+                            full_command: false,
+                            verbose: false,
+                            sort_by: HistorySortField::Time,
+                            format: HistoryOutputFormat::Table,
+                            raw: false,
+                        },
+                    },
+                })
+            });
+           
+            handlers_history::handle_history_command(history_action).await?;
+            Ok(())
         }
         Commands::Patient(action) => {
-
+            Ok(())
         }
         Commands::Encounter(action) => {
-            
+            Ok(())
         }
         Commands::Diagnosis(action) => {
-
+            Ok(())
         }
         Commands::Prescription(action) => {
-
+            Ok(())
         }
         Commands::Note(action) => {
-
+            Ok(())
         }
         Commands::Referral(action) => {
-
+            Ok(())
         }
         Commands::Triage(action) => {
-
+            Ok(())
         }
         Commands::Disposition(action) => {
-
+            Ok(())
         }
         Commands::Allergy(action) => {
-
+            Ok(())
         }
         Commands::Appointment(action) => {
-
+            Ok(())
         }
         Commands::Problem(action) => {
-
+            Ok(())
         }
         Commands::Order(action) => {
-
+            Ok(())
         }
         Commands::Discharge(action) => {
-
+            Ok(())
         }
         Commands::Procedure(action) => {
-
+            Ok(())
         }
         Commands::Dosing(action) => {
-
+            Ok(())
         }
         Commands::Alert(action) => {
-
+            Ok(())
         }
         Commands::Pathology(action) => {
-
+            Ok(())
         }
         Commands::Microbiology(action) => {
-
+            Ok(())
         }
         Commands::Vitals(action) => {
-
+            Ok(())
         }
         Commands::Observation(action) => {
-
+            Ok(())
         }
         Commands::Lab(action) => {
-
+            Ok(())
         }
         Commands::Imaging(action) => {
-
+            Ok(())
         }
         Commands::Chemo(action) => {
-
+            Ok(())
         }
         Commands::Radiation(action) => {
-
+            Ok(())
         }
         Commands::Surgery(action) => {
-
+            Ok(())
         }
         Commands::Drug(action) => {
-
+            Ok(())
         }
         Commands::Population(action) => {
-
+            Ok(())
         }
         Commands::Analytics(action) => {
-
+            Ok(())
         }
         Commands::Metrics(action) => {
-
+            Ok(())
         }
         Commands::Audit(action) => {
-
+            Ok(())
         }
         Commands::Export(action) => {
-
+            Ok(())
         }
         Commands::Facility(action) => {
-
+            Ok(())
         }
         Commands::Access(action) => {
-
+            Ok(())
         }
         Commands::Financial(action) => {
-
-        }
-        Commands::Financial(action) => {
-
+            Ok(())
         }
         Commands::Quality(action) => {
-
+            Ok(())
         }
         Commands::Incident(action) => {
-
+            Ok(())
         }
         Commands::Compliance(action) => {
-
+            Ok(())
         }
         Commands::Research(action) => {
-
+            Ok(())
         }
         Commands::Ml(action) => {
-
+            Ok(())
         }
         Commands::ClinicalTrial(action) => {
-
+            Ok(())
         }
         Commands::Model(action) => {
-
+            Ok(())
         }
         Commands::Nursing(action) => {
-
+            Ok(())
         }
         Commands::Education(action) => {
-
+            Ok(())
         }
         Commands::DischargePlanning(action) => {
+            Ok(())
+        }
+        _ => Err(anyhow::anyhow!("Command handler not found for {:?}", command)),
+    };  
+    
+    // --- START: HISTORY SAVE LOGIC for Non-Interactive Commands ---
+    if !is_interactive && !is_history_command {
+        let end_time_nanos = get_current_time_nanos(); 
 
+        let status = match result.as_ref() {
+            Ok(_) => HistoryStatus::Success,
+            Err(_) => HistoryStatus::Failure,
+        };
+        
+        let error_message = match result.as_ref() {
+            Err(e) => Some(format!("{}", e)),
+            Ok(_) => None,
+        };
+
+        let metadata = HistoryMetadata {
+            id: 0, 
+            user,
+            command: command_string,
+            start_time_nanos,
+            end_time_nanos,
+            status,
+            service_type: "cli".to_string(),
+            port: None, 
+            error_message,
+        };
+        
+        // This is assumed to wrap GLOBAL_HISTORY_SERVICE.register_entry().await
+        if let Err(e) = save_history_metadata(metadata).await {
+            log::error!("Failed to save history metadata for non-interactive command: {}", e);
+        }
+        
+        // FIX 2 (Structural Persistence): Explicitly call .close().await to guarantee 
+        // that the in-memory history is written to the fallback file before the process exits.
+        let history_service_instance = GLOBAL_HISTORY_SERVICE.get().await; 
+        if let Err(e) = history_service_instance.close().await { 
+            log::error!("Failed to close/persist history service before exit: {}", e);
+        }
+        
+        // REMOVED: The unreliable tokio::time::sleep is no longer needed.
+    }
+    // --- END: HISTORY SAVE LOGIC ---
+
+
+    if env_var_set {
+        debug!("Unsetting GRAPHDB_CLI_INTERACTIVE");
+        // Ensure the environment variable modification is wrapped in unsafe.
+        unsafe {
+            env::remove_var("GRAPHDB_CLI_INTERACTIVE");
         }
     }
 
-    if env_var_set {
-        info!("Removing GRAPHDB_CLI_INTERACTIVE after command execution");
-        println!("===> Removed GRAPHDB_CLI_INTERACTIVE after command execution");
-        unsafe { env::remove_var("GRAPHDB_CLI_INTERACTIVE"); }
-    }
-    info!("Command execution completed successfully");
-    println!("===> Command execution completed successfully");
-    Ok(())
+    // Return the result of the command execution
+    result
 }
 
 /// Main entry point for CLI command handling.
