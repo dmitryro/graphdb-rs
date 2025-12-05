@@ -64,8 +64,14 @@ pub use crate::cli::handlers_visualizing::{
                                             handle_unified_query_visualizing,
                                             handle_interactive_query_visualizing,
                                         };
+pub use crate::cli::handlers_history::{ 
+                                            handle_history_command,
+                                            handle_history_command_interactive,
+                                            save_history_metadata,
+                                      };
 pub use crate::cli::handlers_graph::handle_graph_command;
 pub use crate::cli::handlers_index::handle_index_command;
+pub use crate::cli::handlers_user::*;
 pub use crate::cli::handlers_medical::*;
 pub use crate::cli::handlers_connectors::*;
 pub use crate::cli::handlers_hl7::*;
