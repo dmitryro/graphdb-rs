@@ -473,6 +473,18 @@ pub enum Commands {
     Education(EducationCommand),
     #[clap(subcommand)]
     DischargePlanning(DischargePlanningCommand),
+
+    // =========================================================================
+    // EMERGENCY, TIMING, SCHEDULING, RESUS
+    // =========================================================================
+    #[clap(subcommand)]
+    Emerg(EmergCommand),
+    #[clap(subcommand)]
+    Timing(TimingCommand),
+    #[clap(subcommand)]
+    Schedule(ScheduleCommand),
+    #[clap(subcommand)]
+    Resus(ResusCommand)
 }
 
 // Use a TokioMutex to manage the singleton instance of the QueryExecEngine.
@@ -1400,6 +1412,22 @@ pub async fn run_single_command(
             Ok(())
         }
         Commands::DischargePlanning(action) => {
+            Ok(())
+        }
+        Commands::Emerg(action) => {
+            handlers_mod::handle_emerg_command(action).await?;
+            Ok(())
+        }
+        Commands::Timing(action) => {
+            handlers_mod::handle_timing_command(action).await?;
+            Ok(())
+        }
+        Commands::Schedule(action) => {
+            handlers_mod::handle_schedule_command(action).await?;
+            Ok(())
+        }
+        Commands::Resus(action) => {
+            handlers_mod::handle_resus_command(action).await?;
             Ok(())
         }
         _ => Err(anyhow::anyhow!("Command handler not found for {:?}", command)),
