@@ -54,7 +54,7 @@ These commands manage configuration settings, data persistence, key-value storag
 | **cleanup** | `clean` | `logs` | `--days-retention <i32>`, `--force` | Removes old log files. |
 | | | `storage` | `<engine>`, `--force` | **DANGEROUS**: Clears persistent data within a specific storage engine. |
 | | | `temporary-files`, `all` | `--days-retention <i32>`, `--force` | Removes cache/temporary files or runs all cleanup tasks. |
-| | | `graph` |  | Removes orphaned edges and vertices, does garbage collection on graph. |
+| |`graph`  | |  | Removes orphaned edges and vertices, does garbage collection on graph. |
 | **register** | *(None)* | `user` | `<USERNAME> <PASSWORD>` | Creates a new user account. |
 | **auth** | `authenticate` | *(Action)* | `<USERNAME> <PASSWORD>` | User Session Authentication |
 | **access** | *(None)* | `login`, `logout`, `whoami` | `[USERNAME]` | User Session Management |
