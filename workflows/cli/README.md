@@ -161,3 +161,4 @@ These commands are the foundation for managing patient visits, records, and orde
 | **help** | *(None)* | Displays this command reference or detailed help for a specific command path. |
 | **exit** | `quit`, `q` | Terminates the CLI session. |
 
+
