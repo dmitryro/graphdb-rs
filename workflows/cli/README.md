@@ -94,23 +94,27 @@ These commands are the foundation for managing patient visits, records, and orde
 
 | Command | Subcommand/Action | Arguments/Flags | Functional Domain |
 | :--- | :--- | :--- | :--- |
-| **patient** | `create`, `view`, `search`, `timeline` | `id`, `name`, `dob`, `mrn`, `--ssn`, `--mrn` | Patient Demographics & Records |
-| **encounter** | `start`, `end`, `list`, `transfer` | `patient_id`, `location`, `reason` | Patient Visits and Stays (Inpatient/Outpatient) |
 | **diagnosis** | `add`, `update`, `list` | `encounter_id`, `description`, `--icd10`, `--status` | Disease and Condition Management |
+| **discharge** | `plan`, `readiness`, `summary`, `finalize` | `patient_id`, `--actual-date`, `disposition` | Patient Discharge Process and Planning |
+| **discharge-planning**| `update`, `barrier`, `post-acute` | `patient_id`, `status` | Detailed Discharge Readiness Management |
+| **education** | `add`, `document`, `list-material` | `patient_id`, `topic`, `--method` | Patient and Family Education |
+| **emerg** | `alert`, `protocol`, `status`, `team` | `patient_id`, `protocol_name`, `--alert-id`, `--severity`, `--user-id`, `--role`| Acute Emergency Protocol Management (e.g., Sepsis, Trauma, Stroke) |
+| **encounter** | `start`, `end`, `list`, `transfer` | `patient_id`, `location`, `reason` | Patient Visits and Stays (Inpatient/Outpatient) |
 | **problem** | `add`, `update`, `resolve`, `list` | `patient_id`, `problem`, `--icd10`, `--severity`, `--onset-date` | Active and Resolved Patient Problems |
 | **prescription** | `add`, `checkinteractions`, `update` | `encounter_id`, `med_name`, `dose`, `--refills`, `--route`, `--duration` | Medication Ordering and Safety Checks |
 | **note** | `add`, `list` | `patient_id`, `author_id`, `text`, `--note-type` | Clinical Documentation and Charting |
+| **nursing** | `task`, `document`, `shift-report` | `patient_id`, `task_type`, `notes` | Nursing Workflow and Documentation |
 | **order** | `admit`, `lab`, `imaging`, `medication` | `encounter_id`, *(specific order args)*, `--priority`, `--notes` | Physician/Provider Orders |
+| **patient** | `create`, `view`, `search`, `timeline` | `id`, `name`, `dob`, `mrn`, `--ssn`, `--mrn` | Patient Demographics & Records |
 | **procedure** | `order`, `perform`, `result`, `analytics` | `encounter_id`, `cpt_code`, `--scheduled-date`, `--location` | Surgical and Diagnostic Procedure Management |
 | **vitals** | `add`, `list` | `encounter_id`, `--bp`, `--hr`, `--temp`, `--pain-score`, `--spo2`, `--weight` | Patient Physiological Data Recording |
 | **observation** | `add`, `list` | `encounter_id`, `type`, `value`, `unit`, `--method` | General Clinical Observations |
 | **triage** | `assign`, `update`, `queue` | `patient_id`, `acuity`, `--priority` | Patient Acuity Assessment (e.g., ED) |
 | **disposition**| `transfer`, `admit`, `discharge` | `patient_id`, `location`, `status` | Patient Location and Status Tracking |
 | **referral** | `create`, `pending`, `complete` | `patient_id`, `specialty`, `urgency` | Management of Internal and External Referrals |
-| **nursing** | `task`, `document`, `shift-report` | `patient_id`, `task_type`, `notes` | Nursing Workflow and Documentation |
-| **education** | `add`, `document`, `list-material` | `patient_id`, `topic`, `--method` | Patient and Family Education |
-| **discharge** | `plan`, `readiness`, `summary`, `finalize` | `patient_id`, `--actual-date`, `disposition` | Patient Discharge Process and Planning |
-| **discharge-planning**| `update`, `barrier`, `post-acute` | `patient_id`, `status` | Detailed Discharge Readiness Management |
+| **resus** | `code`, `drug`, `shock`, `intervention`, `stop`| `patient_id`, `location`, `--code-id`, `--rhythm`, `--drug-name`, `--energy-joules`, `--outcome` | Cardiac Arrest Documentation (Code Blue) |
+| **schedule** | `book`, `cancel`, `reschedule`, `query`, `available`| `patient_id`, `provider_id`, `--time`, `--duration`, `--schedule-id`, `--new-time`,`--lookahead` | Resource and Appointment Scheduling |
+| **timing** | `start`, `stop`, `mark`, `due`| `encounter_id`, `event_name`, `--timer-id`, `--milestone`, `--order-id`, `--due-time` | Time-Sensitive Clinical Action Tracking |
 
 ***
 
@@ -160,4 +164,5 @@ These commands are the foundation for managing patient visits, records, and orde
 | **clear** | `clean` | Clears the interactive console screen. |
 | **help** | *(None)* | Displays this command reference or detailed help for a specific command path. |
 | **exit** | `quit`, `q` | Terminates the CLI session. |
+
 
