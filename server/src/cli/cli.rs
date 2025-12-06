@@ -56,6 +56,7 @@ use crate::cli::handlers_queries::{
     handle_graphql_query,
     handle_cleanup_command,
 };
+use crate::cli::handlers_mpi::{ self, MPIHandlers };
 use crate::cli::handlers_history::{
     self,
     handle_history_command,
@@ -358,6 +359,8 @@ pub enum Commands {
     Discharge(DischargeCommand),
     #[clap(subcommand)]
     Procedure(ProcedureCommand),
+    #[clap(subcommand)]
+    Mpi(MPICommand),
     // =========================================================================
     // DOSING
     // =========================================================================
@@ -1281,6 +1284,34 @@ pub async fn run_single_command(
            
             handlers_history::handle_history_command(history_action).await?;
             Ok(())
+        }
+        Commands::Mpi(mpi_command) => {
+            match mpi_command {
+                MPICommand::Match { name, dob, address, phone } => {
+                    handlers_mpi::handle_mpi_match(name, dob, address, phone)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MPI match failed: {}", e))?;
+                    Ok(())
+                }
+                MPICommand::Link { master_id, external_id, id_type } => {
+                    handlers_mpi::handle_mpi_link(master_id, external_id, id_type)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MPI link failed: {}", e))?;
+                    Ok(())
+                }
+                MPICommand::Merge { source_id, target_id, resolution_policy } => {
+                    handlers_mpi::handle_mpi_merge(source_id, target_id, resolution_policy)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MPI merge failed: {}", e))?;
+                    Ok(())
+                }
+                MPICommand::Audit { mpi_id, timeframe } => {
+                    handlers_mpi::handle_mpi_audit(mpi_id, timeframe)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))?;
+                    Ok(())
+                }
+            }
         }
         Commands::Patient(action) => {
             Ok(())

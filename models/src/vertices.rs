@@ -1,10 +1,13 @@
+// models/src/vertices.rs
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use bincode::{Encode, Decode};
+use chrono::{DateTime, Utc};
 
 use crate::{
     identifiers::{Identifier, SerializableUuid},
     properties::PropertyValue,
+    timestamp::BincodeDateTime,  // <-- ADD THIS LINE
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -12,23 +15,32 @@ pub struct Vertex {
     pub id: SerializableUuid,
     pub label: Identifier,
     pub properties: HashMap<String, PropertyValue>,
+
+    // Changed to our wrapper
+    pub created_at: BincodeDateTime,
+    pub updated_at: BincodeDateTime,
 }
 
 impl Vertex {
     pub fn new(label: Identifier) -> Self {
-        use uuid::Uuid;
+        let now = Utc::now().into();  // <-- .into() converts to BincodeDateTime
         Vertex {
-            id: SerializableUuid(Uuid::new_v4()),
+            id: SerializableUuid(uuid::Uuid::new_v4()),
             label,
             properties: HashMap::new(),
+            created_at: now,
+            updated_at: now,
         }
     }
 
     pub fn new_with_id(id: impl Into<SerializableUuid>, label: Identifier) -> Self {
+        let now = Utc::now().into();
         Vertex {
             id: id.into(),
             label,
             properties: HashMap::new(),
+            created_at: now,
+            updated_at: now,
         }
     }
 

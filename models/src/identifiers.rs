@@ -1,3 +1,4 @@
+
 use core::{hash::Hash, ops::Deref};
 use std::{cmp::Ordering, fmt, str::FromStr};
 
@@ -254,3 +255,4 @@ impl EdgeId {
         EdgeId(id)
     }
 }
+

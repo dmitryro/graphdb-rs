@@ -65,7 +65,7 @@ impl Address {
         }
 
         // The id field is of type SerializableUuid, convert to Uuid.
-        let id = vertex.id.clone().into();
+        let id: Uuid = vertex.id.into();
 
         // get_property returns Option<&str>.
         let address_line1 = vertex.get_property("address_line1")?.to_string();

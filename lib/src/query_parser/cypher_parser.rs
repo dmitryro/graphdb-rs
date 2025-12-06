@@ -2597,6 +2597,8 @@ pub async fn execute_cypher(
                                 id: new_id,
                                 label: Identifier::new(final_label)?,
                                 properties: props?,
+                                created_at: Utc::now().into(),  
+                                updated_at: Utc::now().into(),   
                             };
                             storage.create_vertex(vertex.clone()).await?;
                             var_to_id.insert(v.clone(), new_id);
@@ -2719,6 +2721,8 @@ pub async fn execute_cypher(
                 id: SerializableUuid(Uuid::new_v4()),
                 label: Identifier::new(label)?,
                 properties: props,
+                created_at: Utc::now().into(),   
+                updated_at: Utc::now().into(), 
             };
             storage.create_vertex(v.clone()).await?;
             Ok(json!({ "vertex": v }))
@@ -2735,6 +2739,8 @@ pub async fn execute_cypher(
                     id: SerializableUuid(Uuid::new_v4()),
                     label: Identifier::new(label)?,
                     properties: props?,
+                    created_at: Utc::now().into(),   
+                    updated_at: Utc::now().into(),  
                 };
                 storage.create_vertex(vertex.clone()).await?;
                 created_vertices.push(vertex);
@@ -2832,6 +2838,8 @@ pub async fn execute_cypher(
                     id: new_id,
                     label: Identifier::new(final_label)?,
                     properties: props?,
+                    created_at: Utc::now().into(),
+                    updated_at: Utc::now().into(),  
                 };
                 storage.create_vertex(vertex.clone()).await?;
                 
@@ -2941,6 +2949,8 @@ pub async fn execute_cypher(
                     id: new_id,
                     label: Identifier::new(final_label)?,
                     properties: props?,
+                    created_at: Utc::now().into(),  
+                    updated_at: Utc::now().into(),  
                 };
                 storage.create_vertex(vertex.clone()).await?;
                 

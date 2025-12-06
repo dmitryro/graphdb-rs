@@ -276,7 +276,12 @@ pub enum CommandType {
     Emerg(EmergCommand),
     Timing(TimingCommand),
     Schedule(ScheduleCommand),
-    Resus(ResusCommand)
+    Resus(ResusCommand),
+
+    // =========================================================================
+    // Master Patient Index
+    // =========================================================================
+    Mpi(MPICommand), 
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -1181,6 +1186,64 @@ pub enum LabFlag {
     CriticalHigh,
     Abnormal,
     Normal,
+}
+
+// --- MASTER PATIENT INDEX COMMANDS ---
+#[derive(Subcommand, Debug, PartialEq, Clone,)]
+/// Commands for Master Patient Index (MPI) operations, including matching, linking, and merging patient identities.
+pub enum MPICommand {
+    /// Runs probabilistic matching logic to find potential duplicate patient records.
+    /// 
+    Match {
+        /// Patient's full name (required for probabilistic match)
+        #[arg(long)]
+        name: String,
+        /// Patient's date of birth (YYYY-MM-DD)
+        #[arg(long)]
+        dob: String,
+        /// Patient's address (street/city/zip) for identity comparison
+        #[arg(long)]
+        address: String,
+        /// Optional: Patient's phone number for higher match certainty
+        #[arg(long)]
+        phone: Option<String>,
+    },
+
+    /// Explicitly links an external identifier (e.g., foreign MRN) to an existing master MPI record.
+    Link {
+        /// The canonical MPI ID to link to
+        #[arg(long)]
+        master_id: String,
+        /// The external ID value (e.g., "98765")
+        #[arg(long)]
+        external_id: String,
+        /// The type of external ID (e.g., "ForeignMRN", "SSN", "Passport")
+        #[arg(long)]
+        id_type: String,
+    },
+
+    /// Merges a duplicate patient record (source-id) into the master record (target-id).
+    Merge {
+        /// The ID of the duplicate record to be consolidated and retired
+        #[arg(long)]
+        source_id: String,
+        /// The ID of the canonical master record that will remain active
+        #[arg(long)]
+        target_id: String,
+        /// Policy for data resolution (e.g., "Latest", "SourceWins", "TargetWins")
+        #[arg(long)]
+        resolution_policy: String,
+    },
+
+    /// Retrieves the immutable audit log for all identity changes (links, merges, demographics) for an MPI record.
+    Audit {
+        /// The MPI ID to audit
+        #[arg(long)]
+        mpi_id: String,
+        /// Optional: Timeframe to filter the audit log (e.g., "30d", "2024-01-01..2024-06-30")
+        #[arg(long)]
+        timeframe: Option<String>,
+    },
 }
 
 // =========================================================================
@@ -3250,7 +3313,13 @@ pub enum Commands {
     #[clap(subcommand)]
     Shcedule(ScheduleCommand),
     #[clap(subcommand)]
-    Resus(ResusCommand)
+    Resus(ResusCommand),
+
+    // =========================================================================
+    // Master Patient Index
+    // =========================================================================
+    #[clap(subcommand)]
+    Mpi(MPICommand), 
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -3877,5 +3946,6 @@ pub fn get_command_string(command: &CommandType) -> String {
         CommandType::Timing(_) => "timing".to_string(),
         CommandType::Triage(_) => "triage".to_string(),
         CommandType::Vitals(_) => "vitals".to_string(),
+        CommandType::Mpi(_) => "mpi".to_string(),
     }
 }
