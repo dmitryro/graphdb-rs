@@ -104,7 +104,6 @@ These commands are the foundation for managing patient visits, records, and orde
 |         |                                  | `link:` `--master-id`, `--external-id`, `--id-type`          |                       |
 |         |                                  | `merge:` `--source-id`, `--target-id`, `--resolution-policy` |                       |
 |         |                                  | `audit:` `--mpi-id`, `[--timeframe]`                         |                       |
-
 | **problem** | `add`, `update`, `resolve`, `list` | `patient_id`, `problem`, `--icd10`, `--severity`, `--onset-date` | Active and Resolved Patient Problems |
 | **prescription** | `add`, `checkinteractions`, `update` | `encounter_id`, `med_name`, `dose`, `--refills`, `--route`, `--duration` | Medication Ordering and Safety Checks |
 | **note** | `add`, `list` | `patient_id`, `author_id`, `text`, `--note-type` | Clinical Documentation and Charting |
