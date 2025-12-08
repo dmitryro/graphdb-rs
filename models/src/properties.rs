@@ -1,3 +1,4 @@
+
 // models/src/properties.rs
 use crate::{edges::Edge, identifiers::Identifier, json::Json, vertices::Vertex};
 use serde::{Deserialize, Serialize};
@@ -165,3 +166,4 @@ impl EdgePropertyUpdate {
         Self { edge, property, value }
     }
 }
+

@@ -102,7 +102,7 @@ pub use crate::storage_engine::mysql_storage::MySQLStorage;
 
 pub static CLEANUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static GLOBAL_STORAGE_ENGINE_MANAGER: OnceCell<Arc<AsyncStorageEngineManager>> = OnceCell::const_new();
-
+pub static GLOBAL_STORAGE_ENGINE: OnceCell<Arc<dyn GraphStorageEngine + Send + Sync>> = OnceCell::const_new();
 #[cfg(feature = "with-sled")]
 pub static SLED_SINGLETON: TokioMutex<Option<Arc<SledStorage>>> = TokioMutex::const_new(None);
 #[cfg(feature = "with-rocksdb")]

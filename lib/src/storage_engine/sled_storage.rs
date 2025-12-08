@@ -62,7 +62,7 @@ type TxError = sled::transaction::TransactionError<GraphError>;
 
 /// Initialise the global SLED_DB singleton exactly once.
 /// After this call every later `SLED_DB.get()` will succeed.
-async fn init_sled_db_singleton(db: Arc<sled::Db>, path: PathBuf) -> Result<(), GraphError> {
+pub async fn init_sled_db_singleton(db: Arc<sled::Db>, path: PathBuf) -> Result<(), GraphError> {
     SLED_DB
         .get_or_init(|| async {
             TokioMutex::new(SledDbWithPath { db, path, client: None })

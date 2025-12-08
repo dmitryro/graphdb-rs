@@ -22,45 +22,49 @@ pub struct PatientService {
 }
 
 impl PatientService {
-    /// Initialise global singleton
+    /// Initialize global singleton
     pub async fn global_init() -> Result<(), &'static str> {
         let service = Arc::new(Self {
             patients: Arc::new(RwLock::new(HashMap::new())),
         });
-
+        
         // 1. preload existing patients
         let graph_service = GraphService::get().await;
-        {
-            let graph = graph_service.get_graph().await; // ← &Graph
-            let mut patients = service.patients.write().await;
-            for vertex in graph.vertices.values() {
-                if vertex.label.as_ref() == "Patient" {
-                    if let Some(patient) = Patient::from_vertex(vertex) {
-                        patients.insert(vertex.id.0, patient);
+        
+        if let Ok(gs) = &graph_service {
+            {
+                let graph = gs.get_graph().await; // ← &Graph
+                let mut patients = service.patients.write().await;
+                for vertex in graph.vertices.values() {
+                    if vertex.label.as_ref() == "Patient" {
+                        if let Some(patient) = Patient::from_vertex(vertex) {
+                            patients.insert(vertex.id.0, patient);
+                        }
                     }
                 }
             }
+            
+            // 2. register observer
+            let service_clone = service.clone();
+            let gs_clone = gs.clone();
+            
+            tokio::spawn(async move {
+                let _ = gs_clone
+                    .add_vertex_observer(move |vertex| {
+                        if vertex.label.as_ref() == "Patient" {
+                            let vertex = vertex.clone();
+                            let svc = service_clone.clone();
+                            tokio::spawn(async move {
+                                if let Some(patient) = Patient::from_vertex(&vertex) {
+                                    svc.add_patient(patient).await;
+                                }
+                            });
+                        }
+                    })
+                    .await;
+            });
         }
-
-        // 2. register observer
-        let service_clone = service.clone();
-        tokio::spawn(async move {
-            graph_service
-                .add_vertex_observer(move |vertex| {
-                    if vertex.label.as_ref() == "Patient" {
-                        let vertex = vertex.clone();
-                        let svc = service_clone.clone();
-                        tokio::spawn(async move {
-                            if let Some(patient) = Patient::from_vertex(&vertex) {
-                                svc.add_patient(patient).await;
-                            }
-                        });
-                    }
-                })
-                .await
-                .expect("observer registration failed");
-        });
-
+        
         PATIENT_SERVICE.set(service).map_err(|_| "PatientService already initialized")
     }
 

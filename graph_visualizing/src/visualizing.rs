@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::Duration;
 use std::collections::BTreeMap;
-
+use chrono::Utc;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -83,6 +83,8 @@ impl TryFrom<GraphJson> for Graph {
                 id: SerializableUuid(uuid),
                 label,
                 properties: props,
+                created_at: Utc::now().into(),  
+                updated_at: Utc::now().into(),   
             };
             graph.add_vertex(vertex);
         }

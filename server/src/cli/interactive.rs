@@ -28,7 +28,9 @@ use crate::cli::help_display::{
 };
 use crate::cli::handlers_history::{
     self,
+    resolve_history_user, 
 };
+use crate::cli::handlers_mpi::{ self, MPIHandlers };
 use crate::cli::handlers_utils::{parse_show_command, get_current_time_nanos};
 pub use lib::config::{StorageEngineType};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
@@ -42,7 +44,63 @@ pub struct SharedState {
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
     query_engine: Arc<TokioMutex<Option<Arc<QueryExecEngine>>>>,
+    pub mpi_handlers: Arc<TokioMutex<Option<MPIHandlers>>>,  // Add this line
 }
+
+
+impl SharedState {
+    pub fn new() -> Self {
+        Self {
+            daemon_handles: Arc::new(TokioMutex::new(HashMap::new())),
+            rest_api_shutdown_tx_opt: Arc::new(TokioMutex::new(None)),
+            rest_api_port_arc: Arc::new(TokioMutex::new(None)),
+            rest_api_handle: Arc::new(TokioMutex::new(None)),
+            storage_daemon_shutdown_tx_opt: Arc::new(TokioMutex::new(None)),
+            storage_daemon_handle: Arc::new(TokioMutex::new(None)),
+            storage_daemon_port_arc: Arc::new(TokioMutex::new(None)),
+            query_engine: Arc::new(TokioMutex::new(None)),
+            mpi_handlers: Arc::new(TokioMutex::new(None)),  // Add this line
+        }
+    }
+
+    /// Initialize MPI handlers if not already initialized (lazy loading)
+    pub async fn ensure_mpi_handlers(&self) -> Result<(), models::errors::GraphError> {
+        let mut handlers_guard = self.mpi_handlers.lock().await;
+        
+        if handlers_guard.is_none() {
+            println!("Initializing MPI service...");
+            match MPIHandlers::new().await {
+                Ok(handlers) => {
+                    *handlers_guard = Some(handlers);
+                    println!("✓ MPI service initialized");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to initialize MPI service: {}", e);
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Synchronously retrieves the initialized MPI handlers.
+    /// FIX: Changed the return type from the alias `MpiHandlersArc` to the concrete type `Arc<MPIHandlers>`
+    /// to resolve the E0412 scope error.
+    pub async fn get_mpi_handlers(&self) -> Option<Arc<MPIHandlers>> {
+        let handlers_guard = self.mpi_handlers.lock().await;
+        // The MpiHandlers struct needs to be Clone to be returned this way.
+        handlers_guard.as_ref().map(|h| Arc::new(h.clone())) 
+    }
+}
+
+impl Default for SharedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 
 // === Levenshtein distance for fuzzy matching ===
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
@@ -2931,7 +2989,207 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 _ => CommandType::Unknown,
             }
         },
-
+        "mpi" => {
+            let mut name: Option<String> = None;
+            let mut dob: Option<String> = None;
+            let mut address: Option<String> = None;
+            let mut phone: Option<String> = None;
+            let mut master_id: Option<String> = None;
+            let mut external_id: Option<String> = None;
+            let mut id_type: Option<String> = None;
+            let mut source_id: Option<String> = None;
+            let mut target_id: Option<String> = None;
+            let mut resolution_policy: Option<String> = None;
+            let mut mpi_id: Option<String> = None;
+            let mut timeframe: Option<String> = None;
+            
+            let mut current_subcommand_index = 0;
+            let mut explicit_subcommand: Option<String> = None;
+            
+            if !remaining_args.is_empty() {
+                match remaining_args[0].to_lowercase().as_str() {
+                    "match" | "link" | "merge" | "audit" => {
+                        explicit_subcommand = Some(remaining_args[0].to_lowercase());
+                        current_subcommand_index = 1;
+                    }
+                    _ => { current_subcommand_index = 0; }
+                }
+            }
+            
+            let mut i = current_subcommand_index;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--name" => {
+                        if i + 1 < remaining_args.len() {
+                            name = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--dob" => {
+                        if i + 1 < remaining_args.len() {
+                            dob = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--address" => {
+                        if i + 1 < remaining_args.len() {
+                            address = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--phone" => {
+                        if i + 1 < remaining_args.len() {
+                            phone = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--master-id" => {
+                        if i + 1 < remaining_args.len() {
+                            master_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--external-id" => {
+                        if i + 1 < remaining_args.len() {
+                            external_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--id-type" => {
+                        if i + 1 < remaining_args.len() {
+                            id_type = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--source-id" => {
+                        if i + 1 < remaining_args.len() {
+                            source_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--target-id" => {
+                        if i + 1 < remaining_args.len() {
+                            target_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--resolution-policy" => {
+                        if i + 1 < remaining_args.len() {
+                            resolution_policy = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--mpi-id" => {
+                        if i + 1 < remaining_args.len() {
+                            mpi_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--timeframe" => {
+                        if i + 1 < remaining_args.len() {
+                            timeframe = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        eprintln!("Warning: Unknown argument for 'mpi': {}", remaining_args[i]);
+                        i += 1;
+                    }
+                }
+            }
+            
+            match explicit_subcommand.as_deref() {
+                Some("match") => {
+                    if let (Some(n), Some(d), Some(a)) = (name, dob, address) {
+                        CommandType::Mpi(MPICommand::Match {
+                            name: n,
+                            dob: d,
+                            address: a,
+                            phone,
+                        })
+                    } else {
+                        eprintln!("Error: 'mpi match' requires --name, --dob, and --address");
+                        CommandType::Unknown
+                    }
+                }
+                Some("link") => {
+                    if let (Some(m), Some(e), Some(t)) = (master_id, external_id, id_type) {
+                        CommandType::Mpi(MPICommand::Link {
+                            master_id: m,
+                            external_id: e,
+                            id_type: t,
+                        })
+                    } else {
+                        eprintln!("Error: 'mpi link' requires --master-id, --external-id, and --id-type");
+                        CommandType::Unknown
+                    }
+                }
+                Some("merge") => {
+                    if let (Some(s), Some(t), Some(r)) = (source_id, target_id, resolution_policy) {
+                        CommandType::Mpi(MPICommand::Merge {
+                            source_id: s,
+                            target_id: t,
+                            resolution_policy: r,
+                        })
+                    } else {
+                        eprintln!("Error: 'mpi merge' requires --source-id, --target-id, and --resolution-policy");
+                        CommandType::Unknown
+                    }
+                }
+                Some("audit") => {
+                    if let Some(m) = mpi_id {
+                        CommandType::Mpi(MPICommand::Audit {
+                            mpi_id: m,
+                            timeframe,
+                        })
+                    } else {
+                        eprintln!("Error: 'mpi audit' requires --mpi-id");
+                        CommandType::Unknown
+                    }
+                }
+                None => {
+                    eprintln!("Error: 'mpi' requires a subcommand: match, link, merge, or audit");
+                    CommandType::Unknown
+                }
+                _ => CommandType::Unknown,
+            }
+        }
         "triage" => {
             if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "assess" {
                 eprintln!("Usage: triage assess --encounter <uuid> --level <ESI1-5> --complaint <text> [--symptoms] [--pain-score] [--notes]");
@@ -8016,12 +8274,14 @@ pub async fn handle_interactive_command(
             let history_action = action.unwrap_or_else(|| {
                 HistoryCommand::List(HistoryListArgs {
                     filters: HistoryFilterArgs {
-                        user: None,
+                        // CRITICAL: Keep None here so `resolve_history_user` can fill it
+                        // for query commands, but preserve None for clear/stats (all users)
+                        user: None, 
                         since: None,
                         until: None,
                         command_type: None,
                         status: None,
-                        limit: usize::MAX, // FIX: Set limit to MAX to retrieve all records when 'history' is run without arguments.
+                        limit: usize::MAX, // Retrieve all records when 'history' is run without arguments
                         display: HistoryDisplayArgs {
                             full_command: false,
                             verbose: false,
@@ -8033,7 +8293,14 @@ pub async fn handle_interactive_command(
                 })
             });
             
-            handlers::handle_history_command_interactive(history_action).await
+            // RESOLUTION STEP: Resolve the user field to the system username if needed.
+            // For query commands (list, search, etc.): None → current user
+            // For clear/stats commands: None → all users (preserved as None)
+            let final_history_action = resolve_history_user(history_action);
+            
+            // INTERACTIVE HANDLER: Contains specific logic for handling commands like 'clear'
+            // by checking if confirmation is needed when --force is not provided.
+            handlers::handle_history_command_interactive(final_history_action).await
         }
         CommandType::SaveStorage => {
             handlers::handle_save_storage().await;
@@ -8224,6 +8491,61 @@ pub async fn handle_interactive_command(
             let engine = ensure_query_engine(state).await?;
             crate::cli::handlers_index::handle_index_command(action).await?;
             Ok(())
+        }
+        // Add this match arm to the CommandType match in interactive.rs
+        CommandType::Mpi(mpi_command) => {
+            // 1. Ensure the MPI handlers are initialized (lazy initialization).
+            state.ensure_mpi_handlers().await.map_err(|e| anyhow::anyhow!("MPI service initialization failed: {:?}", e))?;
+            
+            // FIX: Removed the incorrect logging wrapper.
+            println!("[INFO] Executing interactive MPI subcommand: {:?}", mpi_command);
+
+            // FIX: Retrieve the entire state field (Arc<TokioMutex<Option<MPIHandlers>>>)
+            // and pass it directly to the handlers to satisfy the type requirement.
+            let mpi_handlers_state = state.mpi_handlers.clone();
+
+            match mpi_command {
+                MPICommand::Match { name, dob, address, phone } => {
+                    handlers_mpi::handle_mpi_match_interactive(
+                        name,
+                        dob,
+                        address,
+                        phone,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI match failed: {}", e))
+                }
+                MPICommand::Link { master_id, external_id, id_type } => {
+                    handlers_mpi::handle_mpi_link_interactive(
+                        master_id,
+                        external_id,
+                        id_type,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI link failed: {}", e))
+                }
+                MPICommand::Merge { source_id, target_id, resolution_policy } => {
+                    handlers_mpi::handle_mpi_merge_interactive(
+                        source_id,
+                        target_id,
+                        resolution_policy,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI merge failed: {}", e))
+                }
+                MPICommand::Audit { mpi_id, timeframe } => {
+                    handlers_mpi::handle_mpi_audit_interactive(
+                        mpi_id,
+                        timeframe,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))
+                }
+            }
         }
         CommandType::Patient(command) => {
             Ok(())
@@ -8429,14 +8751,15 @@ pub async fn run_cli_interactive(
     handlers::print_welcome_screen();
 
     let state = SharedState {
-        daemon_handles,
-        rest_api_shutdown_tx_opt,
-        rest_api_port_arc,
-        rest_api_handle,
-        storage_daemon_shutdown_tx_opt,
-        storage_daemon_handle,
-        storage_daemon_port_arc,
+        daemon_handles: Arc::new(TokioMutex::new(HashMap::new())),
+        rest_api_shutdown_tx_opt: Arc::new(TokioMutex::new(None)),
+        rest_api_port_arc: Arc::new(TokioMutex::new(None)),
+        rest_api_handle: Arc::new(TokioMutex::new(None)),
+        storage_daemon_shutdown_tx_opt: Arc::new(TokioMutex::new(None)),
+        storage_daemon_handle: Arc::new(TokioMutex::new(None)),
+        storage_daemon_port_arc: Arc::new(TokioMutex::new(None)),
         query_engine: Arc::new(TokioMutex::new(None)),
+        mpi_handlers: Arc::new(TokioMutex::new(None)),  // Add this line
     };
 
     loop {
