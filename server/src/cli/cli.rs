@@ -30,6 +30,7 @@ use lib::config::{
     DEFAULT_STORAGE_CONFIG_PATH_HYBRID,
     load_cli_config
 };
+use lib::storage_engine::{ GraphStorageEngine, GLOBAL_STORAGE_ENGINE };
 use lib::config as config_mod;
 use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::cli::daemon_management;
@@ -60,6 +61,7 @@ use crate::cli::handlers_mpi::{ self, MPIHandlers };
 use crate::cli::handlers_history::{
     self,
     handle_history_command,
+    resolve_history_user,
 };
 use crate::cli::handlers_visualizing::{
     self,
@@ -548,6 +550,61 @@ fn stop_wrapper(
         Ok(result)
     })
 }
+
+
+/// Retrieves the global, shared instance of the GraphStorageEngine.
+/// Initializes the entire storage and daemon layer if it has not been initialized yet.
+///
+/// Requires the interactive start/stop functions to trigger initialization if needed.
+/// Retrieves the globally set persistent storage engine instance, initializing it 
+/// via the full storage flow if it hasn't been set yet.
+pub async fn get_storage_engine_singleton() -> Result<Arc<dyn GraphStorageEngine>> {
+    // Singleton mutex to prevent multiple simultaneous initializations
+    static INIT_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
+    
+    // Acquire the initialization guard to prevent race conditions
+    let _guard = INIT_MUTEX.lock().await;
+    
+    // 1. Verify if the engine is already initialized to avoid expensive calls.
+    if let Some(engine) = GLOBAL_STORAGE_ENGINE.get() {
+        info!("Reusing existing GLOBAL_STORAGE_ENGINE. Initialization skipped.");
+        return Ok(engine.clone());
+    }
+    
+    // 2. Define start and stop adapters to wrap the futures in Pin<Box<dyn Future + Send>>
+    // These closures do not capture any variables, so they can be coerced to fn pointers
+    let start_fn: StartStorageFn = |port: Option<u16>,
+                                    config_file: Option<PathBuf>,
+                                    new_config: Option<StorageConfig>,
+                                    flag: Option<String>,
+                                    shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+                                    daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+                                    daemon_port_arc: Arc<TokioMutex<Option<u16>>>| {
+        Box::pin(start_storage_interactive(port, config_file, new_config, flag, shutdown_tx, daemon_handle, daemon_port_arc))
+    };
+    let stop_fn: StopStorageFn = |port: Option<u16>,
+                                  shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+                                  daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+                                  daemon_port_arc: Arc<TokioMutex<Option<u16>>>| {
+        Box::pin(stop_storage_interactive(port, shutdown_tx, daemon_handle, daemon_port_arc))
+    };
+    
+    // 3. Run the full initialization flow
+    info!("Engine not found. Calling initialize_storage_for_query...");
+    let _query_exec_engine = initialize_storage_for_query(
+        start_fn,
+        stop_fn
+    ).await?;
+    
+    info!("Successfully initialized storage via initialize_storage_for_query.");
+    
+    // 4. Retrieve the newly set global engine instance
+    Ok(GLOBAL_STORAGE_ENGINE
+        .get()
+        .context("Initialization succeeded but failed to set GLOBAL_STORAGE_ENGINE")?
+        .clone())
+}
+
 
 /// This function implements the singleton pattern for the QueryExecEngine.
 /// It ensures that the QueryExecEngine is initialized only once, even with concurrent access.
@@ -1261,11 +1318,14 @@ pub async fn run_single_command(
         Commands::History { action } => {
             info!("Executing History command: {:?}", action);
             println!("===> Executing History command: {:?}", action);
-           
+            
+            // 1. Determine the action to execute (default to List if None)
             let history_action = action.unwrap_or_else(|| {
+                // Default to 'history list'. The 'user' field MUST be None here
+                // so that `resolve_history_user` can inject the system username.
                 HistoryCommand::List(HistoryListArgs {
                     filters: HistoryFilterArgs {
-                        user: None,
+                        user: None, 
                         since: None,
                         until: None,
                         command_type: None,
@@ -1281,37 +1341,53 @@ pub async fn run_single_command(
                     },
                 })
             });
-           
-            handlers_history::handle_history_command(history_action).await?;
+            
+            // 2. Resolve the user field for the determined action using whoami
+            // NOTE: For 'clear' and 'stats', None user means "all users"
+            // For 'list/search/etc', None user gets replaced with current user
+            let final_history_action = resolve_history_user(history_action);
+            
+            // 3. Hand off the final, resolved command to the handler
+            handlers_history::handle_history_command(final_history_action).await?;
             Ok(())
         }
         Commands::Mpi(mpi_command) => {
+            // Get storage engine singleton
+            let storage: Arc<dyn GraphStorageEngine> = get_storage_engine_singleton()
+                .await
+                .context("Cannot execute MPI command: Storage engine singleton is not initialized.")?;
+
+            info!("Executing MPI subcommand: {:?}", mpi_command);
+
+            // Execute the MPI command - handlers now expect Arc by value (not &Arc)
             match mpi_command {
                 MPICommand::Match { name, dob, address, phone } => {
-                    handlers_mpi::handle_mpi_match(name, dob, address, phone)
+                    handlers_mpi::handle_mpi_match(storage.clone(), name, dob, address, phone)
                         .await
                         .map_err(|e| anyhow::anyhow!("MPI match failed: {}", e))?;
-                    Ok(())
                 }
+
                 MPICommand::Link { master_id, external_id, id_type } => {
-                    handlers_mpi::handle_mpi_link(master_id, external_id, id_type)
+                    handlers_mpi::handle_mpi_link(storage.clone(), master_id, external_id, id_type)
                         .await
                         .map_err(|e| anyhow::anyhow!("MPI link failed: {}", e))?;
-                    Ok(())
                 }
+
                 MPICommand::Merge { source_id, target_id, resolution_policy } => {
-                    handlers_mpi::handle_mpi_merge(source_id, target_id, resolution_policy)
+                    handlers_mpi::handle_mpi_merge(storage.clone(), source_id, target_id, resolution_policy)
                         .await
                         .map_err(|e| anyhow::anyhow!("MPI merge failed: {}", e))?;
-                    Ok(())
                 }
+
                 MPICommand::Audit { mpi_id, timeframe } => {
-                    handlers_mpi::handle_mpi_audit(mpi_id, timeframe)
+                    handlers_mpi::handle_mpi_audit(storage.clone(), mpi_id, timeframe)
                         .await
                         .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))?;
-                    Ok(())
                 }
             }
+
+            info!("MPI command successfully executed");
+            Ok(())
         }
         Commands::Patient(action) => {
             Ok(())

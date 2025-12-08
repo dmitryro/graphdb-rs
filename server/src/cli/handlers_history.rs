@@ -1,9 +1,8 @@
-// lib/src/handlers/handlers_history.rs
-
 use anyhow::{Result, Context, anyhow};
 use log::{info, error};
 use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc, Duration as ChronoDuration};
+use whoami;
 
 use lib::commands::{
     HistoryCommand, HistoryListArgs, HistoryTopTailArgs, HistoryWindowArgs,
@@ -28,14 +27,65 @@ pub async fn handle_history_command(command: HistoryCommand) -> Result<()> {
         HistoryCommand::Top(args) | HistoryCommand::Tail(args) => handle_top_tail(service, args).await,
         HistoryCommand::Window(args) => handle_window(service, args).await,
         HistoryCommand::Search { keyword, filters } => handle_search(service, keyword, filters).await,
+        // Non-interactive clear: requires --force or aborts with a message
         HistoryCommand::Clear { user, force } => handle_clear(service, user, force).await,
         HistoryCommand::Stats { by, user } => handle_stats(service, by, user).await,
     }
 }
 
+// ============================================================================
+// FILE: handlers_history.rs - Complete handle_history_command_interactive
+// ============================================================================
+
+/// Main dispatch function for all 'history' commands in an interactive shell.
+/// This differs from the non-interactive handler by prompting for confirmation
+/// on destructive operations like 'clear' when --force is not provided.
 pub async fn handle_history_command_interactive(command: HistoryCommand) -> Result<()> {
-    handle_history_command(command).await;
-    Ok(())
+    let service = GLOBAL_HISTORY_SERVICE.get().await;
+
+    match command {
+        HistoryCommand::Clear { user, force } => {
+            if force {
+                // If --force is passed, execute the clear immediately without confirmation
+                handle_clear(service, user, true).await
+            } else {
+                // INTERACTIVE CONFIRMATION LOGIC
+                let target_description = match &user {
+                    Some(username) => format!("user '{}'", username),
+                    None => "ALL USERS".to_string(),
+                };
+                
+                println!("⚠️  WARNING: This operation will permanently delete history records for: {}", target_description);
+                println!("Do you want to proceed? (yes/no)");
+
+                // Read user input from stdin
+                use std::io::{self, BufRead};
+                let stdin = io::stdin();
+                let mut line = String::new();
+                
+                match stdin.lock().read_line(&mut line) {
+                    Ok(_) => {
+                        let response = line.trim().to_lowercase();
+                        if response == "yes" || response == "y" {
+                            // User confirmed - proceed with clear
+                            println!("Proceeding with history clear...");
+                            handle_clear(service, user, true).await
+                        } else {
+                            // User declined - abort
+                            println!("❌ Operation cancelled by user.");
+                            Ok(())
+                        }
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to read input: {}. Operation cancelled.", e);
+                        Ok(())
+                    }
+                }
+            }
+        }
+        // For all other commands, delegate to the non-interactive handler
+        _ => handle_history_command(command).await,
+    }
 }
 
 // --- Helper Functions for Time Parsing and Filtering ---
@@ -205,23 +255,37 @@ async fn handle_search(
 }
 
 /// Handles the `history clear` command.
+// ============================================================================
+// PART 2: Fix handle_clear to properly handle None user (all users)
+// FILE: handlers_history.rs
+// ============================================================================
+
+/// Handles the `history clear` command.
 async fn handle_clear(service: &HistoryService, user: Option<String>, force: bool) -> Result<()> {
     if !force {
+        // This is the non-interactive abort path.
         println!("WARNING: This operation will permanently delete history records.");
         println!("Use the --force flag to confirm. Aborting clear operation.");
         return Ok(());
     }
 
+    // CRITICAL FIX: If user is None, we're clearing ALL history
+    let target_description = match &user {
+        Some(username) => format!("user '{}'", username),
+        None => "ALL USERS".to_string(),
+    };
+
+    println!("⚠️  CLEARING HISTORY FOR: {}", target_description);
+
     let filter = HistoryFilter {
-        user,
-        // If user is None, it clears all history (based on service logic).
+        user, // If None, clear all; if Some(user), clear only that user
         ..Default::default()
     };
 
     let count = service.clear_history(filter).await
         .context("Failed to clear history records")?;
 
-    println!("✅ Successfully cleared {} history records.", count);
+    println!("✅ Successfully cleared {} history records for {}.", count, target_description);
     Ok(())
 }
 
@@ -345,18 +409,18 @@ async fn format_and_print_results(
                 } else {
                     let max_len = col_widths.5 - 1;
                     if meta.command.len() > max_len {
-                        format!("{}...", &meta.command[..max_len - 3])
+                        format!("{}...", &meta.command[..max_len.saturating_sub(3)])
                     } else {
                         meta.command.clone()
                     }
                 };
 
                 print!("{:<5} {:<15} {:<10} {:<20} {:<15.3} ", 
-                       meta.id, 
-                       meta.user, 
-                       format!("{:?}", meta.status), 
-                       start_dt_utc.to_rfc3339(), 
-                       duration 
+                        meta.id, 
+                        meta.user, 
+                        format!("{:?}", meta.status), 
+                        start_dt_utc.to_rfc3339(), 
+                        duration 
                 );
                 
                 // Print command (not space-padded to allow full length in the final column)
@@ -367,7 +431,7 @@ async fn format_and_print_results(
                         println!("  - ERROR: {}", msg);
                     }
                     if let Some(port) = meta.port {
-                         println!("  - PORT: {}", port);
+                            println!("  - PORT: {}", port);
                     }
                     println!("  - SERVICE: {}", meta.service_type);
                     println!("{:-<150}", ""); // Separator for verbose entry
@@ -393,4 +457,65 @@ pub async fn save_history_metadata(metadata: HistoryMetadata) -> Result<()> {
     // Use the cloned command string for logging to avoid the E0382 error.
     info!("History metadata saved successfully: {}", command_clone);
     Ok(())
+}
+
+// ============================================================================
+// PART 1: Fix resolve_history_user to NOT inject user for clear/stats when None
+// FILE: handlers_history.rs
+// ============================================================================
+
+/// Helper function to set the default user (current system user) if None is provided
+/// in the HistoryCommand variants that require it.
+/// 
+/// IMPORTANT: For `Clear` and `Stats` commands, if user is None, it means "all users"
+/// and should NOT be replaced with current_user.
+pub fn resolve_history_user(action: HistoryCommand) -> HistoryCommand {
+    // Get the current system username once to use as the meaningful default.
+    let current_user = whoami::username(); 
+
+    match action {
+        // For LIST/SEARCH/TOP/TAIL/WINDOW: Default to current user for filtering
+        HistoryCommand::List(mut args) => {
+            if args.filters.user.is_none() {
+                args.filters.user = Some(current_user);
+            }
+            HistoryCommand::List(args)
+        },
+        HistoryCommand::Search { keyword, mut filters } => {
+            if filters.user.is_none() {
+                filters.user = Some(current_user);
+            }
+            HistoryCommand::Search { keyword, filters }
+        },
+        HistoryCommand::Top(mut args) => {
+            if args.filters.user.is_none() {
+                args.filters.user = Some(current_user);
+            }
+            HistoryCommand::Top(args)
+        },
+        HistoryCommand::Tail(mut args) => {
+            if args.filters.user.is_none() {
+                args.filters.user = Some(current_user);
+            }
+            HistoryCommand::Tail(args)
+        },
+        HistoryCommand::Window(mut args) => {
+            if args.filters.user.is_none() {
+                args.filters.user = Some(current_user);
+            }
+            HistoryCommand::Window(args)
+        },
+        
+        // CRITICAL FIX: For Clear and Stats, None means "all users" - DO NOT replace
+        HistoryCommand::Clear { user, force } => {
+            // If user explicitly passed None, keep it as None (means all users)
+            // If user passed Some(username), keep that specific user
+            HistoryCommand::Clear { user, force }
+        },
+        HistoryCommand::Stats { by, user } => {
+            // If user explicitly passed None, keep it as None (means all users)
+            // If user passed Some(username), keep that specific user
+            HistoryCommand::Stats { by, user }
+        },
+    }
 }

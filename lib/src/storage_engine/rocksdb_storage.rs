@@ -68,6 +68,17 @@ pub const ROCKSDB_COLUMN_FAMILIES: &[&str] = &[
     METADATA_CF,
 ];
 
+/// Initialise the global SLED_DB singleton exactly once.
+/// After this call every later `SLED_DB.get()` will succeed.
+pub async fn init_rocksdb_db_singleton(db: Arc<DB>, path: PathBuf) -> Result<(), GraphError> {
+    ROCKSDB_DB
+        .get_or_init(|| async {
+            TokioMutex::new(RocksDBWithPath { db, path, client: None })
+        })
+        .await;
+    Ok(())
+}
+
 impl RocksDBStorage {
     // Enhanced singleton protection that allows reuse within the same process
     pub async fn ensure_single_instance(path: &Path) -> GraphResult<()> {

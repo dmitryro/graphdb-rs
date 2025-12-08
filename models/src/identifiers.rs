@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::errors::{ValidationError, ValidationResult, GraphError, GraphResult};
 
-#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SerializableUuid(pub Uuid);
 
@@ -72,7 +72,7 @@ impl From<SerializableUuid> for Uuid {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SerializableInternString(pub Intern<String>);
 
@@ -127,7 +127,7 @@ impl fmt::Display for SerializableInternString {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Encode)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize, Encode)]
 pub struct Identifier(pub SerializableInternString);
 
 impl<CTX> Decode<CTX> for Identifier {

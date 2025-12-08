@@ -79,52 +79,54 @@ impl ClinicalEncounterService {
 
             tokio::spawn(async move {
                 let service = service_clone;
-
-                // Vertex observers
-                let _ = graph_service.add_vertex_observer({
-                    let service = service.clone();
-                    move |vertex| {
-                        let vertex = vertex.clone();
+                
+                if let Ok(gs) = graph_service.clone() {
+                    // Vertex observers
+                    let _ = gs.add_vertex_observer({
                         let service = service.clone();
-                        tokio::spawn(async move {
-                            match vertex.label.as_ref() {
-                                "Encounter" => {
-                                    if let Some(encounter) = Encounter::from_vertex(&vertex) {
-                                        service.on_encounter_added(encounter, vertex.id.0).await;
+                        move |vertex| {
+                            let vertex = vertex.clone();
+                            let service = service.clone();
+                            tokio::spawn(async move {
+                                match vertex.label.as_ref() {
+                                    "Encounter" => {
+                                        if let Some(encounter) = Encounter::from_vertex(&vertex) {
+                                            service.on_encounter_added(encounter, vertex.id.0).await;
+                                        }
                                     }
-                                }
-                                "Diagnosis" => {
-                                    if let Some(diagnosis) = Diagnosis::from_vertex(&vertex) {
-                                        service.on_diagnosis_added(diagnosis).await;
+                                    "Diagnosis" => {
+                                        if let Some(diagnosis) = Diagnosis::from_vertex(&vertex) {
+                                            service.on_diagnosis_added(diagnosis).await;
+                                        }
                                     }
-                                }
-                                "Prescription" => {
-                                    if let Some(rx) = Prescription::from_vertex(&vertex) {
-                                        service.on_prescription_added(rx).await;
+                                    "Prescription" => {
+                                        if let Some(rx) = Prescription::from_vertex(&vertex) {
+                                            service.on_prescription_added(rx).await;
+                                        }
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
-                            }
-                        });
-                    }
-                }).await;
+                            });
+                        }
+                    }).await;
 
-                // Edge observers
-                let _ = graph_service.add_edge_observer({
-                    let service = service.clone();
-                    move |edge| {
-                        let edge = edge.clone();
+                    // Edge observers
+                    let _ = gs.add_edge_observer({
                         let service = service.clone();
-                        tokio::spawn(async move {
-                            match edge.edge_type.as_ref() {
-                                "HAS_ENCOUNTER" => service.on_has_encounter_edge(&edge).await,
-                                "HAS_DIAGNOSIS" => service.on_has_diagnosis_edge(&edge).await,
-                                "TAKES_MEDICATION" => service.on_takes_medication_edge(&edge).await,
-                                _ => {}
-                            }
-                        });
-                    }
-                }).await;
+                        move |edge| {
+                            let edge = edge.clone();
+                            let service = service.clone();
+                            tokio::spawn(async move {
+                                match edge.edge_type.as_ref() {
+                                    "HAS_ENCOUNTER" => service.on_has_encounter_edge(&edge).await,
+                                    "HAS_DIAGNOSIS" => service.on_has_diagnosis_edge(&edge).await,
+                                    "TAKES_MEDICATION" => service.on_takes_medication_edge(&edge).await,
+                                    _ => {}
+                                }
+                            });
+                        }
+                    }).await;
+                }
             });
         }
 
@@ -162,17 +164,20 @@ impl ClinicalEncounterService {
 
         let vertex = encounter.to_vertex();
         let graph_service = GraphService::get().await;
-        graph_service.add_vertex(vertex.clone()).await.unwrap();
-        graph_service.add_edge(Edge::new(
-            patient_id,
-            Identifier::new("HAS_ENCOUNTER".to_string()).unwrap(),
-            vertex.id.0,
-        )).await.unwrap();
-        graph_service.add_edge(Edge::new(
-            doctor_id,
-            Identifier::new("PROVIDES_CARE_IN".to_string()).unwrap(),
-            vertex.id.0,
-        )).await.unwrap();
+        
+        if let Ok(gs) = graph_service.clone() {
+            gs.add_vertex(vertex.clone()).await.unwrap();
+            gs.add_edge(Edge::new(
+                patient_id,
+                Identifier::new("HAS_ENCOUNTER".to_string()).unwrap(),
+                vertex.id.0,
+            )).await.unwrap();
+            gs.add_edge(Edge::new(
+                doctor_id,
+                Identifier::new("PROVIDES_CARE_IN".to_string()).unwrap(),
+                vertex.id.0,
+            )).await.unwrap();
+        }
 
         encounter
     }
@@ -189,12 +194,15 @@ impl ClinicalEncounterService {
 
         let vertex = diagnosis.to_vertex();
         let graph_service = GraphService::get().await;
-        graph_service.add_vertex(vertex.clone()).await.unwrap();
-        graph_service.add_edge(Edge::new(
-            encounter_id,
-            Identifier::new("HAS_DIAGNOSIS".to_string()).unwrap(),
-            vertex.id.0,
-        )).await.unwrap();
+        
+        if let Ok(gs) = graph_service.clone() {
+            gs.add_vertex(vertex.clone()).await.unwrap();
+            gs.add_edge(Edge::new(
+                encounter_id,
+                Identifier::new("HAS_DIAGNOSIS".to_string()).unwrap(),
+                vertex.id.0,
+            )).await.unwrap();
+        }
 
         diagnosis
     }
@@ -220,19 +228,22 @@ impl ClinicalEncounterService {
 
         let vertex = rx.to_vertex();
         let graph_service = GraphService::get().await;
-        graph_service.add_vertex(vertex.clone()).await.unwrap();
-        graph_service.add_edge(Edge::new(
-            encounter_id,
-            Identifier::new("HAS_PRESCRIPTION".to_string()).unwrap(),
-            vertex.id.0,
-        )).await.unwrap();
+        
+        if let Ok(gs) = graph_service.clone() {
+            gs.add_vertex(vertex.clone()).await.unwrap();
+            gs.add_edge(Edge::new(
+                encounter_id,
+                Identifier::new("HAS_PRESCRIPTION".to_string()).unwrap(),
+                vertex.id.0,
+            )).await.unwrap();
 
-        let patient_id = self.patient_id_from_encounter(encounter_id).await;
-        graph_service.add_edge(Edge::new(
-            patient_id,
-            Identifier::new("TAKES_MEDICATION".to_string()).unwrap(),
-            vertex.id.0,
-        )).await.unwrap();
+            let patient_id = self.patient_id_from_encounter(encounter_id).await;
+            gs.add_edge(Edge::new(
+                patient_id,
+                Identifier::new("TAKES_MEDICATION".to_string()).unwrap(),
+                vertex.id.0,
+            )).await.unwrap();
+        }
 
         rx
     }
@@ -257,52 +268,62 @@ impl ClinicalEncounterService {
 
     async fn on_diagnosis_added(&self, diagnosis: Diagnosis) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        if let Some(edge) = graph.incoming_edges(&Uuid::from_u128(diagnosis.id as u128))
-            .find(|e| e.edge_type.as_ref() == "HAS_DIAGNOSIS")
-        {
-            let mut problems = self.active_problems.write().await;
-            problems.entry(edge.outbound_id.0).or_default().push(diagnosis);
+        if let Ok(gs) = graph_service.clone() {
+            let graph = gs.read().await;
+            if let Some(edge) = graph.incoming_edges(&Uuid::from_u128(diagnosis.id as u128))
+                .find(|e| e.edge_type.as_ref() == "HAS_DIAGNOSIS")
+            {
+                let mut problems = self.active_problems.write().await;
+                problems.entry(edge.outbound_id.0).or_default().push(diagnosis);
+            }
         }
     }
 
     async fn on_prescription_added(&self, rx: Prescription) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        if let Some(edge) = graph.incoming_edges(&Uuid::from_u128(rx.id as u128))
-            .find(|e| e.edge_type.as_ref() == "TAKES_MEDICATION")
-        {
-            let mut meds = self.current_medications.write().await;
-            meds.entry(edge.outbound_id.0).or_default().push(rx);
+        if let Ok(gs) = graph_service.clone() {
+            let graph = gs.read().await;
+            if let Some(edge) = graph.incoming_edges(&Uuid::from_u128(rx.id as u128))
+                .find(|e| e.edge_type.as_ref() == "TAKES_MEDICATION")
+            {
+                let mut meds = self.current_medications.write().await;
+                meds.entry(edge.outbound_id.0).or_default().push(rx);
+            }
         }
     }
 
     async fn on_has_encounter_edge(&self, edge: &Edge) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
-            if let Some(encounter) = Encounter::from_vertex(vertex) {
-                self.on_encounter_added(encounter, edge.inbound_id.0).await;
+        if let Ok(gs) = graph_service.clone() {
+            let graph = gs.read().await;
+            if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
+                if let Some(encounter) = Encounter::from_vertex(vertex) {
+                    self.on_encounter_added(encounter, edge.inbound_id.0).await;
+                }
             }
         }
     }
 
     async fn on_has_diagnosis_edge(&self, edge: &Edge) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
-            if let Some(diagnosis) = Diagnosis::from_vertex(vertex) {
-                self.on_diagnosis_added(diagnosis).await;
+        if let Ok(gs) = graph_service.clone() {
+            let graph = gs.read().await;
+            if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
+                if let Some(diagnosis) = Diagnosis::from_vertex(vertex) {
+                    self.on_diagnosis_added(diagnosis).await;
+                }
             }
         }
     }
 
     async fn on_takes_medication_edge(&self, edge: &Edge) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
-            if let Some(rx) = Prescription::from_vertex(vertex) {
-                self.on_prescription_added(rx).await;
+        if let Ok(gs) = graph_service.clone() {
+            let graph = gs.read().await;
+            if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
+                if let Some(rx) = Prescription::from_vertex(vertex) {
+                    self.on_prescription_added(rx).await;
+                }
             }
         }
     }
@@ -328,18 +349,30 @@ impl ClinicalEncounterService {
     // Helper methods
     async fn patient_id_from_encounter(&self, encounter_id: Uuid) -> Uuid {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        graph.incoming_edges(&encounter_id)
-            .find_map(|e| if e.edge_type.as_ref() == "HAS_ENCOUNTER" { Some(e.outbound_id.0) } else { None })
-            .unwrap_or_default()
+        if let Ok(gs) = graph_service.clone() {
+            let graph = gs.read().await;
+            return graph.incoming_edges(&encounter_id)
+                .find_map(|e| if e.edge_type.as_ref() == "HAS_ENCOUNTER" { 
+                    Some(e.outbound_id.0) 
+                } else { 
+                    None 
+                })
+                .unwrap_or_default();
+        }
+        Uuid::default()
     }
 
     async fn doctor_for_encounter(&self, encounter_id: Uuid) -> Option<Doctor> {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        graph.incoming_edges(&encounter_id)
-            .find_map(|e| if e.edge_type.as_ref() == "PROVIDES_CARE_IN" {
-                graph.get_vertex(&e.outbound_id.0).and_then(|v| Doctor::from_vertex(v))
-            } else { None })
+        if let Ok(gs) = graph_service.clone() {
+            let graph = gs.read().await;
+            return graph.incoming_edges(&encounter_id)
+                .find_map(|e| if e.edge_type.as_ref() == "PROVIDES_CARE_IN" {
+                    graph.get_vertex(&e.outbound_id.0).and_then(|v| Doctor::from_vertex(v))
+                } else { 
+                    None 
+                });
+        }
+        None
     }
 }

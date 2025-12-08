@@ -1,5 +1,3 @@
-// lib/src/history/history_service.rs
-
 use anyhow::Result;
 use serde_json;
 use std::path::PathBuf;
@@ -14,21 +12,18 @@ use sled::{Db, IVec, Config};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::history::history_types::{HistoryMetadata, HistoryFilter, HistoryStatus, ImprovedSledPool,};
+
 // --- History Service Specific Configuration ---
 
-// Placeholder path, similar to DAEMON_REGISTRY_DB_PATH
-const HISTORY_REGISTRY_DB_PATH: &str = "history_registry_db"; 
+const HISTORY_REGISTRY_DB_PATH: &str = "history_registry_db";
 const HISTORY_FALLBACK_FILE: &str = "history_registry_fallback.json";
 
 // --- NonBlockingHistoryRegistry ---
 
 #[derive(Clone)]
 pub struct NonBlockingHistoryRegistry {
-    // Stores history metadata temporarily and for quick access before persistence
     memory_store: Arc<RwLock<HashMap<u64, HistoryMetadata>>>,
-    // Persistent storage, wrapped in an RwLock and Option for non-blocking init
     storage: Arc<RwLock<Option<ImprovedSledPool>>>,
-    // Tracks the next available history ID
     next_id: Arc<RwLock<u64>>,
     config: Arc<RegistryConfig>,
     background_tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
@@ -83,7 +78,6 @@ impl NonBlockingHistoryRegistry {
         let max_concurrent = self.config.max_concurrent_ops;
 
         let task = tokio::spawn(async move {
-            // NOTE: Assuming ImprovedSledPool is available or defined in a common scope
             match ImprovedSledPool::new(db_path.clone(), max_concurrent).await {
                 Ok(pool) => {
                     let mut storage_guard = storage.write().await;
@@ -106,7 +100,6 @@ impl NonBlockingHistoryRegistry {
         let mut max_id = 0;
         
         if let Some(pool) = &*storage_guard {
-            // Load from Sled first if available
             let all_sled_entries = pool.iter_all().await?;
             for (_, encoded_value) in all_sled_entries {
                 let metadata: HistoryMetadata = decode_from_slice(&encoded_value, config::standard())?.0;
@@ -114,10 +107,7 @@ impl NonBlockingHistoryRegistry {
                 memory.insert(metadata.id, metadata);
             }
             info!("Loaded {} history entries from Sled", memory.len());
-        } 
-        // Use Self:: and pass the required PathBuf argument
-        else if let Ok(data) = Self::load_from_fallback(&self.config.fallback_file).await {
-            // Fallback to JSON file if Sled isn't ready
+        } else if let Ok(data) = Self::load_from_fallback(&self.config.fallback_file).await {
             for metadata in data {
                 max_id = max_id.max(metadata.id);
                 memory.insert(metadata.id, metadata);
@@ -137,7 +127,6 @@ impl NonBlockingHistoryRegistry {
 
         let task = tokio::spawn(async move {
             loop {
-                // Batch changes every 1 second
                 tokio::time::sleep(Duration::from_secs(1)).await;
 
                 let memory = memory_store.read().await;
@@ -146,9 +135,8 @@ impl NonBlockingHistoryRegistry {
 
                 let storage_guard = storage.read().await;
                 if let Some(pool) = &*storage_guard {
-                    // This performs a full sync, an optimized version would only sync new/changed items
                     for metadata in &all_metadata {
-                        let key = metadata.id.to_be_bytes().to_vec(); // Use ID as key
+                        let key = metadata.id.to_be_bytes().to_vec();
                         match encode_to_vec(metadata, config::standard()) {
                             Ok(encoded) => {
                                 if let Err(e) = pool.insert(&key, &encoded).await {
@@ -165,7 +153,6 @@ impl NonBlockingHistoryRegistry {
 
                 let _ = Self::save_fallback_file(&fallback_file, &all_metadata).await;
 
-                // Sync interval
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
@@ -186,12 +173,10 @@ impl NonBlockingHistoryRegistry {
         };
         metadata.id = id;
         
-        // 1. Update in-memory store
         let mut memory = self.memory_store.write().await;
         memory.insert(id, metadata.clone());
         drop(memory);
         
-        // 2. Persist to Sled immediately (synchronously awaited task)
         let storage = self.storage.clone();
         let metadata_clone = metadata.clone();
         
@@ -209,7 +194,6 @@ impl NonBlockingHistoryRegistry {
         });
         task.await??;
         
-        // 3. Update fallback file in background (will be picked up by sync task)
         info!("Registered history entry {}", id);
         Ok(())
     }
@@ -220,37 +204,28 @@ impl NonBlockingHistoryRegistry {
         let mut results: Vec<HistoryMetadata> = memory.values().cloned().collect();
         drop(memory);
 
-        // Apply filtering logic
         results.retain(|m| {
-            // User filter
             if let Some(ref user) = filter.user {
                 if m.user != *user { return false; }
             }
-            // Status filter
             if let Some(ref status) = filter.status {
                 if m.status != *status { return false; }
             }
-            // Since filter
             if let Some(since) = filter.since_nanos {
                 if m.start_time_nanos < since { return false; }
             }
-            // Until filter
             if let Some(until) = filter.until_nanos {
                 if m.start_time_nanos > until { return false; }
             }
-            // Keyword filter
             if let Some(ref keyword) = filter.keyword {
                 if !m.command.contains(keyword) { return false; }
             }
             true
         });
         
-        // Sort results (default: by time descending)
-        // This is a simple in-memory sort; for large history, this should be done by Sled/DB queries.
         results.sort_by_key(|m| m.start_time_nanos);
-        results.reverse(); // Newest first
+        results.reverse();
 
-        // Apply offset and limit (pagination)
         let start = filter.offset.min(results.len());
         let end = (filter.offset + filter.limit).min(results.len());
         
@@ -258,63 +233,182 @@ impl NonBlockingHistoryRegistry {
     }
 
     /// Clears history entries based on a filter or entirely.
+    /// CRITICAL FIX: Now performs SYNCHRONOUS disk removal to ensure persistence.
+    /// If filter.user is None, this clears ALL users' history.
     pub async fn clear_history(&self, filter: HistoryFilter) -> Result<usize> {
+        println!("===> CLEAR_HISTORY: Starting clear operation");
+        println!("===> CLEAR_HISTORY: filter.user = {:?}", filter.user);
+        
         let mut memory = self.memory_store.write().await;
-        let initial_count = memory.len();
-        let mut to_remove = Vec::new();
+        let mut to_remove_ids = Vec::new();
 
-        // 1. Identify IDs to remove (reusing filtering logic)
+        // 1. Identify IDs to remove
         for metadata in memory.values() {
             let mut matches = true;
+            
+            // CRITICAL: User filter - if None, match ALL users
             if let Some(ref user) = filter.user {
-                if metadata.user != *user { matches = false; }
-            }
-            // Add other filter checks here...
-
-            if matches {
-                to_remove.push(metadata.id);
-            }
-        }
-        
-        // If no filters were specified, clear all
-        if filter == HistoryFilter::default() || to_remove.len() == initial_count {
-            memory.clear();
-            to_remove.clear();
-            to_remove.extend(0..initial_count as u64); // Indicate all should be cleared from disk
-        } else {
-            for id in &to_remove {
-                memory.remove(id);
-            }
-        }
-        let removed_count = initial_count - memory.len();
-        drop(memory);
-
-        // 2. Remove from Sled in the background
-        let storage = self.storage.clone();
-        let fallback_file = self.config.fallback_file.clone();
-        let memory_store = self.memory_store.clone();
-        
-        tokio::spawn(async move {
-            let storage_guard = storage.read().await;
-            if let Some(pool) = &*storage_guard {
-                for id in &to_remove {
-                    let key = id.to_be_bytes().to_vec();
-                    let _ = pool.remove(&key).await;
+                if metadata.user != *user { 
+                    matches = false; 
                 }
             }
-            drop(storage_guard);
             
-            // Re-save fallback file
-            let memory = memory_store.read().await;
-            let all_metadata: Vec<_> = memory.values().cloned().collect();
-            let _ = Self::save_fallback_file(&fallback_file, &all_metadata).await;
-        });
+            if let Some(ref status) = filter.status {
+                if metadata.status != *status { matches = false; }
+            }
+            if let Some(since) = filter.since_nanos {
+                if metadata.start_time_nanos < since { matches = false; }
+            }
+            if let Some(until) = filter.until_nanos {
+                if metadata.start_time_nanos > until { matches = false; }
+            }
+            if let Some(ref keyword) = filter.keyword {
+                if !metadata.command.contains(keyword) { matches = false; }
+            }
 
-        info!("Cleared {} history entries", removed_count);
+            if matches {
+                to_remove_ids.push(metadata.id);
+            }
+        }
+        
+        println!("===> CLEAR_HISTORY: Found {} records to remove from memory", to_remove_ids.len());
+        
+        // 2. Remove identified IDs from memory
+        let removed_count = to_remove_ids.len();
+        for id in &to_remove_ids {
+            memory.remove(id);
+        }
+        
+        println!("===> CLEAR_HISTORY: Removed {} records from memory", removed_count);
+        
+        // Get remaining records for fallback save
+        let remaining_metadata: Vec<_> = memory.values().cloned().collect();
+        println!("===> CLEAR_HISTORY: {} records remaining in memory", remaining_metadata.len());
+        
+        drop(memory); // Release lock before disk I/O
+
+        // 3. CRITICAL FIX: Remove from Sled SYNCHRONOUSLY (no spawn!)
+        let storage = self.storage.clone();
+        let ids_for_disk_removal = to_remove_ids.clone();
+        
+        println!("===> CLEAR_HISTORY: Starting Sled removal");
+        let storage_guard = storage.read().await;
+        if let Some(pool) = &*storage_guard {
+            println!("===> CLEAR_HISTORY: Removing {} records from Sled", ids_for_disk_removal.len());
+            let mut sled_remove_count = 0;
+            for id in &ids_for_disk_removal {
+                let key = id.to_be_bytes().to_vec();
+                match pool.remove(&key).await {
+                    Ok(_) => {
+                        sled_remove_count += 1;
+                    },
+                    Err(e) => {
+                        warn!("Failed to remove history entry {} from Sled: {}", id, e);
+                    }
+                }
+            }
+            println!("===> CLEAR_HISTORY: Successfully removed {} records from Sled", sled_remove_count);
+        } else {
+            println!("===> CLEAR_HISTORY: No Sled pool available, skipping Sled removal");
+        }
+        drop(storage_guard);
+        
+        // 4. CRITICAL FIX: Save fallback file SYNCHRONOUSLY (no spawn!)
+        println!("===> CLEAR_HISTORY: Saving {} remaining records to fallback file", remaining_metadata.len());
+        let fallback_file = self.config.fallback_file.clone();
+        match Self::save_fallback_file(&fallback_file, &remaining_metadata).await {
+            Ok(_) => {
+                println!("===> CLEAR_HISTORY: Fallback file saved successfully at {:?}", fallback_file);
+            },
+            Err(e) => {
+                error!("Failed to save fallback file at {:?}: {}", fallback_file, e);
+                return Err(anyhow::anyhow!("Failed to persist clear operation to disk: {}", e));
+            }
+        }
+
+        info!("Cleared {} history entries (logical AND physical removal complete)", removed_count);
+        println!("===> CLEAR_HISTORY: Operation completed successfully");
         Ok(removed_count)
     }
 
-    // --- Utility Methods (Copied/Adapted from DaemonRegistry) ---
+    /// Clears all in-memory history, resets the next ID counter,
+    /// and physically deletes the persistent Sled database and fallback file.
+    /// This should only be called when explicit `--force` is used for a clean command.
+    pub async fn force_cleanup_db(&self) -> Result<()> {
+        info!("Initiating forced history cleanup: clearing memory, resetting ID, and deleting persistent store.");
+        println!("===> FORCE_CLEANUP_DB: Starting forced cleanup");
+        
+        // 1. Clear in-memory state
+        let mut memory = self.memory_store.write().await;
+        let record_count = memory.len();
+        memory.clear();
+        drop(memory);
+        println!("===> FORCE_CLEANUP_DB: Cleared {} records from memory", record_count);
+
+        let mut next_id = self.next_id.write().await;
+        *next_id = 0;
+        drop(next_id);
+        println!("===> FORCE_CLEANUP_DB: Reset next_id to 0");
+
+        // 2. Stop and drop background tasks (sync)
+        let mut tasks = self.background_tasks.write().await;
+        println!("===> FORCE_CLEANUP_DB: Stopping {} background tasks", tasks.len());
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+        drop(tasks);
+        
+        // 3. Close and drop Sled pool BEFORE deleting files
+        {
+            let mut storage_guard = self.storage.write().await;
+            *storage_guard = None;
+            println!("===> FORCE_CLEANUP_DB: Closed Sled pool");
+        }
+        
+        // Give the OS time to release file handles
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // 4. Physically delete the Sled database directory
+        let db_path = self.config.db_path.clone();
+        if db_path.exists() {
+            println!("===> FORCE_CLEANUP_DB: Deleting Sled directory at {:?}", db_path);
+            match fs::remove_dir_all(&db_path).await {
+                Ok(_) => {
+                    info!("Successfully deleted Sled history database directory at {:?}", db_path);
+                    println!("===> FORCE_CLEANUP_DB: Sled directory deleted successfully");
+                }
+                Err(e) => {
+                    error!("Failed to delete Sled history database directory at {:?}: {}", db_path, e);
+                    println!("===> FORCE_CLEANUP_DB: WARNING - Failed to delete Sled directory: {}", e);
+                }
+            }
+        } else {
+            println!("===> FORCE_CLEANUP_DB: Sled directory doesn't exist at {:?}", db_path);
+        }
+
+        // 5. Delete the fallback file
+        let fallback_file = self.config.fallback_file.clone();
+        if fallback_file.exists() {
+            println!("===> FORCE_CLEANUP_DB: Deleting fallback file at {:?}", fallback_file);
+            match fs::remove_file(&fallback_file).await {
+                Ok(_) => {
+                    info!("Successfully deleted history fallback file at {:?}", fallback_file);
+                    println!("===> FORCE_CLEANUP_DB: Fallback file deleted successfully");
+                }
+                Err(e) => {
+                    error!("Failed to delete history fallback file at {:?}: {}", fallback_file, e);
+                    println!("===> FORCE_CLEANUP_DB: WARNING - Failed to delete fallback file: {}", e);
+                }
+            }
+        } else {
+            println!("===> FORCE_CLEANUP_DB: Fallback file doesn't exist at {:?}", fallback_file);
+        }
+
+        println!("===> FORCE_CLEANUP_DB: Forced cleanup completed");
+        Ok(())
+    }
+
+    // --- Utility Methods ---
 
     async fn load_from_fallback(file_path: &PathBuf) -> Result<Vec<HistoryMetadata>> {
         if !file_path.exists() {
@@ -382,6 +476,10 @@ impl HistoryService {
         self.inner.clear_history(filter).await
     }
     
+    pub async fn force_cleanup_db(&self) -> Result<()> {
+        self.inner.force_cleanup_db().await
+    }
+    
     pub async fn close(&self) -> Result<()> {
         self.inner.close().await
     }
@@ -409,8 +507,6 @@ impl HistoryServiceWrapper {
             .await
     }
 
-    // Proxy methods for easy access
-
     pub async fn register_entry(&self, metadata: HistoryMetadata) -> Result<()> {
         self.get().await.register_entry(metadata).await
     }
@@ -423,10 +519,13 @@ impl HistoryServiceWrapper {
         self.get().await.clear_history(filter).await
     }
     
+    pub async fn force_cleanup_db(&self) -> Result<()> {
+        self.get().await.force_cleanup_db().await
+    }
+    
     pub async fn close(&self) -> Result<()> {
         self.get().await.close().await
     }
 }
 
-// The Global Singleton Instance
 pub static GLOBAL_HISTORY_SERVICE: HistoryServiceWrapper = HistoryServiceWrapper::new();

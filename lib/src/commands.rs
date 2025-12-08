@@ -356,12 +356,13 @@ pub enum HistoryCommand {
 
     /// Clears command history for a user or all history (DANGEROUS).
     Clear {
-        /// Specify user history to clear. Defaults to current user. Use 'ALL' to clear all history.
-        #[clap(long, short = 'u', value_name = "USERNAME")]
+        /// Optional: Clear history only for this specific user.
+        /// If not provided, clears history for ALL users.
+        #[arg(long, short = 'u')]
         user: Option<String>,
         
-        /// Force clear without confirmation.
-        #[clap(long)]
+        /// Required: Force clear without confirmation
+        #[arg(long, short = 'f')]
         force: bool,
     },
 

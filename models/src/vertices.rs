@@ -10,20 +10,21 @@ use crate::{
     timestamp::BincodeDateTime,  // <-- ADD THIS LINE
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Encode, Decode)]
+// FIX 1: Added 'Default' to the derive list.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Vertex {
     pub id: SerializableUuid,
     pub label: Identifier,
     pub properties: HashMap<String, PropertyValue>,
 
-    // Changed to our wrapper
     pub created_at: BincodeDateTime,
     pub updated_at: BincodeDateTime,
 }
 
 impl Vertex {
     pub fn new(label: Identifier) -> Self {
-        let now = Utc::now().into();  // <-- .into() converts to BincodeDateTime
+        // Note: The conversion from Utc::now() to BincodeDateTime uses .into()
+        let now = Utc::now().into();
         Vertex {
             id: SerializableUuid(uuid::Uuid::new_v4()),
             label,
@@ -64,11 +65,5 @@ impl Vertex {
                     _ => None,
                 }
             })
-    }
-}
-
-impl Default for Vertex {
-    fn default() -> Self {
-        Vertex::new(Identifier::new("Vertex".to_string()).unwrap())
     }
 }

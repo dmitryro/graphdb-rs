@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 // use uuid::Uuid;
 
 /// A directed, typed edge connecting two vertices.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize, Encode, Decode)]
 pub struct Edge {
     /// Auto-generated unique ID for the edge.
     pub id: SerializableUuid,

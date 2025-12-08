@@ -28,6 +28,7 @@ use crate::cli::help_display::{
 };
 use crate::cli::handlers_history::{
     self,
+    resolve_history_user, 
 };
 use crate::cli::handlers_mpi::{ self, MPIHandlers };
 use crate::cli::handlers_utils::{parse_show_command, get_current_time_nanos};
@@ -82,6 +83,15 @@ impl SharedState {
         } else {
             Ok(())
         }
+    }
+
+    /// Synchronously retrieves the initialized MPI handlers.
+    /// FIX: Changed the return type from the alias `MpiHandlersArc` to the concrete type `Arc<MPIHandlers>`
+    /// to resolve the E0412 scope error.
+    pub async fn get_mpi_handlers(&self) -> Option<Arc<MPIHandlers>> {
+        let handlers_guard = self.mpi_handlers.lock().await;
+        // The MpiHandlers struct needs to be Clone to be returned this way.
+        handlers_guard.as_ref().map(|h| Arc::new(h.clone())) 
     }
 }
 
@@ -8264,12 +8274,14 @@ pub async fn handle_interactive_command(
             let history_action = action.unwrap_or_else(|| {
                 HistoryCommand::List(HistoryListArgs {
                     filters: HistoryFilterArgs {
-                        user: None,
+                        // CRITICAL: Keep None here so `resolve_history_user` can fill it
+                        // for query commands, but preserve None for clear/stats (all users)
+                        user: None, 
                         since: None,
                         until: None,
                         command_type: None,
                         status: None,
-                        limit: usize::MAX, // FIX: Set limit to MAX to retrieve all records when 'history' is run without arguments.
+                        limit: usize::MAX, // Retrieve all records when 'history' is run without arguments
                         display: HistoryDisplayArgs {
                             full_command: false,
                             verbose: false,
@@ -8281,7 +8293,14 @@ pub async fn handle_interactive_command(
                 })
             });
             
-            handlers::handle_history_command_interactive(history_action).await
+            // RESOLUTION STEP: Resolve the user field to the system username if needed.
+            // For query commands (list, search, etc.): None → current user
+            // For clear/stats commands: None → all users (preserved as None)
+            let final_history_action = resolve_history_user(history_action);
+            
+            // INTERACTIVE HANDLER: Contains specific logic for handling commands like 'clear'
+            // by checking if confirmation is needed when --force is not provided.
+            handlers::handle_history_command_interactive(final_history_action).await
         }
         CommandType::SaveStorage => {
             handlers::handle_save_storage().await;
@@ -8475,12 +8494,16 @@ pub async fn handle_interactive_command(
         }
         // Add this match arm to the CommandType match in interactive.rs
         CommandType::Mpi(mpi_command) => {
-            // Ensure MPI handlers are initialized before executing commands
-            if let Err(e) = state.ensure_mpi_handlers().await {
-                eprintln!("Failed to initialize MPI service: {}", e);
-                return Err(anyhow::anyhow!("MPI initialization failed: {}", e));
-            }
+            // 1. Ensure the MPI handlers are initialized (lazy initialization).
+            state.ensure_mpi_handlers().await.map_err(|e| anyhow::anyhow!("MPI service initialization failed: {:?}", e))?;
             
+            // FIX: Removed the incorrect logging wrapper.
+            println!("[INFO] Executing interactive MPI subcommand: {:?}", mpi_command);
+
+            // FIX: Retrieve the entire state field (Arc<TokioMutex<Option<MPIHandlers>>>)
+            // and pass it directly to the handlers to satisfy the type requirement.
+            let mpi_handlers_state = state.mpi_handlers.clone();
+
             match mpi_command {
                 MPICommand::Match { name, dob, address, phone } => {
                     handlers_mpi::handle_mpi_match_interactive(
@@ -8488,7 +8511,7 @@ pub async fn handle_interactive_command(
                         dob,
                         address,
                         phone,
-                        state.mpi_handlers.clone(),
+                        mpi_handlers_state, // Pass the required type
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI match failed: {}", e))
@@ -8498,7 +8521,7 @@ pub async fn handle_interactive_command(
                         master_id,
                         external_id,
                         id_type,
-                        state.mpi_handlers.clone(),
+                        mpi_handlers_state, // Pass the required type
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI link failed: {}", e))
@@ -8508,7 +8531,7 @@ pub async fn handle_interactive_command(
                         source_id,
                         target_id,
                         resolution_policy,
-                        state.mpi_handlers.clone(),
+                        mpi_handlers_state, // Pass the required type
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI merge failed: {}", e))
@@ -8517,7 +8540,7 @@ pub async fn handle_interactive_command(
                     handlers_mpi::handle_mpi_audit_interactive(
                         mpi_id,
                         timeframe,
-                        state.mpi_handlers.clone(),
+                        mpi_handlers_state, // Pass the required type
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))

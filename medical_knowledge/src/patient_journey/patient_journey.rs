@@ -1,3 +1,4 @@
+
 // medical_knowledge/src/patient_journey/patient_journey.rs
 //! Patient Journey Intelligence — Real-time, longitudinal care pathways
 
@@ -75,22 +76,24 @@ impl PatientJourneyService {
         // Build initial journeys
         {
             let graph_service = GraphService::get().await;
-            let graph = graph_service.read().await;
+            if let Ok(gs) = graph_service {
+                let graph = gs.read().await;
 
-            for vertex in graph.vertices.values() {
-                if vertex.label.as_ref() == "Patient" {
-                    if let Some(_patient) = Patient::from_vertex(vertex) {
-                        let patient_id = vertex.id.0;
-                        let mut journey = PatientJourney {
-                            patient_id,
-                            active_pathways: Vec::new(),
-                            completed_pathways: Vec::new(),
-                            deviations: Vec::new(),
-                            current_milestones: Vec::new(),
-                        };
+                for vertex in graph.vertices.values() {
+                    if vertex.label.as_ref() == "Patient" {
+                        if let Some(_patient) = Patient::from_vertex(vertex) {
+                            let patient_id = vertex.id.0;
+                            let mut journey = PatientJourney {
+                                patient_id,
+                                active_pathways: Vec::new(),
+                                completed_pathways: Vec::new(),
+                                deviations: Vec::new(),
+                                current_milestones: Vec::new(),
+                            };
 
-                        service.auto_start_pathways(&mut journey, &graph).await;
-                        service.journeys.write().await.insert(patient_id, journey);
+                            service.auto_start_pathways(&mut journey, &graph).await;
+                            service.journeys.write().await.insert(patient_id, journey);
+                        }
                     }
                 }
             }
@@ -100,29 +103,32 @@ impl PatientJourneyService {
         {
             let service_clone = service.clone();
             let graph_service = GraphService::get().await;
+            
             tokio::spawn(async move {
-                let mut graph = graph_service.write_graph().await;
-                let service = service_clone;
+                if let Ok(gs) = graph_service {
+                    let graph = gs.write_graph().await;
+                    let service = service_clone;
 
-                graph.on_vertex_added({
-                    let service = service.clone();
-                    move |vertex| {
-                        let vertex = vertex.clone();
+                    graph.on_vertex_added({
                         let service = service.clone();
-                        tokio::spawn(async move {
-                            if vertex.label.as_ref() == "Diagnosis" {
-                                if let Some(dx) = Diagnosis::from_vertex(&vertex) {
-                                    service.on_diagnosis_added(dx).await;
+                        move |vertex| {
+                            let vertex = vertex.clone();
+                            let service = service.clone();
+                            tokio::spawn(async move {
+                                if vertex.label.as_ref() == "Diagnosis" {
+                                    if let Some(dx) = Diagnosis::from_vertex(&vertex) {
+                                        service.on_diagnosis_added(dx).await;
+                                    }
                                 }
-                            }
-                            if vertex.label.as_ref() == "Encounter" {
-                                if let Some(enc) = Encounter::from_vertex(&vertex) {
-                                    service.on_encounter_updated(enc).await;
+                                if vertex.label.as_ref() == "Encounter" {
+                                    if let Some(enc) = Encounter::from_vertex(&vertex) {
+                                        service.on_encounter_updated(enc).await;
+                                    }
                                 }
-                            }
-                        });
-                    }
-                }).await;
+                            });
+                        }
+                    }).await;
+                }
             });
         }
 
@@ -203,51 +209,57 @@ impl PatientJourneyService {
 
     async fn on_diagnosis_added(&self, diagnosis: Diagnosis) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
+        
+        if let Ok(gs) = graph_service {
+            let graph = gs.read().await;
 
-        let patient_id = graph.incoming_edges(&Uuid::from_u128(diagnosis.id as u128))
-            .find_map(|e| if e.edge_type.as_ref() == "HAS_DIAGNOSIS" {
-                Some(e.outbound_id.0)
-            } else { None })
-            .unwrap_or(Uuid::nil());
+            let patient_id = graph.incoming_edges(&Uuid::from_u128(diagnosis.id as u128))
+                .find_map(|e| if e.edge_type.as_ref() == "HAS_DIAGNOSIS" {
+                    Some(e.outbound_id.0)
+                } else { None })
+                .unwrap_or(Uuid::nil());
 
-        if patient_id == Uuid::nil() {
-            return;
+            if patient_id == Uuid::nil() {
+                return;
+            }
+
+            let mut journeys = self.journeys.write().await;
+            let journey = journeys.entry(patient_id).or_insert_with(|| PatientJourney {
+                patient_id,
+                active_pathways: Vec::new(),
+                completed_pathways: Vec::new(),
+                deviations: Vec::new(),
+                current_milestones: Vec::new(),
+            });
+
+            self.auto_start_pathways(journey, &graph).await;
+            self.check_milestone_progress(journey, &diagnosis.description).await;
         }
-
-        let mut journeys = self.journeys.write().await;
-        let journey = journeys.entry(patient_id).or_insert_with(|| PatientJourney {
-            patient_id,
-            active_pathways: Vec::new(),
-            completed_pathways: Vec::new(),
-            deviations: Vec::new(),
-            current_milestones: Vec::new(),
-        });
-
-        self.auto_start_pathways(journey, &graph).await;
-        self.check_milestone_progress(journey, &diagnosis.description).await;
     }
 
     async fn on_encounter_updated(&self, encounter: Encounter) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
+        
+        if let Ok(gs) = graph_service {
+            let graph = gs.read().await;
 
-        let patient_id = graph.incoming_edges(&Uuid::from_u128(encounter.id as u128))
-            .find_map(|e| if e.edge_type.as_ref() == "HAS_ENCOUNTER" {
-                Some(e.outbound_id.0)
-            } else { None })
-            .unwrap_or(Uuid::nil());
+            let patient_id = graph.incoming_edges(&Uuid::from_u128(encounter.id as u128))
+                .find_map(|e| if e.edge_type.as_ref() == "HAS_ENCOUNTER" {
+                    Some(e.outbound_id.0)
+                } else { None })
+                .unwrap_or(Uuid::nil());
 
-        if patient_id == Uuid::nil() {
-            return;
-        }
+            if patient_id == Uuid::nil() {
+                return;
+            }
 
-        let mut journeys = self.journeys.write().await;
-        if let Some(journey) = journeys.get_mut(&patient_id) {
-            self.check_milestone_progress(journey, &encounter.encounter_type).await;
+            let mut journeys = self.journeys.write().await;
+            if let Some(journey) = journeys.get_mut(&patient_id) {
+                self.check_milestone_progress(journey, &encounter.encounter_type).await;
+            }
         }
     }
-
+    
     // =========================================================================
     // CORE LOGIC
     // =========================================================================
