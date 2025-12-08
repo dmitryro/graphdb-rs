@@ -57,28 +57,31 @@ impl FhirService {
             resources: Arc::new(RwLock::new(HashMap::new())),
             client: Arc::new(client),
         });
-
+        
         // Register observers for graph changes
         let service_clone = service.clone();
         let graph_service = GraphService::get().await;
+        
         tokio::spawn(async move {
-            let mut graph_lock = graph_service.write_graph().await;
-            let service = service_clone;
-
-            graph_lock.on_vertex_added({
-                let service = service.clone();
-                move |vertex| {
-                    let vertex = vertex.clone();
+            if let Ok(gs) = graph_service {
+                let mut graph_lock = gs.write_graph().await;
+                let service = service_clone;
+                
+                graph_lock.on_vertex_added({
                     let service = service.clone();
-                    tokio::spawn(async move {
-                        if let Some(fhir_json) = service.convert_to_fhir(&vertex).await {
-                            service.add_resource(Uuid::new_v4(), fhir_json).await;
-                        }
-                    });
-                }
-            }).await;
+                    move |vertex| {
+                        let vertex = vertex.clone();
+                        let service = service.clone();
+                        tokio::spawn(async move {
+                            if let Some(fhir_json) = service.convert_to_fhir(&vertex).await {
+                                service.add_resource(Uuid::new_v4(), fhir_json).await;
+                            }
+                        });
+                    }
+                }).await;
+            }
         });
-
+        
         FHIR_SERVICE.set(service).map_err(|_| "FHIRService already initialized")
     }
 
@@ -276,7 +279,7 @@ impl FhirService {
         if resource_type != "Patient" {
             return Err(format!("Unsupported FHIR resource type: {}", resource_type));
         }
-
+        
         let fhir_patient: FhirPatient = serde_json::from_value(fhir_json)
             .map_err(|e| format!("Failed to parse FHIR Patient: {}", e))?;
         
@@ -303,7 +306,7 @@ impl FhirService {
                 }
             }
         }
-
+        
         if let Some(gender) = &patient_inner.gender {
             let gender_str = match gender {
                 AdministrativeGender::Male => "MALE",
@@ -338,9 +341,12 @@ impl FhirService {
         vertex.add_property("updated_at", &now);
         vertex.add_property("patient_status", "ACTIVE");
         
+        // Add vertex to graph if GraphService is available
         let graph_service = GraphService::get().await;
-        let mut graph = graph_service.write_graph().await;
-        graph.add_vertex(vertex.clone());
+        if let Ok(gs) = graph_service {
+            let mut graph = gs.write_graph().await;
+            graph.add_vertex(vertex.clone());
+        }
         
         Ok(vertex)
     }

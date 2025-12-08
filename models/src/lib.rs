@@ -12,6 +12,7 @@ pub mod vertices;
 pub mod graph;
 pub mod errors;
 pub mod util;
+pub mod timestamp;
 
 // Declare the 'medical' sub-module
 pub mod medical;
@@ -25,7 +26,7 @@ pub mod medical;
 // and make it public. For now, to fix the compilation, it's removed.
 pub use vertices::Vertex; // Changed from `pub use vertices::{Node, Vertex};`
 // ---------------------------------
-
+pub use timestamp::*;
 pub use edges::Edge;
 pub use properties::{PropertyValue, PropertyMap};
 pub use identifiers::Identifier;

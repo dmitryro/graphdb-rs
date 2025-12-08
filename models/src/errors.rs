@@ -47,6 +47,8 @@ pub enum GraphError {
     LockError(String),
     #[error("System failure: {0}")]
     SystemError(String),
+    #[error("Runtime failure: {0}")]
+    RuntimeError(String),
     #[error("Feature not implemented: {0}")]
     NotImplemented(String),
     #[error("Entity already exists: {0}")]

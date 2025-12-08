@@ -77,49 +77,53 @@ impl SNOMEDKnowledgeService {
             child_index: Arc::new(RwLock::new(HashMap::new())),
             tag_index: Arc::new(RwLock::new(HashMap::new())),
         });
-
+        
         // Load all MedicalCode vertices
         {
             let graph_service = GraphService::get().await;
-            let graph = graph_service.read().await;
-
-            for vertex in graph.vertices.values() {
-                if vertex.label.as_ref() == "MedicalCode" {
-                    if let Some(code) = MedicalCode::from_vertex(vertex) {
-                        service.index_code(&code).await;
+            if let Ok(gs) = graph_service {
+                let graph = gs.read().await;
+                for vertex in graph.vertices.values() {
+                    if vertex.label.as_ref() == "MedicalCode" {
+                        if let Some(code) = MedicalCode::from_vertex(vertex) {
+                            service.index_code(&code).await;
+                        }
                     }
                 }
             }
         }
-
+        
         // Real-time validation observer
         {
             let service_clone = service.clone();
             let graph_service = GraphService::get().await;
+            
             tokio::spawn(async move {
-                let mut graph = graph_service.write_graph().await;
-                let service = service_clone;
-
-                graph.on_vertex_added({
-                    let service = service.clone();
-                    move |vertex| {
-                        let vertex = vertex.clone();
+                if let Ok(gs) = graph_service {
+                    let graph = gs.write_graph().await;
+                    let service = service_clone;
+                    
+                    graph.on_vertex_added({
                         let service = service.clone();
-                        tokio::spawn(async move {
-                            if vertex.label.as_ref() == "MedicalCode" {
-                                if let Some(code) = MedicalCode::from_vertex(&vertex) {
-                                    service.index_code(&code).await;
+                        move |vertex| {
+                            let vertex = vertex.clone();
+                            let service = service.clone();
+                            tokio::spawn(async move {
+                                if vertex.label.as_ref() == "MedicalCode" {
+                                    if let Some(code) = MedicalCode::from_vertex(&vertex) {
+                                        service.index_code(&code).await;
+                                    }
                                 }
-                            }
-                            if vertex.label.as_ref() == "Diagnosis" || vertex.label.as_ref() == "EdProcedure" {
-                                service.validate_clinical_code_usage(&vertex).await;
-                            }
-                        });
-                    }
-                }).await;
+                                if vertex.label.as_ref() == "Diagnosis" || vertex.label.as_ref() == "EdProcedure" {
+                                    service.validate_clinical_code_usage(&vertex).await;
+                                }
+                            });
+                        }
+                    }).await;
+                }
             });
         }
-
+        
         SNOMED_SERVICE
             .set(service)
             .map_err(|_| "SNOMEDKnowledgeService already initialized")

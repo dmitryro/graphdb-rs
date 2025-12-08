@@ -72,7 +72,8 @@ use lib::config::{StorageEngineType, StorageConfig as EngineStorageConfig, TikvC
                                   };
 use lib::storage_engine::{AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER, 
                           emergency_cleanup_storage_engine_manager,  SledStorage, RocksDBStorage, TikvStorage, 
-                          log_lock_file_diagnostics, SurrealdbGraphStorage};
+                          log_lock_file_diagnostics, SurrealdbGraphStorage, GLOBAL_STORAGE_ENGINE, 
+                          GraphStorageEngine};
 
 use lib::daemon::daemon_management::{
     is_port_free,
@@ -1120,6 +1121,29 @@ pub async fn start_storage_interactive(
     let pid = start_daemon_with_retry(target_port, &storage_cfg).await?;
     register_daemon(target_port, pid, &storage_cfg, &cfg_path).await?;
     initialise_storage_manager(target_port, &storage_cfg, &cfg_path, is_permanent, must_migrate).await?;
+
+    // -----------------------------------------------------------------
+    // STEP 11: POPULATE GLOBAL_STORAGE_ENGINE SINGLETON (SAFE + IDEMPOTENT)
+    // -----------------------------------------------------------------
+    let manager = GLOBAL_STORAGE_ENGINE_MANAGER
+        .get()
+        .context("Storage manager was not set after initialization.")?;
+
+    let storage_engine = manager.get_persistent_engine().await;
+
+    // Clone first to avoid move issues later (if you use it again)
+    let storage_engine_clone = storage_engine.clone();
+
+    GLOBAL_STORAGE_ENGINE
+        .get_or_try_init(|| async move {
+            Ok::<Arc<dyn GraphStorageEngine + Send + Sync>, std::convert::Infallible>(storage_engine_clone)
+        })
+        .await;
+
+    info!("GLOBAL_STORAGE_ENGINE singleton populated (idempotent async set).");
+    println!("===> GLOBAL_STORAGE_ENGINE SINGLETON POPULATED (IDEMPOTENT)");
+
+    // -----------------------------------------------------------------
     engine_specific_post_init(target_port, &storage_cfg).await?;
     finalise_startup(
         target_port,
@@ -1376,6 +1400,26 @@ pub async fn stop_storage_interactive(
             println!("===> WARNING: {}", msg);
             failed_ports.push(msg);
         }
+    }
+
+    // === AFTER CLEANUP: CLEAR GLOBAL_STORAGE_ENGINE IF NO DAEMONS LEFT ===
+    let remaining_storage_daemons = daemon_registry
+        .list_storage_daemons()
+        .await
+        .unwrap_or_default()
+        .len();
+
+    if remaining_storage_daemons == 0 {
+        // tokio::sync::OnceCell has no .take() — we cannot "clear" it safely
+        // Instead, we just log that it would be ideal to clear, but it's not possible
+        // Alternatively: use a wrapper with Mutex<Option<Arc<...>>> if you really need reset
+        info!("No storage daemons remain — ideally GLOBAL_STORAGE_ENGINE would be cleared, but tokio::OnceCell does not support clearing.");
+        println!("===> NO STORAGE DAEMONS LEFT — GLOBAL_STORAGE_ENGINE KEPT (cannot clear tokio::OnceCell)");
+    } else {
+        info!(
+            "GLOBAL_STORAGE_ENGINE preserved — {} storage daemon(s) still running.",
+            remaining_storage_daemons
+        );
     }
 
     // === CLEAR HANDLES ===

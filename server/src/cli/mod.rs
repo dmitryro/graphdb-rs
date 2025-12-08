@@ -32,7 +32,7 @@ pub mod handlers_drug_interactions;
 pub mod handlers_mpi;
 
 // Re-export the main CLI entry point from cli.rs
-pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
+pub use cli::{start_cli, CliArgs, Commands, get_storage_engine_singleton }; // Corrected: Changed run_cli to start_cli
 pub use lib::daemon::*;
 pub use lib::config::config_structs::*;
 pub use lib::config::config_defaults::*;

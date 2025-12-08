@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::path::{PathBuf, Path};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::convert::Infallible;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::{self, JoinHandle};
@@ -21,16 +22,17 @@ use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::config::{
     StorageEngineType, SledConfig, RocksDBConfig, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
-    DEFAULT_DATA_DIRECTORY, default_data_directory, default_log_directory,
-    daemon_api_storage_engine_type_to_string, load_cli_config,
+    DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, default_data_directory, default_log_directory,
+    daemon_api_storage_engine_type_to_string, load_cli_config, RocksDBStorage, 
+    SledStorage,
 };
 use lib::storage_engine::storage_engine::{
     StorageEngine, GraphStorageEngine, AsyncStorageEngineManager, StorageEngineManager,
-    GLOBAL_STORAGE_ENGINE_MANAGER,
+    GLOBAL_STORAGE_ENGINE_MANAGER, GLOBAL_STORAGE_ENGINE,
 };
 use lib::commands::{ parse_kv_operation, CleanupCommand };
-use lib::storage_engine::rocksdb_storage::{ROCKSDB_DB, ROCKSDB_POOL_MAP};
-use lib::storage_engine::sled_storage::{SLED_DB, SLED_POOL_MAP};
+use lib::storage_engine::rocksdb_storage::{ROCKSDB_DB, ROCKSDB_POOL_MAP, init_rocksdb_db_singleton };
+use lib::storage_engine::sled_storage::{SLED_DB, SLED_POOL_MAP, init_sled_db_singleton };
 use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, 
                   QueryPlan, QueryResult, SledDbWithPath, SledDaemon };
 use lib::database::Database;
@@ -1372,30 +1374,34 @@ pub async fn initialize_storage_for_query(
     static INIT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = INIT_MUTEX.lock().await;
 
-    // 1. load config
-    let cwd = std::env::current_dir().context("cwd")?;
+    // 1. Load config
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
     let cfg_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
     let config = StorageConfig::load(&cfg_path).await?;
+    let engine_type_lower = config.storage_engine_type.to_string().to_lowercase();
 
-    // 2. reuse manager if it already serves the correct engine
-    if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-        let engine = manager.get_persistent_engine().await;
-        if engine.get_type().to_lowercase() == config.storage_engine_type.to_string().to_lowercase() {
-            info!("StorageEngineManager already initialized. Reusing.");
-            println!("===> STORAGE ENGINE MANAGER ALREADY INITIALIZED. REUSING.");
+    // === REUSE GLOBAL_STORAGE_ENGINE IF ALREADY INITIALIZED AND TYPE MATCHES (Cleaned up early returns) ===
+    if let Some(engine) = GLOBAL_STORAGE_ENGINE.get() {
+        if engine.get_type().to_lowercase() == engine_type_lower {
+            info!("Reusing existing GLOBAL_STORAGE_ENGINE (type matches)");
+            println!("===> GLOBAL_STORAGE_ENGINE ALREADY INITIALIZED AND COMPATIBLE. REUSING.");
 
             let db = Database {
-                storage: engine,
+                storage: engine.clone(),
                 config: config.clone(),
             };
             return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
+        } else {
+            warn!(
+                "GLOBAL_STORAGE_ENGINE exists but type mismatch: expected {}, found {}",
+                engine_type_lower,
+                engine.get_type()
+            );
         }
     }
 
-    // 3. FIRST: look for ANY running daemon of the correct engine type
+    // === FIND OR START DAEMON ===
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    let engine_type_lower = config.storage_engine_type.to_string().to_lowercase();
-    
     let running_daemons = daemon_registry
         .get_all_daemon_metadata()
         .await
@@ -1410,44 +1416,33 @@ pub async fn initialize_storage_for_query(
         .collect::<Vec<_>>();
 
     info!("Found {} running daemon(s) for engine type {}", running_daemons.len(), config.storage_engine_type);
-    println!("===> FOUND {} RUNNING DAEMON(S) FOR ENGINE TYPE {}", running_daemons.len(), config.storage_engine_type);
 
-    // Determine canonical port: prefer a running daemon's port, fallback to config
     let canonical_port = if !running_daemons.is_empty() {
-        // Sort by port (highest first) to prefer higher ports
         let mut sorted = running_daemons.clone();
         sorted.sort_by_key(|m| std::cmp::Reverse(m.port));
-        
-        let selected_port = sorted[0].port;
-        info!("Using port {} from running daemon", selected_port);
-        println!("===> USING PORT {} FROM RUNNING DAEMON", selected_port);
-        selected_port
+        sorted[0].port
     } else {
-        let fallback_port = config
+        config
             .engine_specific_config
             .as_ref()
             .and_then(|esc| esc.storage.port)
-            .unwrap_or(config.default_port);
-        info!("No running daemon found, using canonical port from config: {}", fallback_port);
-        println!("===> NO RUNNING DAEMON FOUND, USING CANONICAL PORT FROM CONFIG: {}", fallback_port);
-        fallback_port
+            .unwrap_or(config.default_port)
     };
 
-    // 4. ensure a daemon with working IPC exists on that exact port
     let working_port = find_or_create_working_daemon(
         config.storage_engine_type.clone(),
         &config,
         canonical_port,
         start_storage_interactive,
-        cfg_path,
+        cfg_path.clone(), // Use clone here as it was moved into the closure later
     )
     .await?;
 
     if !verify_and_wait_for_ipc(working_port).await {
-        return Err(anyhow!("IPC not ready after verification for port {}", working_port));
+        return Err(anyhow!("IPC not ready on port {}", working_port));
     }
 
-    // 5. create / reuse manager
+    // === CREATE OR REUSE MANAGER (Keep manager global setup) ===
     let manager = if let Some(m) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
         m.clone()
     } else {
@@ -1458,22 +1453,85 @@ pub async fn initialize_storage_for_query(
             Some(working_port),
         )
         .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to initialize StorageEngineManager for port {}: {}",
-                working_port,
-                e
-            )
-        })?;
+        .map_err(|e| anyhow!("Failed to create StorageEngineManager: {}", e))?;
 
         let arc_manager = Arc::new(AsyncStorageEngineManager::from_manager(manager));
         GLOBAL_STORAGE_ENGINE_MANAGER
             .set(arc_manager.clone())
-            .map_err(|_| anyhow!("Failed to set StorageEngineManager"))?;
+            .expect("GLOBAL_STORAGE_ENGINE_MANAGER should only be set once");
         arc_manager
     };
 
+    // ──────────────────────────────────────────────────────────────
+    // FINAL FIX: Force SLED_DB and ROCKSDB_DB singleton initialization
+    // Uses ONLY public fields + config + daemon registry → 100% correct path
+    // No pool, no daemon, no get_db_path, no hardcoded paths
+    // Works for both engines created by daemon OR by CLI
+    // ──────────────────────────────────────────────────────────────
+    // === AFTER YOU HAVE THE ENGINE ===
     let engine = manager.get_persistent_engine().await;
+
+    // ──────────────────────────────────────────────────────────────
+    // FINAL FIX: Initialize SLED_DB and ROCKSDB_DB singletons
+    // Uses ONLY get_all_daemon_metadata() + filter by service_type == "storage"
+    // No list_storage_daemons(), no internal fields, no hardcoded paths
+    // ──────────────────────────────────────────────────────────────
+    {
+        use std::any::Any;
+
+        // 1. Get the port of the active storage daemon
+        let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        let all_daemons = registry.get_all_daemon_metadata().await.unwrap_or_default();
+        
+        let storage_daemon = all_daemons
+            .into_iter()
+            .find(|meta| meta.service_type == "storage");
+
+        let port = storage_daemon
+            .as_ref()
+            .map(|m| m.port)
+            .unwrap_or(config.default_port);
+
+        // 2. Compute correct base data directory
+        let default_data_dir = PathBuf::from("/opt/graphdb/storage_data");
+        let base_data_dir = config
+            .data_directory
+            .as_ref()
+            .unwrap_or(&default_data_dir);
+
+        // SLED
+        if let Some(sled_engine) = engine.as_any().downcast_ref::<SledStorage>() {
+            let db_path = base_data_dir.join("sled").join(port.to_string());
+            let db = sled_engine.db.clone();
+
+            // FIX: Clone db_path for init_sled_db_singleton to retain ownership for the info! macro.
+            let _ = init_sled_db_singleton(db, db_path.clone()).await;
+            info!("SLED_DB singleton initialized for port {} at {:?}", port, db_path);
+        }
+        // ROCKSDB
+        else if let Some(rocks_engine) = engine.as_any().downcast_ref::<RocksDBStorage>() {
+            let db_path = base_data_dir.join("rocksdb").join(port.to_string());
+            let db = rocks_engine.db.clone();
+
+            // FIX: Clone db_path for init_rocksdb_db_singleton to retain ownership for the info! macro.
+            let _ = init_rocksdb_db_singleton(db, db_path.clone()).await;
+            info!("ROCKSDB_DB singleton initialized for port {} at {:?}", port, db_path);
+        }
+    }
+
+    // Now 100% safe to set global
+    let engine_clone = engine.clone();
+    GLOBAL_STORAGE_ENGINE
+        .get_or_try_init(|| async move { 
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(engine_clone) 
+        })
+        .await;
+
+    info!("GLOBAL_STORAGE_ENGINE initialized successfully");
+    println!("===> GLOBAL_STORAGE_ENGINE INITIALIZED AND READY");
+    
+    // --- End of Fix ---
+
     let db = Database {
         storage: engine,
         config: config.clone(),

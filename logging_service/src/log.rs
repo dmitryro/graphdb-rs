@@ -69,6 +69,8 @@ impl LogServiceTrait for LogService {
             id: SerializableUuid(Uuid::new_v4()),
             label: Identifier(SerializableInternString("QueryLog".to_string().into())),
             properties,
+            created_at: Utc::now().into(),  
+            updated_at: Utc::now().into(),   
         };
 
         // Convert ModelsGraphError to LibGraphError using generic error conversion

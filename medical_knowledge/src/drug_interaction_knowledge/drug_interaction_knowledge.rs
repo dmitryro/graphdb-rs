@@ -2,7 +2,7 @@
 //! Drug Interaction Knowledge — Global singleton, real-time, high-performance
 
 use lib::graph_engine::graph_service::GraphService;
-use models::{ ToVertex, Graph, Vertex, Edge };  // ← THIS WAS MISSING
+use models::{ ToVertex, Graph, Vertex, Edge };
 use models::medical::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,27 +63,29 @@ impl DrugInteractionKnowledgeService {
             let graph_service = GraphService::get().await;
 
             tokio::spawn(async move {
-                // 1.  load existing interactions
-                {
-                    let graph = graph_service.get_graph().await;
-                    service_clone.load_all_interactions(&graph).await;
-                }
-
-                // 2.  register vertex observer
-                graph_service.add_vertex_observer({
-                    let service = service_clone.clone();
-                    move |vertex| {
-                        if vertex.label.as_ref() == "MedicalInteractionSecondary" {
-                            let svc = service.clone();
-                            let v   = vertex.clone();
-                            tokio::spawn(async move {
-                                if let Some(sec) = MedicalInteractionSecondary::from_vertex(&v) {
-                                    svc.on_secondary_interaction_added(sec).await;
-                                }
-                            });
-                        }
+                if let Ok(gs) = graph_service {
+                    // 1. Load existing interactions
+                    {
+                        let graph = gs.get_graph().await;
+                        service_clone.load_all_interactions(&graph).await;
                     }
-                }).await.expect("register vertex observer");
+
+                    // 2. Register vertex observer
+                    let _ = gs.add_vertex_observer({
+                        let service = service_clone.clone();
+                        move |vertex| {
+                            if vertex.label.as_ref() == "MedicalInteractionSecondary" {
+                                let svc = service.clone();
+                                let v = vertex.clone();
+                                tokio::spawn(async move {
+                                    if let Some(sec) = MedicalInteractionSecondary::from_vertex(&v) {
+                                        svc.on_secondary_interaction_added(sec).await;
+                                    }
+                                });
+                            }
+                        }
+                    }).await;
+                }
             });
         }
 
@@ -129,56 +131,59 @@ impl DrugInteractionKnowledgeService {
         current_medications: &[Prescription],
     ) -> Vec<DrugInteractionAlert> {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
-        let interactions = self.interactions_by_primary.read().await;
         let mut alerts = Vec::new();
 
-        let current_med_ids: HashSet<i32> = current_medications
-            .iter()
-            .filter_map(|rx| {
-                graph.outgoing_edges(&Uuid::from_u128(rx.id as u128))
-                    .find(|e| e.edge_type.as_ref() == "HAS_MEDICATION")
-                    .and_then(|e| graph.get_vertex(&e.inbound_id.0))
-                    .and_then(|v| v.properties.get("id")?.as_str()?.parse().ok())
-            })
-            .collect();
+        if let Ok(gs) = graph_service {
+            let graph = gs.read().await;
+            let interactions = self.interactions_by_primary.read().await;
 
-        for med_id in &current_med_ids {
-            if let Some(secondary_list) = interactions.get(med_id) {
-                for interaction in secondary_list {
-                    if current_med_ids.contains(&interaction.secondary_medication_id) {
-                        let severity = InteractionSeverity::from_string(&interaction.severity);
-                        let message = interaction
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| "Drug-drug interaction detected".to_string());
+            let current_med_ids: HashSet<i32> = current_medications
+                .iter()
+                .filter_map(|rx| {
+                    graph.outgoing_edges(&Uuid::from_u128(rx.id as u128))
+                        .find(|e| e.edge_type.as_ref() == "HAS_MEDICATION")
+                        .and_then(|e| graph.get_vertex(&e.inbound_id.0))
+                        .and_then(|v| v.properties.get("id")?.as_str()?.parse().ok())
+                })
+                .collect();
 
-                        let primary_med = self.medication_from_id(*med_id, &graph).await
-                            .unwrap_or_else(|| Medication {
-                                id: 0,
-                                name: "Unknown Medication".to_string(),
-                                brand_name: None,
-                                generic_name: None,
-                                medication_class: "Unknown".to_string(),
+            for med_id in &current_med_ids {
+                if let Some(secondary_list) = interactions.get(med_id) {
+                    for interaction in secondary_list {
+                        if current_med_ids.contains(&interaction.secondary_medication_id) {
+                            let severity = InteractionSeverity::from_string(&interaction.severity);
+                            let message = interaction
+                                .description
+                                .clone()
+                                .unwrap_or_else(|| "Drug-drug interaction detected".to_string());
+
+                            let primary_med = self.medication_from_id(*med_id, &graph).await
+                                .unwrap_or_else(|| Medication {
+                                    id: 0,
+                                    name: "Unknown Medication".to_string(),
+                                    brand_name: None,
+                                    generic_name: None,
+                                    medication_class: "Unknown".to_string(),
+                                });
+
+                            let interacting_med = self.medication_from_id(interaction.secondary_medication_id, &graph).await
+                                .unwrap_or_else(|| Medication {
+                                    id: 0,
+                                    name: "Unknown Medication".to_string(),
+                                    brand_name: None,
+                                    generic_name: None,
+                                    medication_class: "Unknown".to_string(),
+                                });
+
+                            alerts.push(DrugInteractionAlert {
+                                severity,
+                                message,
+                                primary_medication: primary_med,
+                                interacting_medication: interacting_med,
+                                evidence: interaction.description.clone().unwrap_or_default(),
+                                management: None,
                             });
-
-                        let interacting_med = self.medication_from_id(interaction.secondary_medication_id, &graph).await
-                            .unwrap_or_else(|| Medication {
-                                id: 0,
-                                name: "Unknown Medication".to_string(),
-                                brand_name: None,
-                                generic_name: None,
-                                medication_class: "Unknown".to_string(),
-                            });
-
-                        alerts.push(DrugInteractionAlert {
-                            severity,
-                            message,
-                            primary_medication: primary_med,
-                            interacting_medication: interacting_med,
-                            evidence: interaction.description.clone().unwrap_or_default(),
-                            management: None,
-                        });
+                        }
                     }
                 }
             }
