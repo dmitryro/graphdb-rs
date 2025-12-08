@@ -34,38 +34,40 @@ impl ClinicalNoteService {
             let graph_service = GraphService::get().await;
 
             tokio::spawn(async move {
-                let mut graph = graph_service.write_graph().await;
-                let service = service_clone;
+                if let Ok(gs) = graph_service {
+                    let mut graph = gs.write_graph().await;
+                    let service = service_clone;
 
-                // Observe ClinicalNote vertices
-                graph.on_vertex_added({
-                    let service = service.clone();
-                    move |vertex| {
-                        let vertex = vertex.clone();
+                    // Observe ClinicalNote vertices
+                    graph.on_vertex_added({
                         let service = service.clone();
-                        tokio::spawn(async move {
-                            if vertex.label.as_ref() == "ClinicalNote" {
-                                if let Some(note) = ClinicalNote::from_vertex(&vertex) {
-                                    service.on_note_added(note, vertex.id.0).await;
+                        move |vertex| {
+                            let vertex = vertex.clone();
+                            let service = service.clone();
+                            tokio::spawn(async move {
+                                if vertex.label.as_ref() == "ClinicalNote" {
+                                    if let Some(note) = ClinicalNote::from_vertex(&vertex) {
+                                        service.on_note_added(note, vertex.id.0).await;
+                                    }
                                 }
-                            }
-                        });
-                    }
-                }).await;
+                            });
+                        }
+                    }).await;
 
-                // Observe HAS_CLINICAL_NOTE edges
-                graph.on_edge_added({
-                    let service = service.clone();
-                    move |edge| {
-                        let edge = edge.clone();
+                    // Observe HAS_CLINICAL_NOTE edges
+                    graph.on_edge_added({
                         let service = service.clone();
-                        tokio::spawn(async move {
-                            if edge.edge_type.as_ref() == "HAS_CLINICAL_NOTE" {
-                                service.on_has_note_edge(&edge).await;
-                            }
-                        });
-                    }
-                }).await;
+                        move |edge| {
+                            let edge = edge.clone();
+                            let service = service.clone();
+                            tokio::spawn(async move {
+                                if edge.edge_type.as_ref() == "HAS_CLINICAL_NOTE" {
+                                    service.on_has_note_edge(&edge).await;
+                                }
+                            });
+                        }
+                    }).await;
+                }
             });
         }
 
@@ -103,8 +105,9 @@ impl ClinicalNoteService {
 
         let vertex = note.to_vertex();
         let graph_service = GraphService::get().await;
-        {
-            let mut graph = graph_service.write_graph().await;
+        
+        if let Ok(gs) = graph_service {
+            let mut graph = gs.write_graph().await;
             graph.add_vertex(vertex.clone());
             graph.add_edge(Edge::new(
                 encounter_id,
@@ -124,29 +127,35 @@ impl ClinicalNoteService {
     /// Real-time: when a note vertex is added
     async fn on_note_added(&self, note: ClinicalNote, note_vertex_id: Uuid) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
+        
+        if let Ok(gs) = graph_service {
+            let graph = gs.read().await;
 
-        let patient_id = graph.incoming_edges(&note_vertex_id)
-            .find_map(|e| if e.edge_type.as_ref() == "HAS_CLINICAL_NOTE" {
-                graph.incoming_edges(&e.outbound_id.0)
-                    .find_map(|ee| if ee.edge_type.as_ref() == "HAS_ENCOUNTER" {
-                        Some(ee.outbound_id.0)
-                    } else { None })
-            } else { None })
-            .unwrap_or_default();
+            let patient_id = graph.incoming_edges(&note_vertex_id)
+                .find_map(|e| if e.edge_type.as_ref() == "HAS_CLINICAL_NOTE" {
+                    graph.incoming_edges(&e.outbound_id.0)
+                        .find_map(|ee| if ee.edge_type.as_ref() == "HAS_ENCOUNTER" {
+                            Some(ee.outbound_id.0)
+                        } else { None })
+                } else { None })
+                .unwrap_or_default();
 
-        let mut notes = self.patient_notes.write().await;
-        notes.entry(patient_id).or_default().push(note);
+            let mut notes = self.patient_notes.write().await;
+            notes.entry(patient_id).or_default().push(note);
+        }
     }
 
     /// Real-time: when a HAS_CLINICAL_NOTE edge is added
     async fn on_has_note_edge(&self, edge: &Edge) {
         let graph_service = GraphService::get().await;
-        let graph = graph_service.read().await;
+        
+        if let Ok(gs) = graph_service {
+            let graph = gs.read().await;
 
-        if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
-            if let Some(note) = ClinicalNote::from_vertex(vertex) {
-                self.on_note_added(note, edge.inbound_id.0).await;
+            if let Some(vertex) = graph.get_vertex(&edge.inbound_id.0) {
+                if let Some(note) = ClinicalNote::from_vertex(vertex) {
+                    self.on_note_added(note, edge.inbound_id.0).await;
+                }
             }
         }
     }

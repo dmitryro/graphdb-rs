@@ -1702,6 +1702,17 @@ async fn run_zmq_server_lazy(
                             "message": "DETACH DELETE + full orphan cleanup completed"
                         })
                     }
+                        // --- NEW MATCH ARM ---
+                    "get_engine_type" => {
+                        // When this Sled daemon receives the "get_engine_type" command, 
+                        // it reports its static engine type.
+                        info!("Responding to 'get_engine_type' request.");
+                        json!({
+                            "status": "success",
+                            "engine_type": "RocksDB", // Fixed value for the Sled implementation
+                            "request_id": request_id
+                        })
+                    }
                     "cleanup_orphaned_edges" | "cleanup_storage" | "cleanup_storage_force" => {
                         // 1. Target vertex IDs are always empty for this call
                         let target_vertex_ids: HashSet<Uuid> = HashSet::new();

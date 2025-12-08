@@ -100,6 +100,10 @@ These commands are the foundation for managing patient visits, records, and orde
 | **education** | `add`, `document`, `list-material` | `patient_id`, `topic`, `--method` | Patient and Family Education |
 | **emerg** | `alert`, `protocol`, `status`, `team` | `patient_id`, `protocol_name`, `--alert-id`, `--severity`, `--user-id`, `--role`| Acute Emergency Protocol Management (e.g., Sepsis, Trauma, Stroke) |
 | **encounter** | `start`, `end`, `list`, `transfer` | `patient_id`, `location`, `reason` | Patient Visits and Stays (Inpatient/Outpatient) |
+| **mpi** | `match`, `link`, `merge`, `audit`| `match:` `--name`, `--dob`, `--address`, `[--phone]` | Master Patient Index (MPI) for deduplication, linking, and auditing identity changes. |
+|         |                                  | `link:` `--master-id`, `--external-id`, `--id-type`          |                       |
+|         |                                  | `merge:` `--source-id`, `--target-id`, `--resolution-policy` |                       |
+|         |                                  | `audit:` `--mpi-id`, `[--timeframe]`                         |                       |
 | **problem** | `add`, `update`, `resolve`, `list` | `patient_id`, `problem`, `--icd10`, `--severity`, `--onset-date` | Active and Resolved Patient Problems |
 | **prescription** | `add`, `checkinteractions`, `update` | `encounter_id`, `med_name`, `dose`, `--refills`, `--route`, `--duration` | Medication Ordering and Safety Checks |
 | **note** | `add`, `list` | `patient_id`, `author_id`, `text`, `--note-type` | Clinical Documentation and Charting |

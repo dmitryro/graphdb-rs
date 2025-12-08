@@ -25,6 +25,6 @@ members = [
     "graph_visualizing", 
     "medical_knowledge", 
     "driver", 
-    "history_service", 
+    "schema", 
 ]
 

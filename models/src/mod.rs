@@ -8,6 +8,7 @@ pub mod queries;
 pub mod vertices;
 pub mod to_vertex;
 pub mod medical;
+pub mod timestamp;
 
 pub use self::bulk_insert::BulkInsertItem;
 pub use self::edges::Edge;
@@ -20,6 +21,7 @@ pub use self::properties::{
     VertexProperties,
     VertexProperty,
 };
+pub use self::timestamp::*;
 pub use self::queries::*;
 pub use self::vertices::Vertex;
 pub use self::to_vertex::ToVertex;
