@@ -98,6 +98,7 @@ thiserror = "2.0.12"
 indexing_service = { path = "../indexing_service" }
 models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] }
 caching = { path = "../caching" }
+schema = { path = "../schema", version = "0.1.0" }
 bcrypt = "0.15.1"
 regex = "1.11.1"
 mysql = { version="26.0.1", optional = true}

@@ -7,6 +7,7 @@ pub mod properties;
 pub mod queries;
 pub mod vertices;
 pub mod to_vertex;
+pub mod to_edge;
 pub mod medical;
 pub mod timestamp;
 
@@ -25,6 +26,7 @@ pub use self::timestamp::*;
 pub use self::queries::*;
 pub use self::vertices::Vertex;
 pub use self::to_vertex::ToVertex;
+pub use self::to_edge::ToEdge;
 pub use self::errors::*;
 
 pub use self::medical::{
