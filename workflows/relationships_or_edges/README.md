@@ -10,7 +10,7 @@
 ![Lab](https://img.shields.io/badge/Domain-Laboratory_|_Pathology-purple)
 ![Imaging](https://img.shields.io/badge/Domain-Radiology_|_Imaging-teal)
 
-**This is the definitive, exhaustive, production-grade reference** of **every meaningful relationship (edge)** in the GraphDB healthcare knowledge graph — **no shortcuts, no omissions**.
+**This is the definitive reference** of **most meaningful relationships (edges)** in healthcare knowledge graph.
 
 Fully covers:  
 - Master Patient Index (MPI) & Identity Resolution  
