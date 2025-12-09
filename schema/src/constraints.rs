@@ -1,6 +1,7 @@
 use regex::Regex; 
 use serde::{Deserialize, Serialize};
-use serde_json;
+use serde_json::{self, Value};
+use chrono::{DateTime, Utc};
 // Assuming the 'regex' crate is available in Cargo.toml for use in validate()
 
 /// Defines the set of allowed string values for a property, effectively
@@ -42,21 +43,24 @@ pub enum Constraint {
     /// Must be unique across all elements of this type.
     Unique,
     /// The property cannot be modified after the vertex is created.
-    Immutable, // Added: Necessary for fields like created_at or IDs
+    Immutable,
     /// The property must be stored using encryption/hashing techniques (e.g., SSN, password hashes).
-    Encrypted, // Added: Necessary for sensitive data like SSN
+    Encrypted,
 
     /// Minimum length for strings.
-    MinLength(i64), // Added: Used for minimum string length checks
+    MinLength(i64),
 
     /// Must match a regex pattern (e.g., for FHIR IDs, patient MRNs).
     Pattern(String),
-    /// Minimum value for numbers.
-    /// For decimals, multiply by 100 and store as integer (e.g., 10.5 -> 1050)
+    
+    /// Minimum value for numbers (used for Integer and Decimal types).
     Min(i64),
-    /// Maximum value for numbers.
-    /// For decimals, multiply by 100 and store as integer (e.g., 10.5 -> 1050)
+    /// Maximum value for numbers (used for Integer and Decimal types).
     Max(i64),
+
+    /// Time constraint: the DateTime property must represent a time in the future.
+    FutureTime, 
+
     /// Only allows values from a predefined set.
     Enum(Vec<String>),
     /// A custom validation function name defined elsewhere (e.g., "validate_medical_record_number").
@@ -138,7 +142,7 @@ impl PropertyConstraint {
     }
 
     /// Validates a given value against all defined constraints.
-    pub fn validate(&self, value: &serde_json::Value) -> Result<(), String> {
+    pub fn validate(&self, value: &Value) -> Result<(), String> {
         // 1. Check for Required constraint (using the dedicated bool field for simplicity)
         if self.required && value.is_null() {
             return Err(format!("Property '{}' is required but missing/null.", self.name));
@@ -158,8 +162,11 @@ impl PropertyConstraint {
             match constraint {
                 Constraint::Unique | Constraint::Immutable | Constraint::Encrypted => {
                     // These constraints are policy flags enforced at the database/storage layer (runtime persistence enforcement)
-                    // and do not require pre-write validation here (except for the presence of the value itself, which is handled by 'Required').
+                    // and do not require pre-write validation here.
                 },
+                Constraint::Required => {
+                    // Handled by the dedicated `self.required` check at the start.
+                }
                 Constraint::MinLength(min_len) => {
                     if let Some(s) = value.as_str() {
                         if s.len() < *min_len as usize {
@@ -170,21 +177,20 @@ impl PropertyConstraint {
                                 min_len
                             ));
                         }
-                    } else {
-                        // MinLength is only meaningful for strings. If applied to non-string, ignore or throw schema error.
-                        // Assuming schema ensures type matching.
                     }
                 },
                 Constraint::Pattern(pattern) => {
                     // Runtime check for string pattern
                     if let Some(s) = value.as_str() {
-                        // Assuming 'regex' crate is available and imported via `use regex::Regex;`
-                        if !Regex::new(pattern).expect("Invalid regex pattern defined in schema constraint.").is_match(s) {
+                        let re = match Regex::new(pattern) {
+                            Ok(r) => r,
+                            // Fatal schema definition error
+                            Err(_) => return Err(format!("Internal Schema Error: Invalid regex pattern defined for property '{}'", self.name))
+                        };
+
+                        if !re.is_match(s) {
                             return Err(format!("Property '{}' does not match pattern: {}", self.name, pattern));
                         }
-                    } else {
-                        // If Pattern constraint is on a non-string type, it's a schema definition error,
-                        // but for runtime safety, we skip or error. Assuming schema ensures type matching.
                     }
                 },
                 Constraint::Min(min_val) => {
@@ -193,7 +199,6 @@ impl PropertyConstraint {
                             return Err(format!("Property '{}' value {} is below the minimum allowed value of {}", self.name, num, min_val));
                         }
                     }
-                    // Handle float/other types similarly if needed
                 },
                 Constraint::Max(max_val) => {
                     if let Some(num) = value.as_i64() {
@@ -201,7 +206,31 @@ impl PropertyConstraint {
                             return Err(format!("Property '{}' value {} is above the maximum allowed value of {}", self.name, num, max_val));
                         }
                     }
-                    // Handle float/other types similarly if needed
+                },
+                Constraint::FutureTime => {
+                    // Validation for DateTime types: must be in the future.
+                    if let Some(s) = value.as_str() {
+                        match s.parse::<DateTime<Utc>>() {
+                            Ok(dt) => {
+                                let now = Utc::now();
+                                if dt <= now {
+                                    return Err(format!(
+                                        "Property '{}' time '{}' must be in the future (current time: {}).",
+                                        self.name,
+                                        dt.to_rfc3339(),
+                                        now.to_rfc3339()
+                                    ));
+                                }
+                            },
+                            Err(_) => {
+                                // If parsing fails, it's either not a string or not a valid ISO 8601 date.
+                                return Err(format!(
+                                    "Property '{}' failed to parse as valid DateTime (required for FutureTime constraint).",
+                                    self.name
+                                ));
+                            }
+                        }
+                    }
                 },
                 Constraint::Enum(allowed_values) => {
                     if let Some(s) = value.as_str() {
@@ -209,9 +238,6 @@ impl PropertyConstraint {
                             return Err(format!("Property '{}' value '{}' is not one of the allowed values: {:?}", self.name, s, allowed_values));
                         }
                     }
-                }
-                Constraint::Required => {
-                    // Handled by the dedicated `self.required` check at the start.
                 }
                 Constraint::CustomValidator(_) => {
                     // Custom validators are typically called by the upstream validation service
