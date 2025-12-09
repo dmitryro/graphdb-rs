@@ -7,7 +7,7 @@ pub struct BillingAddress {
     pub patient_id: Option<i32>,
     pub address: Option<String>,
     pub city: Option<String>,
-    pub state: Option<String>,
+    pub state_province: Option<Identifier>,
     pub postal_code: Option<String>,
     pub country: Option<String>,
 }
@@ -28,8 +28,8 @@ impl ToVertex for BillingAddress {
         if let Some(ref v) = self.city {
             vertex.add_property("city", v);
         }
-        if let Some(ref v) = self.state {
-            vertex.add_property("state", v);
+        if let Some(ref v) = self.state_province {
+            vertex.add_property("state_province", v);
         }
         if let Some(ref v) = self.postal_code {
             vertex.add_property("postal_code", v);
