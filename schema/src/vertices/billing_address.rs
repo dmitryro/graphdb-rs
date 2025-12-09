@@ -1,16 +1,11 @@
-use serde_json::json;
-
 use crate::definitions::VertexSchema;
-use crate::properties::{
-    PropertyDefinition, OntologyReference,
-};
-use crate::constraints::{ PropertyConstraint, Constraint, DataType, EnumValues };
-use crate::lifecycle::{
-    LifecycleRule, StateTransition, MessagingSchema, SchemaAction
-};
+use crate::constraints::{PropertyConstraint, EnumValues, DataType, Constraint};
+use crate::lifecycle::{LifecycleRule, MessagingSchema};
+use crate::properties::OntologyReference;
+use serde_json::Value as JsonValue;
 
-/// Implementation of the VertexSchema for the BillingAddress vertex type.
-/// This vertex captures the financial address information associated with a patient.
+/// Defines the schema for a billing address, which may have stricter security or auditing requirements
+/// than a standard Address, though the structural properties are similar.
 pub struct BillingAddress;
 
 impl VertexSchema for BillingAddress {
@@ -18,119 +13,63 @@ impl VertexSchema for BillingAddress {
         "BillingAddress"
     }
 
-    /// Returns the list of property constraints for the BillingAddress vertex type.
     fn property_constraints() -> Vec<PropertyConstraint> {
         vec![
-            // 1. Patient ID (Foreign Key to Patient vertex) - Required
-            // Maps to the 'patient_id' field in the source model.
-            PropertyConstraint::new("patient_id", true)
-                .with_data_type(DataType::String)
-                .with_constraints(vec![
-                    Constraint::MinLength(1),
-                    Constraint::Immutable, // Link to patient should not change
-                ])
-                .with_description("Identifier of the related Patient vertex (Foreign Key). Required."),
+            PropertyConstraint::new("id", true)
+                .with_description("Globally Unique Identifier (UUID) for the billing address.")
+                .with_data_type(DataType::Uuid)
+                .with_constraints(vec![Constraint::Required, Constraint::Unique, Constraint::Immutable]),
 
-            // 2. Address Line 1 - Required
-            // Maps to the 'address' field in the source model.
-            PropertyConstraint::new("address_line1", true)
+            PropertyConstraint::new("street1", true)
+                .with_description("Primary street address line.")
                 .with_data_type(DataType::String)
-                .with_constraints(vec![Constraint::MinLength(1)])
-                .with_description("The primary street address line (billing address). Required."),
+                .with_constraints(vec![Constraint::Required, Constraint::Mutable]),
 
-            // 3. City - Required
+            PropertyConstraint::new("street2", false)
+                .with_description("Secondary street address line (apartment, suite, etc.).")
+                .with_data_type(DataType::String)
+                .with_constraints(vec![Constraint::Optional, Constraint::Mutable]),
+
             PropertyConstraint::new("city", true)
+                .with_description("City or locality name.")
                 .with_data_type(DataType::String)
-                .with_constraints(vec![Constraint::MinLength(1)])
-                .with_description("The city name. Required."),
+                .with_constraints(vec![Constraint::Required, Constraint::Mutable]),
 
-            // 4. State/Province ID (Foreign Key to StateProvince vertex) - Required
-            // Maps to the 'state_province' field (using its ID).
-            PropertyConstraint::new("state_province_id", true)
+            PropertyConstraint::new("state_province", true)
+                .with_description("State, province, or region code/name.")
                 .with_data_type(DataType::String)
-                .with_constraints(vec![
-                    Constraint::MinLength(2),
-                    Constraint::Immutable,
-                ])
-                .with_description("Identifier of the related StateProvince vertex (Foreign Key). Required."),
+                .with_constraints(vec![Constraint::Required, Constraint::Mutable]),
 
-            // 5. Postal Code - Required
-            // Maps to the 'postal_code' field in the source model.
             PropertyConstraint::new("postal_code", true)
+                .with_description("Postal or ZIP code.")
                 .with_data_type(DataType::String)
-                .with_constraints(vec![Constraint::MinLength(3)])
-                .with_description("The postal code or ZIP code. Required."),
+                .with_constraints(vec![Constraint::Required, Constraint::Mutable, Constraint::Indexable]),
 
-            // 6. Country Code - Required
-            // Maps to the 'country' field in the source model (using the code).
-            PropertyConstraint::new("country_code", true)
+            // FIX: Changed Constraint::Pattern to Constraint::Format
+            PropertyConstraint::new("country", true)
+                .with_description("The two or three-letter ISO country code (e.g., US, GBR).")
                 .with_data_type(DataType::String)
                 .with_constraints(vec![
-                    Constraint::MinLength(2),
-                    Constraint::Pattern(r"^[A-Z]{2,3}$".to_string()), // ISO country codes
-                ])
-                .with_description("ISO 3166-1 alpha-2 or alpha-3 country code. Required."),
+                    Constraint::Required,
+                    Constraint::Format(r"^[A-Z]{2,3}$".to_string()), // ISO country codes format check
+                ]),
 
-            // 7. Validity Status - Required for Lifecycle Tracking
-            PropertyConstraint::new("validity_status", true)
-                .with_data_type(DataType::String)
-                .with_enum_values(EnumValues::new(vec![
-                    "Current".to_string(),
-                    "Historical".to_string(),
-                    "Invalid".to_string(),
-                ]))
-                .with_description("The current operational status of the billing address record. Defaults to 'Current'."),
+            PropertyConstraint::new("is_validated", true)
+                .with_description("Flag indicating if the address has been validated against a postal authority database.")
+                .with_data_type(DataType::Boolean)
+                .with_constraints(vec![Constraint::Required, Constraint::Mutable])
+                .with_default_value(JsonValue::Bool(false)),
         ]
     }
 
     fn lifecycle_rules() -> Vec<LifecycleRule> {
-        vec![
-            LifecycleRule {
-                element: "validity_status".to_string(),
-                initial_state: Some("Current".to_string()),
-                transitions: vec![
-                    StateTransition {
-                        from_state: "Current".to_string(),
-                        to_state: "Historical".to_string(),
-                        required_rules: vec!["Newer_Billing_Address_Exists".to_string()],
-                        triggers_events: vec!["BILLING_ADDRESS_BECAME_HISTORICAL".to_string()],
-                    },
-                    StateTransition {
-                        from_state: "Current".to_string(),
-                        to_state: "Invalid".to_string(),
-                        required_rules: vec!["Address_Verification_Failed".to_string()],
-                        triggers_events: vec!["BILLING_ADDRESS_INVALIDATED".to_string()],
-                    },
-                    StateTransition {
-                        from_state: "Historical".to_string(),
-                        to_state: "Current".to_string(),
-                        required_rules: vec!["Verified_Is_Latest_Billing_Address".to_string()],
-                        triggers_events: vec!["BILLING_ADDRESS_REVERTED_TO_CURRENT".to_string()],
-                    },
-                ],
-                pre_action_checks: vec![],
-                post_action_actions: vec![
-                    SchemaAction::PublishMessage {
-                        topic: "billing_address_lifecycle_changes".to_string(),
-                        payload_template: "Billing Address {id} changed status from {old_status} to {new_status}".to_string()
-                    }
-                ],
-            }
-        ]
+        // Simple lifecycle for data entity
+        vec![]
     }
 
     fn ontology_references() -> Vec<OntologyReference> {
-        // References to external geographic standards (e.g., ISO for country codes)
-        vec![
-            OntologyReference {
-                name: "ISO 3166-1".to_string(),
-                ontology_system_id: "ISO3166_1".to_string(),
-                // Include both 'uri' and 'reference_uri'
-                uri: Some("https://www.iso.org/iso-3166-country-codes.html".to_string()),
-                reference_uri: Some("https://www.iso.org/iso-3166-country-codes.html".to_string()),
-                description: Some("Used for validation of country_code property.".to_string()),
-            },
-        ]
+        // References to payment or tax standards if needed
+        vec![]
     }
 
     fn messaging_schema() -> MessagingSchema {
@@ -138,7 +77,7 @@ impl VertexSchema for BillingAddress {
             creation_topic: Some("billing_address.created".to_string()),
             update_topic: Some("billing_address.updated".to_string()),
             deletion_topic: Some("billing_address.deleted".to_string()),
-            error_queue: Some("billing_address.errors".to_string()),
+            error_queue: Some("finance.audit_alerts".to_string()),
         }
     }
 }

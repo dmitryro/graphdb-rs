@@ -42,6 +42,8 @@ pub enum SchemaAction {
     CallExternalService { service_name: String, endpoint: String, method: String },
     /// Create or update a related graph element.
     GraphMutation { mutation_type: String, target_schema: String },
+    /// Execute an internal pre-defined function within the schema system's runtime.
+    FunctionCall { function_name: String, arguments: Vec<String> },
 }
 
 /// Defines the queues and topics related to this schema element.
