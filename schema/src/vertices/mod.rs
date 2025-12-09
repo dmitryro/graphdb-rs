@@ -2,8 +2,13 @@
 
 pub mod address;
 pub mod allergy;
+pub mod appointment;
 pub mod billing_address;
+pub mod care_plan;
+pub mod claim;
 pub mod clinical_note;
+pub mod department;
+pub mod disposition;
 pub mod doctor;
 pub mod diagnosis;
 pub mod encounter;
@@ -17,9 +22,14 @@ pub mod procedure;
 pub mod snomed_concept;
 
 pub use address::*;
-pub use billing_address::*;
 pub use allergy::*;
+pub use appointment::*;
+pub use billing_address::*;
+pub use care_plan::*;
+pub use claim::*;
 pub use clinical_note::*;
+pub use department::*;
+pub use disposition::*;
 pub use doctor::*;
 pub use diagnosis::*;
 pub use encounter::*;
