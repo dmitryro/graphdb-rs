@@ -1,11 +1,14 @@
 // schema/src/edges/mod.rs
 
-pub mod has_medication;
+pub mod has_allergy;
 pub mod has_diagnosis;
 pub mod has_encounter;
-pub mod has_allergy;
+pub mod has_medication;
+pub mod relationship;
+pub mod relationship_types;
 
-pub use has_medication::*;
-pub use has_diagnosis::*;
-pub use has_encounter::*;
-pub use has_allergy::*;
+// Export the generic handler components
+pub use relationship::*;
+
+// Export the types list (if needed elsewhere)
+pub use relationship_types::*;

@@ -1,7 +1,17 @@
 // schema/src/vertices/mod.rs
 
-pub mod patient;
+pub mod allergy;
 pub mod doctor;
+pub mod diagnosis;
+pub mod encounter;
+pub mod fhir_patient;
+pub mod patient;
+pub mod snomed_concept;
 
-pub use patient::*;
+pub use allergy::*;
 pub use doctor::*;
+pub use diagnosis::*;
+pub use encounter::*;
+pub use fhir_patient::*;
+pub use patient::*;
+pub use snomed_concept::*;

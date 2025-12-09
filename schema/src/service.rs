@@ -3,13 +3,17 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use anyhow::Result;
 use log::info;
-// Importing both for context. We assume PropertyConstraint is correctly available.
+use serde_json; // Needed for the enforce_contract method
+
+// Importing schema component definitions
 use crate::constraints::{ PropertyConstraint }; 
 use crate::errors::{ SchemaError };
 use crate::definitions::{ VertexSchema }; 
 use crate::vertices::patient::Patient;
-// Import other schema types here as they are implemented...
-// use crate::edges::has_appointment::HasAppointment;
+// NEW IMPORT: Bring in the generic edge loading function
+use crate::edges::relationship::{ load_all_relationship_definitions };
+// NEW IMPORT: Bring in EdgeSchema trait definition
+use crate::edges::relationship::EdgeSchema;
 
 /// The structure holding the entire, compiled graph schema definition.
 /// This is the central source of truth for all graph element contracts.
@@ -32,24 +36,39 @@ impl SchemaService {
         info!("Initializing SchemaService: Compiling declarative schema definitions...");
 
         let mut vertices = HashMap::new();
+        let mut edges = HashMap::new();
         
         // 1. Load all Vertex Schemas
         Self::load_vertex_schema::<Patient>(&mut vertices);
 
-        // 2. Load all Edge Schemas (Implementation omitted for brevity, but follows the same pattern)
-        let edges = HashMap::new(); 
+        // 2. Load all Edge Schemas (NOW GENERICALLY LOADED)
+        // This iterates through ALL_MEDICAL_RELATIONSHIPS and loads all definitions.
+        let edge_definitions = load_all_relationship_definitions();
+        for def in edge_definitions {
+            // Use the correct field: `edge_label` instead of the old `label`
+            let label = def.metadata.edge_label;
+            let constraints = def.properties; 
+            // The edge label is a String, we convert it to &'static str for the HashMap key
+            // NOTE: In a production environment, this might require a different HashMap structure (e.g., HashMap<String, ...>)
+            // to store the owned string, but we stick to the required signature for now by using .leak().
+            edges.insert(label, constraints); 
+        }
 
         let schema = SchemaDefinition {
             vertices,
             edges,
         };
 
-        info!("SchemaService initialized successfully with {} vertices.", schema.vertices.len());
+        // Updated log message to reflect both vertices and edges
+        info!("SchemaService initialized successfully with {} vertices and {} edges.", 
+            schema.vertices.len(), 
+            schema.edges.len()
+        );
         
         Ok(SchemaService { schema })
     }
 
-    /// Helper function to load schema properties from a concrete type.
+    /// Helper function to load schema properties from a concrete type implementing `VertexSchema`.
     fn load_vertex_schema<T: VertexSchema>(map: &mut HashMap<&'static str, Vec<PropertyConstraint>>) {
         map.insert(T::schema_name(), T::property_constraints());
     }
@@ -70,10 +89,9 @@ impl SchemaService {
 
         // Iterate through properties and apply constraints
         for constraint in constraints {
-            // FIXED (E0609): Use .as_str() to get a &str reference for the JSON key lookup.
+            // Use .as_str() to get a &str reference for the JSON key lookup.
             let value = properties.get(constraint.name.as_str()).unwrap_or(&serde_json::Value::Null);
             
-            // FIXED (E0599): This method call should work if the type is correct.
             // We capture and return the detailed String error `e`.
             if let Err(e) = constraint.validate(value) { 
                 return Err(SchemaError::ConstraintViolation(e));

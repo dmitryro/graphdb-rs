@@ -1,5 +1,24 @@
-// schema/src/constraints.rs
 use serde::{Deserialize, Serialize};
+use serde_json;
+// Assuming the 'regex' crate is available in Cargo.toml for use in validate()
+
+/// Defines the set of allowed string values for a property, effectively
+/// creating an internal enum constraint for the graph schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumValues {
+    /// The list of allowed string values for the property.
+    pub allowed_values: Vec<String>,
+}
+
+impl EnumValues {
+    /// Creates a new EnumValues instance with the specified list of allowed values.
+    pub fn new(allowed_values: Vec<String>) -> Self {
+        EnumValues {
+            allowed_values,
+        }
+    }
+}
+
 
 /// Defines the data types allowed for a property.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +59,10 @@ pub enum Constraint {
 pub struct PropertyConstraint {
     /// The name of the property (e.g., "first_name", "date_of_birth").
     pub name: String,
+    /// Whether the property is required (true) or optional (false).
+    pub required: bool,
+    /// An optional human-readable description of the property's purpose.
+    pub description: Option<String>, // CHANGED to owned String
     /// The data type this property must hold.
     pub data_type: DataType,
     /// The list of constraints that must be enforced.
@@ -48,47 +71,135 @@ pub struct PropertyConstraint {
     pub default_value: Option<serde_json::Value>,
 }
 
+// --- Implementation of Constructors/Methods (Updated for owned String and missing fields) ---
 impl PropertyConstraint {
+    /// Creates a new PropertyConstraint instance with default type (String) and constraints.
+    /// Automatically adds the Required constraint if `required` is true.
+    ///
+    /// # Arguments
+    /// * `name` - The name of the property.
+    /// * `required` - If the property is mandatory.
+    pub fn new(name: &str, required: bool) -> Self {
+        PropertyConstraint {
+            name: name.to_string(), // Convert &str to owned String
+            required,
+            description: None,
+            data_type: DataType::String, // Default to String
+            // Initialize constraints, adding Required if necessary
+            constraints: if required { vec![Constraint::Required] } else { vec![] },
+            default_value: None,
+        }
+    }
+
+    /// Adds a descriptive comment to the constraint and returns the modified instance.
+    pub fn with_description(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string()); // Convert &str to owned String
+        self
+    }
+
+    /// Sets the data type for the constraint.
+    pub fn with_data_type(mut self, data_type: DataType) -> Self {
+        self.data_type = data_type;
+        self
+    }
+
+    /// Sets the list of constraints, replacing any existing ones (including the auto-added Required constraint).
+    pub fn with_constraints(mut self, constraints: Vec<Constraint>) -> Self {
+        self.constraints = constraints;
+        // Ensure the required flag matches the presence of the constraint
+        self.required = self.constraints.contains(&Constraint::Required);
+        self
+    }
+
+    /// Sets the default value.
+    pub fn with_default_value(mut self, value: serde_json::Value) -> Self {
+        self.default_value = Some(value);
+        self
+    }
+
+    /// Adds an Enum constraint using the helper struct, replacing any existing Enum constraints.
+    /// This resolves the error from your consuming code.
+    pub fn with_enum_values(mut self, enum_values: EnumValues) -> Self {
+        // 1. Filter out any existing Enum constraint
+        self.constraints.retain(|c| !matches!(c, Constraint::Enum(_)));
+
+        // 2. Add the new Enum constraint
+        self.constraints.push(Constraint::Enum(enum_values.allowed_values));
+        self
+    }
+
     /// Validates a given value against all defined constraints.
     pub fn validate(&self, value: &serde_json::Value) -> Result<(), String> {
-        // 1. Check for Required constraint
-        let is_required = self.constraints.contains(&Constraint::Required);
-        if is_required && value.is_null() {
+        // 1. Check for Required constraint (using the dedicated bool field for simplicity)
+        if self.required && value.is_null() {
             return Err(format!("Property '{}' is required but missing/null.", self.name));
         }
-        
+
         if value.is_null() {
             return Ok(()); // Skip further checks if optional and null
         }
-        
+
         // 2. Check Data Type
         if !self.check_data_type(value) {
             return Err(format!("Property '{}' failed type check for {:?}", self.name, self.data_type));
         }
-        
+
         // 3. Check other Constraints (Pattern, Min/Max, Enum, etc.)
         for constraint in &self.constraints {
             match constraint {
                 Constraint::Unique => {
                     // This check must be done at the database service layer (runtime enforcement)
-                    // but the constraint must be declared here.
                 },
                 Constraint::Pattern(pattern) => {
                     // Runtime check for string pattern
+                    // NOTE: Assumes the 'regex' crate is available in the project dependencies.
                     if let Some(s) = value.as_str() {
-                        if !regex::Regex::new(pattern).unwrap().is_match(s) {
+                        // Using unwrap() on Regex::new is acceptable here as the pattern should be statically valid
+                        // or validated at schema ingestion time.
+                        // Assuming 'regex' crate is imported/available.
+                        if !regex::Regex::new(pattern).expect("Invalid regex pattern defined in schema constraint.").is_match(s) {
                             return Err(format!("Property '{}' does not match pattern: {}", self.name, pattern));
                         }
+                    } else {
+                        // If Pattern constraint is on a non-string type, it's a schema definition error,
+                        // but for runtime safety, we skip or error. Assuming schema ensures type matching.
                     }
                 },
-                // ... implementation for Min, Max, Enum, CustomValidator
-                _ => {}
+                Constraint::Min(min_val) => {
+                    if let Some(num) = value.as_i64() {
+                        if num < *min_val {
+                            return Err(format!("Property '{}' value {} is below the minimum allowed value of {}", self.name, num, min_val));
+                        }
+                    }
+                    // Handle float/other types similarly if needed
+                },
+                Constraint::Max(max_val) => {
+                    if let Some(num) = value.as_i64() {
+                        if num > *max_val {
+                            return Err(format!("Property '{}' value {} is above the maximum allowed value of {}", self.name, num, max_val));
+                        }
+                    }
+                    // Handle float/other types similarly if needed
+                },
+                Constraint::Enum(allowed_values) => {
+                    if let Some(s) = value.as_str() {
+                        if !allowed_values.contains(&s.to_string()) {
+                             return Err(format!("Property '{}' value '{}' is not one of the allowed values: {:?}", self.name, s, allowed_values));
+                        }
+                    }
+                }
+                Constraint::Required => {
+                    // Handled by the dedicated `self.required` check at the start.
+                }
+                Constraint::CustomValidator(_) => {
+                    // Custom validators are typically called by the upstream validation service
+                }
             }
         }
-        
+
         Ok(())
     }
-    
+
     // Helper to check if the value matches the defined DataType
     fn check_data_type(&self, value: &serde_json::Value) -> bool {
         match self.data_type {

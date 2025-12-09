@@ -78,5 +78,7 @@ pub use self::medical::{
     Department,
     FacilityUnit,
     StaffAssignment,
+    FHIR_Patient,
+    SNOMED_Concept,
 };
 

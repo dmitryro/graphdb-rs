@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc, NaiveDate};
-use models::{Edge, ToEdge, Identifier, SerializableUuid, PropertyValue}; // Added SerializableUuid and PropertyValue
 use uuid::Uuid;
+use crate::constraints::PropertyConstraint;
+use models::{Edge, ToEdge, FromEdge, Identifier, SerializableUuid, PropertyValue}; 
+use crate::edges::relationship::EdgeSchema;
 
 /// Represents the relationship (edge) between a Patient and a Diagnosis record,
 /// signifying that the Patient has received that specific diagnosis.
@@ -24,18 +26,38 @@ pub struct HasDiagnosis {
     pub status: Option<String>,
 }
 
+// --- EdgeSchema Implementation for declarative schema definition ---
+impl EdgeSchema for HasDiagnosis {
+    fn edge_label() -> &'static str {
+        "HAS_DIAGNOSIS"
+    }
+
+    fn property_constraints() -> Vec<PropertyConstraint> {
+        vec![
+            PropertyConstraint::new("id", true)
+                .with_description("Unique edge instance ID (i32, stored as String)."),
+            PropertyConstraint::new("recorded_date", true)
+                .with_description("Date diagnosis was recorded (YYYY-MM-DD)."),
+            PropertyConstraint::new("created_at", true)
+                .with_description("Timestamp of relationship creation (RFC3339)."),
+            PropertyConstraint::new("status", false)
+                .with_description("Status of the diagnosis (ACTIVE, RESOLVED, HISTORY)."),
+        ]
+    }
+}
+// --- END EdgeSchema ---
+
 impl ToEdge for HasDiagnosis {
     /// Converts the HasDiagnosis struct into a generic Edge structure for the graph database.
     fn to_edge(&self) -> Edge {
         // Prepare IDs and Label for the new Edge::new(outbound_id, edge_type, inbound_id) signature
-        // Parse the source_id string as a UUID, or handle the error appropriately
         let outbound_id: SerializableUuid = Uuid::parse_str(&self.source_id.to_string())
             .expect("Invalid source_id UUID format")
             .into();
         let inbound_id: SerializableUuid = Uuid::parse_str(&self.target_id.to_string())
             .expect("Invalid target_id UUID format")
             .into();
-        let edge_label_identifier = Identifier::new("HAS_DIAGNOSIS".to_string())
+        let edge_label_identifier = Identifier::new(Self::edge_label().to_string())
             .expect("Invalid edge label identifier");
 
         let mut e = Edge::new(
@@ -44,15 +66,13 @@ impl ToEdge for HasDiagnosis {
             inbound_id
         );
 
-        // Add relationship-specific properties using the chainable with_property method,
-        // and wrapping values in PropertyValue::String
+        // Add relationship-specific properties
         e = e.with_property(
             "id".to_string(), 
             PropertyValue::String(self.id.to_string())
         );
         e = e.with_property(
             "recorded_date".to_string(), 
-            // NaiveDate::to_string() yields a format like YYYY-MM-DD
             PropertyValue::String(self.recorded_date.to_string()) 
         );
         e = e.with_property(
@@ -71,41 +91,38 @@ impl ToEdge for HasDiagnosis {
     }
 }
 
-impl HasDiagnosis {
-    /// Attempts to construct a HasDiagnosis struct from a generic Edge representation.
-    pub fn from_edge(edge: &Edge) -> Option<Self> {
-        // Use as_str() for explicit string comparison
-        if edge.label.as_str() != "HAS_DIAGNOSIS" { return None; }
 
-        // Helper closure to parse DateTime<Utc> from property string
+impl FromEdge for HasDiagnosis {
+    // FIX E0185: Removed '&self' to match the trait definition (now a static method)
+    fn from_edge(edge: &Edge) -> Option<Self> {
+        if edge.label.as_str() != Self::edge_label() { return None; }
+
         let parse_datetime = |prop_name: &str, edge: &Edge| -> Option<DateTime<Utc>> {
             edge.properties.get(prop_name)
-                // Access the underlying string value from the PropertyValue enum
-                .and_then(|v| v.as_str()) 
+                .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         };
 
-        // Helper closure to parse NaiveDate from property string
         let parse_naive_date = |prop_name: &str, edge: &Edge| -> Option<NaiveDate> {
             edge.properties.get(prop_name)
-                // Access the underlying string value from the PropertyValue enum
-                .and_then(|v| v.as_str()) 
-                // We rely on the to_string() format from the to_edge implementation (YYYY-MM-DD)
-                .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()) 
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        };
+        
+        // This closure is correct for parsing an &str into an i32
+        let parse_id = |id_str: &str| -> Option<i32> {
+            id_str.parse().ok()
         };
 
+
         Some(HasDiagnosis {
-            // Retrieve string from PropertyValue before parsing to i32
             id: edge.properties.get("id")?.as_str()?.parse().ok()?,
-            // Source ID (Patient) - Use the renamed 'outbound_id' field
-            source_id: edge.outbound_id.to_string().parse().ok()?,
-            // Target ID (Diagnosis) - Use the renamed 'inbound_id' field
-            target_id: edge.inbound_id.to_string().parse().ok()?,
-            // Relationship-specific properties
+            // FIX E0308: Convert SerializableUuid to String, then take &str for parse_id
+            source_id: parse_id(&edge.outbound_id.to_string())?, 
+            target_id: parse_id(&edge.inbound_id.to_string())?,
             recorded_date: parse_naive_date("recorded_date", edge)?,
             created_at: parse_datetime("created_at", edge)?,
-            // Retrieve string from PropertyValue before mapping
             status: edge.properties.get("status").and_then(|v| v.as_str()).map(|s| s.to_string()),
         })
     }
