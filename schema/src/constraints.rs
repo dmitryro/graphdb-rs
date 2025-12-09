@@ -1,3 +1,4 @@
+use regex::Regex; 
 use serde::{Deserialize, Serialize};
 use serde_json;
 // Assuming the 'regex' crate is available in Cargo.toml for use in validate()
@@ -18,7 +19,6 @@ impl EnumValues {
         }
     }
 }
-
 
 /// Defines the data types allowed for a property.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,12 +41,20 @@ pub enum Constraint {
     Required,
     /// Must be unique across all elements of this type.
     Unique,
+    /// The property cannot be modified after the vertex is created.
+    Immutable, // Added: Necessary for fields like created_at or IDs
+    /// The property must be stored using encryption/hashing techniques (e.g., SSN, password hashes).
+    Encrypted, // Added: Necessary for sensitive data like SSN
+
+    /// Minimum length for strings.
+    MinLength(i64), // Added: Used for minimum string length checks
+
     /// Must match a regex pattern (e.g., for FHIR IDs, patient MRNs).
     Pattern(String),
-    /// Minimum length for strings, or minimum value for numbers.
+    /// Minimum value for numbers.
     /// For decimals, multiply by 100 and store as integer (e.g., 10.5 -> 1050)
     Min(i64),
-    /// Maximum length for strings, or maximum value for numbers.
+    /// Maximum value for numbers.
     /// For decimals, multiply by 100 and store as integer (e.g., 10.5 -> 1050)
     Max(i64),
     /// Only allows values from a predefined set.
@@ -148,17 +156,30 @@ impl PropertyConstraint {
         // 3. Check other Constraints (Pattern, Min/Max, Enum, etc.)
         for constraint in &self.constraints {
             match constraint {
-                Constraint::Unique => {
-                    // This check must be done at the database service layer (runtime enforcement)
+                Constraint::Unique | Constraint::Immutable | Constraint::Encrypted => {
+                    // These constraints are policy flags enforced at the database/storage layer (runtime persistence enforcement)
+                    // and do not require pre-write validation here (except for the presence of the value itself, which is handled by 'Required').
+                },
+                Constraint::MinLength(min_len) => {
+                    if let Some(s) = value.as_str() {
+                        if s.len() < *min_len as usize {
+                            return Err(format!(
+                                "Property '{}' string length ({}) is below the minimum allowed length of {}.",
+                                self.name,
+                                s.len(),
+                                min_len
+                            ));
+                        }
+                    } else {
+                        // MinLength is only meaningful for strings. If applied to non-string, ignore or throw schema error.
+                        // Assuming schema ensures type matching.
+                    }
                 },
                 Constraint::Pattern(pattern) => {
                     // Runtime check for string pattern
-                    // NOTE: Assumes the 'regex' crate is available in the project dependencies.
                     if let Some(s) = value.as_str() {
-                        // Using unwrap() on Regex::new is acceptable here as the pattern should be statically valid
-                        // or validated at schema ingestion time.
-                        // Assuming 'regex' crate is imported/available.
-                        if !regex::Regex::new(pattern).expect("Invalid regex pattern defined in schema constraint.").is_match(s) {
+                        // Assuming 'regex' crate is available and imported via `use regex::Regex;`
+                        if !Regex::new(pattern).expect("Invalid regex pattern defined in schema constraint.").is_match(s) {
                             return Err(format!("Property '{}' does not match pattern: {}", self.name, pattern));
                         }
                     } else {
@@ -185,7 +206,7 @@ impl PropertyConstraint {
                 Constraint::Enum(allowed_values) => {
                     if let Some(s) = value.as_str() {
                         if !allowed_values.contains(&s.to_string()) {
-                             return Err(format!("Property '{}' value '{}' is not one of the allowed values: {:?}", self.name, s, allowed_values));
+                            return Err(format!("Property '{}' value '{}' is not one of the allowed values: {:?}", self.name, s, allowed_values));
                         }
                     }
                 }
