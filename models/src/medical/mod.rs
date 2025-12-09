@@ -54,6 +54,19 @@ pub mod department;
 pub mod facility_unit;
 pub mod staff_assignment;
 
+// Necessary Models for Schema
+pub mod lab_result;
+pub mod lab_order;
+pub mod lab_panel;
+pub mod specimen;
+pub mod microbiology_culture;
+pub mod pathology_report;
+pub mod imaging_order;
+pub mod imaging_study;
+pub mod radiology_report;
+pub mod procedure;
+pub mod care_plan;
+
 pub use appointment::Appointment;
 pub use allergy::Allergy;
 pub use address::Address;
@@ -110,3 +123,16 @@ pub use hospital::Hospital;
 pub use department::Department;
 pub use facility_unit::FacilityUnit;
 pub use staff_assignment::StaffAssignment;
+
+// New necessary models for Schema Management
+pub use lab_result::LabResult;
+pub use lab_order::LabOrder;
+pub use lab_panel::LabPanel;
+pub use specimen::Specimen;
+pub use microbiology_culture::MicrobiologyCulture;
+pub use pathology_report::PathologyReport;
+pub use imaging_order::ImagingOrder;
+pub use imaging_study::ImagingStudy;
+pub use radiology_report::RadiologyReport;
+pub use procedure::Procedure;
+pub use care_plan::CarePlan;
