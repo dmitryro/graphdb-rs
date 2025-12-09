@@ -28,6 +28,7 @@ pub enum DataType {
     Float,
     Boolean,
     Timestamp,
+    DateTime,
     Json,
     List(Box<DataType>), // For Array types
     Relationship, // Used specifically for enforcing edge types on a vertex property
@@ -208,6 +209,7 @@ impl PropertyConstraint {
             DataType::Float => value.is_f64(),
             DataType::Boolean => value.is_boolean(),
             DataType::Timestamp => value.as_i64().is_some() || value.as_str().is_some(), // Allow epoch or string
+            DataType::DateTime => value.as_i64().is_some() || value.as_str().is_some(), // Allow epoch or ISO8601 string
             DataType::Json => value.is_object() || value.is_array(),
             DataType::List(_) => value.is_array(),
             DataType::Relationship => value.is_string() || value.is_object(), // Expecting a ID or Vertex/Edge stub

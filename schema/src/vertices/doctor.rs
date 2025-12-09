@@ -3,9 +3,9 @@ use serde_json::json;
 // Import PropertyConstraint from constraints module, not properties module
 use crate::definitions::VertexSchema;
 use crate::properties::{
-    PropertyDefinition, OntologyReference, DataType,
+    PropertyDefinition, OntologyReference, 
 };
-use crate::constraints::PropertyConstraint; // Changed: import from constraints
+use crate::constraints::{ PropertyConstraint, DataType }; // Changed: import from constraints
 use crate::lifecycle::{
     LifecycleRule, StateTransition, MessagingSchema, SchemaAction
 };

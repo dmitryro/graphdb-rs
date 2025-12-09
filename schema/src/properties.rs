@@ -1,20 +1,5 @@
 use serde_json::Value;
-use crate::constraints::PropertyConstraint;
-
-/// Defines the supported data types within the graph schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DataType {
-    Boolean,
-    Integer,
-    Float,
-    String,
-    Uuid,
-    Byte,
-    Date,
-    DateTime,
-    Timestamp,
-    Json,      // For complex, unstructured data
-}
+use crate::constraints::{ PropertyConstraint, DataType };
 
 /// Defines the fields for linking a property to an external ontology or standard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +34,3 @@ pub struct PropertyDefinition {
     /// Optional additional constraints. (Currently a marker)
     pub constraints: Option<PropertyConstraint>, 
 }
-
-// Re-export the corrected DataType enum
-pub use DataType as SchemaDataType;
