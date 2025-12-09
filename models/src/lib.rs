@@ -8,6 +8,8 @@ pub mod json;
 pub mod properties;
 pub mod queries;
 pub mod to_vertex; // This was added/confirmed in the last step
+pub mod to_edge;
+pub mod from_edge;
 pub mod vertices;
 pub mod graph;
 pub mod errors;
@@ -29,9 +31,11 @@ pub use vertices::Vertex; // Changed from `pub use vertices::{Node, Vertex};`
 pub use timestamp::*;
 pub use edges::Edge;
 pub use properties::{PropertyValue, PropertyMap};
-pub use identifiers::Identifier;
+pub use identifiers::{ Identifier, SerializableUuid };
 pub use json::Json;
 pub use to_vertex::ToVertex; // Trait re-export - confirmed this is correct now
+pub use to_edge::ToEdge;
+pub use from_edge::FromEdge;
 pub use graph::*;
 
 // Re-export User and Login from medical models if

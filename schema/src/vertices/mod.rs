@@ -1,0 +1,33 @@
+// schema/src/vertices/mod.rs
+
+pub mod address;
+pub mod allergy;
+pub mod billing_address;
+pub mod clinical_note;
+pub mod doctor;
+pub mod diagnosis;
+pub mod encounter;
+pub mod fhir_patient;
+pub mod imaging_study;
+pub mod lab_result;
+pub mod master_patient_index;
+pub mod medication;
+pub mod patient;
+pub mod procedure;
+pub mod snomed_concept;
+
+pub use address::*;
+pub use billing_address::*;
+pub use allergy::*;
+pub use clinical_note::*;
+pub use doctor::*;
+pub use diagnosis::*;
+pub use encounter::*;
+pub use fhir_patient::*;
+pub use imaging_study::*;
+pub use lab_result::*;
+pub use master_patient_index::*;
+pub use medication::*;
+pub use patient::*;
+pub use procedure::*;
+pub use snomed_concept::*;
