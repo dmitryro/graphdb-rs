@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod diagnosis;
 pub mod encounter;
 pub mod fhir_patient;
+pub mod medication;
 pub mod patient;
 pub mod snomed_concept;
 
@@ -13,5 +14,6 @@ pub use doctor::*;
 pub use diagnosis::*;
 pub use encounter::*;
 pub use fhir_patient::*;
+pub use medication::*;
 pub use patient::*;
 pub use snomed_concept::*;
