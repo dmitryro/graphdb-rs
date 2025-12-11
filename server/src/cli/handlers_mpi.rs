@@ -130,8 +130,31 @@ impl MPIHandlers {
                 resolution_policy,
             } => self.handle_merge(source_id, target_id, resolution_policy).await,
             MPICommand::Audit { mpi_id, timeframe } => self.handle_audit(mpi_id, timeframe).await,
+
+            // FIX 1 (Split): Deserialize the JSON string into the Patient struct
+            MPICommand::Split {
+                merged_id,
+                new_patient_data_json,
+                reason,
+            } => {
+                // FIX E0308: Convert String to Patient
+                let new_patient_data: Patient = serde_json::from_str(&new_patient_data_json)
+                    // Convert serde_json error into GraphError, using InternalError as a fallback
+                    .map_err(|e| GraphError::InternalError(format!("Failed to parse new patient data JSON: {}", e)))?;
+
+                // Pass the deserialized Patient to the handler
+                self.handle_split(merged_id, new_patient_data, reason).await
+            }
+            
+            // FIX 2 (GetGoldenRecord): Consume the Result<Patient, GraphError> and return Result<(), GraphError>
+            MPICommand::GetGoldenRecord { patient_id } => {
+                // Check for error and discard the returned Patient object on success
+                self.handle_get_golden_record(patient_id).await?;
+                Ok(())
+            }
         }
     }
+
     // =========================================================================
     // Core MPI Operations
     // =========================================================================
@@ -593,6 +616,91 @@ impl MPIHandlers {
         }
         Ok(())
     }
+
+// =========================================================================
+    // Identity Management Operations
+    // =========================================================================
+
+    /// Split - Reverse a previous merge operation (Unmerge)
+    ///
+    /// This creates a new, distinct Patient record (the 'NewPatient') and links
+    /// it back to the original merged record (the 'TargetPatient') using the
+    /// IS_SPLIT_FROM edge, preserving the audit trail.
+    async fn handle_split(
+        &self,
+        merged_id: String,
+        new_patient_data: Patient,
+        reason: String,
+    ) -> Result<(), GraphError> {
+        println!("=== MPI Identity Split (Unmerge) ===");
+        println!("Reversing a previous merge operation...\n");
+        
+        let target_mpi_id = merged_id;
+        
+        println!("Merged Record to Split: {}", target_mpi_id);
+        println!("New Patient Data ID: {}", new_patient_data.id);
+        println!("Reason for Split: {}", reason);
+        println!();
+
+        // Display warning about split consequences
+        println!("⚠ WARNING: This operation will:");
+        println!(" 1. Create a new Patient record with new ID.");
+        println!(" 2. Link the new record back to the merged record.");
+        println!(" 3. **NOTE**: Clinical data is NOT automatically migrated on split (manual step).");
+        println!(" 4. Create permanent audit trail.");
+        println!();
+
+        let result = self
+            .mpi_service
+            .identity_split(
+                target_mpi_id.clone(),
+                new_patient_data,
+                reason,
+            )
+            .await;
+
+        match result {
+            Ok(new_vertex_id) => {
+                println!("✓ Identity Split completed successfully");
+                println!(
+                    " Original Merged ID: {} → New Patient Vertex ID: {}",
+                    target_mpi_id, new_vertex_id
+                );
+                println!(" New Patient record is now ACTIVE.");
+            }
+            Err(e) => {
+                eprintln!("✗ Identity Split failed: {}", e);
+                eprintln!("\nPossible causes:");
+                eprintln!(" - Merged patient ID does not exist");
+                return Err(GraphError::InternalError(e.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Get Golden Record - Retrieve the authoritative patient record
+    ///
+    /// This method is intended to retrieve the MasterPatientIndex record and
+    /// the most current/best version of the Patient data linked to it.
+    async fn handle_get_golden_record(
+        &self,
+        patient_id: PatientId,
+    ) -> Result<Patient, GraphError> {
+        // Since `MasterPatientIndex` is essentially the golden record container,
+        // we should conceptually fetch the *best* Patient data linked to it.
+        // For now, we stub this out with a better TODO, as the MPI service needs
+        // a dedicated `get_golden_record` method that performs graph traversal.
+        
+        // TODO: Implement actual traversal logic in MpiIdentityResolutionService
+        // and call it here. E.g., find MPI record by patient_id, then follow
+        // HAS_MPI_RECORD edges to get all linked Patient records, apply survivorship
+        // rules (if implemented) and return the "Golden Patient" struct.
+        
+        eprintln!("TODO: Golden record retrieval logic not fully implemented. Returning placeholder error.");
+        Err(GraphError::NotImplemented(
+            format!("Retrieving Golden Record for {} requires advanced graph traversal and survivorship logic, which is currently a placeholder.", patient_id)
+        ))
+    }
 }
 
 // =========================================================================
@@ -755,9 +863,90 @@ pub async fn handle_mpi_audit_interactive(
     }
 }
 
+/// Handle MPI Split command in interactive mode (New addition)
+pub async fn handle_mpi_split_interactive(
+    merged_id: String,
+    new_patient_data: Patient,
+    reason: String,
+    mpi_handlers: Arc<TokioMutex<Option<MPIHandlers>>>,
+) -> Result<(), GraphError> {
+    let handlers_guard = mpi_handlers.lock().await;
+    
+    match handlers_guard.as_ref() {
+        Some(handlers) => {
+            // Display confirmation prompt for split operation
+            println!("\n⚠️ WARNING: Split is a sensitive operation!");
+            println!("This will create a new patient record to reverse the merge of {}", merged_id);
+            println!("Type 'CONFIRM' to proceed, or anything else to cancel:");
+            
+            let mut input = String::new();
+            if let Err(e) = std::io::stdin().read_line(&mut input) {
+                eprintln!("Failed to read confirmation: {}", e);
+                return Err(GraphError::InternalError("Failed to read input".into()));
+            }
+            
+            if input.trim() != "CONFIRM" {
+                println!("Split operation cancelled.");
+                return Ok(());
+            }
+            
+            handlers.handle_split(merged_id, new_patient_data, reason).await
+        }
+        None => {
+            eprintln!("Error: MPI handlers not initialized");
+            eprintln!("Please ensure the MPI service is running");
+            Err(GraphError::InternalError("MPI handlers not available".into()))
+        }
+    }
+}
+
+/// Handle MPI Get Golden Record command in interactive mode
+pub async fn handle_get_golden_record_interactive(
+    patient_id: PatientId, // String
+    mpi_handlers: Arc<TokioMutex<Option<MPIHandlers>>>,
+) -> Result<(), GraphError> {
+    let handlers_guard = mpi_handlers.lock().await;
+
+    match handlers_guard.as_ref() {
+        Some(handlers) => {
+            // Call the implementation method within MPIHandlers
+            let _record = handlers.handle_get_golden_record(patient_id.clone()).await?;
+            println!("Golden Record for Patient {} retrieved successfully.", patient_id);
+            Ok(())
+        }
+        None => {
+            eprintln!("Error: MPI handlers not initialized");
+            eprintln!("Please ensure the MPI service is running");
+            Err(GraphError::InternalError("MPI handlers not available".into()))
+        }
+    }
+}
+
 // =========================================================================
 // Non-Interactive Mode Handlers (standalone functions)
 // =========================================================================
+
+/// Handle MPI Split command in non-interactive mode (scripts, tests, API, etc.)
+pub async fn handle_mpi_split(
+    storage: Arc<dyn GraphStorageEngine>,
+    merged_id: String,
+    new_patient_data: Patient,
+    reason: String,
+) -> Result<(), GraphError> {
+    let handlers = MPIHandlers::new_with_storage(storage).await?;
+    handlers.handle_split(merged_id, new_patient_data, reason).await
+}
+
+/// Handle MPI Get Golden Record command in non-interactive mode
+pub async fn handle_get_golden_record(
+    storage: Arc<dyn GraphStorageEngine>,
+    patient_id: PatientId, // String
+) -> Result<(), GraphError> {
+    let handlers = MPIHandlers::new_with_storage(storage).await?;
+    let _record = handlers.handle_get_golden_record(patient_id).await?;
+    println!("Golden Record retrieved successfully.");
+    Ok(())
+}
 
 /// Handle MPI Match command in non-interactive mode (scripts, tests, API, etc.)
 pub async fn handle_mpi_match(

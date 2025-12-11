@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use std::fmt;
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
+pub use models::medical::{ Patient };
 
 // Helper structs for variants that need Args implementation
 #[derive(Args, Debug, PartialEq, Clone)]
@@ -1006,16 +1007,35 @@ pub enum OrderCommand {
     },
 }
 
+// Define the argument struct outside the enum
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct CreatePatientArgs {
+    // FIX: Added #[arg(long, required = true)] to force these to be flags
+    #[arg(long, required = true)]
+    pub first_name: String,
+    
+    #[arg(long, required = true)]
+    pub last_name: String,
+    
+    #[arg(long, required = true, help = "Patient's date of birth (YYYY-MM-DD)")]
+    pub dob: String, // ISO date
+    
+    #[arg(long, required = true)]
+    pub gender: String,
+    
+    #[arg(long)] 
+    pub ssn: Option<String>,
+    
+    #[arg(long)] 
+    pub mrn: Option<String>,
+}
+
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum PatientCommand {
-    Create {
-        first_name: String,
-        last_name: String,
-        dob: String,           // ISO date
-        gender: String,
-        #[arg(long)] ssn: Option<String>,
-        #[arg(long)] mrn: Option<String>,
-    },
+    // FIX: Using the separate argument struct here
+    Create(CreatePatientArgs), 
+
+    // Single-field variants correctly use positional argument by default
     View { patient_id: i32 },
     Search { query: String },
     Timeline { patient_id: i32 },
@@ -1024,26 +1044,29 @@ pub enum PatientCommand {
     CareGaps { patient_id: Option<i32> }, // None = all
     Allergies { patient_id: i32 },
     Referrals { patient_id: i32 },
+    
     /// View full patient clinical journey with pathways, milestones, deviations
     Journey {
         patient_id: i32,
-        #[clap(long)] pathway: Option<String>,        // Filter by pathway name
-        #[clap(long)] show_completed: bool,           // Include completed pathways
-        #[clap(long)] show_deviations_only: bool,     // Show only deviations
-        #[clap(long)] format: Option<JourneyFormat>,  // text, json, timeline
+        // Consistency: Using #[arg(long)]
+        #[arg(long)] pathway: Option<String>, // Filter by pathway name
+        #[arg(long)] show_completed: bool, // Include completed pathways
+        #[arg(long)] show_deviations_only: bool, // Show only deviations
+        #[arg(long)] format: Option<JourneyFormat>, // text, json, timeline
     },
 
     /// View all active drug alerts and interactions for patient
     DrugAlerts {
         patient_id: i32,
-        #[clap(long)] severity: Option<AlertSeverity>,     // Critical, High, Medium, Low
-        #[clap(long)] include_resolved: bool,             // Show resolved alerts
-        #[clap(long)] include_overridden: bool,            // Show overridden alerts
-        #[clap(long)] drug_class: Option<String>,          // Filter by drug class
-        #[clap(long)] format: Option<AlertFormat>,         // text, json, summary
-        #[clap(long)] include_inactive: bool,
-        #[clap(long)] severity_filter: Option<AlertSeverity>,  
-   },
+        // Consistency: Using #[arg(long)]
+        #[arg(long)] severity: Option<AlertSeverity>, // Critical, High, Medium, Low
+        #[arg(long)] include_resolved: bool, // Show resolved alerts
+        #[arg(long)] include_overridden: bool, // Show overridden alerts
+        #[arg(long)] drug_class: Option<String>, // Filter by drug class
+        #[arg(long)] format: Option<AlertFormat>, // text, json, summary
+        #[arg(long)] include_inactive: bool,
+        #[arg(long)] severity_filter: Option<AlertSeverity>, 
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
@@ -1244,6 +1267,29 @@ pub enum MPICommand {
         /// Optional: Timeframe to filter the audit log (e.g., "30d", "2024-01-01..2024-06-30")
         #[arg(long)]
         timeframe: Option<String>,
+    },
+
+    /// Reverses an erroneous merge operation, creating a new patient record and maintaining an audit trail.
+    Split {
+        /// The ID of the target record that was previously merged into (the one to split from).
+        #[arg(long)]
+        merged_id: String,
+        
+        /// The complete data for the new Patient record being split out (provided as a JSON string).
+        // FIX: Changed type from 'Patient' to 'String' to satisfy clap parsing requirements.
+        #[arg(long)] 
+        new_patient_data_json: String, 
+        
+        /// The reason for the identity split (required for audit).
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Retrieves the consolidated "Golden Record" (single source of truth) for a given patient.
+    GetGoldenRecord {
+        /// The canonical MPI ID of the patient to retrieve.
+        #[arg(long)]
+        patient_id: String,
     },
 }
 

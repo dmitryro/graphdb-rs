@@ -9,12 +9,13 @@ use std::process;
 use std::env;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, from_str};
 use serde_yaml2 as serde_yaml;
 use std::fs;
 use lib::daemon::storage_daemon_server::{StorageSettings, StorageSettingsWrapper};
 use log::{info, debug, warn, error};
 use models::errors::GraphError;
+use models::medical::{ Patient };
 use tokio::time::{timeout, Duration as TokioDuration};
 use std::future::Future;
 use chrono::Utc; 
@@ -80,6 +81,7 @@ use lib::storage_engine::storage_engine::{StorageEngineManager, AsyncStorageEngi
 use lib::history::{HistoryMetadata, HistoryStatus, GLOBAL_HISTORY_SERVICE};
 use crate::cli::handlers_user::{ get_current_user };
 use crate::cli::handlers_history::{ save_history_metadata };
+use crate::cli::handlers_patient::{ handle_patient_command };
 
 /// Detect query language from query content (auto-detection)
 fn detect_query_language(query: &str) -> &'static str {
@@ -1384,12 +1386,53 @@ pub async fn run_single_command(
                         .await
                         .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))?;
                 }
+                
+                MPICommand::Split { merged_id, new_patient_data_json, reason } => {
+                    // 1. Deserialize the JSON string provided by the CLI argument into the Patient struct.
+                    let new_patient_data: Patient = from_str(&new_patient_data_json)
+                        .map_err(|e| anyhow::anyhow!("Failed to parse Patient data JSON for Split command: {}", e))?;
+                    
+                    // 2. Call the handler with the correctly typed Patient struct.
+                    handlers_mpi::handle_mpi_split(
+                        storage.clone(), 
+                        merged_id, 
+                        new_patient_data, // Now correctly a Patient struct
+                        reason
+                    )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MPI split/unmerge failed: {}", e))?;
+                }
+
+                // --- ADDED: Golden Record Retrieval ---
+                MPICommand::GetGoldenRecord { patient_id } => {
+                    // Note: handle_get_golden_record is implemented to take a PatientId (String)
+                    let patient_id_str = format!("{}", patient_id);
+                    handlers_mpi::handle_get_golden_record(storage.clone(), patient_id_str)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MPI Golden Record retrieval failed: {}", e))?;
+                }
             }
 
             info!("MPI command successfully executed");
             Ok(())
         }
         Commands::Patient(action) => {
+            // 1. MUST Initialize storage explicitly before proceeding.
+            // This mirrors the MPI command's robust initialization check.
+            let _storage: Arc<dyn GraphStorageEngine> = get_storage_engine_singleton()
+                .await
+                .context("Cannot execute Patient command: Storage engine singleton is not initialized.")?;
+            
+            info!("Executing Patient subcommand in non-interactive mode: {:?}", action);
+
+            // 2. Call the existing non-interactive handler function.
+            // This function (handle_patient_command) will now run against an initialized storage.
+            let output = handle_patient_command(action).await;
+
+            // 3. Print the formatted output string from the handler.
+            println!("{}", output);
+            
+            info!("Patient command finished.");
             Ok(())
         }
         Commands::Encounter(action) => {

@@ -1,9 +1,11 @@
 // models/src/medical/patient.rs
+use bincode::{Encode, Decode};
+use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 use crate::{Vertex, ToVertex, identifiers::Identifier};
 use crate::medical::Address;   // or wherever it lives
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Patient {
     // Primary identifiers
     pub id: i32,

@@ -35,6 +35,8 @@ pub enum GraphError {
     SerializationError(String), // Error during data serialization
     #[error("Deserialization error: {0}")]
     DeserializationError(String), // Error during data deserialization
+    #[error("Invalid query execution: {0}")]
+    QueryExecutionError(String), // Error during execution of a query
     #[error("Invalid query: {0}")]
     QueryError(String), // Error during query parsing or execution logic
     #[error("Database connection error: {0}")]
@@ -49,6 +51,8 @@ pub enum GraphError {
     SystemError(String),
     #[error("Runtime failure: {0}")]
     RuntimeError(String),
+    #[error("Record not found: {0}")]
+    NotFoundError(String),
     #[error("Feature not implemented: {0}")]
     NotImplemented(String),
     #[error("Entity already exists: {0}")]

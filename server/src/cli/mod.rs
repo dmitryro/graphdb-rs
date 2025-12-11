@@ -30,6 +30,7 @@ pub mod handlers_patient_journey;
 pub mod handlers_encounters;
 pub mod handlers_drug_interactions;
 pub mod handlers_mpi;
+pub mod handlers_patient;
 
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands, get_storage_engine_singleton }; // Corrected: Changed run_cli to start_cli
@@ -148,6 +149,7 @@ pub use handlers_patient_journey::*;
 pub use handlers_encounters::*;
 pub use handlers_drug_interactions::*;
 pub use handlers_mpi::*;
+pub use handlers_patient::*;
 
 pub use handlers_main::{
     DaemonArgs,

@@ -10,6 +10,7 @@ pub mod queries;
 pub mod to_vertex; // This was added/confirmed in the last step
 pub mod to_edge;
 pub mod from_edge;
+pub mod from_vertex;
 pub mod vertices;
 pub mod graph;
 pub mod errors;
@@ -36,6 +37,8 @@ pub use json::Json;
 pub use to_vertex::ToVertex; // Trait re-export - confirmed this is correct now
 pub use to_edge::ToEdge;
 pub use from_edge::FromEdge;
+pub use from_vertex::FromVertex;
 pub use graph::*;
+pub use medical::*;
 
 // Re-export User and Login from medical models if

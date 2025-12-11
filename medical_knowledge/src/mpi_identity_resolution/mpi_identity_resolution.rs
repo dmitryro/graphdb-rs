@@ -6,6 +6,7 @@ use models::medical::*;
 use models::{Graph, Identifier, Edge, Vertex, ToVertex};
 use models::medical::{Patient, MasterPatientIndex};
 use models::identifiers::SerializableUuid;
+use models::properties::{ PropertyValue, SerializableFloat };
 use models::timestamp::BincodeDateTime;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -473,5 +474,271 @@ impl MpiIdentityResolutionService {
 
         info!("Auto-merge complete: New patient {} and candidate {} linked to MPI {}", 
             new_patient.id, candidate.patient_id, target_mpi_vertex_id);
+    }
+
+    /// Records the user who manually resolves a conflict, typically linking an MPI record to an AuditLog or Conflict vertex.
+    /// This uses the RESOLVED_BY relationship structure.
+    pub async fn log_conflict_resolution(
+        &self,
+        conflict_vertex_id: Uuid,
+        user_id: String,
+    ) -> Result<Uuid, String> {
+        let gs = self.graph_service.clone();
+
+        // Create User vertex (ephemeral clinician/analyst)
+        let user_vertex_id = Uuid::new_v4();
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "user_id".to_string(),
+            PropertyValue::String(user_id.clone()),
+        );
+        properties.insert(
+            "timestamp".to_string(),
+            PropertyValue::String(Utc::now().to_rfc3339()),
+        );
+        properties.insert(
+            "action".to_string(),
+            PropertyValue::String("conflict_resolution".to_string()),
+        );
+
+        let user_vertex = Vertex {
+            id: user_vertex_id.into(),
+            label: Identifier::new("User".to_string()).map_err(|e| e.to_string())?,
+            properties,
+            created_at: Utc::now().into(),
+            updated_at: Utc::now().into(),
+        };
+
+        gs.create_vertex(user_vertex)
+            .await
+            .map_err(|e| format!("Failed to create User vertex: {e}"))?;
+
+        // Create RESOLVED_BY edge
+        let edge = Edge::new(
+            conflict_vertex_id,
+            Identifier::new("RESOLVED_BY".to_string()).map_err(|e| e.to_string())?,
+            user_vertex_id,
+        );
+
+        gs.create_edge(edge)
+            .await
+            .map_err(|e| format!("Failed to create RESOLVED_BY edge: {e}"))?;
+
+        info!("Conflict resolution logged for {conflict_vertex_id} by user {user_id}");
+        Ok(user_vertex_id)
+    }
+
+    /// Creates a SurvivorshipRule vertex and links it to an MPI record.
+    pub async fn create_survivorship_rule_link(
+        &self,
+        mpi_vertex_id: Uuid,
+        rule_name: String,
+        field: String,
+        policy: String,
+    ) -> Result<Uuid, String> {
+        let gs = self.graph_service.clone();
+
+        let rule_vertex_id = Uuid::new_v4();
+
+        let mut properties = HashMap::new();
+        properties.insert("rule_name".to_string(), PropertyValue::String(rule_name));
+        properties.insert("field".to_string(), PropertyValue::String(field));
+        properties.insert("policy".to_string(), PropertyValue::String(policy));
+        properties.insert(
+            "applied_at".to_string(),
+            PropertyValue::String(Utc::now().to_rfc3339()),
+        );
+
+        let rule_vertex = Vertex {
+            id: rule_vertex_id.into(),
+            label: Identifier::new("SurvivorshipRule".to_string()).map_err(|e| e.to_string())?,
+            properties,
+            created_at: Utc::now().into(),
+            updated_at: Utc::now().into(),
+        };
+
+        gs.create_vertex(rule_vertex)
+            .await
+            .map_err(|e| format!("Failed to create SurvivorshipRule vertex: {e}"))?;
+
+        let edge = Edge::new(
+            mpi_vertex_id,
+            Identifier::new("HAS_SURVIVORSHIP_RULE".to_string()).map_err(|e| e.to_string())?,
+            rule_vertex_id,
+        );
+
+        gs.create_edge(edge)
+            .await
+            .map_err(|e| format!("Failed to create HAS_SURVIVORSHIP_RULE edge: {e}"))?;
+
+        info!("Created SurvivorshipRule link for MPI record {mpi_vertex_id}");
+        Ok(rule_vertex_id)
+    }
+
+    // =========================================================================
+    // CORE MPI ENTITY CREATION
+    // =========================================================================
+
+    /// Creates a MatchScore vertex and links it to an MPI record.
+    /// This is used after run_probabilistic_match identifies a score.
+    pub async fn create_match_score_link(
+        &self,
+        mpi_vertex_id: Uuid,
+        score: f64,
+        matching_algo: String,
+    ) -> Result<Uuid, String> {
+        let gs = self.graph_service.clone();
+
+        let score_vertex_id = Uuid::new_v4();
+        let matching_algo_clone = matching_algo.clone();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "score".to_string(),
+            PropertyValue::Float(SerializableFloat(score)),
+        );
+        properties.insert("algorithm".to_string(), PropertyValue::String(matching_algo));
+        properties.insert(
+            "recorded_at".to_string(),
+            PropertyValue::String(Utc::now().to_rfc3339()),
+        );
+
+        let score_vertex = Vertex {
+            id: score_vertex_id.into(),
+            label: Identifier::new("MatchScore".to_string()).map_err(|e| e.to_string())?,
+            properties,
+            created_at: Utc::now().into(),
+            updated_at: Utc::now().into(),
+        };
+
+        gs.create_vertex(score_vertex)
+            .await
+            .map_err(|e| format!("Failed to create MatchScore vertex: {e}"))?;
+
+        let edge = Edge::new(
+            mpi_vertex_id,
+            Identifier::new("HAS_MATCH_SCORE".to_string()).map_err(|e| e.to_string())?,
+            score_vertex_id,
+        );
+
+        gs.create_edge(edge)
+            .await
+            .map_err(|e| format!("Failed to create HAS_MATCH_SCORE edge: {e}"))?;
+
+        info!("Created MatchScore {:?} (algo: {:?}) for MPI {:?}", score, matching_algo_clone, mpi_vertex_id );
+        Ok(score_vertex_id)
+    }
+
+    // =========================================================================
+    // SOFT-LINKING & CONFLICT MANAGEMENT
+    // =========================================================================
+
+    /// Creates a soft-link (IS_LINKED_TO) between two Patient records based on probabilistic scoring.
+    /// This flags them as potential duplicates requiring manual review.
+    pub async fn create_potential_duplicate(
+        &self,
+        patient_a_vertex_id: Uuid,
+        patient_b_vertex_id: Uuid,
+        score: f64,
+        user: Option<String>,
+    ) -> Result<Uuid, String> {
+        let gs = self.graph_service.clone();
+
+        let mut edge = Edge::new(
+            patient_a_vertex_id,
+            Identifier::new("IS_LINKED_TO".to_string()).map_err(|e| e.to_string())?,
+            patient_b_vertex_id,
+        );
+
+        edge = edge.with_property(
+            "match_score",
+            PropertyValue::Float(SerializableFloat(score)),
+        );
+
+        if let Some(u) = user {
+            edge = edge.with_property("flagged_by", PropertyValue::String(u));
+        }
+
+        edge = edge.with_property(
+            "detected_at",
+            PropertyValue::String(Utc::now().to_rfc3339()),
+        );
+
+        gs.create_edge(edge)
+            .await
+            .map_err(|e| format!("Failed to create IS_LINKED_TO edge: {e}"))?;
+
+        info!(
+            "Created potential duplicate link between {patient_a_vertex_id} <> {patient_b_vertex_id} (score: {score})"
+        );
+
+        Ok(patient_a_vertex_id) // or return edge.id.0 if you add it to Edge
+    }
+
+    // =========================================================================
+    // IDENTITY SPLIT (Reversing a Merge)
+    // =========================================================================
+
+    /// Performs an identity split, reversing an erroneous merge by creating a new Patient record
+    /// and linking it back to the original source.
+    pub async fn identity_split(
+        &self,
+        target_patient_id_str: String,
+        new_patient_data: Patient,
+        reason: String
+    ) -> Result<Uuid, String> {
+        let gs = &self.graph_service;
+        
+        let target_id = extract_numeric_patient_id(&target_patient_id_str)
+            .map_err(|e| format!("Invalid Target Patient ID format: {}. {}", target_patient_id_str, e))?;
+
+        // 1. Validate Target Patient (the one that needs to be split)
+        let target_vertex = gs.get_patient_vertex_by_id(target_id)
+            .await
+            .ok_or_else(|| format!("Target Patient ID {} not found for split.", target_id))?;
+        let target_vertex_id = target_vertex.id.0;
+        
+        // 2. Create the new Patient record
+        let new_patient_vertex = new_patient_data.to_vertex();
+        let new_patient_vertex_id = new_patient_vertex.id.0;
+
+        gs.add_vertex(new_patient_vertex).await
+            .map_err(|e| format!("Failed to create new Patient vertex for split: {}", e))?;
+
+        // 3. Create Audit Vertex for the split
+        let audit_vertex_id = Uuid::new_v4();
+        let audit_vertex = Vertex {
+            id: SerializableUuid(audit_vertex_id),
+            label: Identifier::new("AuditLog".to_string()).unwrap(),
+            properties: HashMap::from([
+                ("reason".to_string(), models::PropertyValue::String(reason)),
+                ("action".to_string(), models::PropertyValue::String("IDENTITY_SPLIT".to_string())),
+            ]),
+            created_at: Utc::now().into(),
+            updated_at: Utc::now().into(),
+        };
+        gs.add_vertex(audit_vertex).await
+            .map_err(|e| format!("Failed to add AuditLog vertex for split: {}", e))?;
+            
+        // 4. Create IS_SPLIT_FROM edge (NewPatient -> Original/Target Patient)
+        let split_edge = Edge::new(
+            new_patient_vertex_id,
+            Identifier::new("IS_SPLIT_FROM".to_string()).unwrap(),
+            target_vertex_id,
+        );
+        gs.add_edge(split_edge).await
+            .map_err(|e| format!("Failed to link IS_SPLIT_FROM edge: {}", e))?;
+            
+        // 5. Link New Patient to Audit Log
+        let audit_edge = Edge::new(
+            new_patient_vertex_id,
+            Identifier::new("HAS_IDENTITY_HISTORY".to_string()).unwrap(),
+            audit_vertex_id,
+        );
+        gs.add_edge(audit_edge).await
+            .map_err(|e| format!("Failed to link AuditLog edge: {}", e))?;
+
+        info!("Identity split successful: New Patient {} created from {}", new_patient_vertex_id, target_vertex_id);
+        Ok(new_patient_vertex_id)
     }
 }
