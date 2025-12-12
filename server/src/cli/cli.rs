@@ -1363,8 +1363,8 @@ pub async fn run_single_command(
 
             // Execute the MPI command - handlers now expect Arc by value (not &Arc)
             match mpi_command {
-                MPICommand::Match { name, dob, address, phone } => {
-                    handlers_mpi::handle_mpi_match(storage.clone(), name, dob, address, phone)
+                MPICommand::Match { name, dob, address, phone, name_algo} => {
+                    handlers_mpi::handle_mpi_match(storage.clone(), name, dob, address, phone, name_algo)
                         .await
                         .map_err(|e| anyhow::anyhow!("MPI match failed: {}", e))?;
                 }

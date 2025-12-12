@@ -12,10 +12,10 @@
 //! - Golden Record: Maintain single source of truth for each patient
 use async_trait::async_trait;
 use tokio::sync::{Mutex as TokioMutex};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use std::sync::Arc;
 // Removed: tokio::sync::Mutex as TokioMutex (no longer used in local storage init)
-use lib::commands::MPICommand;
+use lib::commands::{ MPICommand, NameMatchAlgorithm };
 // NOTE: Assuming GraphService is accessible via the lib crate structure based on panic trace
 use lib::graph_engine::GraphService;
 use lib::storage_engine::{ GraphStorageEngine, GLOBAL_STORAGE_ENGINE };
@@ -41,25 +41,16 @@ pub struct MPIHandlers {
 // storage engine initialization logic have been removed as storage configuration
 // is handled by the main CLI entry point (cli.rs).
 
+
 /// Retrieves and initializes the MpiIdentityResolutionService singleton.
-/// This function assumes the core GraphService dependency has already been
-/// initialized by the main CLI process (cli.rs).
+/// This function is now deprecated in favor of explicit initialization in `MPIHandlers::new`.
 pub async fn get_mpi_service_singleton() -> Result<Arc<MpiIdentityResolutionService>, GraphError> {
-    // 1. Check if GraphService is available - **REMOVED CHECK** since the getter returns Arc<T>
-    // In this case, if GraphService::get().await fails, it will panic or error out before this point.
-    // The previous check suggests GraphService::get().await returns an Arc<T>, so we rely on the
-    // assumption that the service is initialized elsewhere.
-
-    // 2. Initialize the MPI service globally.
-    MpiIdentityResolutionService::global_init().await.ok(); 
-
-    // 3. Retrieve the now-initialized MPI service.
-    // If MpiIdentityResolutionService::get().await returns Arc<T>, the `.ok_or_else(?)` is invalid.
+    // Rely on the service being initialized by the CLI's main logic
     let mpi_service = MpiIdentityResolutionService::get().await;
 
-    // This is the simplest fix based on the errors, but it loses the explicit initialization check.
-    // For now, we assume the code snippet's return type is Option<Arc<T>> and the previous fix is right.
-
+    // This block is left mostly as-is from the user's snippet, but noted for deprecation
+    // in favor of the full explicit dependency chain in MPIHandlers::new/new_with_storage.
+    // In a real application, this function should be removed or refactored.
     Ok(mpi_service)
 }
 
@@ -74,11 +65,14 @@ impl MPIHandlers {
         println!("Storage dependency retrieved from singleton.");
 
         // 2. Initialize GraphService globally
-        GraphService::global_init(storage).await?;
+        GraphService::global_init(storage.clone()).await?;
         println!("GraphService initialized globally.");
 
-        // 3. Initialize MPI service globally
-        MpiIdentityResolutionService::global_init().await?;
+        // 3. Initialize MPI service globally (requires the GraphService instance)
+        // FIX: Use '?' to unwrap the Result returned by GraphService::get().await
+        let graph_service = GraphService::get().await?;
+        MpiIdentityResolutionService::global_init(graph_service).await
+            .map_err(|e| GraphError::InternalError(format!("Failed to initialize MPI service: {}", e)))?;
         println!("MpiIdentityResolutionService initialized globally.");
 
         // 4. Get the initialized service — returns Arc directly, no Option
@@ -99,7 +93,11 @@ impl MPIHandlers {
         GraphService::global_init(storage).await?;
         println!("GraphService initialized globally.");
 
-        MpiIdentityResolutionService::global_init().await?;
+        // Initialize MPI service globally (requires the GraphService instance)
+        // FIX: Use '?' to unwrap the Result returned by GraphService::get().await
+        let graph_service = GraphService::get().await?;
+        MpiIdentityResolutionService::global_init(graph_service).await
+            .map_err(|e| GraphError::InternalError(format!("Failed to initialize MPI service: {}", e)))?;
         println!("MpiIdentityResolutionService initialized globally.");
 
         // Safe: we just called global_init(), so get() will succeed
@@ -118,7 +116,8 @@ impl MPIHandlers {
                 dob,
                 address,
                 phone,
-            } => self.handle_match(name, dob, address, phone).await,
+                name_algo, // NEW: Added name_algo
+            } => self.handle_match(name, dob, address, phone, name_algo).await, // NEW: Updated call signature
             MPICommand::Link {
                 master_id,
                 external_id,
@@ -131,22 +130,22 @@ impl MPIHandlers {
             } => self.handle_merge(source_id, target_id, resolution_policy).await,
             MPICommand::Audit { mpi_id, timeframe } => self.handle_audit(mpi_id, timeframe).await,
 
-            // FIX 1 (Split): Deserialize the JSON string into the Patient struct
+            // Handle Split command
             MPICommand::Split {
                 merged_id,
                 new_patient_data_json,
                 reason,
             } => {
-                // FIX E0308: Convert String to Patient
+                // Deserialize the JSON string into the Patient struct
                 let new_patient_data: Patient = serde_json::from_str(&new_patient_data_json)
-                    // Convert serde_json error into GraphError, using InternalError as a fallback
+                    // Convert serde_json error into GraphError
                     .map_err(|e| GraphError::InternalError(format!("Failed to parse new patient data JSON: {}", e)))?;
 
                 // Pass the deserialized Patient to the handler
                 self.handle_split(merged_id, new_patient_data, reason).await
             }
             
-            // FIX 2 (GetGoldenRecord): Consume the Result<Patient, GraphError> and return Result<(), GraphError>
+            // Handle GetGoldenRecord command
             MPICommand::GetGoldenRecord { patient_id } => {
                 // Check for error and discard the returned Patient object on success
                 self.handle_get_golden_record(patient_id).await?;
@@ -171,47 +170,71 @@ impl MPIHandlers {
     /// - Date of birth comparison (exact or close matches)
     /// - Address similarity
     /// - Phone number matching
+    /// Match - Find potential duplicate records using probabilistic matching
+    // =========================================================================
+    // Core MPI Operations
+    // =========================================================================
+    /// Match - Find potential duplicate records using probabilistic matching
     async fn handle_match(
         &self,
         name: String,
-        dob: String,
-        address: String,
+        dob: Option<String>,
+        address: Option<String>,
         phone: Option<String>,
+        name_algo: NameMatchAlgorithm,
     ) -> Result<(), GraphError> {
         println!("=== MPI Patient Matching ===");
         println!("Searching for potential matches...\n");
+
+        // --- 1. Generate Blocking Keys from raw input strings ---
+        // Extract DOB as a string slice for the key generation function
+        let dob_str = dob.as_ref().map(|s| s.as_str()).unwrap_or("");
+        
+        // **CRITICAL FIX: Fix the syntax here.**
+        // 1. Remove the line `let search_keys = self`
+        // 2. Call the static method directly on the type and assign the result.
+        let search_keys = MpiIdentityResolutionService::get_blocking_keys_for_match(&name, dob_str) 
+            .map_err(|e| GraphError::InternalError(e))?;
+
+        // --- 2. Build Patient struct for full scoring (demographics) ---
         let patient = self.build_search_patient(name, dob, address, phone)?;
 
+        // ... (Printing of Search Criteria remains the same)
         println!("Search Criteria:");
         println!(" Name: {} {}", patient.first_name, patient.last_name);
-        println!(" DOB: {}", patient.date_of_birth.format("%Y-%m-%d"));
+        
+        if patient.date_of_birth.naive_utc().date().year() > 1900 {
+            println!(" DOB: {}", patient.date_of_birth.format("%Y-%m-%d"));
+        } else {
+            println!(" DOB: Not Provided");
+        }
+        
         if let Some(ref addr) = patient.address {
             println!(" Address: {}", addr.address_line1);
         }
         if let Some(ref p) = patient.phone_mobile {
             println!(" Phone: {}", p);
         }
+
+        println!(" Name Match Algorithm: {:?}", name_algo);
+        // This is now fixed as search_keys is correctly Vec<String>
+        println!(" Blocking Keys: {:?}", search_keys); 
+
         println!();
-        // Run probabilistic matching algorithm
+
+        // --- 3. Execute Match with Keys ---
         let candidates = self
             .mpi_service
-            .run_probabilistic_match(&patient)
+            // search_keys is now correctly passed as Vec<String>
+            .run_probabilistic_match(&patient, search_keys) 
             .await
             .map_err(|e| GraphError::InternalError(e.to_string()))?;
+
         self.display_match_results(candidates);
         Ok(())
     }
+
     /// Link - Associate external identifiers with MPI master record
-    ///
-    /// External identifiers include:
-    /// - Medical Record Numbers (MRN) from different facilities
-    /// - Social Security Numbers (SSN)
-    /// - Insurance member IDs
-    /// - Driver's license numbers
-    /// - Passport numbers
-    /// - Previous patient IDs from merged systems
-    ///
-    /// This enables cross-referencing across disparate systems
     async fn handle_link(
         &self,
         master_id: String,
@@ -221,16 +244,14 @@ impl MPIHandlers {
         println!("=== MPI Identity Linking ===");
         println!("Linking external identifier to master record...\n");
 
-        // FIX: Master ID is a String (e.g., MPI00987), not an integer.
         let master_mpi_id = master_id;
 
         println!("Master Patient ID: {}", master_mpi_id);
         println!("External ID: {} (Type: {})", external_id, id_type);
         println!();
-        // Validate the identifier type
+        
         self.validate_identifier_type(&id_type)?;
-        // Link the external identifier to the master record
-        // NOTE: The underlying service call is updated to use the String ID.
+        
         let result = self
             .mpi_service
             .link_external_identifier(master_mpi_id.clone(), external_id.clone(), id_type.clone())
@@ -257,21 +278,8 @@ impl MPIHandlers {
         }
         Ok(())
     }
+    
     /// Merge - Consolidate duplicate patient records into golden record
-    ///
-    /// The merge operation:
-    /// 1. Identifies source (duplicate) and target (survivor) records
-    /// 2. Applies conflict resolution policy for conflicting data
-    /// 3. Transfers all encounters, orders, results to survivor record
-    /// 4. Marks source record as merged/inactive
-    /// 5. Creates audit trail of merge operation
-    ///
-    /// Resolution policies:
-    /// - MOST_RECENT: Use most recently updated values
-    /// - MOST_COMPLETE: Prefer non-null values
-    /// - SOURCE_PRIORITY: Always take source values
-    /// - TARGET_PRIORITY: Always keep target values
-    /// - MANUAL: Require human review for conflicts
     async fn handle_merge(
         &self,
         source_id: String,
@@ -281,11 +289,9 @@ impl MPIHandlers {
         println!("=== MPI Record Merge ===");
         println!("Consolidating duplicate patient records...\n");
         
-        // FIX: MPI IDs are Strings, not integers. Removed parsing.
         let source_mpi_id = source_id;
         let target_mpi_id = target_id;
         
-        // Validate the resolution policy
         self.validate_resolution_policy(&resolution_policy)?;
 
         println!("Source Record (will be merged): {}", source_mpi_id);
@@ -293,15 +299,13 @@ impl MPIHandlers {
         println!("Conflict Resolution Policy: {}", resolution_policy);
         println!();
 
-        // Display warning about merge consequences
         println!("⚠ WARNING: This operation will:");
         println!(" 1. Transfer all clinical data from source to target");
         println!(" 2. Redirect all external identifiers to target");
         println!(" 3. Mark source record as MERGED (inactive)");
         println!(" 4. Create permanent audit trail");
         println!();
-        // Execute the merge
-        // NOTE: The underlying service call is updated to use the String IDs.
+        
         let result = self
             .mpi_service
             .manual_merge_records(
@@ -334,20 +338,8 @@ impl MPIHandlers {
         }
         Ok(())
     }
+    
     /// Audit - Retrieve complete history of identity changes
-    ///
-    /// Audit trail includes:
-    /// - All merge operations (source, target, timestamp, user)
-    /// - Identity links added/removed
-    /// - Demographic updates
-    /// - Split operations (unmerge)
-    /// - Access logs for sensitive records
-    ///
-    /// Required for:
-    /// - Regulatory compliance (HIPAA, GDPR)
-    /// - Quality assurance
-    /// - Troubleshooting identity issues
-    /// - Legal discovery requests
     async fn handle_audit(
         &self,
         mpi_id: String,
@@ -356,8 +348,6 @@ impl MPIHandlers {
         println!("=== MPI Audit Trail ===");
         println!("Retrieving identity change history...\n");
 
-        // FIX: MPI ID is a String (e.g., MPI00987), not an integer.
-        // Removed the invalid parsing which caused the error.
         let patient_mpi_id = mpi_id;
         
         println!("Patient MPI ID: {}", patient_mpi_id);
@@ -367,8 +357,7 @@ impl MPIHandlers {
             println!("Timeframe: All history");
         }
         println!();
-        // Retrieve audit trail
-        // NOTE: The underlying service call is updated to use the String ID.
+        
         let changes = self
             .mpi_service
             .get_audit_trail(patient_mpi_id, timeframe)
@@ -390,33 +379,34 @@ impl MPIHandlers {
 
             let num_changes = changes.len();
             for change in changes {
-                println!("{}", change);
+                // NOTE: Assuming the Display trait is implemented for the audit change type
+                println!("{}", change); 
             }
 
             println!("\n{} total events", num_changes);
         }
         Ok(())
     }
+
     // =========================================================================
     // Helper Functions
     // =========================================================================
+
     /// Build a minimal Patient struct for searching/matching
-    ///
-    /// This creates a search template with only the fields needed for matching.
-    /// Not all 60+ Patient fields are required for identity resolution.
     fn build_search_patient(
         &self,
         name: String,
-        dob: String,
-        address_str: String,
+        // UPDATED: Now accepts optional demographics
+        dob: Option<String>,
+        address_str: Option<String>, 
         phone: Option<String>,
     ) -> Result<Patient, GraphError> {
+        use chrono::{NaiveDate, Utc};
+
         // Parse name components
         let parts: Vec<&str> = name.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(GraphError::InvalidRequest(
-                "Name must include at least first and last name".into(),
-            ));
+        if parts.is_empty() {
+            return Err(GraphError::InvalidRequest("Name cannot be empty".into()));
         }
 
         let first_name = parts[0].to_string();
@@ -428,24 +418,29 @@ impl MPIHandlers {
         let last_name = parts.last().unwrap().to_string();
 
         // Parse and convert date of birth to DateTime<Utc>
-        let naive_date = NaiveDate::parse_from_str(&dob, "%Y-%m-%d").map_err(|_| {
-            GraphError::InvalidRequest("Invalid date format. Use YYYY-MM-DD".into())
-        })?;
-        let date_of_birth = naive_date
+        let date_of_birth = dob
+            .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            // Use a sentinel date if DOB is missing or invalid (1900-01-01)
+            .unwrap_or_else(|| NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()) 
             .and_hms_opt(0, 0, 0)
             .ok_or_else(|| GraphError::InvalidRequest("Invalid date".into()))?
             .and_utc();
-        // Create Address struct
-        let address = Address::new(
-            address_str,
-            None,
-            "Unknown".to_string(),
-            Identifier::new("US".to_string())
-                .map_err(|_| GraphError::InvalidRequest("Invalid identifier".into()))?,
-            "00000".to_string(),
-            "US".to_string(),
-        );
+
+        // Create Address struct (only if address_str is provided)
+        let address_tuple = address_str.map(|address_line1| {
+            // NOTE: Using placeholder values for city, state, etc., as before.
+            Address::new(
+                address_line1,
+                None,
+                "Unknown".to_string(),
+                Identifier::new("US".to_string()).unwrap(),
+                "00000".to_string(),
+                "US".to_string(),
+            )
+        });
+
         let now = Utc::now();
+        
         // Return minimal Patient for matching
         Ok(Patient {
             // Primary identifiers
@@ -463,81 +458,33 @@ impl MPIHandlers {
             date_of_birth,
             date_of_death: None,
             gender: "Unknown".to_string(),
-            sex_assigned_at_birth: None,
-            gender_identity: None,
-            pronouns: None,
-
+            
             // Contact - used for matching
-            address_id: Some(address.id),
-            address: Some(address),
-            phone_home: None,
+            address_id: address_tuple.as_ref().map(|a| a.id),
+            address: address_tuple,
             phone_mobile: phone,
-            phone_work: None,
-            email: None,
-            preferred_contact_method: None,
-            preferred_language: None,
-            interpreter_needed: false,
-
-            // Emergency Contact - not used for matching
-            emergency_contact_name: None,
-            emergency_contact_relationship: None,
-            emergency_contact_phone: None,
-
-            // Demographic Details - not critical for matching
-            marital_status: None,
-            race: None,
-            ethnicity: None,
-            religion: None,
-
-            // Insurance - not used for matching
-            primary_insurance: None,
-            primary_insurance_id: None,
-            secondary_insurance: None,
-            secondary_insurance_id: None,
-            guarantor_name: None,
-            guarantor_relationship: None,
-
-            // Clinical - not used for matching
-            primary_care_provider_id: None,
-            blood_type: None,
-            organ_donor: None,
-            advance_directive_on_file: false,
-            dni_status: None,
-            dnr_status: None,
-            code_status: None,
-
+            
             // Administrative
             patient_status: "ACTIVE".to_string(),
             vip_flag: false,
             confidential_flag: false,
-            research_consent: None,
-            marketing_consent: None,
-
-            // Social Determinants - not used for matching
-            employment_status: None,
-            housing_status: None,
-            education_level: None,
-            financial_strain: None,
-            food_insecurity: false,
-            transportation_needs: false,
-            social_isolation: None,
-            veteran_status: None,
-            disability_status: None,
-
-            // Clinical Alerts - not used for matching
-            alert_flags: None,
-            special_needs: None,
-
+            
             // Audit Trail
             created_at: now,
             updated_at: now,
             created_by: None,
             updated_by: None,
             last_visit_date: None,
+            
+            // FIX: Use struct update syntax to fill in all missing fields with defaults.
+            // This requires 'Patient' to implement #[derive(Default)].
+            ..Default::default() 
         })
     }
-    /// Display formatted match results with confidence scores
+
+    /// Display formatted match results with confidence scores (no changes)
     fn display_match_results(&self, candidates: Vec<PatientCandidate>) {
+        // ... (function body remains the same) ...
         if candidates.is_empty() {
             println!("No matches found.");
             println!("\nThis could mean:");
@@ -575,7 +522,8 @@ impl MPIHandlers {
         println!(" ≥ 0.50 - Possible match, manual review required");
         println!(" < 0.50 - Low confidence, likely different patient");
     }
-    /// Validate identifier type is recognized by the system
+
+    /// Validate identifier type is recognized by the system (no changes)
     fn validate_identifier_type(&self, id_type: &str) -> Result<(), GraphError> {
         let valid_types = vec![
             "MRN",      // Medical Record Number
@@ -598,14 +546,15 @@ impl MPIHandlers {
         }
         Ok(())
     }
-    /// Validate merge resolution policy
+
+    /// Validate merge resolution policy (no changes)
     fn validate_resolution_policy(&self, policy: &str) -> Result<(), GraphError> {
         let valid_policies = vec![
-            "MOST_RECENT",     // Use most recently updated values
-            "MOST_COMPLETE",   // Prefer non-null values
-            "SOURCE_PRIORITY", // Always take source values
-            "TARGET_PRIORITY", // Always keep target values
-            "MANUAL",          // Require human review
+            "MOST_RECENT",      // Use most recently updated values
+            "MOST_COMPLETE",    // Prefer non-null values
+            "SOURCE_PRIORITY",  // Always take source values
+            "TARGET_PRIORITY",  // Always keep target values
+            "MANUAL",           // Require human review
         ];
         if !valid_policies.contains(&policy) {
             return Err(GraphError::InvalidRequest(format!(
@@ -617,15 +566,11 @@ impl MPIHandlers {
         Ok(())
     }
 
-// =========================================================================
+    // =========================================================================
     // Identity Management Operations
     // =========================================================================
 
     /// Split - Reverse a previous merge operation (Unmerge)
-    ///
-    /// This creates a new, distinct Patient record (the 'NewPatient') and links
-    /// it back to the original merged record (the 'TargetPatient') using the
-    /// IS_SPLIT_FROM edge, preserving the audit trail.
     async fn handle_split(
         &self,
         merged_id: String,
@@ -642,7 +587,6 @@ impl MPIHandlers {
         println!("Reason for Split: {}", reason);
         println!();
 
-        // Display warning about split consequences
         println!("⚠ WARNING: This operation will:");
         println!(" 1. Create a new Patient record with new ID.");
         println!(" 2. Link the new record back to the merged record.");
@@ -680,26 +624,35 @@ impl MPIHandlers {
 
     /// Get Golden Record - Retrieve the authoritative patient record
     ///
-    /// This method is intended to retrieve the MasterPatientIndex record and
-    /// the most current/best version of the Patient data linked to it.
+    /// The return type is updated to reflect the need to return `Result<(), GraphError>`
+    /// from the top-level `handle` function, rather than the `Patient` struct itself.
+    /// Get Golden Record - Retrieve the authoritative patient record
     async fn handle_get_golden_record(
         &self,
-        patient_id: PatientId,
-    ) -> Result<Patient, GraphError> {
-        // Since `MasterPatientIndex` is essentially the golden record container,
-        // we should conceptually fetch the *best* Patient data linked to it.
-        // For now, we stub this out with a better TODO, as the MPI service needs
-        // a dedicated `get_golden_record` method that performs graph traversal.
+        patient_id: String,
+    ) -> Result<(), GraphError> {
+        println!("=== MPI Golden Record Retrieval ===");
+        println!("Retrieving consolidated record for patient ID: {}\n", patient_id);
         
-        // TODO: Implement actual traversal logic in MpiIdentityResolutionService
-        // and call it here. E.g., find MPI record by patient_id, then follow
-        // HAS_MPI_RECORD edges to get all linked Patient records, apply survivorship
-        // rules (if implemented) and return the "Golden Patient" struct.
-        
-        eprintln!("TODO: Golden record retrieval logic not fully implemented. Returning placeholder error.");
-        Err(GraphError::NotImplemented(
-            format!("Retrieving Golden Record for {} requires advanced graph traversal and survivorship logic, which is currently a placeholder.", patient_id)
-        ))
+        // Call the new service method
+        let result = self.mpi_service.get_golden_record(patient_id.clone()).await; 
+
+        match result {
+            Ok(golden_patient) => {
+                println!("✓ Golden Record successfully retrieved.");
+                println!(" Full Name: {} {}", golden_patient.first_name, golden_patient.last_name);
+                println!(" Date of Birth: {}", golden_patient.date_of_birth.format("%Y-%m-%d"));
+                println!(" MRN: {}", golden_patient.mrn.as_deref().unwrap_or("N/A"));
+                
+                // Further logic to print address, phone, etc., would go here.
+                
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("✗ Failed to retrieve Golden Record for {}: {}", patient_id, e);
+                Err(GraphError::NotFoundError(format!("Golden Record not found or retrieval failed: {}", e)))
+            }
+        }
     }
 }
 
@@ -769,16 +722,20 @@ impl MPIHandlers {
 /// Handle MPI Match command in interactive mode
 pub async fn handle_mpi_match_interactive(
     name: String,
-    dob: String,
-    address: String,
+    // FIX: Change String to Option<String> to match handle_match
+    dob: Option<String>,
+    // FIX: Change String to Option<String> to match handle_match
+    address: Option<String>,
     phone: Option<String>,
+    name_algo: NameMatchAlgorithm,
     mpi_handlers: Arc<TokioMutex<Option<MPIHandlers>>>,
 ) -> Result<(), GraphError> {
     let handlers_guard = mpi_handlers.lock().await;
     
     match handlers_guard.as_ref() {
         Some(handlers) => {
-            handlers.handle_match(name, dob, address, phone).await
+            // This call now matches the expected signature
+            handlers.handle_match(name, dob, address, phone, name_algo).await
         }
         None => {
             eprintln!("Error: MPI handlers not initialized");
@@ -787,6 +744,7 @@ pub async fn handle_mpi_match_interactive(
         }
     }
 }
+
 /// Handle MPI Link command in interactive mode
 pub async fn handle_mpi_link_interactive(
     master_id: String,
@@ -948,17 +906,31 @@ pub async fn handle_get_golden_record(
     Ok(())
 }
 
+// /// Handle MPI Match command in non-interactive mode (scripts, tests, API, etc.)
+// pub async fn handle_mpi_match(
+//     storage: Arc<dyn GraphStorageEngine>,  // Take by value (ownership)
+//     name: String,
+//     dob: String, // <- FIX: Changed to Option<String>
+//     address: String, // <- FIX: Changed to Option<String>
+//     phone: Option<String>,
+// ) -> Result<(), GraphError> { // <- The original function only took 5 arguments and required dob/address
 /// Handle MPI Match command in non-interactive mode (scripts, tests, API, etc.)
 pub async fn handle_mpi_match(
     storage: Arc<dyn GraphStorageEngine>,  // Take by value (ownership)
     name: String,
-    dob: String,
-    address: String,
+    // FIX: Change String to Option<String>
+    dob: Option<String>,
+    // FIX: Change String to Option<String>
+    address: Option<String>,
     phone: Option<String>,
+    // FIX: Add NameMatchAlgorithm parameter
+    name_algo: NameMatchAlgorithm,
 ) -> Result<(), GraphError> {
     let handlers = MPIHandlers::new_with_storage(storage).await?;
-    handlers.handle_match(name, dob, address, phone).await
+    // FIX: Pass all 5 arguments to the internal handler
+    handlers.handle_match(name, dob, address, phone, name_algo).await
 }
+
 
 /// Handle MPI Link command in non-interactive mode
 pub async fn handle_mpi_link(

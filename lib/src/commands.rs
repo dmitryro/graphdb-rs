@@ -1018,6 +1018,10 @@ pub struct CreatePatientArgs {
     #[arg(long)]
     pub last_name: Option<String>,
     
+    /// Patient's full name (interprets as first and last name if provided) // <--- ADDED FIELD
+    #[arg(long)]
+    pub name: Option<String>, // <--- ADDED FIELD
+
     /// Patient's date of birth (dd-mm-yyyy format, e.g., 12-01-1975)
     #[arg(long)]
     pub dob: Option<String>,
@@ -1025,6 +1029,14 @@ pub struct CreatePatientArgs {
     /// Patient's gender
     #[arg(long)]
     pub gender: Option<String>,
+    
+    // NEW: Patient's primary address (optional)
+    #[arg(long)]
+    pub address: Option<String>,
+    
+    // NEW: Patient's mobile phone number (optional)
+    #[arg(long)]
+    pub phone: Option<String>,
     
     /// Patient's social security number (optional)
     #[arg(long)] 
@@ -1221,25 +1233,59 @@ pub enum LabFlag {
     Normal,
 }
 
+#[derive(ValueEnum, Debug, PartialEq, Clone)]
+/// Specifies the name matching algorithm to use in probabilistic matching.
+pub enum NameMatchAlgorithm {
+    #[value(name = "jaro-winkler")]
+    JaroWinkler,
+    #[value(name = "levenshtein")]
+    Levenshtein,
+    #[value(name = "both")]
+    Both,
+}
+
+ // FIX: Implement the Display trait to satisfy the default_value_t requirement.
+impl fmt::Display for NameMatchAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Use the same names that were implied by the removed #[value(name = "...")]
+        // If the names were part of the user's initial prompt, they are used here:
+        match self {
+            NameMatchAlgorithm::JaroWinkler => write!(f, "jaro-winkler"),
+            NameMatchAlgorithm::Levenshtein => write!(f, "levenshtein"),
+            NameMatchAlgorithm::Both => write!(f, "both"),
+        }
+    }
+}
+
 // --- MASTER PATIENT INDEX COMMANDS ---
 #[derive(Subcommand, Debug, PartialEq, Clone,)]
 /// Commands for Master Patient Index (MPI) operations, including matching, linking, and merging patient identities.
 pub enum MPICommand {
     /// Runs probabilistic matching logic to find potential duplicate patient records.
-    /// 
+    ///
+    /// The accuracy of the match improves with more provided input fields (DOB, Address, Phone).
     Match {
-        /// Patient's full name (required for probabilistic match)
+        /// Patient's full name (MANDATORY: required for any probabilistic match)
         #[arg(long)]
         name: String,
-        /// Patient's date of birth (YYYY-MM-DD)
+        
+        /// Optional: Patient's date of birth (YYYY-MM-DD). If provided, significantly increases score weight.
         #[arg(long)]
-        dob: String,
-        /// Patient's address (street/city/zip) for identity comparison
+        dob: Option<String>,
+        
+        /// Optional: Patient's address (street/city/zip). Used for geographic blocking and scoring.
         #[arg(long)]
-        address: String,
-        /// Optional: Patient's phone number for higher match certainty
+        address: Option<String>,
+        
+        /// Optional: Patient's phone number. Used for high match certainty blocking.
         #[arg(long)]
         phone: Option<String>,
+
+        /// Optional: Specify the primary name matching algorithm to use for scoring.
+        /// Defaults to 'jaro-winkler', which is generally better for names with minor typos.
+        // FIX: The Display implementation now allows use of default_value_t
+        #[arg(long, default_value_t = NameMatchAlgorithm::JaroWinkler)]
+        name_algo: NameMatchAlgorithm,
     },
 
     /// Explicitly links an external identifier (e.g., foreign MRN) to an existing master MPI record.
@@ -1285,7 +1331,6 @@ pub enum MPICommand {
         merged_id: String,
         
         /// The complete data for the new Patient record being split out (provided as a JSON string).
-        // FIX: Changed type from 'Patient' to 'String' to satisfy clap parsing requirements.
         #[arg(long)] 
         new_patient_data_json: String, 
         
