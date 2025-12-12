@@ -8,7 +8,7 @@
 // FIXED: 2025-08-09 - Added `ShowArgs` wrapper struct to fix `E0277` trait bound error for `ShowAction`.
 // UPDATED: 2025-11-06 - Unified `Exec`, `Query`, `-q`, `-c` into single `Query` command with optional `--language`.
 //                     Bare strings in interactive mode are now treated as queries with inference.
-
+use serde::{Deserialize, Serialize};
 use clap::{Parser, Subcommand, Arg, Args, ArgAction, ValueEnum}; 
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -1008,26 +1008,35 @@ pub enum OrderCommand {
 }
 
 // Define the argument struct outside the enum
-#[derive(Args, Debug, PartialEq, Clone)]
+#[derive(Args, Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct CreatePatientArgs {
-    // FIX: Added #[arg(long, required = true)] to force these to be flags
-    #[arg(long, required = true)]
-    pub first_name: String,
+    /// Patient's first name
+    #[arg(long)]
+    pub first_name: Option<String>,
     
-    #[arg(long, required = true)]
-    pub last_name: String,
+    /// Patient's last name
+    #[arg(long)]
+    pub last_name: Option<String>,
     
-    #[arg(long, required = true, help = "Patient's date of birth (YYYY-MM-DD)")]
-    pub dob: String, // ISO date
+    /// Patient's date of birth (dd-mm-yyyy format, e.g., 12-01-1975)
+    #[arg(long)]
+    pub dob: Option<String>,
     
-    #[arg(long, required = true)]
-    pub gender: String,
+    /// Patient's gender
+    #[arg(long)]
+    pub gender: Option<String>,
     
+    /// Patient's social security number (optional)
     #[arg(long)] 
     pub ssn: Option<String>,
     
+    /// Patient's medical record number (optional)
     #[arg(long)] 
     pub mrn: Option<String>,
+    
+    /// Batch create using JSON string with all patient fields
+    #[arg(long)]
+    pub batch: Option<String>,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]

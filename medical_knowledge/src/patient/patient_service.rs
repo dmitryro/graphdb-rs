@@ -5,6 +5,7 @@
 use std::collections::{ HashMap };
 // Assuming GraphService is accessible via lib
 use lib::graph_engine::graph_service::{GraphService}; 
+use lib::config::{ sanitize_cypher_string, format_optional_string };
 use models::medical::{Patient, Problem, Prescription, Allergy, Referral};
 use models::{Vertex};
 use crate::{FromVertex}; // Assuming FromVertex is a trait in the current crate
@@ -107,37 +108,43 @@ impl PatientService {
         new_patient.id = patient_uuid.as_u128() as i32;
         new_patient.created_at = Utc::now();
         new_patient.updated_at = Utc::now();
-
-        // Parse the date string and convert to DateTime<Utc>
-        let naive_date = NaiveDate::parse_from_str("01-05-1977", "%d-%m-%Y")
-            .map_err(|e| GraphError::InternalError(format!("Invalid date string: {}", e)))?;
-        new_patient.date_of_birth = DateTime::<Utc>::from_naive_utc_and_offset(
-            naive_date.and_hms_opt(0, 0, 0).unwrap(),
-            Utc,
-        );
-
-        // Convert Patient struct to properties (assuming Patient derives Serialize)
-        let properties = json!(new_patient);
-
-        // Cypher to create a new Patient node
+        
+        // Sanitize required string fields
+        let first_name = sanitize_cypher_string(&new_patient.first_name);
+        let last_name = sanitize_cypher_string(&new_patient.last_name);
+        let gender = sanitize_cypher_string(&new_patient.gender);
+        
+        // Format optional fields
+        let ssn = format_optional_string(&new_patient.ssn);
+        let mrn = format_optional_string(&new_patient.mrn);
+        
+        // Format timestamps in ISO 8601 format
+        let dob = new_patient.date_of_birth.to_rfc3339();
+        let created_at = new_patient.created_at.to_rfc3339();
+        let updated_at = new_patient.updated_at.to_rfc3339();
+        
+        // Build Cypher query with properly formatted values
         let query = format!(
-            "CREATE (p:Patient {{id:{:?}, first_name: {:?},last_name:{:?},gender:{:?},ssn:{:?},mrn:{:?},date_of_birth:{:?},created_at:{:?},updated_at:{:?}}});",
+            "CREATE (p:Patient {{id: {}, first_name: \"{}\", last_name: \"{}\", gender: \"{}\", ssn: {}, mrn: {}, date_of_birth: \"{}\", created_at: \"{}\", updated_at: \"{}\"}});",
             new_patient.id,
-            new_patient.first_name,
-            new_patient.last_name,
-            new_patient.gender,
-            new_patient.ssn,
-            new_patient.mrn,
-            new_patient.date_of_birth.to_rfc3339(),
-            new_patient.created_at.to_rfc3339(),
-            new_patient.updated_at.to_rfc3339()
+            first_name,
+            last_name,
+            gender,
+            ssn,
+            mrn,
+            dob,
+            created_at,
+            updated_at
         );
-
+        
+        // Convert Patient struct to properties for any additional processing
+        let properties = json!(new_patient);
+        
         self.graph_service
             .execute_cypher_write(&query, properties)
             .await
             .map_err(|e| GraphError::InternalError(format!("Graph write failed: {}", e)))?;
-
+        
         Ok(format!("Patient registered with UUID: {}", patient_uuid))
     }
 

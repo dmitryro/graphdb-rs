@@ -2116,7 +2116,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     let mut gender: Option<String> = None;
                     let mut ssn: Option<String> = None;
                     let mut mrn: Option<String> = None;
-                    
+                    let mut batch_json: Option<String> = None; // The variable is named `batch_json`
+
                     let mut i = 0; 
                     let mut successfully_parsed = true;
 
@@ -2142,6 +2143,24 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                     successfully_parsed = false;
                                     break;
                                 }
+                            } 
+                            // Handle --batch flag
+                            "--batch" => {
+                                if i + 1 < remaining_args.len() {
+                                    // Consume the next argument as the raw JSON string.
+                                    // Trim leading/trailing whitespace, single, and double quotes
+                                    let value = remaining_args[i + 1].trim().trim_matches('\'').trim_matches('"').to_string();
+                                    
+                                    if batch_json.is_some() {
+                                        eprintln!("Warning: --batch flag specified multiple times. Using the last one.");
+                                    }
+                                    batch_json = Some(value);
+                                    i += 2;
+                                } else {
+                                    eprintln!("Error: Flag --batch requires a JSON string value.");
+                                    successfully_parsed = false;
+                                    break;
+                                }
                             }
                             _ => {
                                 eprintln!("Error: Unexpected argument for create: {}", remaining_args[i]);
@@ -2152,24 +2171,30 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     
                     if successfully_parsed {
-                        if let (Some(first_name), Some(last_name), Some(dob), Some(gender)) = (first_name, last_name, dob, gender) {
+                        // FIX 1: Change `batch` to `batch_json` on the RHS of the pattern match.
+                        // FIX 2: All fields in CreatePatientArgs are Option<String>, so unwrapped values
+                        //        must be wrapped back in Some().
+                        if let (Some(fnm), Some(lnm), Some(d), Some(g), Some(b)) = (first_name, last_name, dob, gender, batch_json) {
                             // Success: Clear the original vector since all arguments were processed and consumed.
                             remaining_args.clear();
                             
-                            // FIX: Construct the CreatePatientArgs struct first, 
-                            // then wrap it in the PatientCommand::Create tuple variant.
+                            // Construct the CreatePatientArgs struct. Note the use of Some() to wrap the 
+                            // mandatory unwrapped values, and the direct use of `ssn` and `mrn` which are already Option<String>.
                             let create_args = CreatePatientArgs {
-                                first_name,
-                                last_name,
-                                dob,
-                                gender,
+                                first_name: Some(fnm), // Wrapped
+                                last_name: Some(lnm),   // Wrapped
+                                dob: Some(d),           // Wrapped
+                                gender: Some(g),        // Wrapped
                                 ssn,
                                 mrn,
+                                batch: Some(b),         // Wrapped (the JSON string)
                             };
 
                             CommandType::Patient(PatientCommand::Create(create_args))
                             
                         } else {
+                            // NOTE: This logic only succeeds if ALL 5 fields are present. A more robust
+                            // parser would handle individual flags without --batch.
                             eprintln!("Error: Missing required fields for patient create.");
                             CommandType::Unknown
                         }
@@ -2177,7 +2202,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::Unknown
                     }
                 }
-
                 // === SIMPLE COMMANDS (consume one argument: patient_id) ===
                 // Uses `remaining_args.remove(0)` to consume the argument on success.
                 "view" | "timeline" | "problems" | "meds" | "alerts" | "allergies" => {

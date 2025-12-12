@@ -435,7 +435,7 @@ pub async fn match_nodes(
 
         // FIX 1 (E0061): Remove the `params` argument from the call.
         // FIX 2 (E0308): Use `.map(|value| vec![value])` to convert the single Value into a Vec<Value>.
-        println!("===> in execute_cypher_read - query was: {:?}", query);
+        println!("===> in execute_cypher_read - query was: {}", query);
         engine.execute_cypher(query) 
             .await
             .map_err(|e| GraphError::QueryExecutionError(format!("Cypher READ failed: {}", e)))
@@ -457,7 +457,7 @@ pub async fn match_nodes(
 
         // FIX 1 (E0061): Remove the `params` argument from the call.
         // FIX 2 (E0308): Use `.map(|value| vec![value])` to convert the single Value into a Vec<Value>.
-        println!("===> in execute_cypher_write - query was: {:?}", query);
+        println!("===> in execute_cypher_write - query was: {}", query);
         engine.execute_cypher(query)
             .await
             .map_err(|e| GraphError::QueryExecutionError(format!("Cypher WRITE failed: {}", e)))

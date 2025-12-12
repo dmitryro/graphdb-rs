@@ -1424,11 +1424,11 @@ pub async fn run_single_command(
                 .context("Cannot execute Patient command: Storage engine singleton is not initialized.")?;
             
             info!("Executing Patient subcommand in non-interactive mode: {:?}", action);
-
+            
             // 2. Call the existing non-interactive handler function.
             // This function (handle_patient_command) will now run against an initialized storage.
             let output = handle_patient_command(action).await;
-
+            
             // 3. Print the formatted output string from the handler.
             println!("{}", output);
             

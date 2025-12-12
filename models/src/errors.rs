@@ -65,6 +65,8 @@ pub enum GraphError {
     EvaluationError(String),
     #[error("entity with identifier {0} was not found")]
     NotFound(Identifier),
+    #[error("Parse error: {0}")]
+    ParseError(String),
     #[error("Validation error: {0}")]
     Validation(ValidationError),
     #[error("Validation error: {0}")]

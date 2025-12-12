@@ -12,9 +12,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 
 // =========================================================================
-// INTERNAL BUSINESS LOGIC
+// INTERNAL BUSINESS LOGIC (omitted for brevity, assume unchanged)
 // =========================================================================
 
 /// State and logic container for patient-related operations.
@@ -60,13 +61,11 @@ impl PatientHandlers {
     pub async fn new_with_service(patient_service: Arc<PatientService>) -> Self {
         Self { patient_service }
     }
-
-    // --- Core Methods called by command handlers ---
     
     pub async fn create_patient(&self, new_patient: Patient) -> Result<String, GraphError> {
         self.patient_service.create_patient(new_patient).await
     }
-
+    
     pub async fn view_patient(&self, patient_id: i32) -> Result<String, GraphError> {
         // PatientService::view_patient was implemented to return Result<Patient, GraphError>
         // Here we serialize it back to a readable string format.
@@ -75,7 +74,7 @@ impl PatientHandlers {
             Err(e) => Err(e),
         }
     }
-
+    
     pub async fn search_patients(&self, query: &str) -> Result<String, GraphError> {
         self.patient_service.search_patients(query).await
     }
@@ -142,7 +141,6 @@ impl PatientHandlers {
     }
 }
 
-
 // =========================================================================
 // NON-INTERACTIVE COMMAND HANDLER (CLI/API)
 // =========================================================================
@@ -150,27 +148,97 @@ impl PatientHandlers {
 /// Handles Patient-related commands in non-interactive mode. Returns a formatted String result.
 pub async fn handle_patient_command(action: PatientCommand) -> String {
     // Initialize handlers instance
-    // FIX: Using the fully dependency-aware `new` method for non-interactive mode.
     let handlers = match PatientHandlers::new().await {
         Ok(h) => h,
         Err(e) => return format!("FATAL ERROR: Failed to initialize PatientHandlers: {}", e),
     };
 
     let result = match action {
-        // FIX E0023: Match the single CreatePatientArgs argument (args) and destructure it.
         PatientCommand::Create(args) => {
-            let CreatePatientArgs { first_name, last_name, dob, gender, ssn, mrn } = args;
+            // Define the final tuple that will hold our parsed values
+            let patient_args_tuple: (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
             
-            let dob_parsed = NaiveDate::parse_from_str(&dob, "%Y-%m-%d")
-                .unwrap_or(NaiveDate::from_ymd_opt(1900, 1, 1).unwrap());
+            // Check if batch is present and perform JSON deserialization if necessary.
+            if let Some(json_str) = &args.batch {
+                // CASE 1: Batch JSON is provided, deserialize it.
+                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                    Ok(json_value) => {
+                        // Extract fields from JSON
+                        let first_name = json_value.get("first_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let last_name = json_value.get("last_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let dob = json_value.get("dob")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let gender = json_value.get("gender")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let ssn = json_value.get("ssn")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let mrn = json_value.get("mrn")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        
+                        patient_args_tuple = (first_name, last_name, dob, gender, ssn, mrn);
+                    },
+                    Err(e) => return format!("Error: Failed to parse batch JSON: {}", e),
+                }
+            } else {
+                // CASE 2: Individual flags were provided, use them directly from `args`.
+                patient_args_tuple = (
+                    args.first_name.clone(), 
+                    args.last_name.clone(), 
+                    args.dob.clone(), 
+                    args.gender.clone(), 
+                    args.ssn.clone(), 
+                    args.mrn.clone()
+                );
+            };
+
+            // Destructure the Option<String> tuple
+            let (first_name_opt, last_name_opt, dob_opt, gender_opt, ssn_opt, mrn_opt) = patient_args_tuple;
+            
+            // Validate that required fields are present
+            let (first_name, last_name, dob, gender) = match (first_name_opt, last_name_opt, dob_opt, gender_opt) {
+                (Some(fnm), Some(lnm), Some(dob), Some(g)) => (fnm, lnm, dob, g),
+                _ => {
+                    if args.batch.is_some() {
+                        return format!("Error: Batch JSON missing required field(s). Required: first_name, last_name, dob, gender");
+                    } else {
+                        return format!("Error: Missing required field(s). Required: --first-name, --last-name, --dob, --gender");
+                    }
+                }
+            };
+            
+            // Parse the date with the specific format: "dd-mm-yyyy"
+            let dob_parsed = match NaiveDate::parse_from_str(&dob, "%d-%m-%Y") {
+                 Ok(d) => d,
+                 Err(e) => return format!("Error: Invalid DOB format ('{}'), expected 'dd-mm-yyyy': {}", dob, e),
+            };
             
             // Build the Patient struct
             let new_patient = Patient {
+                mrn: mrn_opt, 
+                ssn: ssn_opt, 
+                first_name, 
+                last_name, 
+                gender,
+                
+                // Calculated/Default fields
                 id: 0, 
-                user_id: None, mrn, ssn, first_name, middle_name: None, last_name, suffix: None,
-                preferred_name: None,
                 date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
-                date_of_death: None, gender, sex_assigned_at_birth: None, gender_identity: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                patient_status: "ACTIVE".to_string(), 
+
+                // Default/None fields
+                user_id: None, middle_name: None, suffix: None,
+                preferred_name: None,
+                date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, address: None, phone_home: None,
                 phone_mobile: None, phone_work: None, email: None, preferred_contact_method: None,
                 preferred_language: None, interpreter_needed: false, emergency_contact_name: None,
@@ -180,13 +248,12 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 secondary_insurance_id: None, guarantor_name: None, guarantor_relationship: None,
                 primary_care_provider_id: None, blood_type: None, organ_donor: None,
                 advance_directive_on_file: false, dni_status: None, dnr_status: None,
-                code_status: None, patient_status: "ACTIVE".to_string(), vip_flag: false,
+                code_status: None, vip_flag: false,
                 confidential_flag: false, research_consent: None, marketing_consent: None,
                 employment_status: None, housing_status: None, education_level: None,
                 financial_strain: None, food_insecurity: false, transportation_needs: false,
                 social_isolation: None, veteran_status: None, disability_status: None,
-                alert_flags: None, special_needs: None, created_at: Utc::now(),
-                updated_at: Utc::now(), created_by: None, updated_by: None, last_visit_date: None,
+                alert_flags: None, special_needs: None, created_by: None, updated_by: None, last_visit_date: None,
             };
             handlers.create_patient(new_patient).await
         }
@@ -226,22 +293,92 @@ pub async fn handle_patient_command_interactive(
     // FIX: Using the fully dependency-aware `new` method for interactive mode.
     let handlers = PatientHandlers::new().await?;
 
-    // All execution logic is the same as non-interactive, but error handling is done via `?`
-    // and the result is printed to stdout.
     let result = match action {
-        // FIX E0023: Match the single CreatePatientArgs argument (args) and destructure it.
         PatientCommand::Create(args) => {
-            let CreatePatientArgs { first_name, last_name, dob, gender, ssn, mrn } = args;
+            // Define the final tuple that will hold our parsed values
+            let patient_args_tuple: (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
 
-            let dob_parsed = NaiveDate::parse_from_str(&dob, "%Y-%m-%d")
-                .unwrap_or(NaiveDate::from_ymd_opt(1900, 1, 1).unwrap());
+            // Check if batch is present and perform JSON deserialization if necessary.
+            if let Some(json_str) = &args.batch {
+                // CASE 1: Batch JSON is provided, deserialize it.
+                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                    Ok(json_value) => {
+                        // Extract fields from JSON
+                        let first_name = json_value.get("first_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let last_name = json_value.get("last_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let dob = json_value.get("dob")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let gender = json_value.get("gender")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let ssn = json_value.get("ssn")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let mrn = json_value.get("mrn")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        
+                        patient_args_tuple = (first_name, last_name, dob, gender, ssn, mrn);
+                    },
+                    Err(e) => return Err(anyhow!("Failed to parse batch JSON: {}", e)),
+                }
+            } else {
+                // CASE 2: Individual flags were provided, use them directly from `args`.
+                patient_args_tuple = (
+                    args.first_name.clone(), 
+                    args.last_name.clone(), 
+                    args.dob.clone(), 
+                    args.gender.clone(), 
+                    args.ssn.clone(), 
+                    args.mrn.clone()
+                );
+            };
+
+            // Destructure the Option<String> tuple
+            let (first_name_opt, last_name_opt, dob_opt, gender_opt, ssn_opt, mrn_opt) = patient_args_tuple;
             
-            // Build the Patient struct (omitted for brevity, assume same structure as above)
+            // Validate that required fields are present
+            let (first_name, last_name, dob, gender) = match (first_name_opt, last_name_opt, dob_opt, gender_opt) {
+                (Some(fnm), Some(lnm), Some(dob), Some(g)) => (fnm, lnm, dob, g),
+                _ => {
+                    if args.batch.is_some() {
+                        return Err(anyhow!("Batch JSON missing required field(s). Required: first_name, last_name, dob, gender"));
+                    } else {
+                        return Err(anyhow!("Missing required field(s). Required: --first-name, --last-name, --dob, --gender"));
+                    }
+                }
+            };
+            
+            // Parse the date with the specific format: "dd-mm-yyyy"
+            let dob_parsed = match NaiveDate::parse_from_str(&dob, "%d-%m-%Y") {
+                Ok(d) => d,
+                Err(e) => return Err(anyhow!("Invalid DOB format ('{}'), expected 'dd-mm-yyyy': {}", dob, e)),
+            };
+            
+            // Build the Patient struct
             let new_patient = Patient {
-                id: 0, user_id: None, mrn, ssn, first_name, middle_name: None, last_name, suffix: None,
-                preferred_name: None,
+                mrn: mrn_opt, 
+                ssn: ssn_opt, 
+                first_name, 
+                last_name, 
+                gender,
+
+                // Calculated/Default fields
+                id: 0, 
                 date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
-                date_of_death: None, gender, sex_assigned_at_birth: None, gender_identity: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                patient_status: "ACTIVE".to_string(), 
+
+                // Default/None fields
+                user_id: None, middle_name: None, suffix: None,
+                preferred_name: None,
+                date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, address: None, phone_home: None,
                 phone_mobile: None, phone_work: None, email: None, preferred_contact_method: None,
                 preferred_language: None, interpreter_needed: false, emergency_contact_name: None,
@@ -251,13 +388,12 @@ pub async fn handle_patient_command_interactive(
                 secondary_insurance_id: None, guarantor_name: None, guarantor_relationship: None,
                 primary_care_provider_id: None, blood_type: None, organ_donor: None,
                 advance_directive_on_file: false, dni_status: None, dnr_status: None,
-                code_status: None, patient_status: "ACTIVE".to_string(), vip_flag: false,
+                code_status: None, vip_flag: false,
                 confidential_flag: false, research_consent: None, marketing_consent: None,
                 employment_status: None, housing_status: None, education_level: None,
                 financial_strain: None, food_insecurity: false, transportation_needs: false,
                 social_isolation: None, veteran_status: None, disability_status: None,
-                alert_flags: None, special_needs: None, created_at: Utc::now(),
-                updated_at: Utc::now(), created_by: None, updated_by: None, last_visit_date: None,
+                alert_flags: None, special_needs: None, created_by: None, updated_by: None, last_visit_date: None,
             };
             handlers.create_patient(new_patient).await
         }
