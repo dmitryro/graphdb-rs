@@ -2,6 +2,11 @@
 //! Global singleton with blocking + scoring + auto-merge
 
 // Assuming strsim is available as a dependency based on previous usage
+use anyhow::{Result, Context, anyhow};
+use std::convert::TryFrom; // Needed for i64 -> i32 conversion
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::str::FromStr; // FIX for E0599 (no function from_str)
 use lib::graph_engine::graph_service::{GraphService, initialize_graph_service}; 
 use models::medical::*;
 use models::{Graph, Identifier, Edge, Vertex, ToVertex};
@@ -9,19 +14,15 @@ use models::medical::{Patient, MasterPatientIndex};
 use models::identifiers::SerializableUuid;
 use models::properties::{ PropertyValue, SerializableFloat };
 use models::timestamp::BincodeDateTime;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
 use chrono::{DateTime, TimeZone, NaiveDate, Utc, Datelike};
-use log::{info, error};
-
+use log::{info, error, warn};
+use serde_json::{ self, Value }; // ADDED for JSON parsing in global_init
 // Assuming the 'strsim' crate is a dependency in Cargo.toml
 // If 'strsim' is not imported globally, you might need 'use strsim;' here
 // if using it outside of `self::` or module paths.
 
-use anyhow::Result;
-use serde_json; // ADDED for JSON parsing in global_init
 
 /// Global singleton — use via MPI_RESOLUTION_SERVICE.get().await
 pub static MPI_RESOLUTION_SERVICE: OnceCell<Arc<MpiIdentityResolutionService>> = OnceCell::const_new();
@@ -68,6 +69,166 @@ fn extract_numeric_patient_id(patient_id_str: &str) -> Result<PatientIdInternal,
         })
 }
 
+/// Helper to extract a single Patient Vertex from the graph query result.
+/// 
+/// The raw result from the DB is expected to be: 
+/// Vec<Value> (length 1) -> Value (JSON object) -> "results" array -> 
+/// First element -> "vertices" array -> First Vertex JSON.
+// --- FIX FOR E0515 ---
+fn extract_single_vertex(result_vec: Vec<Value>) -> Option<Vertex> {
+    result_vec.into_iter()
+        .flat_map(|val| {
+            // Get the "results" array. We need to clone it to pass ownership 
+            // to the outer iterator chain. This is expensive but necessary
+            // given the data structure and lifetime constraints.
+            val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec())
+        }) 
+        .flatten() // Now iterating over Vec<Value> (the results array items)
+        .flat_map(|res_item| {
+            // Get the "vertices" array and clone it.
+            res_item.get("vertices").and_then(Value::as_array).map(|arr| arr.to_vec())
+        })
+        .flatten() // Now iterating over Vec<Value> (the vertex JSONs)
+        .filter_map(|v_val| {
+            // We have ownership of v_val here, so cloning is fine
+            serde_json::from_value::<Vertex>(v_val).ok()
+        })
+        .next() 
+}
+
+// --- The Core Lookup Function ---
+async fn get_patient_vertex_by_id_or_mrn(
+    gs: &GraphService, 
+    identifier: &str
+// FIX: Replace unknown type `GraphVertex` with known type `Vertex`
+) -> Result<Vertex, String> {
+    
+    let clean_id = identifier.trim_matches(|c| c == '\'' || c == '"');
+
+    // Define queries: Try MRN, then String ID, then Numeric ID
+    let mut queries = vec![
+        format!("MATCH (p:Patient {{mrn: \"{}\"}}) RETURN p", clean_id),
+        format!("MATCH (p:Patient {{id: \"{}\"}}) RETURN p", clean_id),
+    ];
+    if let Ok(num_id) = clean_id.parse::<i64>() {
+        queries.push(format!("MATCH (p:Patient {{id: {}}}) RETURN p", num_id));
+    }
+
+    for query in queries {
+        match gs.execute_cypher_read(&query, Value::Null).await {
+            Ok(result_vec) => {
+                // FIX: Use the new extraction logic
+                if let Some(vertex) = extract_single_vertex(result_vec) {
+                    println!("[Service Debug] Patient found by query: {}", query);
+                    return Ok(vertex);
+                }
+            },
+            Err(e) => println!("[Service Debug] Query failed: {}. Error: {:?}", query, e),
+        }
+    }
+    
+    // If no match is found after all attempts
+    Err(format!("Patient with identifier '{}' not found in graph.", clean_id))
+}
+// Helper function to get patient data (ID and UUID) from MRN or numeric ID
+async fn get_patient_data_helper(
+    gs: &GraphService, 
+    identifier: &str
+) -> Result<(i32, String), String> {
+    use std::str::FromStr;
+    
+    // Check if input is already numeric
+    if let Ok(id) = i32::from_str(identifier) {
+        if id != 0 {
+            // Look up by numeric ID (no quotes!)
+            let query = format!("MATCH (p:Patient {{id: {}}}) RETURN p", id);
+            let result = gs.execute_cypher_read(&query, Value::Null).await
+                .map_err(|e| format!("Graph lookup for ID '{}' failed: {}", id, e))?;
+            return parse_patient_from_result(result, identifier);
+        }
+    }
+    
+    // Look up by MRN (with quotes for string)
+    let query = format!("MATCH (p:Patient {{mrn: \"{}\"}}) RETURN p", identifier);
+    let result = gs.execute_cypher_read(&query, Value::Null).await
+        .map_err(|e| format!("Graph lookup for MRN '{}' failed: {}", identifier, e))?;
+    parse_patient_from_result(result, identifier)
+}
+
+// Helper function: Maps an MRN (e.g., "A-100") or raw numeric ID to the internal Patient ID (i32).
+// This function addresses the failure to extract the integer from the successful Cypher result.
+async fn map_mrn_to_internal_id(gs: &GraphService, mrn: &str) -> Result<i32, String> {
+    
+    // 1. Check if the input is already a pure numeric ID (i32)
+    if let Ok(id) = i32::from_str(mrn) {
+        if id != 0 { 
+            return Ok(id); 
+        }
+    }
+    
+    // 2. Execute Cypher READ to find the associated 'id' integer property.
+    let query = format!(r#"MATCH (p:Patient {{mrn: "{}"}}) RETURN p"#, mrn); 
+    
+    println!("[MPI Debug] Executing MRN lookup query (Returning full node): {}", query);
+    
+    let result = gs.execute_cypher_read(&query, Value::Null).await
+        .map_err(|e| format!("Graph lookup for MRN '{}' failed (Cypher execution error): {}", mrn, e))?;
+    println!("===> execute_cypher_read returned {:?}", result);
+    
+    // 3. FIX: Parse the result by navigating the deep JSON structure returned by the engine.
+    if let Some(outer_wrapper) = result.into_iter().next() {
+        
+        // Navigation path: outer_wrapper -> "results" -> [0] -> "vertices" -> [0] -> "properties" -> "id"
+        let id_result = outer_wrapper
+            .get("results")
+            .and_then(|results| results.as_array())
+            .and_then(|results_array| results_array.get(0))
+            .and_then(|first_result| first_result.get("vertices"))
+            .and_then(|vertices| vertices.as_array())
+            .and_then(|vertices_array| vertices_array.get(0))
+            .and_then(|first_vertex| first_vertex.get("properties"))
+            .and_then(|props| props.get("id"))
+            .and_then(|id_prop| id_prop.as_i64()); // Extract the numeric ID
+            
+        if let Some(id_i64) = id_result {
+            return Ok(id_i64 as i32);
+        }
+    }
+    
+    // If lookup failed (result was empty or parsing failed)
+    Err(format!("Patient with MRN/ID '{}' not found or ID could not be parsed from query result.", mrn))
+}
+
+// Helper function to parse patient data from Cypher result
+fn parse_patient_from_result(
+    result: Vec<serde_json::Value>, 
+    identifier: &str
+) -> Result<(i32, String), String> {
+    if let Some(outer_wrapper) = result.into_iter().next() {
+        let vertex = outer_wrapper
+            .get("results")
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.get(0))
+            .and_then(|r| r.get("vertices"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.get(0));
+            
+        if let Some(v) = vertex {
+            let id = v.get("properties")
+                .and_then(|p| p.get("id"))
+                .and_then(|i| i.as_i64())
+                .ok_or_else(|| format!("No 'id' property found for '{}'", identifier))?;
+            
+            let uuid = v.get("id")
+                .and_then(|u| u.as_str())
+                .ok_or_else(|| format!("No UUID found for '{}'", identifier))?;
+            
+            return Ok((id as i32, uuid.to_string()));
+        }
+    }
+    
+    Err(format!("Patient '{}' not found or data could not be parsed", identifier))
+}
 
 impl MpiIdentityResolutionService {
     /// ✅ CONSTRUCTOR: Requires the GraphService instance, guaranteeing a valid state.
@@ -217,6 +378,105 @@ impl MpiIdentityResolutionService {
         }
     }
 
+    // =========================================================================
+    // CORE PUBLIC INDEXING API
+    // =========================================================================
+
+    /// Handles the entire process of indexing a new patient record from a public interface:
+    /// 1. Checks for existing Patient via MRN (fast lookup).
+    /// 2. Creates the Patient vertex if new.
+    /// 3. Runs probabilistic matching against existing candidates.
+    /// 4. Performs auto-merge/update if a high-confidence match is found.
+    /// Handles the entire process of indexing a new patient record from a public interface.
+    pub async fn index_new_patient(&self, mut patient_data: Patient) -> Result<Patient, String> {
+        let gs = &self.graph_service;
+
+        let mut new_patient_vertex_id;
+        let mut is_new_creation = false;
+
+        // 1. Check for existing patient via MRN (Optimization)
+        if let Some(mrn) = patient_data.mrn.as_ref() {
+            match gs.get_patient_by_mrn(mrn).await {
+                Ok(Some(existing_vertex)) => {
+                    // Patient exists by MRN, perform update/re-indexing
+                    new_patient_vertex_id = existing_vertex.id.0;
+                    
+                    // FIX 1: Safely extract and cast the Integer value to i32, matching patient_data.id's type
+                    patient_data.id = existing_vertex.properties.get("id")
+                        .and_then(|p| match p {
+                            PropertyValue::Integer(val) => Some(*val as i32), // Cast to i32
+                            _ => None,
+                        })
+                        // FIX 1: unwrap_or must receive the same type (i32) as the inner Option value
+                        .unwrap_or(patient_data.id); 
+                        
+                    info!("Patient with MRN {} found (Vertex ID {}). Re-indexing triggered.", mrn, new_patient_vertex_id);
+                }
+                Ok(None) => {
+                    // Patient is new by MRN, proceed with creation.
+                    is_new_creation = true;
+                    let patient_vertex = patient_data.to_vertex();
+                    new_patient_vertex_id = patient_vertex.id.0;
+                    gs.add_vertex(patient_vertex).await
+                        .map_err(|e| format!("Failed to add new Patient vertex: {}", e))?;
+                }
+                Err(e) => {
+                    return Err(format!("Error during MRN lookup: {}", e));
+                }
+            }
+        } else {
+             return Err("MRN is missing and required for patient indexing.".to_string());
+        }
+
+        // 2. Run the indexing and probabilistic matching
+        info!("Patient {} indexed. Starting probabilistic matching.", patient_data.id);
+        
+        // Update the in-memory indexes with the new/updated patient_data
+        self.index_patient(&patient_data, new_patient_vertex_id).await;
+
+        let candidates = self.find_candidates(&patient_data).await;
+        
+        if let Some(best) = candidates.into_iter().max_by(|a, b| a.match_score.partial_cmp(&b.match_score).unwrap_or(std::cmp::Ordering::Equal)) {
+            info!("Best candidate found for patient {} with score: {}", patient_data.id, best.match_score);
+
+            // 3. Auto-merge/Update if score is high enough
+            if best.match_score > 0.95 {
+                
+                // FIX 2: Use the correct field: `patient_vertex_id`
+                let target_vertex_id: Uuid = best.patient_vertex_id; 
+                
+                // If we just created a new vertex, but found a high-confidence match 
+                if is_new_creation && target_vertex_id != new_patient_vertex_id {
+                    let mut update_props = HashMap::new();
+                    
+                    if let Some(new_mrn) = patient_data.mrn.as_ref() {
+                        // Inject the newly supplied MRN into the existing, matching vertex
+                        update_props.insert(String::from("mrn"), PropertyValue::String(new_mrn.clone()));
+                    }
+                    
+                    // If we found a match, update the properties of the existing Golden Record Candidate.
+                    if !update_props.is_empty() {
+                        // FIX 3: Call the assumed GraphService method
+                        match gs.update_vertex_properties(target_vertex_id, update_props).await {
+                             Ok(_) => info!("Updated Golden Record candidate {} with new MRN/properties.", target_vertex_id),
+                             Err(e) => warn!("Failed to update Golden Record candidate properties: {}", e),
+                        }
+                    }
+                }
+                
+                // Perform the actual merge (linking the new/duplicate record to the golden record)
+                self.auto_merge(new_patient_vertex_id, patient_data.clone(), best).await;
+                info!("Auto-merge successful for Patient {}", patient_data.id);
+                
+            } else {
+                info!("Score {} is below auto-merge threshold (0.95). No auto-merge performed.", best.match_score);
+            }
+        }
+        
+        // Return the final patient record
+        Ok(patient_data)
+    }
+
 
     // Finally, the global_init remains as previously fixed for logging:
 
@@ -322,13 +582,13 @@ impl MpiIdentityResolutionService {
     }
 
     // Retaining original get implementation, only updating internal comment.
-    pub async fn get() -> Arc<Self> {
+    pub async fn get() -> Result<Arc<Self>, anyhow::Error> {
         MPI_RESOLUTION_SERVICE
-            .get_or_init(|| async {
-                panic!("MpiIdentityResolutionService not initialized! Call global_init(graph_service_instance) first.");
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("MpiIdentityResolutionService not initialized! Call global_init(graph_service_instance) first.")
             })
-            .await
-            .clone()
     }
 
     /// Runs the probabilistic matching algorithm by first blocking on keys, 
@@ -429,67 +689,119 @@ impl MpiIdentityResolutionService {
         })
     }
 
-      /// Manually merges a source patient record into a target patient record.
+    /// Manually merges a source patient record into a target patient record.
+    // In mpi_identity_resolution::MpiIdentityResolutionService::manual_merge_records
     pub async fn manual_merge_records(
         &self, 
         source_id_str: String,
         target_id_str: String,
-        _policy: String
+        policy: String
     ) -> Result<MasterPatientIndex, String> {
-        let source_id = extract_numeric_patient_id(&source_id_str)
-            .map_err(|e| format!("Invalid Source Patient ID format: {}. {}", source_id_str, e))?;
-        let target_id = extract_numeric_patient_id(&target_id_str)
-            .map_err(|e| format!("Invalid Target Patient ID format: {}. {}", target_id_str, e))?;
-        // 🎯 Using injected dependency
+        
+        // 1. Clean and fetch source/target vertices using the robust helper
+        let source_clean = source_id_str.trim_matches(|c| c == '\'' || c == '"').to_string();
+        let target_clean = target_id_str.trim_matches(|c| c == '\'' || c == '"').to_string();
+        
         let gs = &self.graph_service; 
         
-        // 1. Validate Target
-        let target_vertex = gs.get_patient_vertex_by_id(target_id)
+        // Use the new robust helper to get the vertex data
+        let source_vertex = get_patient_vertex_by_id_or_mrn(gs, &source_clean)
             .await
-            .ok_or_else(|| format!("Target Patient ID {} not found.", target_id))?;
-        let target_vertex_id = target_vertex.id.0;
-        
-        // 2. Validate Source
-        let source_vertex = gs.get_patient_vertex_by_id(source_id)
+            .map_err(|e| format!("Source lookup failed for '{}': {}", source_id_str, e))?;
+
+        let target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean)
             .await
-            .ok_or_else(|| format!("Source Patient ID {} not found for merge.", source_id))?;
-        let source_vertex_id = source_vertex.id.0;
+            .map_err(|e| format!("Target lookup failed for '{}': {}", target_id_str, e))?;
+
+        // Extract the primary internal IDs (the 'id' property which is used for the merge key)
+        // FIX 1: Use .cloned() to unify the return type to Option<i64> for or_else.
+        let source_id = source_vertex.properties.get("id")
+            .and_then(|v| v.as_i64().cloned()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+            .ok_or_else(|| "Source vertex is missing a valid numeric 'id' property.".to_string())?;
+
+        // FIX 2: Use .cloned() to unify the return type to Option<i64> for or_else.
+        let target_id = target_vertex.properties.get("id")
+            .and_then(|v| v.as_i64().cloned()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+            .ok_or_else(|| "Target vertex is missing a valid numeric 'id' property.".to_string())?;
+
+        // Extract MRN for the merge relationship properties
+        let target_mrn = target_vertex.properties.get("mrn")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| target_clean.clone()); // Fallback to the identifier if MRN not present
+
+        println!("[MPI Debug] Source ID for merge: {}", source_id);
+        println!("[MPI Debug] Target ID for merge: {}", target_id);
+
+        // --- The Two-Step Cypher Merge ---
         
-        // 3. Create Audit Log Vertex (Placeholder for actual audit data)
-        let audit_vertex = Vertex {
-            id: SerializableUuid(Uuid::new_v4()),
-            label: Identifier::new("AuditLog".to_string()).unwrap(),
-            properties: HashMap::new(),
-            created_at: Utc::now().into(),
-            updated_at: Utc::now().into(),
-        };
-        gs.add_vertex(audit_vertex.clone()).await
-            .map_err(|e| format!("Failed to add audit vertex: {}", e))?;
-        
-        // 4. Link Target to Audit Log
-        let edge = Edge::new(
-            target_vertex_id,
-            Identifier::new("HAS_IDENTITY_HISTORY".to_string()).unwrap(),
-            audit_vertex.id.0,
+        // 2. Query 1: Create the MERGED_INTO relationship
+        let create_rel_query = format!(
+            "MATCH (source:Patient {{id: {}}}), (target:Patient {{id: {}}}) 
+             CREATE (source)-[:MERGED_INTO {{policy: \"{}\", merged_at: timestamp(), target_id_numeric: {}, target_mrn: \"{}\"}}]->(target) 
+             RETURN target",
+            source_id,
+            target_id,
+            policy,
+            target_id,
+            target_mrn
         );
-        gs.add_edge(edge).await
-            .map_err(|e| format!("Failed to add HAS_IDENTITY_HISTORY edge: {}", e))?;
+
+        println!("[MPI Debug] Executing CREATE relationship query: {}", create_rel_query);
         
-        // 5. Delete Source Vertex - Convert Uuid to Identifier
-        let source_identifier = Identifier::new(source_vertex_id.to_string())
-            .map_err(|e| format!("Failed to create identifier for source vertex: {}", e))?;
-        gs.delete_vertex(source_identifier).await
-            .map_err(|e| format!("Failed to delete source vertex: {}", e))?;
+        let _result_rel = gs.execute_cypher_write(&create_rel_query, Value::Null)
+            .await
+            .map_err(|e| format!("Graph merge transaction (CREATE) failed: {}", e))?;
         
-        info!("Manual merge successful: {} -> {}. Source retired.", source_id, target_id);
+        // 3. Query 2: Update the source node's status to MERGED
+        let set_status_query = format!(
+            "MATCH (source:Patient {{id: {}}}) 
+             SET source.patient_status = \"MERGED\", source.updated_at = timestamp() 
+             RETURN source",
+            source_id
+        );
+
+        println!("[MPI Debug] Executing SET status query: {}", set_status_query);
+
+        let _result_status = gs.execute_cypher_write(&set_status_query, Value::Null)
+            .await
+            .map_err(|e| format!("Graph merge transaction (SET) failed: {}", e))?;
+
+        // --- Post-Merge and Return ---
+
+        info!("Manual merge successful: {} -> {}. Source redirected and retired.", source_clean, target_clean);
         
+        // We already have target_vertex, we can just return the MasterPatientIndex using its properties
         Ok(MasterPatientIndex {
             id: rand::random(),
-            patient_id: Some(target_id),
-            first_name: None, last_name: None, date_of_birth: None, gender: None,
-            address: None, contact_number: None, email: None, social_security_number: None,
-            match_score: None, match_date: None,
-            created_at: Utc::now(), updated_at: Utc::now(),
+            // FIX 3: Unify ID extraction to Option<i64>, then convert to Option<i32> for the field.
+            patient_id: source_vertex.properties.get("id") 
+                // 1. Get source ID as owned i64
+                .and_then(|v| v.as_i64().cloned()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+                // 2. Fallback to target ID as owned i64
+                .or_else(|| target_vertex.properties.get("id")
+                    .and_then(|v| v.as_i64().cloned()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))))
+                // 3. Convert the final Option<i64> result to the expected Option<i32>
+                .and_then(|id_i64| i32::try_from(id_i64).ok()),
+                
+            first_name: target_vertex.properties.get("first_name")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            last_name: target_vertex.properties.get("last_name")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            // ... (other fields)
+            date_of_birth: None, 
+            gender: None, 
+            address: None, 
+            contact_number: None, 
+            email: None, 
+            social_security_number: None,
+            match_score: None, 
+            match_date: None,
+            created_at: Utc::now(), 
+            updated_at: Utc::now(),
         })
     }
 
@@ -954,31 +1266,41 @@ impl MpiIdentityResolutionService {
     /// Retrieves the consolidated "Golden Record" (Patient struct) for a given MPI ID.
     /// This involves graph traversal and survivorship logic.
     pub async fn get_golden_record(&self, patient_id: String) -> Result<Patient, String> {
-        // In a real scenario, this method would execute the following steps:
-        // 1. Find the MasterPatientIndex vertex using the provided patient_id.
-        // 2. Traverse the graph using the graph_service dependency (e.g., following HAS_RECORD edges)
-        //    to gather all linked Patient and associated demographic records.
-        // 3. Apply the survivorship rules (Most Recent, Most Complete, etc.) to the gathered data
-        //    to consolidate the definitive attributes.
-        // 4. Construct and return the resulting "Golden" Patient struct.
+        let gs = &self.graph_service;
 
-        // --- Placeholder Implementation ---
         if patient_id.is_empty() {
-             return Err("Patient ID cannot be empty.".to_string());
+            return Err("Patient ID cannot be empty.".to_string());
         }
 
-        println!("[Service] Starting graph traversal for Golden Record: {}", patient_id);
-
-        // Simulate successful retrieval of a Patient
-        Ok(Patient {
-            id: patient_id.parse().unwrap_or_default(), // Use patient_id as a base for ID
-            mrn: Some(format!("GOLDEN_{}", patient_id)),
-            first_name: "Authoritative".to_string(),
-            last_name: "Patient".to_string(),
-            date_of_birth: chrono::NaiveDate::from_ymd_opt(1980, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc(),
-            // Add other critical consolidated fields here
-            ..Default::default() 
-        })
-        // --- End Placeholder Implementation ---
+        // 1. Use the targeted query to find the Patient Vertex by MRN.
+        match gs.get_patient_by_mrn(&patient_id).await {
+            Ok(Some(v)) => {
+                info!("[Service] Found Patient Vertex {} ({}) for Golden Record ID: {}", v.id.0, v.label, patient_id);
+                
+                // 2. Conversion/Survivorship (Placeholder)
+                // FIX: Change match arms from Ok/Err (Result) to Some/None (Option)
+                // If conversion fails (None), return an overall error (Err).
+                match Patient::from_vertex(&v) {
+                    Some(mut patient) => { // Use Some
+                        // Mark it as a Golden Record for the response consistency
+                        if let Some(mrn) = patient.mrn.take() {
+                             patient.mrn = Some(format!("GOLDEN_{}", mrn));
+                        } else {
+                            patient.mrn = Some(format!("GOLDEN_ID_{}", patient.id));
+                        }
+                        Ok(patient) // Return Ok(Patient) to satisfy function signature
+                    },
+                    None => Err(format!("Found vertex but failed to convert to Patient model: {}", v.id.0)), // Use None
+                }
+            },
+            Ok(None) => {
+                // Patient not found by MRN.
+                Err(format!("Patient or MPI record with MRN '{}' not found in the graph.", patient_id))
+            },
+            Err(e) => {
+                // Error during graph search.
+                Err(format!("Error searching graph for MRN '{}': {}", patient_id, e))
+            }
+        }
     }
 }

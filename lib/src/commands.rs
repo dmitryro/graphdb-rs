@@ -1244,11 +1244,9 @@ pub enum NameMatchAlgorithm {
     Both,
 }
 
- // FIX: Implement the Display trait to satisfy the default_value_t requirement.
+// FIX: Implement the Display trait to satisfy the default_value_t requirement.
 impl fmt::Display for NameMatchAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Use the same names that were implied by the removed #[value(name = "...")]
-        // If the names were part of the user's initial prompt, they are used here:
         match self {
             NameMatchAlgorithm::JaroWinkler => write!(f, "jaro-winkler"),
             NameMatchAlgorithm::Levenshtein => write!(f, "levenshtein"),
@@ -1261,6 +1259,38 @@ impl fmt::Display for NameMatchAlgorithm {
 #[derive(Subcommand, Debug, PartialEq, Clone,)]
 /// Commands for Master Patient Index (MPI) operations, including matching, linking, and merging patient identities.
 pub enum MPICommand {
+    /// Indexes a new patient record into the MPI for future matching and retrieval.
+    /// Requires either --name OR the combination of --first-name and --last-name.
+    Index {
+        /// Patient's full name (e.g., "Alex Johnson"). Conflicts with --first-name and --last-name.
+        #[arg(long, conflicts_with_all = ["first_name", "last_name"])]
+        name: Option<String>,
+
+        /// Patient's first name. Requires --last-name if --name is not provided.
+        #[arg(long)]
+        first_name: Option<String>,
+
+        /// Patient's last name. Requires --first-name if --name is not provided.
+        #[arg(long)]
+        last_name: Option<String>,
+
+        /// Optional: Patient's date of birth (YYYY-MM-DD). Accepts --dob or --date_of_birth interchangeably.
+        #[arg(long, aliases = ["date_of_birth"])]
+        dob: Option<String>,
+
+        /// Mandatory: Patient's Medical Record Number (MRN).
+        #[arg(long)]
+        mrn: String,
+        
+        /// Optional: Patient's address (street/city/zip).
+        #[arg(long)]
+        address: Option<String>,
+        
+        /// Optional: Patient's phone number.
+        #[arg(long)]
+        phone: Option<String>,
+    },
+    
     /// Runs probabilistic matching logic to find potential duplicate patient records.
     ///
     /// The accuracy of the match improves with more provided input fields (DOB, Address, Phone).
@@ -1283,7 +1313,6 @@ pub enum MPICommand {
 
         /// Optional: Specify the primary name matching algorithm to use for scoring.
         /// Defaults to 'jaro-winkler', which is generally better for names with minor typos.
-        // FIX: The Display implementation now allows use of default_value_t
         #[arg(long, default_value_t = NameMatchAlgorithm::JaroWinkler)]
         name_algo: NameMatchAlgorithm,
     },

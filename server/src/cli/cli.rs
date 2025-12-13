@@ -1361,8 +1361,24 @@ pub async fn run_single_command(
 
             info!("Executing MPI subcommand: {:?}", mpi_command);
 
-            // Execute the MPI command - handlers now expect Arc by value (not &Arc)
+            // Execute the MPI command
             match mpi_command {
+                // --- ADDED: Patient Indexing Operation (Non-Interactive CLI) ---
+                MPICommand::Index { name, first_name, last_name, dob, mrn, address, phone } => {
+                    handlers_mpi::handle_mpi_index(
+                        storage.clone(),
+                        name,
+                        first_name,
+                        last_name,
+                        dob,
+                        mrn, // Mandatory String
+                        address,
+                        phone,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI index failed: {}", e))?;
+                }
+
                 MPICommand::Match { name, dob, address, phone, name_algo} => {
                     handlers_mpi::handle_mpi_match(storage.clone(), name, dob, address, phone, name_algo)
                         .await
@@ -1403,7 +1419,7 @@ pub async fn run_single_command(
                         .map_err(|e| anyhow::anyhow!("MPI split/unmerge failed: {}", e))?;
                 }
 
-                // --- ADDED: Golden Record Retrieval ---
+                // --- Golden Record Retrieval ---
                 MPICommand::GetGoldenRecord { patient_id } => {
                     // Note: handle_get_golden_record is implemented to take a PatientId (String)
                     let patient_id_str = format!("{}", patient_id);

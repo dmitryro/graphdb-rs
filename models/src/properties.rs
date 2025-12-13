@@ -66,6 +66,12 @@ impl PropertyValue {
             _ => None,
         }
     }
+    pub fn as_i64(&self) -> Option<&i64> {
+        match self {
+            PropertyValue::Integer(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 impl From<String> for PropertyValue {

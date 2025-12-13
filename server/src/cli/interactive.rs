@@ -3167,8 +3167,9 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut dob: Option<String> = None;
             let mut address: Option<String> = None;
             let mut phone: Option<String> = None;
-            let mut name_algo: Option<String> = None; // NEW: For probabilistic matching algorithm
+            let mut name_algo: Option<String> = None; 
 
+            // Link/Merge/Audit variables
             let mut master_id: Option<String> = None;
             let mut external_id: Option<String> = None;
             let mut id_type: Option<String> = None;
@@ -3178,18 +3179,24 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut mpi_id: Option<String> = None;
             let mut timeframe: Option<String> = None;
             
-            let mut merged_id: Option<String> = None; // NEW: For Split subcommand
-            let mut new_patient_data_json: Option<String> = None; // NEW: For Split subcommand
-            let mut reason: Option<String> = None; // NEW: For Split subcommand
-            let mut patient_id: Option<String> = None; // NEW: For GetGoldenRecord subcommand
+            // Split/GetGoldenRecord variables
+            let mut merged_id: Option<String> = None; 
+            let mut new_patient_data_json: Option<String> = None; 
+            let mut reason: Option<String> = None; 
+            let mut patient_id: Option<String> = None; 
 
+            // NEW: Index variables
+            let mut mrn: Option<String> = None;
+            let mut first_name: Option<String> = None;
+            let mut last_name: Option<String> = None;
+            
             let mut current_subcommand_index = 0;
             let mut explicit_subcommand: Option<String> = None;
             
             if !remaining_args.is_empty() {
                 match remaining_args[0].to_lowercase().as_str() {
-                    // UPDATED: Added new subcommands
-                    "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" => {
+                    // UPDATED: Added "index" subcommand
+                    "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" | "index" => {
                         explicit_subcommand = Some(remaining_args[0].to_lowercase());
                         current_subcommand_index = 1;
                     }
@@ -3209,7 +3216,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    "--dob" => {
+                    // UPDATED: Handle both --dob and --date_of_birth
+                    "--dob" | "--date_of_birth" => {
                         if i + 1 < remaining_args.len() {
                             dob = Some(remaining_args[i + 1].clone());
                             i += 2;
@@ -3236,7 +3244,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    // NEW: Name algorithm flag
                     "--name-algo" => {
                         if i + 1 < remaining_args.len() {
                             let value = remaining_args[i + 1].to_lowercase();
@@ -3252,6 +3259,38 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
+                    
+                    // NEW: Index Flags
+                    "--mrn" => {
+                        if i + 1 < remaining_args.len() {
+                            mrn = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--first-name" => {
+                        if i + 1 < remaining_args.len() {
+                            first_name = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--last-name" => {
+                        if i + 1 < remaining_args.len() {
+                            last_name = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    
+                    // ... existing link/merge/audit/split/getgoldenrecord flags ...
+                    
                     "--master-id" => {
                         if i + 1 < remaining_args.len() {
                             master_id = Some(remaining_args[i + 1].clone());
@@ -3324,7 +3363,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    // NEW: Split flags
                     "--merged-id" => {
                         if i + 1 < remaining_args.len() {
                             merged_id = Some(remaining_args[i + 1].clone());
@@ -3352,7 +3390,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    // NEW: GetGoldenRecord flag
                     "--patient-id" => {
                         if i + 1 < remaining_args.len() {
                             patient_id = Some(remaining_args[i + 1].clone());
@@ -3370,20 +3407,45 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
             
             match explicit_subcommand.as_deref() {
+                // NEW: Index Subcommand implementation
+                Some("index") => {
+                    if let Some(m) = mrn {
+                        // Check if either --name OR (--first-name AND --last-name) are present
+                        let name_ok = name.is_some() || (first_name.is_some() && last_name.is_some());
+                        
+                        if name_ok {
+                            CommandType::Mpi(MPICommand::Index {
+                                name,
+                                first_name,
+                                last_name,
+                                dob,
+                                mrn: m,
+                                address,
+                                phone,
+                            })
+                        } else {
+                            eprintln!("Error: 'mpi index' requires either --name OR both --first-name and --last-name.");
+                            CommandType::Unknown
+                        }
+                    } else {
+                        eprintln!("Error: 'mpi index' requires the mandatory flag --mrn.");
+                        CommandType::Unknown
+                    }
+                }
+                
                 Some("match") => {
                     if let Some(n) = name {
-                        // Determine the NameMatchAlgorithm enum value based on the parsed string, defaulting to JaroWinkler
                         let algo = match name_algo.as_deref() {
                             Some("levenshtein") => NameMatchAlgorithm::Levenshtein,
                             Some("both") => NameMatchAlgorithm::Both,
-                            _ => NameMatchAlgorithm::JaroWinkler, // Default
+                            _ => NameMatchAlgorithm::JaroWinkler,
                         };
 
                         CommandType::Mpi(MPICommand::Match {
                             name: n,
-                            dob,         // Optional
-                            address,     // Optional
-                            phone,       // Optional
+                            dob,
+                            address,
+                            phone,
                             name_algo: algo,
                         })
                     } else {
@@ -3426,7 +3488,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::Unknown
                     }
                 }
-                // NEW: Split subcommand
                 Some("split") => {
                     if let (Some(m), Some(d), Some(r)) = (merged_id, new_patient_data_json, reason) {
                         CommandType::Mpi(MPICommand::Split {
@@ -3439,7 +3500,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::Unknown
                     }
                 }
-                // NEW: GetGoldenRecord subcommand
                 Some("getgoldenrecord") => {
                     if let Some(p) = patient_id {
                         CommandType::Mpi(MPICommand::GetGoldenRecord {
@@ -3451,7 +3511,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                 }
                 None => {
-                    eprintln!("Error: 'mpi' requires a subcommand: match, link, merge, audit, split, or getgoldenrecord");
+                    eprintln!("Error: 'mpi' requires a subcommand: index, match, link, merge, audit, split, or getgoldenrecord");
                     CommandType::Unknown
                 }
                 _ => CommandType::Unknown,
@@ -8760,18 +8820,41 @@ pub async fn handle_interactive_command(
             crate::cli::handlers_index::handle_index_command(action).await?;
             Ok(())
         }
-        // Add this match arm to the CommandType match in interactive.rs
         CommandType::Mpi(mpi_command) => {
             // 1. Ensure the MPI handlers are initialized (lazy initialization).
             state.ensure_mpi_handlers().await.map_err(|e| anyhow::anyhow!("MPI service initialization failed: {:?}", e))?;
             
-            // FIX: Removed the incorrect logging wrapper.
             println!("[INFO] Executing interactive MPI subcommand: {:?}", mpi_command);
 
             // FIX: Retrieve the entire state field (Arc<TokioMutex<Option<MPIHandlers>>>)
             // and pass it directly to the handlers to satisfy the type requirement.
             let mpi_handlers_state = state.mpi_handlers.clone();
+            
             match mpi_command {
+                // --- ADDED: Patient Indexing Operation ---
+                MPICommand::Index { 
+                    name, 
+                    first_name, 
+                    last_name, 
+                    dob, 
+                    mrn, 
+                    address, 
+                    phone 
+                } => {
+                    handlers_mpi::handle_mpi_index_interactive(
+                        name,
+                        first_name,
+                        last_name,
+                        dob,
+                        mrn, // Mandatory String
+                        address,
+                        phone,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI index failed: {}", e))
+                }
+
                 MPICommand::Match { name, dob, address, phone, name_algo } => {
                     handlers_mpi::handle_mpi_match_interactive(
                         name,
@@ -8813,10 +8896,9 @@ pub async fn handle_interactive_command(
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))
                 }
-                // --- ADDED: Identity Split/Unmerge Operation ---
+                // --- Identity Split/Unmerge Operation ---
                 MPICommand::Split { merged_id, new_patient_data_json, reason } => {
                     // 1. Deserialize the JSON string provided by the CLI argument into the Patient struct.
-                    //    We use 'anyhow' to simplify error handling and propagation.
                     let new_patient_data: Patient = from_str(&new_patient_data_json)
                         .map_err(|e| anyhow::anyhow!("Failed to parse Patient data JSON for Split command: {}", e))?;
                         
@@ -8830,7 +8912,7 @@ pub async fn handle_interactive_command(
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI split/unmerge failed: {}", e))
                 }
-                // --- ADDED: Golden Record Retrieval ---
+                // --- Golden Record Retrieval ---
                 MPICommand::GetGoldenRecord { patient_id } => {
                     handlers_mpi::handle_get_golden_record_interactive(
                         patient_id,

@@ -5,11 +5,13 @@
 //! patient identification and linking across disparate healthcare systems.
 //!
 //! Core MPI Functions:
+//! - Patient Index:
 //! - Patient Matching: Probabilistic and deterministic matching algorithms
 //! - Identity Linking: Cross-reference external identifiers (MRN, SSN, etc.)
 //! - Record Merging: Consolidate duplicate patient records with conflict resolution
 //! - Audit Trail: Complete history of identity changes and merge operations
 //! - Golden Record: Maintain single source of truth for each patient
+use anyhow::{Result, anyhow, Context};
 use async_trait::async_trait;
 use tokio::sync::{Mutex as TokioMutex};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -51,7 +53,7 @@ pub async fn get_mpi_service_singleton() -> Result<Arc<MpiIdentityResolutionServ
     // This block is left mostly as-is from the user's snippet, but noted for deprecation
     // in favor of the full explicit dependency chain in MPIHandlers::new/new_with_storage.
     // In a real application, this function should be removed or refactored.
-    Ok(mpi_service)
+    Ok(mpi_service?)
 }
 
 impl MPIHandlers {
@@ -76,8 +78,8 @@ impl MPIHandlers {
         println!("MpiIdentityResolutionService initialized globally.");
 
         // 4. Get the initialized service — returns Arc directly, no Option
-        let mpi_service: Arc<MpiIdentityResolutionService> = MpiIdentityResolutionService::get().await;
-
+        // server/src/cli/handlers_mpi.rs: Line 81
+        let mpi_service: Arc<MpiIdentityResolutionService> = MpiIdentityResolutionService::get().await?;
         println!("Master Patient Index (MPI) service ready.");
 
         Ok(Self { mpi_service })
@@ -101,8 +103,8 @@ impl MPIHandlers {
         println!("MpiIdentityResolutionService initialized globally.");
 
         // Safe: we just called global_init(), so get() will succeed
-        let mpi_service: Arc<MpiIdentityResolutionService> = MpiIdentityResolutionService::get().await;
-
+        // server/src/cli/handlers_mpi.rs: Line 106
+        let mpi_service: Arc<MpiIdentityResolutionService> = MpiIdentityResolutionService::get().await?;
         println!("Master Patient Index (MPI) service ready.");
 
         Ok(Self { mpi_service })
@@ -111,13 +113,24 @@ impl MPIHandlers {
     /// Main command router - dispatches to appropriate handler
     pub async fn handle(&self, command: MPICommand) -> Result<(), GraphError> {
         match command {
+            // --- ADDED: Index Command Routing ---
+            MPICommand::Index {
+                name,
+                first_name,
+                last_name,
+                dob,
+                mrn,
+                address,
+                phone,
+            } => self.handle_index(name, first_name, last_name, dob, mrn, address, phone).await,
+
             MPICommand::Match {
                 name,
                 dob,
                 address,
                 phone,
-                name_algo, // NEW: Added name_algo
-            } => self.handle_match(name, dob, address, phone, name_algo).await, // NEW: Updated call signature
+                name_algo,
+            } => self.handle_match(name, dob, address, phone, name_algo).await,
             MPICommand::Link {
                 master_id,
                 external_id,
@@ -157,23 +170,57 @@ impl MPIHandlers {
     // =========================================================================
     // Core MPI Operations
     // =========================================================================
-    /// Match - Find potential duplicate records using probabilistic matching
-    ///
-    /// This implements the core patient matching logic that:
-    /// 1. Accepts patient demographics
-    /// 2. Runs probabilistic matching algorithm
-    /// 3. Returns scored candidates with match confidence
-    ///
-    /// Match scores typically use:
-    /// - Exact matches on key identifiers (SSN, MRN)
-    /// - Fuzzy matching on names (Soundex, Levenshtein distance)
-    /// - Date of birth comparison (exact or close matches)
-    /// - Address similarity
-    /// - Phone number matching
-    /// Match - Find potential duplicate records using probabilistic matching
-    // =========================================================================
-    // Core MPI Operations
-    // =========================================================================
+
+    /// Index - Insert a new patient record or update an existing one based on MRN.
+    async fn handle_index(
+        &self,
+        name: Option<String>,
+        first_name: Option<String>,
+        last_name: Option<String>,
+        dob: Option<String>,
+        mrn: String,
+        address: Option<String>,
+        phone: Option<String>,
+    ) -> Result<(), GraphError> {
+        println!("=== MPI Patient Indexing ===");
+        println!("Inserting or updating patient record (MRN: {})...\n", mrn);
+
+        // 1. Build the Patient struct from input
+        let new_patient = self.create_patient_from_index_input(
+            name,
+            first_name,
+            last_name,
+            dob,
+            mrn.clone(), // MRN is mandatory for Index
+            address,
+            phone
+        )?;
+
+        println!("Indexing Patient:");
+        println!(" MRN: {}", new_patient.mrn.as_deref().unwrap_or("N/A"));
+        println!(" Name: {} {}", new_patient.first_name, new_patient.last_name);
+        println!(" DOB: {}", new_patient.date_of_birth.format("%Y-%m-%d"));
+        println!();
+
+        // 2. Call the core service method (assumes the service method exists and takes Patient)
+        // This method should perform matching and either create a new Golden Record or link to an existing one.
+        let result = self.mpi_service.index_new_patient(new_patient).await;
+
+        match result {
+            Ok(indexed_record) => {
+                println!("✓ Indexing successful");
+                println!(" Assigned Patient ID: {}", indexed_record.id);
+                println!(" Linked Vertex ID: {}", indexed_record.user_id.map(|id| id.to_string()).unwrap_or_else(|| "N/A".to_string()));
+                println!("\nRecord indexed and matched/linked to the Golden Record.");
+            }
+            Err(e) => {
+                eprintln!("✗ Indexing failed: {}", e);
+                return Err(GraphError::InternalError(e.to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// Match - Find potential duplicate records using probabilistic matching
     async fn handle_match(
         &self,
@@ -191,8 +238,6 @@ impl MPIHandlers {
         let dob_str = dob.as_ref().map(|s| s.as_str()).unwrap_or("");
         
         // **CRITICAL FIX: Fix the syntax here.**
-        // 1. Remove the line `let search_keys = self`
-        // 2. Call the static method directly on the type and assign the result.
         let search_keys = MpiIdentityResolutionService::get_blocking_keys_for_match(&name, dob_str) 
             .map_err(|e| GraphError::InternalError(e))?;
 
@@ -241,6 +286,7 @@ impl MPIHandlers {
         external_id: String,
         id_type: String,
     ) -> Result<(), GraphError> {
+        // ... (handle_link implementation remains the same) ...
         println!("=== MPI Identity Linking ===");
         println!("Linking external identifier to master record...\n");
 
@@ -286,6 +332,7 @@ impl MPIHandlers {
         target_id: String,
         resolution_policy: String,
     ) -> Result<(), GraphError> {
+        // ... (handle_merge implementation remains the same) ...
         println!("=== MPI Record Merge ===");
         println!("Consolidating duplicate patient records...\n");
         
@@ -345,6 +392,7 @@ impl MPIHandlers {
         mpi_id: String,
         timeframe: Option<String>,
     ) -> Result<(), GraphError> {
+        // ... (handle_audit implementation remains the same) ...
         println!("=== MPI Audit Trail ===");
         println!("Retrieving identity change history...\n");
 
@@ -401,6 +449,7 @@ impl MPIHandlers {
         address_str: Option<String>, 
         phone: Option<String>,
     ) -> Result<Patient, GraphError> {
+        // ... (build_search_patient implementation remains the same) ...
         use chrono::{NaiveDate, Utc};
 
         // Parse name components
@@ -481,6 +530,77 @@ impl MPIHandlers {
             ..Default::default() 
         })
     }
+    
+    /// Create a complete Patient struct suitable for indexing/insertion.
+    /// This ensures mandatory fields like MRN and names are present.
+    fn create_patient_from_index_input(
+        &self,
+        name: Option<String>,
+        first_name: Option<String>,
+        last_name: Option<String>,
+        dob: Option<String>,
+        mrn: String,
+        address_str: Option<String>,
+        phone: Option<String>,
+    ) -> Result<Patient, GraphError> {
+        use chrono::{NaiveDate, Utc};
+
+        // 1. Resolve First Name and Last Name
+        let (final_first_name, final_last_name) = match (first_name, last_name) {
+            (Some(f), Some(l)) => (f, l),
+            // If individual names are missing, try to parse from the full 'name' field
+            _ => {
+                let full_name = name.ok_or_else(|| GraphError::InvalidRequest(
+                    "Must provide (first_name and last_name) or a full name string.".into()
+                ))?;
+                let parts: Vec<&str> = full_name.split_whitespace().collect();
+                if parts.is_empty() {
+                    return Err(GraphError::InvalidRequest("Name cannot be empty".into()));
+                }
+                let first = parts.first().unwrap().to_string();
+                let last = parts.last().unwrap().to_string();
+                (first, last)
+            }
+        };
+
+        // 2. Parse Date of Birth (using sentinel value if missing)
+        let date_of_birth = dob
+            .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()) 
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| GraphError::InvalidRequest("Invalid date".into()))?
+            .and_utc();
+        
+        // 3. Create Address struct (if address_str is provided)
+        let address_tuple = address_str.map(|address_line1| {
+            // Using placeholder values for city, state, etc., as in other helpers.
+            Address::new(
+                address_line1,
+                None,
+                "Unknown".to_string(),
+                Identifier::new("US".to_string()).unwrap(),
+                "00000".to_string(),
+                "US".to_string(),
+            )
+        });
+
+        let now = Utc::now();
+        
+        Ok(Patient {
+            id: rand::random(), // New ID for the patient record
+            mrn: Some(mrn),     // MRN is the key for the Index operation
+            first_name: final_first_name,
+            last_name: final_last_name,
+            date_of_birth,
+            address_id: address_tuple.as_ref().map(|a| a.id),
+            address: address_tuple,
+            phone_mobile: phone,
+            created_at: now,
+            updated_at: now,
+            // Fill in the rest of the fields with defaults
+            ..Default::default() 
+        })
+    }
 
     /// Display formatted match results with confidence scores (no changes)
     fn display_match_results(&self, candidates: Vec<PatientCandidate>) {
@@ -525,17 +645,18 @@ impl MPIHandlers {
 
     /// Validate identifier type is recognized by the system (no changes)
     fn validate_identifier_type(&self, id_type: &str) -> Result<(), GraphError> {
+        // ... (validate_identifier_type implementation remains the same) ...
         let valid_types = vec![
-            "MRN",      // Medical Record Number
-            "SSN",      // Social Security Number
-            "DL",       // Driver's License
+            "MRN",     // Medical Record Number
+            "SSN",     // Social Security Number
+            "DL",      // Driver's License
             "PASSPORT", // Passport Number
-            "INS",      // Insurance Member ID
+            "INS",     // Insurance Member ID
             "MILITARY", // Military Service Number
             "MEDICAID", // Medicaid ID
             "MEDICARE", // Medicare ID
-            "NPI",      // National Provider Identifier
-            "OTHER",    // Other identifier types
+            "NPI",     // National Provider Identifier
+            "OTHER",   // Other identifier types
         ];
         if !valid_types.contains(&id_type) {
             return Err(GraphError::InvalidRequest(format!(
@@ -549,6 +670,7 @@ impl MPIHandlers {
 
     /// Validate merge resolution policy (no changes)
     fn validate_resolution_policy(&self, policy: &str) -> Result<(), GraphError> {
+        // ... (validate_resolution_policy implementation remains the same) ...
         let valid_policies = vec![
             "MOST_RECENT",      // Use most recently updated values
             "MOST_COMPLETE",    // Prefer non-null values
@@ -577,6 +699,7 @@ impl MPIHandlers {
         new_patient_data: Patient,
         reason: String,
     ) -> Result<(), GraphError> {
+        // ... (handle_split implementation remains the same) ...
         println!("=== MPI Identity Split (Unmerge) ===");
         println!("Reversing a previous merge operation...\n");
         
@@ -623,14 +746,11 @@ impl MPIHandlers {
     }
 
     /// Get Golden Record - Retrieve the authoritative patient record
-    ///
-    /// The return type is updated to reflect the need to return `Result<(), GraphError>`
-    /// from the top-level `handle` function, rather than the `Patient` struct itself.
-    /// Get Golden Record - Retrieve the authoritative patient record
     async fn handle_get_golden_record(
         &self,
         patient_id: String,
     ) -> Result<(), GraphError> {
+        // ... (handle_get_golden_record implementation remains the same) ...
         println!("=== MPI Golden Record Retrieval ===");
         println!("Retrieving consolidated record for patient ID: {}\n", patient_id);
         
@@ -716,9 +836,49 @@ impl MPIHandlers {
         todo!("Quality reporting not yet implemented")
     }
 }
+
 // =========================================================================
 // Interactive Mode Handlers (standalone functions, outside impl)
 // =========================================================================
+
+/// Handles the 'mpi index' command from the interactive shell.
+/// 
+/// This version uses the shared, potentially pre-initialized MPIHandlers state.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_mpi_index_interactive(
+    name: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    dob: Option<String>,
+    mrn: String,
+    address: Option<String>,
+    phone: Option<String>,
+    mpi_handlers_state: Arc<TokioMutex<Option<MPIHandlers>>>,
+) -> Result<()> {
+    
+    // 1. Acquire lock and retrieve the MPIHandlers instance
+    let handlers_lock = mpi_handlers_state.lock().await;
+    let handlers = handlers_lock.as_ref()
+        .context("MPI handlers are not initialized in the interactive state. This is a severe logic error.")?;
+
+    // 2. Call the core handler logic
+    handlers.handle_index(
+        name,
+        first_name,
+        last_name,
+        dob,
+        mrn,
+        address,
+        phone,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("MPI index operation failed: {}", e))?;
+
+    // Lock is automatically dropped here
+
+    Ok(())
+}
+
 /// Handle MPI Match command in interactive mode
 pub async fn handle_mpi_match_interactive(
     name: String,
@@ -883,6 +1043,42 @@ pub async fn handle_get_golden_record_interactive(
 // =========================================================================
 // Non-Interactive Mode Handlers (standalone functions)
 // =========================================================================
+
+/// Handles the 'mpi index' command from the non-interactive CLI.
+/// 
+/// This version initializes a temporary MPIHandlers instance using the provided 
+/// storage engine to execute the command directly.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_mpi_index(
+    storage: Arc<dyn GraphStorageEngine>,
+    name: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    dob: Option<String>,
+    mrn: String,
+    address: Option<String>,
+    phone: Option<String>,
+) -> Result<()> {
+    // 1. Initialize MPI Handlers using the provided storage instance
+    let handlers = MPIHandlers::new_with_storage(storage)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to initialize MPI handlers for index command: {}", e))?;
+
+    // 2. Call the core handler logic
+    handlers.handle_index(
+        name,
+        first_name,
+        last_name,
+        dob,
+        mrn,
+        address,
+        phone,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("MPI index operation failed: {}", e))?;
+
+    Ok(())
+}
 
 /// Handle MPI Split command in non-interactive mode (scripts, tests, API, etc.)
 pub async fn handle_mpi_split(

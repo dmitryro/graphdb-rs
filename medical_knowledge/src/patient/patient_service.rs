@@ -65,13 +65,39 @@ impl PatientService {
         service
     }
 
-    /// Factory method for the global singleton, taking the required dependencies.
+    /// Factory method for the global singleton, taking the required dependencies,
+    /// and performing all necessary ASYNC initialization.
     /// This replaces the reliance on `GraphService::get()` inside `init()`.
     /// 
     /// Usage: `PatientService::global_init(graph_service_instance).await?`
     pub async fn global_init(graph_service_instance: Arc<GraphService>) -> std::result::Result<(), &'static str> {
         let service = Arc::new(Self::new(graph_service_instance));
+
+        // --- FIXED INITIALIZATION LOGIC (Moved from 'new' to 'global_init') ---
+        // 2. Register observer to keep cache warm and perform the necessary async call.
+        let service_clone = service.clone();
+        let gs_clone = service.graph_service.clone();
         
+        // Spawn a task to register the observer and run the async cache update logic
+        tokio::spawn(async move {
+            let _ = gs_clone
+                .add_vertex_observer(move |vertex| {
+                    if vertex.label.as_ref() == "Patient" {
+                        let vertex = vertex.clone();
+                        let svc = service_clone.clone();
+                        tokio::spawn(async move {
+                            // Assuming Patient::from_vertex exists to deserialize
+                            // NOTE: The previous code used Patient::from_vertex(&vertex) which returns Option<Self>
+                            // You must implement the FromVertex trait correctly for Patient.
+                            if let Some(patient) = Patient::from_vertex(&vertex) { 
+                                svc.add_patient_to_cache(patient).await;
+                            }
+                        });
+                    }
+                })
+                .await;
+        });
+
         PATIENT_SERVICE
             .set(service)
             .map_err(|_| "PatientService already initialized")
@@ -303,7 +329,7 @@ impl PatientService {
     pub async fn get_drug_alerts(
         &self, 
         patient_id: i32, 
-        severity: Option<AlertSeverity>, 
+        _severity: Option<AlertSeverity>, 
         include_resolved: bool, 
         include_overridden: bool, 
         drug_class: Option<String>, 

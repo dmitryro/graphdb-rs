@@ -1,4 +1,5 @@
 use std::collections::{ HashSet, HashMap };
+use internment::Intern;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,14 +9,14 @@ use uuid::Uuid;
 use anyhow::Error;
 use serde_json::{json, Value};
 use chrono::Utc;
-
+use log::{info, error, warn};
 use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
 use crate::graph_engine::medical::*;
 use crate::storage_engine::{ GraphStorageEngine, StorageEngine, GraphOp }; // Ensure this trait is in scope
 use models::identifiers::{ Identifier, SerializableUuid, SerializableInternString };
 use models::properties::{ PropertyValue, SerializableFloat };
 use models::medical::*;
-use models::{ Graph, Vertex, Edge };
+use models::{ Graph, Vertex, Edge, timestamp::BincodeDateTime };
 use models::errors::{GraphError, GraphResult};
 
 /// Defines the event types for all graph mutations.
@@ -42,6 +43,73 @@ pub struct GraphService {
     storage: Arc<dyn GraphStorageEngine + Send + Sync + 'static>,
     /// Field to hold observers for all graph-level mutations/transactions.
     mutation_observers: Arc<RwLock<Vec<MutationObserver>>>,
+}
+
+/// Helper to convert a Cypher Node (represented as serde_json::Value) into our Rust Vertex model.
+/// This assumes the JSON Value contains the 'id', 'labels', and 'properties' fields.
+fn try_parse_cypher_node_to_vertex(cypher_node: Value) -> Result<Vertex, GraphError> {
+    
+    let node_map = cypher_node.as_object()
+        .ok_or_else(|| GraphError::DeserializationError("Cypher node result not an object".into()))?;
+
+    // 1. Get ID
+    let id_str = node_map.get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| GraphError::DeserializationError("Missing 'id' in Cypher Node result".into()))?;
+        
+    let id = Uuid::from_str(id_str)
+        .map_err(|e| GraphError::DeserializationError(format!("Invalid Uuid format: {}", e)))?;
+
+    // 2. Get Label
+    let labels = node_map.get("labels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| GraphError::DeserializationError("Missing 'labels' in Cypher Node result".into()))?;
+        
+    let label_str = labels.get(0)
+        .and_then(Value::as_str)
+        .ok_or_else(|| GraphError::DeserializationError("No primary label found in Cypher Node result".into()))?;
+        
+    // 3. Get Properties
+    let properties_val = node_map.get("properties")
+        .ok_or_else(|| GraphError::DeserializationError("Missing 'properties' in Cypher Node result".into()))?;
+
+    let mut properties = HashMap::new();
+    
+    if let Some(prop_map) = properties_val.as_object() {
+        for (key, val) in prop_map {
+            let pv = to_property_value(val.clone())
+                .map_err(|e| GraphError::DeserializationError(format!("Failed to convert property value for key {}: {}", key, e)))?;
+
+            // Key is String, which matches the previous fix for the Vertex model.
+            properties.insert(key.clone(), pv); 
+        }
+    }
+
+    let now = Utc::now();
+
+    Ok(Vertex {
+        id: SerializableUuid(id),
+        label: Identifier(
+            // Assuming SerializableInternString is an alias for Intern<String>
+            // and implements From<Intern<String>>
+            SerializableInternString::from(Intern::from(label_str.to_string()))
+        ),
+        // FIX 2 & 3: Wrap the chrono DateTime in the required BincodeDateTime struct.
+        created_at: BincodeDateTime(now),
+        updated_at: BincodeDateTime(now),
+        
+        properties,
+    })
+}
+
+// Helper function to create the correct Identifier type for GraphError::NotFound
+// ASSUMPTION: Intern is available and has a method to convert to Intern<String>
+fn create_error_identifier(s: String) -> models::Identifier {
+    // 1. Intern the String
+    let interned_string = Intern::from(s); // Or Intern::new(s) or similar
+    
+    // 2. Convert the Interned type to SerializableInternString
+    Identifier(SerializableInternString::from(interned_string))
 }
 
 impl GraphService {
@@ -250,7 +318,7 @@ impl GraphService {
         Ok(deleted_count)
     }
 
-pub async fn match_nodes(
+    pub async fn match_nodes(
         &self,
         label: Option<&str>,
         query_props: &HashMap<String, PropertyValue>,
@@ -347,6 +415,50 @@ pub async fn match_nodes(
         }
         
         Ok(created_vertices)
+    }
+
+    /// Performs a partial update on a Vertex by ID.
+    /// Fetches the existing vertex, merges the new properties, and saves the updated vertex.
+    pub async fn update_vertex_properties(&self, id: Uuid, props: HashMap<String, PropertyValue>) -> Result<(), GraphError> {
+        
+        // 1. Read: Fetch the existing vertex (returns Option<Vertex> per E0308 error)
+        // FIX for E0308: Use a match structure for Option<Vertex> and manually handle the error return path.
+        // FIX for E0308: Borrow '&id' for the method call.
+        let mut existing_vertex = match self.get_vertex(&id).await { 
+            Some(v) => v, // Success
+            None => {
+                warn!("Attempted to update properties for non-existent Vertex ID: {}", id);
+                // Error path for 'NotFound'
+                let err_msg = format!("Vertex with ID {} not found for update.", id);
+                return Err(GraphError::NotFound(create_error_identifier(err_msg)));
+            }
+        };
+        
+        // NOTE: If get_vertex() can fail with a storage error, you must wrap it in a custom function
+        // that returns Result<Option<Vertex>, GraphError> to properly handle that case.
+        // For now, we proceed assuming get_vertex handles storage errors internally and returns None on not-found.
+
+        // 2. Modify: Merge new properties
+        info!("Merging {} new properties into Vertex ID {}", props.len(), id);
+        for (key, value) in props {
+            existing_vertex.properties.insert(key, value);
+        }
+        
+        // Update the timestamp to reflect the modification
+        existing_vertex.updated_at = BincodeDateTime(Utc::now());
+        
+        // 3. Write: Save the modified vertex
+        match self.update_vertex(existing_vertex).await {
+            Ok(_) => {
+                info!("Successfully updated Vertex properties for ID {}", id);
+                Ok(())
+            },
+            Err(e) => {
+                // GraphError::StorageError expects String
+                let err_msg = format!("Failed to save updated vertex {}: {}", id, e);
+                Err(GraphError::StorageError(err_msg))
+            }
+        }
     }
 
     /// Key-value insert operation.
@@ -457,11 +569,75 @@ pub async fn match_nodes(
 
         // FIX 1 (E0061): Remove the `params` argument from the call.
         // FIX 2 (E0308): Use `.map(|value| vec![value])` to convert the single Value into a Vec<Value>.
-        println!("===> in execute_cypher_write - query was: {}", query);
+        println!("===> in execute_cypher_write - query was: {:?}", query);
         engine.execute_cypher(query)
             .await
             .map_err(|e| GraphError::QueryExecutionError(format!("Cypher WRITE failed: {}", e)))
             .map(|value| vec![value]) // Wrap the single result in a vector
+    }
+
+    /// Finds a single Patient vertex by its Medical Record Number (MRN) using a Cypher query.
+    pub async fn get_patient_by_mrn(&self, mrn: &str) -> Result<Option<Vertex>, GraphError> {
+        
+        // Construct the Cypher query
+        // NOTE: Parameterized queries should be used in production to prevent injection.
+        let query = format!(
+            "MATCH (p:Patient {{mrn: '{}'}}) RETURN p",
+            // Use basic escaping for the single quote within the MRN value
+            mrn.replace('\'', "\\'") 
+        );
+
+        // Execute the read query.
+        // Assuming execute_cypher_read returns Result<Vec<Value>, GraphError>.
+        let results_vec = self.execute_cypher_read(&query, json!({})).await?;
+        
+        // The immediate Vec<Value> (results_vec) returned by execute_cypher_read 
+        // should contain the overall Cypher JSON response as its first (and usually only) element.
+        let cypher_json_value = results_vec.into_iter().next()
+            .ok_or_else(|| GraphError::DeserializationError("Cypher execution returned an empty top-level array.".into()))?;
+
+        // --- Start Parsing the Actual Query Engine Result Structure ---
+        
+        // 1. Get the 'results' array from the top-level JSON object.
+        let results_array = cypher_json_value.as_object()
+            .and_then(|obj| obj.get("results"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| GraphError::DeserializationError("Cypher response missing top-level 'results' array.".into()))?;
+
+        // 2. Get the first result block (which contains vertices/edges/stats).
+        let first_result_block = results_array.get(0)
+            .ok_or_else(|| GraphError::DeserializationError("Cypher 'results' array was empty.".into()))?;
+
+        // 3. Extract the 'vertices' array (the list of matched nodes).
+        let vertices = first_result_block.as_object()
+            .and_then(|obj| obj.get("vertices"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| GraphError::DeserializationError("Cypher result block missing 'vertices' array.".into()))?;
+
+        // >>> CRITICAL FIX: Gracefully handle the empty match. <<<
+        if vertices.is_empty() {
+            return Ok(None);
+        }
+        
+        // 4. Check for multiple matches (unexpected for MRN lookup).
+        if vertices.len() > 1 {
+            warn!("MRN lookup returned {} vertices. Returning the first one.", vertices.len());
+        }
+
+        // 5. Extract the first vertex JSON value.
+        let vertex_json_value = vertices.get(0)
+            .ok_or_else(|| GraphError::DeserializationError("Vertices array was unexpectedly empty.".into()))?;
+
+        // 6. Convert the extracted node structure into our Rust Vertex model.
+        // Since the structure of the JSON returned in the 'vertices' array already matches 
+        // your Vertex model's serialization format, we can directly deserialize it.
+        match serde_json::from_value(vertex_json_value.clone()) {
+            Ok(vertex) => Ok(Some(vertex)),
+            Err(e) => {
+                error!("Failed to deserialize JSON to Vertex: {}", e);
+                Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)))
+            }
+        }
     }
 
     // =========================================================================
@@ -595,6 +771,61 @@ pub async fn match_nodes(
             .collect()
     }
     
+    // In graph_service.rs or a storage trait:
+    pub async fn get_vertex_by_internal_id(&self, internal_id: i32) -> GraphResult<Vertex> {
+        
+        // 1. Look up the UUID from the internal_id using the Cypher query approach
+        let query = format!("MATCH (p:Patient {{id: {}}}) RETURN p", internal_id);
+        
+        let result = self.execute_cypher_read(&query, serde_json::Value::Null)
+            .await
+            .map_err(|e| {
+                let id_str = format!("internal_id_{}", internal_id);
+                GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) })
+            })?;
+        
+        // Parse the result to extract the UUID
+        if let Some(outer_wrapper) = result.into_iter().next() {
+            let vertex_data = outer_wrapper
+                .get("results")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.get(0))
+                .and_then(|r| r.get("vertices"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(0));
+                
+            if let Some(v) = vertex_data {
+                let uuid_str = v.get("id")
+                    .and_then(|u| u.as_str())
+                    .ok_or_else(|| {
+                        let id_str = format!("internal_id_{}", internal_id);
+                        GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) })
+                    })?;
+                
+                let uuid = Uuid::parse_str(uuid_str)
+                    .map_err(|_| {
+                        let id_str = format!("internal_id_{}", internal_id);
+                        GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) })
+                    })?;
+                
+                // 2. Retrieve the vertex using the UUID
+                match self.storage.get_vertex(&uuid).await? {
+                    Some(vertex) => Ok(vertex),
+                    None => {
+                        let id_str = format!("internal_id_{}", internal_id);
+                        Err(GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) }))
+                    }
+                }
+            } else {
+                let id_str = format!("internal_id_{}", internal_id);
+                Err(GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) }))
+            }
+        } else {
+            let id_str = format!("internal_id_{}", internal_id);
+            Err(GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) }))
+        }
+    }
+
     /// Retrieves the Patient Vertex based on its i32 ID (patient_id field).
     pub async fn get_patient_vertex_by_id(&self, patient_id: i32) -> Option<Vertex> {
         let graph = self.read().await;

@@ -1,5 +1,4 @@
 // models/src/lib.rs
-
 // Declare all top-level modules within the 'models' crate
 pub mod bulk_insert;
 pub mod edges;

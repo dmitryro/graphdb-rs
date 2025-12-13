@@ -61,6 +61,15 @@ pub enum CypherQuery {
     MatchPattern {
         patterns: Vec<Pattern>,
     },
+    MatchSet {
+        match_patterns: Vec<Pattern>,
+        set_clauses: Vec<(String, String, Value)>, // (variable, property, value)
+    },
+    MatchCreateSet {
+        match_patterns: Vec<Pattern>,
+        create_patterns: Vec<Pattern>,
+        set_clauses: Vec<(String, String, Value)>,
+    },
     MatchCreate {
         match_patterns: Vec<Pattern>,
         create_patterns: Vec<Pattern>,
@@ -120,6 +129,25 @@ pub enum CypherQuery {
 
 }
 
+// Add this helper function before execute_cypher
+async fn get_vertex_by_internal_id_direct(
+    graph_service: &GraphService,
+    internal_id: i32,
+) -> GraphResult<Option<models::Vertex>> {
+    // Direct database lookup without going through Cypher to avoid recursion
+    let all_vertices = graph_service.get_all_vertices().await?;
+    
+    Ok(all_vertices.into_iter().find(|v| {
+        v.properties.get("id")
+            .and_then(|prop| match prop {
+                PropertyValue::Integer(val) => Some(*val as i32),
+                PropertyValue::I32(val) => Some(*val),
+                _ => None,
+            })
+            .map_or(false, |id| id == internal_id)
+    }))
+}
+
 pub fn is_cypher(query: &str) -> bool {
     let cypher_keywords = ["MATCH", "CREATE", "SET", "RETURN", "DELETE"];
     cypher_keywords.iter().any(|kw| query.trim().to_uppercase().starts_with(kw))
@@ -140,6 +168,7 @@ fn parse_identifier(input: &str) -> IResult<&str, &str> {
 }
 
 // Check if we're at the start of a new Cypher clause
+// Helper function to check if we're at the start of a new Cypher clause
 fn is_at_keyword_boundary(input: &str) -> bool {
     let trimmed = input.trim_start();
     trimmed.starts_with("WHERE") ||
@@ -153,71 +182,119 @@ fn is_at_keyword_boundary(input: &str) -> bool {
     trimmed.starts_with("SKIP") ||
     trimmed.starts_with("skip") ||
     trimmed.starts_with("LIMIT") ||
-    trimmed.starts_with("limit")
+    trimmed.starts_with("limit") ||
+    trimmed.starts_with("SET") ||
+    trimmed.starts_with("set") ||
+    trimmed.starts_with("DELETE") ||
+    trimmed.starts_with("delete") ||
+    trimmed.starts_with("DETACH") ||
+    trimmed.starts_with("detach")
     // Do NOT include "OPTIONAL MATCH" here — it must be parsed as part of the pattern list
 }
 
+/// Parses a full MATCH ... SET ... [RETURN] statement.
+fn parse_match_set_relationship(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        tuple((
+            tag_no_case("MATCH"),
+            multispace1,
+            parse_match_clause_patterns, // Assumed to return Vec<Pattern>
+            multispace1,
+            tag_no_case("SET"),
+            multispace1,
+            // Parse one or more comma-separated SET clauses
+            separated_list1(
+                ws(char(',')),
+                parse_set_clause // (variable, property, value)
+            ),
+            // Optionally consume RETURN clause if present
+            opt(preceded(multispace1, tag_no_case("RETURN"))),
+            opt(take_while(|c| c != '\n')), // Consume the rest of the line (Return items)
+        )),
+        |(_, _, match_patterns, _, _, _, set_clauses, _, _)| {
+            let set_clauses: Vec<(String, String, Value)> = set_clauses.into_iter().flat_map(|(var, map): (String, HashMap<String, Value>)| {
+                map.into_iter().map(move |(key, val)| (var.clone(), key, val))
+            }).collect();
+            CypherQuery::MatchSet {
+                match_patterns,
+                set_clauses,
+            }
+        },
+    ).parse(input)
+}
+
+// Modify parse_match_create_relationship
 fn parse_match_create_relationship(input: &str) -> IResult<&str, CypherQuery> {
     // 1. Consume 'MATCH' and mandatory space after it.
     let (input, _) = terminated(tag_no_case("MATCH"), multispace1).parse(input)?;
-
-    // 2. Parse the patterns in the MATCH clause (e.g., (p:Patient), (e:Encounter))
-    let (input, match_patterns) = parse_match_clause_patterns(input)?; 
-    // The input remaining after this step is what caused the previous failure.
-
+    
+    // 2. Parse the patterns in the MATCH clause
+    let (input, match_patterns) = parse_match_clause_patterns(input)?;
+    
     // 3. Parse the mandatory CREATE keyword and the space that follows it.
-    //    We use 'preceded(multispace0, ...)' to allow zero or more space 
-    //    between the last pattern and the 'CREATE' keyword, fixing the MultiSpace error.
     let (input, _) = preceded(
-        multispace0, 
+        multispace0,
         terminated(tag_no_case("CREATE"), multispace1)
     ).parse(input)?;
-
-    // 4. Parse the relationship pattern (e.g., (p)-[:HAS_ENCOUNTER]->(e))
+    
+    // 4. Parse the relationship pattern
     let (input, create_pattern) = parse_single_pattern(input)?;
-
-    // This returns the full query structure, which the execution engine must use
-    // to find the existing nodes (from match_patterns) and then create the edge
-    // using their UUIDs (from create_pattern's variables).
-    Ok((
-        input,
-        CypherQuery::MatchCreate {
+    
+    // 5. Optional SET clause
+    let (input, set_clauses_opt) = opt(preceded(
+        tuple((multispace1, tag_no_case("SET"), multispace1)),
+        separated_list1(
+            tuple((multispace0, char(','), multispace0)),
+            parse_single_set_assignment,
+        ),
+    )).parse(input)?;
+    
+    // Optionally consume RETURN clause if present
+    let (input, _) = opt(preceded(multispace1, tag_no_case("RETURN"))).parse(input)?;
+    let (input, _) = opt(take_while(|c| c != '\n')).parse(input)?;
+    
+    let set_clauses = set_clauses_opt.unwrap_or_default();
+    
+    if !set_clauses.is_empty() {
+        Ok((input, CypherQuery::MatchCreateSet {
             match_patterns,
-            create_patterns: vec![create_pattern], // Use existing MatchCreate and wrap the single pattern in a Vec
-        }
-    ))
+            create_patterns: vec![create_pattern],
+            set_clauses,
+        }))
+    } else {
+        Ok((input, CypherQuery::MatchCreate {
+            match_patterns,
+            create_patterns: vec![create_pattern],
+        }))
+    }
 }
 
 // Parse a single pattern (node or node-relationship-node chain)
-// Stops at keyword boundaries
 /// Parse **one** complete pattern:
-///   (a)-[:KNOWS]->(b)          or
-///   (a)-[:KNOWS]-(b)           or
-///   (a)<-[:KNOWS]-(b)          or
-///   (a)-[r:KNOWS*0..2]-(b)    etc.
+/// (a)-[:KNOWS]->(b) or
+/// (a)-[:KNOWS]-(b) or
+/// (a)<-[:KNOWS]-(b) or
+/// (a)-[r:KNOWS*0..2]-(b) etc.
 /// Stops **only** when it hits a real clause keyword (RETURN, WHERE, CREATE…)
 fn parse_single_pattern(input: &str) -> IResult<&str, Pattern> {
     use nom::Parser;
-    
+   
     println!("===> parse_single_pattern START, input: '{}'", input);
-    
+   
     let mut all_nodes: Vec<NodePattern> = Vec::new();
     let mut all_relationships: Vec<RelPattern> = Vec::new();
-    
+   
     // 1. Parse the starting node (must be in parentheses)
     let (mut current_input, node_a) = parse_node(input)?;
     all_nodes.push(node_a);
-    
+   
     // 2. Parse (RELATIONSHIP + NODE) pairs
     loop {
-        // Skip whitespace
-        let (after_space, _) = multispace0(current_input)?;
-        
-        // Check if we've hit a keyword or end condition
-        let remaining = after_space.trim_start();
-        let upper = remaining.to_uppercase();
-        
-        if remaining.is_empty() ||
+        // Check if we've hit a keyword or end condition WITHOUT consuming space
+        let remaining_trim = current_input.trim_start();
+        let upper = remaining_trim.to_uppercase();
+       
+        if remaining_trim.is_empty() ||
            upper.starts_with("RETURN") ||
            upper.starts_with("WHERE") ||
            upper.starts_with("OPTIONAL") ||
@@ -226,12 +303,17 @@ fn parse_single_pattern(input: &str) -> IResult<&str, Pattern> {
            upper.starts_with("LIMIT") ||
            upper.starts_with("SKIP") ||
            upper.starts_with("CREATE") ||
-           // --- FIX: REMOVED COMMA CHECK ---
-           remaining.starts_with(';') {
-            current_input = after_space;
+           upper.starts_with("SET") ||
+           upper.starts_with("DELETE") ||
+           upper.starts_with("DETACH") ||
+           remaining_trim.starts_with(';') {
+            // Do not consume space, break with current_input unchanged
             break;
         }
-        
+       
+        // Now safe to consume whitespace
+        let (after_space, _) = multispace0(current_input)?;
+       
         // Try to parse relationship + node
         match pair(parse_relationship, parse_node).parse(after_space) {
             Ok((remaining, (rel, node))) => {
@@ -246,19 +328,19 @@ fn parse_single_pattern(input: &str) -> IResult<&str, Pattern> {
             }
         }
     }
-    
+   
     let num_nodes = all_nodes.len();
     let num_rels = all_relationships.len();
-    
+   
     if num_nodes == 0 {
         return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Many1)));
     }
-    
+   
     println!("===> parse_single_pattern END – {} nodes, {} rels", num_nodes, num_rels);
-    
+   
     // Build and return the final Pattern
     let result_pattern = build_pattern_from_elements(all_nodes, all_relationships);
-    
+   
     Ok((current_input, result_pattern))
 }
 
@@ -340,14 +422,10 @@ fn parse_property_value(input: &str) -> IResult<&str, Value> {
     alt((
         // String literals
         map(parse_string_literal, |s: &str| Value::String(s.to_string())),
-        // Numbers
-        map(nom::number::complete::double, |n| {
-            if n.fract() == 0.0 {
-                Value::Number((n as i64).into())
-            } else {
-                Value::Number(serde_json::Number::from_f64(n).unwrap_or(0.into()))
-            }
-        }),
+        
+        // Numbers (FIXED: Uses custom parser to correctly handle signed numbers)
+        parse_signed_number_value, // <-- Replaces the old number block
+        
         // Booleans
         map(|i| nom::bytes::complete::tag("true")(i), |_| Value::Bool(true)),
         map(|i| nom::bytes::complete::tag("false")(i), |_| Value::Bool(false)),
@@ -891,6 +969,87 @@ fn parse_set_query(input: &str) -> IResult<&str, CypherQuery> {
     }))
 }
 
+// Custom parser for signed integers and floats, returning serde_json::Value
+// This robustly recognizes the optional leading '-' sign.
+fn parse_signed_number_value(input: &str) -> IResult<&str, Value> {
+    // Manual parsing approach to avoid nom parser composition issues
+    let original_input = input;
+    let mut chars = input.chars().peekable();
+    let mut number_str = String::new();
+    
+    // Check for optional negative sign
+    if let Some('-') = chars.peek() {
+        number_str.push('-');
+        chars.next();
+    }
+    
+    // Check if we have at least one digit or a decimal point
+    let mut has_digits = false;
+    let mut has_decimal = false;
+    
+    // Parse digits before decimal point
+    while let Some(&ch) = chars.peek() {
+        if ch.is_ascii_digit() {
+            number_str.push(ch);
+            chars.next();
+            has_digits = true;
+        } else {
+            break;
+        }
+    }
+    
+    // Check for decimal point
+    if let Some(&'.') = chars.peek() {
+        number_str.push('.');
+        chars.next();
+        has_decimal = true;
+        
+        // Parse digits after decimal point
+        while let Some(&ch) = chars.peek() {
+            if ch.is_ascii_digit() {
+                number_str.push(ch);
+                chars.next();
+                has_digits = true;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    // Must have at least one digit
+    if !has_digits {
+        return Err(nom::Err::Error(NomError::Error {
+            input: original_input,
+            code: NomError::ErrorKind::Digit,
+        }));
+    }
+    
+    // Calculate remaining input
+    let consumed = number_str.len();
+    let remaining = &original_input[consumed..];
+    
+    // Attempt to parse the recognized string into the appropriate Value.
+    // Try i64 first (for integers, like -295941589)
+    if !has_decimal {
+        if let Ok(i) = number_str.parse::<i64>() {
+            return Ok((remaining, Value::Number(i.into())));
+        }
+    }
+    
+    // Fallback to f64 (for floats)
+    if let Ok(f) = number_str.parse::<f64>() {
+        if let Some(num) = serde_json::Number::from_f64(f) {
+            return Ok((remaining, Value::Number(num)));
+        }
+    }
+    
+    // Return error if parsing fails
+    Err(nom::Err::Error(NomError::Error {
+        input: original_input,
+        code: NomError::ErrorKind::Float,
+    }))
+}
+
 // ----------------------------------------------------------------------------------
 // --- DEFINED: parse_simple_query_type (New, requested function) ---
 // ----------------------------------------------------------------------------------
@@ -899,12 +1058,14 @@ fn parse_set_query(input: &str) -> IResult<&str, CypherQuery> {
 /// This is used by `parse_sequential_statements` to consume clauses in a batch.
 fn parse_simple_query_type(input: &str) -> IResult<&str, CypherQuery> {
     alt((
-        parse_match_detach_delete, // <--- NEW FIX: Handle MATCH...DETACH DELETE
-        parse_create_statement, // <--- NEW/REPLACEMENT FIX
-        // CRITICAL FIX: This MUST be the first or near-first entry.
-        // It correctly handles the full query: MATCH ... OPTIONAL MATCH ... RETURN ...
+        parse_match_detach_delete, 
+        parse_create_statement, 
         parse_delete_edges_simple,
-        parse_match_create_relationship, // <--- NEW FIX: Handle MATCH...CREATE as a single statement
+        
+        // *** FIX: Added MatchSet, prioritized over MatchCreate ***
+        parse_match_set_relationship, // <--- NEW FIX: Handle MATCH...SET
+        parse_match_create_relationship, 
+        
         full_statement_parser,
         parse_detach_delete,
         parse_delete_edges,
@@ -914,7 +1075,7 @@ fn parse_simple_query_type(input: &str) -> IResult<&str, CypherQuery> {
         parse_create_nodes,
         parse_create_node,
         parse_create_edge,
-        parse_match_multiple_nodes, // Note: This likely calls parse_single_pattern, which would fail if tried first.
+        parse_match_multiple_nodes, 
         parse_set_query,
         parse_set_node,
         parse_delete_node,
@@ -1442,29 +1603,43 @@ fn parse_match_detach_delete(input: &str) -> IResult<&str, CypherQuery> {
 
 /// your **old** top-level logic, just moved into a helper
 /// Helper function to parse a single statement string.
-/// Helper function to parse a single statement string.
 // ----------------------------------------------------------------------------------
-// --- UPDATED: parse_single_statement (Prioritizes new sequence parser) ---
+// --- UPDATED: parse_single_statement (Prioritizes MATCH...SET over MATCH...CREATE) ---
 // ----------------------------------------------------------------------------------
+// In cypher_parser.rs
 fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
     let trimmed = input.trim();
     let upper = trimmed.to_ascii_uppercase();
-    
+   
     // 1. DETACH DELETE (unchanged)
     if upper.contains("DETACH DELETE") {
         return parse_match_detach_delete(trimmed)
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-DETACH-DELETE parse error: {:?}", e));
     }
-    
-    // 2. *** NEW: Check for MATCH ... CREATE before generic relationship parsing ***
+   
+    // 2. *** NEW: Check for MATCH ... CREATE ... SET ***
+    if upper.starts_with("MATCH") && upper.contains("CREATE") && upper.contains("SET") {
+        return parse_match_create_relationship(trimmed) // Reuse the parser since it now handles SET
+            .map(|(_, q)| q)
+            .map_err(|e| format!("MATCH-CREATE-SET parse error: {:?}", e));
+    }
+   
+    // 3. Check for MATCH ... SET
+    if upper.starts_with("MATCH") && upper.contains("SET") {
+        return parse_match_set_relationship(trimmed)
+            .map(|(_, q)| q)
+            .map_err(|e| format!("MATCH-SET parse error: {:?}", e));
+    }
+   
+    // 4. Check for MATCH ... CREATE (old step 2, now step 3)
     if upper.starts_with("MATCH") && upper.contains("CREATE") {
         return parse_match_create_relationship(trimmed)
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-CREATE parse error: {:?}", e));
     }
-    
-    // 3. single CREATE (no rels) → use original parsers that return the data
+   
+    // 5. single CREATE (no rels) → use original parsers that return the data (old step 3, now step 4)
     if upper.starts_with("CREATE") && !upper.contains("-[") {
         let create_parsers: Vec<fn(&str) -> IResult<&str, CypherQuery>> = vec![
             parse_create_node,
@@ -1481,16 +1656,14 @@ fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
             }
         }
     }
-    
-    // 4. ANY query that contains a relationship arrow → simple parsers
+   
+    // 6. ANY query that contains a relationship arrow → simple parsers (old step 4, now step 5)
     if upper.contains("-[") && (upper.contains("]->") || upper.contains("]-") || upper.contains("<-[")) {
         return parse_simple_query_type(trimmed)
             .map(|(_, q)| q)
             .map_err(|e| format!("Simple-statement parse error: {:?}", e));
     }
-
-
-    // 5.  full MATCH … RETURN … queries (unchanged)
+    // 7. full MATCH … RETURN … queries (old step 5, now step 6)
     if let Ok((remainder, query)) = full_statement_parser(trimmed) {
         let remainder_trimmed = remainder.trim();
         if !remainder_trimmed.is_empty() {
@@ -1502,8 +1675,7 @@ fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
         return Ok(query);
     }
-
-    // 6.  sequential / batch statements (unchanged)
+    // 8. sequential / batch statements (old step 6, now step 7)
     if let Ok((remainder, query)) = parse_sequential_statements(trimmed) {
         let remainder_trimmed = remainder.trim();
         if !remainder_trimmed.is_empty() {
@@ -1515,8 +1687,7 @@ fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
         return Ok(query);
     }
-
-    // 7.  fallback list (unchanged)
+    // 9. fallback list (old step 7, now step 8)
     let parsers: Vec<fn(&str) -> IResult<&str, CypherQuery>> = vec![
         parse_create_statement,
         parse_delete_edges_simple,
@@ -1529,7 +1700,6 @@ fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         parse_get_kv,
         parse_delete_kv,
     ];
-
     for parser in parsers {
         if let Ok((remainder, query)) = parser(trimmed) {
             let remainder_trimmed = remainder.trim();
@@ -1540,7 +1710,6 @@ fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
             return Ok(query);
         }
     }
-
     Err(format!("Unable to parse statement: {}", trimmed))
 }
 
@@ -1582,6 +1751,69 @@ fn parse_pattern(input: &str) -> IResult<&str, Pattern> {
     Ok((remaining, (path_var.map(String::from), nodes, rels)))
 }
 
+// Helper function to handle optional whitespace around a parser
+// Assumes multispace0 is imported from nom::character::complete
+// FIX E0277/E0618: Defines 'ws' to return an explicit closure, making it compatible
+// with the IResult function style when used as an argument to combinators.
+fn ws<'a, F, O>(mut inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
+where
+    F: FnMut(&'a str) -> IResult<&'a str, O>,
+{
+    // Use the function call style for delimited
+    move |input: &'a str| {
+        delimited(multispace0, &mut inner, multispace0).parse(input)
+    }
+}
+/// Parses a Cypher literal value.
+// FIX E0618: Must be a function that returns an IResult by calling the parser immediately.
+fn parse_value(input: &str) -> IResult<&str, Value> {
+    alt((
+        // 1. Strings
+        map(
+            delimited(char('"'), take_while(|c: char| c != '"'), char('"')),
+            |s: &str| Value::String(s.to_string()),
+        ),
+        // 2. Numbers (Float or Integer)
+        map(double, |f: f64| {
+            if f.fract() == 0.0 {
+                Value::Number(serde_json::Number::from(f as i64))
+            } else {
+                Value::Number(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)))
+            }
+        }),
+        // 3. Booleans
+        value(Value::Bool(true), tag_no_case("TRUE")),
+        value(Value::Bool(false), tag_no_case("FALSE")),
+        // 4. NULL
+        value(Value::Null, tag_no_case("NULL")),
+        // 5. Functions (like timestamp())
+        map(
+            tuple((
+                tag_no_case("timestamp"),
+                ws(char('(')),
+                char(')'))
+            ),
+            |(_, _, _)| json!({"__CYPHER_FUNC__": "timestamp"}),
+        )
+    )).parse(input) // <-- CRITICAL: The function is called here to return IResult
+}
+/// Parses a single assignment in a SET clause, e.g., 'n.property = "value"'
+fn parse_single_set_assignment(input: &str) -> IResult<&str, (String, String, Value)> {
+    map(
+        tuple((
+            // 1. Variable name
+            parse_identifier,
+            ws(char('.')),
+            // 2. Property name
+            parse_identifier,
+            ws(char('=')),
+            // 3. New value
+            parse_value,
+        )),
+        // Map the result to the expected (variable, property_name, value) tuple
+        |(variable, _, property, _, value)| (variable.to_string(), property.to_string(), value),
+    ).parse(input) // <-- CRITICAL: The function is called here to return IResult
+}
 
 // CRITICAL FIX:
 // 1. Make sure "use nom::Parser;" is at the top of your file
@@ -1594,47 +1826,59 @@ fn parse_pattern(input: &str) -> IResult<&str, Pattern> {
 // 2. Use the corrected parse_cypher above
 // 3. Ensure parse_pattern comes BEFORE full_statement_parser in file
 // 4. The parser chain order matters - full_statement_parser MUST be first in alt()
+// In lib/src/query_parser/cypher_parser.rs
 
+// Assuming parse_set_clause is defined elsewhere, likely:
+// fn parse_set_clause(input: &str) -> IResult<&str, (String, String, Value)> { ... }
 fn parse_cypher_statement(input: &str) -> IResult<&str, CypherQuery> {
+    // FIX E0618: Call all parsers with (input)
     // Match "MATCH" or "OPTIONAL MATCH" anywhere at start
-    let (input, _) = alt((tag("MATCH"), tag("OPTIONAL MATCH"))).parse(input)?;
+    let (input, _) = alt((tag_no_case("MATCH"), tag_no_case("OPTIONAL MATCH"))).parse(input)?;
     let (input, _) = multispace1.parse(input)?;
-
-    // Consume ALL patterns (including commas, OPTIONAL MATCH, etc.)
+    // Consume ALL patterns
     let (input, patterns) = separated_list1(
         tuple((multispace0, char(','), multispace0)),
-        parse_pattern, // your existing parse_pattern works great!
+        parse_pattern,
     ).parse(input)?;
-
     // Consume OPTIONAL MATCH clauses
     let (input, _) = many0(preceded(
-        tuple((multispace1, tag("OPTIONAL MATCH"), multispace1)),
+        tuple((multispace1, tag_no_case("OPTIONAL MATCH"), multispace1)),
         parse_pattern,
     )).parse(input)?;
-
     // Consume WHERE (optional)
     let (input, _) = opt(preceded(
-        tuple((multispace1, tag("WHERE"), multispace1)),
+        tuple((multispace1, tag_no_case("WHERE"), multispace1)),
         take_until("RETURN"),
     )).parse(input)?;
-
+    // Consume SET clause (if present)
+    let (input, set_clauses) = opt(preceded(
+        tuple((multispace1, tag_no_case("SET"), multispace1)),
+        separated_list1(
+            tuple((multispace0, char(','), multispace0)),
+            parse_single_set_assignment, // This must be the 3-tuple parser
+        ),
+    )).parse(input)?;
     // Consume CREATE clause (if present)
     let (input, create_patterns) = opt(preceded(
-        tuple((multispace1, tag("CREATE"), multispace1)),
+        tuple((multispace1, tag_no_case("CREATE"), multispace1)),
         separated_list1(
             tuple((multispace0, char(','), multispace0)),
             parse_pattern,
         ),
     )).parse(input)?;
-
     // Consume RETURN (and everything after)
     let (input, _) = opt(preceded(
-        tuple((multispace1, tag("RETURN"), multispace1)),
+        tuple((multispace1, tag_no_case("RETURN"), multispace1)),
         take_while1(|_| true), // eat rest of line
     )).parse(input)?;
-
-    // Decide result
-    if create_patterns.is_some() {
+    // Decide result: Check SET first, then CREATE, then fallback to MATCH
+    if set_clauses.is_some() {
+        // FIX E0308: This now correctly uses the 3-tuple Vec returned by parse_single_set_assignment
+        Ok((input, CypherQuery::MatchSet {
+            match_patterns: patterns,
+            set_clauses: set_clauses.unwrap_or_default(),
+        }))
+    } else if create_patterns.is_some() {
         Ok((input, CypherQuery::MatchCreate {
             match_patterns: patterns,
             create_patterns: create_patterns.unwrap_or_default(),
@@ -1804,6 +2048,85 @@ fn parse_match_clause_patterns(input: &str) -> IResult<&str, Vec<Pattern>> {
     println!("===> parse_match_clause_patterns END, {} patterns", patterns.len());
     
     Ok((input, patterns))
+}
+
+// Parses a Cypher numeric literal (signed integers or floats) and maps it to a PropertyValue.
+// Parses a Cypher numeric literal (signed integers or floats) and maps it to a PropertyValue.
+pub fn parse_numeric_literal(input: &str) -> IResult<&str, PropertyValue> {
+    // Manual parsing approach to avoid nom parser composition issues
+    let original_input = input;
+    let mut chars = input.chars().peekable();
+    let mut number_str = String::new();
+    
+    // Check for optional negative sign
+    if let Some('-') = chars.peek() {
+        number_str.push('-');
+        chars.next();
+    }
+    
+    // Check if we have at least one digit or a decimal point
+    let mut has_digits = false;
+    let mut has_decimal = false;
+    
+    // Parse digits before decimal point
+    while let Some(&ch) = chars.peek() {
+        if ch.is_ascii_digit() {
+            number_str.push(ch);
+            chars.next();
+            has_digits = true;
+        } else {
+            break;
+        }
+    }
+    
+    // Check for decimal point
+    if let Some(&'.') = chars.peek() {
+        number_str.push('.');
+        chars.next();
+        has_decimal = true;
+        
+        // Parse digits after decimal point
+        while let Some(&ch) = chars.peek() {
+            if ch.is_ascii_digit() {
+                number_str.push(ch);
+                chars.next();
+                has_digits = true;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    // Must have at least one digit
+    if !has_digits {
+        return Err(nom::Err::Error(NomError::Error {
+            input: original_input,
+            code: NomError::ErrorKind::Digit,
+        }));
+    }
+    
+    // Calculate remaining input
+    let consumed = number_str.len();
+    let remaining = &original_input[consumed..];
+    
+    // Attempt to parse the recognized string into the appropriate PropertyValue.
+    // Try i64 first (for integers, like -295941589)
+    if !has_decimal {
+        if let Ok(i) = number_str.parse::<i64>() {
+            return Ok((remaining, PropertyValue::Integer(i)));
+        }
+    }
+    
+    // Fallback to f64 (for floats)
+    if let Ok(f) = number_str.parse::<f64>() {
+        return Ok((remaining, PropertyValue::Float(SerializableFloat(f))));
+    }
+    
+    // Error case
+    Err(nom::Err::Error(NomError::Error {
+        input: original_input,
+        code: NomError::ErrorKind::Float,
+    }))
 }
 
 // --- Required Type Definitions (from query_types.rs) ---
@@ -2531,11 +2854,157 @@ pub async fn execute_cypher(
                 }
             }))
         }
+        CypherQuery::MatchCreateSet { match_patterns, create_patterns, set_clauses } => {
+            info!("===> EXECUTING MatchCreateSet: {} match patterns, {} create patterns, {} set clauses",
+                  match_patterns.len(), create_patterns.len(), set_clauses.len());
+            
+            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
+            let mut created_vertices = Vec::new();
+            let mut created_edges = Vec::new();
+            let mut updated_vertices = Vec::new();
+            
+            // 1. Resolve MATCH patterns
+            var_to_id.extend(
+                resolve_match_patterns(&graph_service, match_patterns).await?
+            );
+            
+            // 2. Process CREATE patterns (same as MatchCreate)
+            for pat in create_patterns.iter() {
+                // Create nodes
+                for (var_opt, label_opt, properties) in &pat.1 {
+                    if let Some(v) = var_opt.as_ref() {
+                        if !var_to_id.contains_key(v) {
+                            let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                                .iter()
+                                .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
+                                .collect();
+                            
+                            let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                            let new_id = SerializableUuid(Uuid::new_v4());
+                            
+                            let vertex = Vertex {
+                                id: new_id,
+                                label: Identifier::new(final_label)?,
+                                properties: props?,
+                                created_at: Utc::now().into(),
+                                updated_at: Utc::now().into(),
+                            };
+                            
+                            graph_service.create_vertex(vertex.clone()).await?;
+                            var_to_id.insert(v.clone(), new_id);
+                            created_vertices.push(vertex);
+                        }
+                    }
+                }
+                
+                // Create edges
+                for (i, rel_tuple) in pat.2.iter().enumerate() {
+                    let from_var = pat.1[i].0.as_ref().ok_or(GraphError::ValidationError("No from var".into()))?;
+                    let to_var = pat.1[i + 1].0.as_ref().ok_or(GraphError::ValidationError("No to var".into()))?;
+                    
+                    let from_id = *var_to_id.get(from_var).unwrap();
+                    let to_id = *var_to_id.get(to_var).unwrap();
+                    
+                    let (_rel_var, label_opt, _len_range, properties, direction_opt) = rel_tuple;
+                    
+                    let (outbound_id, inbound_id) = match direction_opt {
+                        Some(true) => (to_id, from_id), // <-
+                        _ => (from_id, to_id),
+                    };
+                    
+                    let edge_type_str = label_opt.as_ref().cloned().unwrap_or("RELATED".to_string());
+                    
+                    let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
+                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                        .collect();
+                    
+                    let edge = Edge {
+                        id: SerializableUuid(Uuid::new_v4()),
+                        outbound_id,
+                        inbound_id,
+                        edge_type: Identifier::new(edge_type_str.clone())?,
+                        label: edge_type_str,
+                        properties: props?,
+                    };
+                    
+                    graph_service.create_edge(edge.clone()).await?;
+                    created_edges.push(edge);
+                }
+            }
+            
+            // 3. Apply SET clauses
+            for (var, prop, val) in set_clauses {
+                let id = var_to_id.get(&var)
+                    .ok_or(GraphError::ValidationError(format!("Unbound var in SET: {}", var)))?
+                    .0;
+                
+                let mut vertex = graph_service.get_vertex(&id).await
+                    .ok_or_else(|| {
+                        let id_str = format!("vertex_{}", id);
+                        GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) })
+                    })?;
+                
+                let prop_value = to_property_value(val)?;
+                vertex.properties.insert(prop, prop_value);
+                vertex.updated_at = Utc::now().into();
+                
+                graph_service.update_vertex(vertex.clone()).await?;
+                updated_vertices.push(vertex);
+            }
+
+            Ok(json!({
+                "status": "success",
+                "created_vertices": created_vertices,
+                "created_edges": created_edges,
+                "updated_vertices": updated_vertices,
+                "stats": {
+                    "vertices_created": created_vertices.len(),
+                    "relationships_created": created_edges.len(),
+                    "vertices_updated": updated_vertices.len()
+                }
+            }))
+        },
+        CypherQuery::MatchSet { match_patterns, set_clauses } => {
+            info!("===> EXECUTING MatchSet: {} patterns, {} SET clauses", 
+                match_patterns.len(), set_clauses.len());
+            
+            // 1. Find the vertices to update
+            let (matched_vertices, _) = exec_cypher_pattern(match_patterns, &graph_service).await?;
+            
+            if matched_vertices.is_empty() {
+                return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
+            }
+            
+            // 2. Apply SET operations to each matched vertex
+            let mut updated_vertices = Vec::new();
+            
+            for mut vertex in matched_vertices {
+                for (var, prop_name, new_value) in &set_clauses {
+                    // Convert the value
+                    let prop_value = to_property_value(new_value.clone())?;
+                    
+                    // Update the property
+                    vertex.properties.insert(prop_name.clone(), prop_value);
+                    vertex.updated_at = Utc::now().into();
+                }
+                
+                // Persist the update
+                graph_service.update_vertex(vertex.clone()).await?;
+                updated_vertices.push(vertex);
+            }
+            
+            Ok(json!({ 
+                "vertices": updated_vertices,
+                "stats": {
+                    "vertices_updated": updated_vertices.len()
+                }
+            }))
+        }
         // --- SIGNIFICANTLY UPDATED MATCH/CREATE (MERGE-like) ---
         // 1. MATCH nodes to resolve their IDs (populates var_to_id).
         // 2. CREATE nodes whose variables are not in var_to_id (populates var_to_id and created_vertices).
         // 3. CREATE relationships between the now-resolved/created nodes.
-CypherQuery::MatchCreate { match_patterns, create_patterns } => {
+        CypherQuery::MatchCreate { match_patterns, create_patterns } => {
             // NOTE: graph_service is now confirmed to be an Arc<GraphService> 
             // in this scope based on the compiler error.
             
@@ -2764,15 +3233,51 @@ CypherQuery::MatchCreate { match_patterns, create_patterns } => {
             
             Ok(json!({ "vertices": created_vertices }))
         }
+
         CypherQuery::MatchNode { label, properties } => {
-            // *** DELEGATION FIX: Fetch all vertices via graph_service ***
-            let vertices = graph_service.get_all_vertices().await?;
-            
-            let query_props: GraphResult<HashMap<String, PropertyValue>> = properties
+            // 1. Convert properties to a mutable PropertyValue map
+            let mut query_props: HashMap<String, PropertyValue> = properties
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
-                .collect();
-            let query_props = query_props?;
+                .collect::<GraphResult<_>>()?;
+            
+            // --- START FIX: Indexed lookup for internal 'id' property ---
+            if let Some(prop_value) = query_props.remove("id") {
+                let internal_id: Option<i32> = match prop_value {
+                    PropertyValue::Integer(val) => Some(val as i32), 
+                    PropertyValue::I32(val) => Some(val),
+                    _ => None,
+                };
+
+                if let Some(internal_id) = internal_id {
+                    // Use direct lookup to avoid recursion
+                    match get_vertex_by_internal_id_direct(&graph_service, internal_id).await? {
+                        Some(v) => {
+                            let matches_label = label.as_ref().map_or(true, |l| {
+                                let vl = v.label.as_ref();
+                                vl == l || vl.starts_with(&format!("{}:", l))
+                            });
+                            
+                            let matches_remaining_props = query_props.iter().all(|(k, expected_val)| {
+                                v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+                            });
+
+                            if matches_label && matches_remaining_props {
+                                return Ok(json!({ "vertices": vec![v] }));
+                            } else {
+                                return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
+                            }
+                        }
+                        None => {
+                            return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
+                        }
+                    }
+                }
+            }
+            // --- END FIX ---
+
+            // Fallback/Standard path: Full scan 
+            let vertices = graph_service.get_all_vertices().await?;
             
             let filtered = vertices.into_iter().filter(|v| {
                 let matches_label = if let Some(query_label) = &label {
@@ -2796,22 +3301,61 @@ CypherQuery::MatchCreate { match_patterns, create_patterns } => {
             
             Ok(json!({ "vertices": filtered }))
         }
-        
+
         CypherQuery::MatchMultipleNodes { nodes } => {
-            // *** DELEGATION FIX: Fetch all vertices via graph_service ***
-            let all_vertices = graph_service.get_all_vertices().await?;
-            
             let mut result_vertices = Vec::new();
             let mut matched_ids = HashSet::new();
+            
+            let all_vertices = graph_service.get_all_vertices().await?;
 
             for (_var, label, properties) in nodes {
-                let props: HashMap<String, PropertyValue> = properties
+                let mut props: HashMap<String, PropertyValue> = properties
                     .iter()
                     .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
                     .collect::<GraphResult<_>>()?;
                 
+                let mut handled_by_id_constraint = false;
+                
+                // --- START FIX: Indexed lookup for internal 'id' property ---
+                if let Some(prop_value) = props.remove("id") {
+                    let internal_id = match prop_value {
+                        PropertyValue::Integer(val) => Some(val as i32), 
+                        PropertyValue::I32(val) => Some(val), 
+                        _ => None,
+                    };
+                    
+                    if let Some(internal_id) = internal_id {
+                        handled_by_id_constraint = true; 
+                    
+                        // Use direct lookup to avoid recursion
+                        if let Some(v) = get_vertex_by_internal_id_direct(&graph_service, internal_id).await? {
+                            let matches_label = label.as_ref().map_or(true, |l| {
+                                let vl = v.label.as_ref();
+                                vl == l || vl.starts_with(&format!("{}:", l))
+                            });
+
+                            let matches_remaining_props = props.iter().all(|(k, expected_val)| {
+                                v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+                            });
+
+                            if matches_label && matches_remaining_props && !matched_ids.contains(&v.id) {
+                                result_vertices.push(v.clone());
+                                matched_ids.insert(v.id);
+                            }
+                        }
+                    }
+                }
+                // --- END FIX ---
+
+                if handled_by_id_constraint {
+                    continue;
+                }
+
+                // Fallback/Standard path: Full scan
+                let label_ref = label.as_ref();
+                
                 for v in &all_vertices {
-                    let matches_label = label.as_ref().map_or(true, |l| {
+                    let matches_label = label_ref.map_or(true, |l| {
                         let vl = v.label.as_ref();
                         vl == l || vl.starts_with(&format!("{}:", l))
                     });
@@ -2829,6 +3373,7 @@ CypherQuery::MatchCreate { match_patterns, create_patterns } => {
             
             Ok(json!({ "vertices": result_vertices, "count": result_vertices.len() }))
         }
+
 
         // --- UPDATED CREATE COMPLEX PATTERN (Pure CREATE of a Path) ---
         // This is structurally similar to the CREATE part of MatchCreate, 
@@ -3446,6 +3991,15 @@ fn type_name_of_val(v: &Value) -> &str {
 }
 /// Helper to convert Cypher `Value` → `PropertyValue`
 fn to_property_value(v: Value) -> GraphResult<PropertyValue> {
+    // Check for special function calls first
+    if let Value::Object(ref m) = v {
+        if let Some(func) = m.get("__CYPHER_FUNC__") {
+            if func.as_str() == Some("timestamp") {
+                return Ok(PropertyValue::Integer(Utc::now().timestamp_millis()));
+            }
+        }
+    }
+    
     match v {
         Value::String(s) => Ok(PropertyValue::String(s)),
         Value::Number(n) if n.is_i64() => Ok(PropertyValue::Integer(n.as_i64().unwrap())),
