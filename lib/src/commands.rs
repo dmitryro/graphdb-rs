@@ -8,7 +8,7 @@
 // FIXED: 2025-08-09 - Added `ShowArgs` wrapper struct to fix `E0277` trait bound error for `ShowAction`.
 // UPDATED: 2025-11-06 - Unified `Exec`, `Query`, `-q`, `-c` into single `Query` command with optional `--language`.
 //                     Bare strings in interactive mode are now treated as queries with inference.
-
+use serde::{Deserialize, Serialize};
 use clap::{Parser, Subcommand, Arg, Args, ArgAction, ValueEnum}; 
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use std::fmt;
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
+pub use models::medical::{ Patient };
 
 // Helper structs for variants that need Args implementation
 #[derive(Args, Debug, PartialEq, Clone)]
@@ -1006,16 +1007,56 @@ pub enum OrderCommand {
     },
 }
 
+// Define the argument struct outside the enum
+#[derive(Args, Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct CreatePatientArgs {
+    /// Patient's first name
+    #[arg(long)]
+    pub first_name: Option<String>,
+    
+    /// Patient's last name
+    #[arg(long)]
+    pub last_name: Option<String>,
+    
+    /// Patient's full name (interprets as first and last name if provided) // <--- ADDED FIELD
+    #[arg(long)]
+    pub name: Option<String>, // <--- ADDED FIELD
+
+    /// Patient's date of birth (dd-mm-yyyy format, e.g., 12-01-1975)
+    #[arg(long)]
+    pub dob: Option<String>,
+    
+    /// Patient's gender
+    #[arg(long)]
+    pub gender: Option<String>,
+    
+    // NEW: Patient's primary address (optional)
+    #[arg(long)]
+    pub address: Option<String>,
+    
+    // NEW: Patient's mobile phone number (optional)
+    #[arg(long)]
+    pub phone: Option<String>,
+    
+    /// Patient's social security number (optional)
+    #[arg(long)] 
+    pub ssn: Option<String>,
+    
+    /// Patient's medical record number (optional)
+    #[arg(long)] 
+    pub mrn: Option<String>,
+    
+    /// Batch create using JSON string with all patient fields
+    #[arg(long)]
+    pub batch: Option<String>,
+}
+
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum PatientCommand {
-    Create {
-        first_name: String,
-        last_name: String,
-        dob: String,           // ISO date
-        gender: String,
-        #[arg(long)] ssn: Option<String>,
-        #[arg(long)] mrn: Option<String>,
-    },
+    // FIX: Using the separate argument struct here
+    Create(CreatePatientArgs), 
+
+    // Single-field variants correctly use positional argument by default
     View { patient_id: i32 },
     Search { query: String },
     Timeline { patient_id: i32 },
@@ -1024,26 +1065,29 @@ pub enum PatientCommand {
     CareGaps { patient_id: Option<i32> }, // None = all
     Allergies { patient_id: i32 },
     Referrals { patient_id: i32 },
+    
     /// View full patient clinical journey with pathways, milestones, deviations
     Journey {
         patient_id: i32,
-        #[clap(long)] pathway: Option<String>,        // Filter by pathway name
-        #[clap(long)] show_completed: bool,           // Include completed pathways
-        #[clap(long)] show_deviations_only: bool,     // Show only deviations
-        #[clap(long)] format: Option<JourneyFormat>,  // text, json, timeline
+        // Consistency: Using #[arg(long)]
+        #[arg(long)] pathway: Option<String>, // Filter by pathway name
+        #[arg(long)] show_completed: bool, // Include completed pathways
+        #[arg(long)] show_deviations_only: bool, // Show only deviations
+        #[arg(long)] format: Option<JourneyFormat>, // text, json, timeline
     },
 
     /// View all active drug alerts and interactions for patient
     DrugAlerts {
         patient_id: i32,
-        #[clap(long)] severity: Option<AlertSeverity>,     // Critical, High, Medium, Low
-        #[clap(long)] include_resolved: bool,             // Show resolved alerts
-        #[clap(long)] include_overridden: bool,            // Show overridden alerts
-        #[clap(long)] drug_class: Option<String>,          // Filter by drug class
-        #[clap(long)] format: Option<AlertFormat>,         // text, json, summary
-        #[clap(long)] include_inactive: bool,
-        #[clap(long)] severity_filter: Option<AlertSeverity>,  
-   },
+        // Consistency: Using #[arg(long)]
+        #[arg(long)] severity: Option<AlertSeverity>, // Critical, High, Medium, Low
+        #[arg(long)] include_resolved: bool, // Show resolved alerts
+        #[arg(long)] include_overridden: bool, // Show overridden alerts
+        #[arg(long)] drug_class: Option<String>, // Filter by drug class
+        #[arg(long)] format: Option<AlertFormat>, // text, json, summary
+        #[arg(long)] include_inactive: bool,
+        #[arg(long)] severity_filter: Option<AlertSeverity>, 
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
@@ -1189,25 +1233,88 @@ pub enum LabFlag {
     Normal,
 }
 
+#[derive(ValueEnum, Debug, PartialEq, Clone)]
+/// Specifies the name matching algorithm to use in probabilistic matching.
+pub enum NameMatchAlgorithm {
+    #[value(name = "jaro-winkler")]
+    JaroWinkler,
+    #[value(name = "levenshtein")]
+    Levenshtein,
+    #[value(name = "both")]
+    Both,
+}
+
+// FIX: Implement the Display trait to satisfy the default_value_t requirement.
+impl fmt::Display for NameMatchAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            NameMatchAlgorithm::JaroWinkler => write!(f, "jaro-winkler"),
+            NameMatchAlgorithm::Levenshtein => write!(f, "levenshtein"),
+            NameMatchAlgorithm::Both => write!(f, "both"),
+        }
+    }
+}
+
 // --- MASTER PATIENT INDEX COMMANDS ---
 #[derive(Subcommand, Debug, PartialEq, Clone,)]
 /// Commands for Master Patient Index (MPI) operations, including matching, linking, and merging patient identities.
 pub enum MPICommand {
-    /// Runs probabilistic matching logic to find potential duplicate patient records.
-    /// 
-    Match {
-        /// Patient's full name (required for probabilistic match)
+    /// Indexes a new patient record into the MPI for future matching and retrieval.
+    /// Requires either --name OR the combination of --first-name and --last-name.
+    Index {
+        /// Patient's full name (e.g., "Alex Johnson"). Conflicts with --first-name and --last-name.
+        #[arg(long, conflicts_with_all = ["first_name", "last_name"])]
+        name: Option<String>,
+
+        /// Patient's first name. Requires --last-name if --name is not provided.
         #[arg(long)]
-        name: String,
-        /// Patient's date of birth (YYYY-MM-DD)
+        first_name: Option<String>,
+
+        /// Patient's last name. Requires --first-name if --name is not provided.
         #[arg(long)]
-        dob: String,
-        /// Patient's address (street/city/zip) for identity comparison
+        last_name: Option<String>,
+
+        /// Optional: Patient's date of birth (YYYY-MM-DD). Accepts --dob or --date_of_birth interchangeably.
+        #[arg(long, aliases = ["date_of_birth"])]
+        dob: Option<String>,
+
+        /// Mandatory: Patient's Medical Record Number (MRN).
         #[arg(long)]
-        address: String,
-        /// Optional: Patient's phone number for higher match certainty
+        mrn: String,
+        
+        /// Optional: Patient's address (street/city/zip).
+        #[arg(long)]
+        address: Option<String>,
+        
+        /// Optional: Patient's phone number.
         #[arg(long)]
         phone: Option<String>,
+    },
+    
+    /// Runs probabilistic matching logic to find potential duplicate patient records.
+    ///
+    /// The accuracy of the match improves with more provided input fields (DOB, Address, Phone).
+    Match {
+        /// Patient's full name (MANDATORY: required for any probabilistic match)
+        #[arg(long)]
+        name: String,
+        
+        /// Optional: Patient's date of birth (YYYY-MM-DD). If provided, significantly increases score weight.
+        #[arg(long)]
+        dob: Option<String>,
+        
+        /// Optional: Patient's address (street/city/zip). Used for geographic blocking and scoring.
+        #[arg(long)]
+        address: Option<String>,
+        
+        /// Optional: Patient's phone number. Used for high match certainty blocking.
+        #[arg(long)]
+        phone: Option<String>,
+
+        /// Optional: Specify the primary name matching algorithm to use for scoring.
+        /// Defaults to 'jaro-winkler', which is generally better for names with minor typos.
+        #[arg(long, default_value_t = NameMatchAlgorithm::JaroWinkler)]
+        name_algo: NameMatchAlgorithm,
     },
 
     /// Explicitly links an external identifier (e.g., foreign MRN) to an existing master MPI record.
@@ -1244,6 +1351,28 @@ pub enum MPICommand {
         /// Optional: Timeframe to filter the audit log (e.g., "30d", "2024-01-01..2024-06-30")
         #[arg(long)]
         timeframe: Option<String>,
+    },
+
+    /// Reverses an erroneous merge operation, creating a new patient record and maintaining an audit trail.
+    Split {
+        /// The ID of the target record that was previously merged into (the one to split from).
+        #[arg(long)]
+        merged_id: String,
+        
+        /// The complete data for the new Patient record being split out (provided as a JSON string).
+        #[arg(long)] 
+        new_patient_data_json: String, 
+        
+        /// The reason for the identity split (required for audit).
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Retrieves the consolidated "Golden Record" (single source of truth) for a given patient.
+    GetGoldenRecord {
+        /// The canonical MPI ID of the patient to retrieve.
+        #[arg(long)]
+        patient_id: String,
     },
 }
 

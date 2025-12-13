@@ -7,30 +7,28 @@ use crate::constraints::PropertyConstraint;
 use models::{Edge, ToEdge, FromEdge, Identifier, SerializableUuid, PropertyValue};
 use crate::edges::relationship::EdgeSchema;
 
-/// Represents the relationship type for a patient's encounter with a healthcare entity.
-/// This edge is designed to be flexible, allowing different source vertices (Patient, EpisodeOfCare)
-/// to link to a target vertex (Encounter).
+/// Represents an unplanned readmission event occurring within 30 days of the preceding encounter's discharge.
+/// This edge links the initial Encounter (Encounter A) to the readmission Encounter (Encounter B).
+/// Clinical Purpose: Readmission tracking for quality metrics.
+/// FHIR Mapping: CMS Measure (e.g., Readmission Rate).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HasEncounter {
+pub struct ReadmittedWithin30Days {
     /// The unique identifier for this specific edge instance (stored as String in the graph).
     pub id: String,
     
-    /// ID of the source vertex (e.g., Patient, EpisodeOfCare)
+    /// ID of the source vertex (Encounter A - the initial discharge)
     pub source_id: Uuid,
-    /// ID of the target vertex (e.g., Encounter)
+    /// ID of the target vertex (Encounter B - the subsequent readmission)
     pub target_id: Uuid,
 
-    /// The date and time the relationship (encounter) began. 
-    pub start_time: DateTime<Utc>,
+    /// The date and time the patient was readmitted (start time of Encounter B).
+    pub readmission_time: DateTime<Utc>,
 
-    /// The date and time the relationship (encounter) ended. If null, the encounter is ongoing.
-    pub end_time: Option<DateTime<Utc>>,
+    /// The number of days between the discharge of Encounter A and the start of Encounter B.
+    pub days_since_discharge: i64,
 
-    /// The duration of the relationship/encounter in minutes. Calculated from start and end times.
-    pub duration_minutes: Option<i64>,
-
-    /// A brief description of the primary reason for the encounter.
-    pub reason_for_encounter: String,
+    /// The primary reason or diagnosis that led to the readmission.
+    pub readmission_reason: Option<String>,
     
     /// A map for any additional, non-standard properties stored directly on the edge.
     #[serde(default)]
@@ -38,46 +36,32 @@ pub struct HasEncounter {
 }
 
 // --- Domain-Specific Methods and Constants ---
-impl HasEncounter {
-    pub const RELATIONSHIP_TYPE: &'static str = "HAS_ENCOUNTER";
+impl ReadmittedWithin30Days {
+    pub const RELATIONSHIP_TYPE: &'static str = "READMITTED_WITHIN_30_DAYS";
 
-    /// Creates a new, minimal HasEncounter instance.
+    /// Creates a new ReadmittedWithin30Days instance.
     pub fn new(
         id: String,
         source_id: Uuid,
         target_id: Uuid,
-        start_time: DateTime<Utc>,
-        reason: String,
+        readmission_time: DateTime<Utc>,
+        days_since_discharge: i64,
     ) -> Self {
         Self {
             id,
-            start_time,
-            end_time: None,
-            duration_minutes: None,
-            reason_for_encounter: reason,
+            readmission_time,
+            days_since_discharge,
+            readmission_reason: None,
             additional_properties: HashMap::new(),
             source_id,
             target_id,
         }
     }
-
-    /// Sets the end time for the encounter and calculates the duration.
-    pub fn end_encounter(&mut self, end_time: DateTime<Utc>) -> Result<(), String> {
-        if end_time < self.start_time {
-            return Err("End time cannot be before start time.".to_string());
-        }
-        
-        // Calculate duration and store in minutes (i64)
-        let duration: Duration = end_time.signed_duration_since(self.start_time);
-        self.duration_minutes = Some(duration.num_minutes());
-        self.end_time = Some(end_time);
-        Ok(())
-    }
 }
 
 
 // --- EdgeSchema Implementation for declarative schema definition ---
-impl EdgeSchema for HasEncounter {
+impl EdgeSchema for ReadmittedWithin30Days {
     fn edge_label() -> &'static str {
         Self::RELATIONSHIP_TYPE
     }
@@ -86,14 +70,12 @@ impl EdgeSchema for HasEncounter {
         vec![
             PropertyConstraint::new("id", true)
                 .with_description("Unique edge instance ID (String)."),
-            PropertyConstraint::new("start_time", true)
-                .with_description("Start time of the encounter (RFC3339)."),
-            PropertyConstraint::new("end_time", false)
-                .with_description("End time of the encounter (RFC3339)."),
-            PropertyConstraint::new("duration_minutes", false)
-                .with_description("Duration in minutes (i64, stored as String)."),
-            PropertyConstraint::new("reason_for_encounter", true)
-                .with_description("Primary reason for the encounter."),
+            PropertyConstraint::new("readmission_time", true)
+                .with_description("The date and time of the readmission (RFC3339)."),
+            PropertyConstraint::new("days_since_discharge", true)
+                .with_description("The number of days between discharge and readmission (i64)."),
+            PropertyConstraint::new("readmission_reason", false)
+                .with_description("Primary reason for readmission (String)."),
         ]
     }
 }
@@ -101,8 +83,8 @@ impl EdgeSchema for HasEncounter {
 
 
 // --- ToEdge Implementation: Struct -> Generic Edge ---
-impl ToEdge for HasEncounter {
-    /// Converts the HasEncounter struct into a generic Edge structure for the graph database.
+impl ToEdge for ReadmittedWithin30Days {
+    /// Converts the ReadmittedWithin30Days struct into a generic Edge structure for the graph database.
     fn to_edge(&self) -> Edge {
         // 1. Convert IDs to SerializableUuid
         let outbound_id: SerializableUuid = self.source_id.into();
@@ -113,16 +95,12 @@ impl ToEdge for HasEncounter {
         let mut e = Edge::new(outbound_id, edge_label_identifier, inbound_id)
             // Mandatory properties wrapped in PropertyValue::String
             .with_property("id".to_string(), PropertyValue::String(self.id.clone()))
-            .with_property("start_time".to_string(), PropertyValue::String(self.start_time.to_rfc3339()))
-            .with_property("reason_for_encounter".to_string(), PropertyValue::String(self.reason_for_encounter.clone()));
+            .with_property("readmission_time".to_string(), PropertyValue::String(self.readmission_time.to_rfc3339()))
+            .with_property("days_since_discharge".to_string(), PropertyValue::String(self.days_since_discharge.to_string()));
 
         // Optional properties
-        if let Some(val) = self.end_time {
-            e = e.with_property("end_time".to_string(), PropertyValue::String(val.to_rfc3339()));
-        }
-        if let Some(val) = self.duration_minutes {
-            // i64 converted to String
-            e = e.with_property("duration_minutes".to_string(), PropertyValue::String(val.to_string()));
+        if let Some(val) = self.readmission_reason.clone() {
+            e = e.with_property("readmission_reason".to_string(), PropertyValue::String(val));
         }
 
         // Additional/Dynamic Properties: Iterate and add all items from the map
@@ -136,7 +114,7 @@ impl ToEdge for HasEncounter {
 
 
 // --- FromEdge Implementation: Generic Edge -> Struct ---
-impl FromEdge for HasEncounter {
+impl FromEdge for ReadmittedWithin30Days {
     fn from_edge(edge: &Edge) -> Option<Self> {
         if edge.label.as_str() != Self::RELATIONSHIP_TYPE { return None; }
         
@@ -153,10 +131,15 @@ impl FromEdge for HasEncounter {
             edge.properties.get(prop_name).and_then(|v| v.as_str()?.parse().ok())
         };
 
+        // Helper to parse string property into String (wrapped in Option for optional fields)
+        let parse_string = |prop_name: &str, edge: &Edge| -> Option<String> {
+            edge.properties.get(prop_name).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+
         // 1. Collect Additional Properties (must run before returning the struct)
         let mut additional_properties = HashMap::new();
         // Define all standard keys explicitly to exclude them from the dynamic map
-        let known_keys: &[&str] = &["id", "start_time", "end_time", "duration_minutes", "reason_for_encounter"];
+        let known_keys: &[&str] = &["id", "readmission_time", "days_since_discharge", "readmission_reason"];
 
         for (key, val) in &edge.properties {
             if !known_keys.contains(&key.as_str()) {
@@ -167,21 +150,19 @@ impl FromEdge for HasEncounter {
             }
         }
         
-        // 2. Map the extracted and parsed data to the HasEncounter struct
-        Some(HasEncounter {
+        // 2. Map the extracted and parsed data to the ReadmittedWithin30Days struct
+        Some(ReadmittedWithin30Days {
             // Mandatory fields use '?' for early exit on failure
             id: edge.properties.get("id")?.as_str()?.to_string(),
-            start_time: parse_datetime("start_time", edge)?,
-            reason_for_encounter: edge.properties.get("reason_for_encounter")?.as_str()?.to_string(),
+            readmission_time: parse_datetime("readmission_time", edge)?,
+            days_since_discharge: parse_i64("days_since_discharge", edge)?,
             
             // Source/Target IDs: Convert SerializableUuid back to Uuid
             source_id: Uuid::parse_str(&edge.outbound_id.to_string()).ok()?, 
             target_id: Uuid::parse_str(&edge.inbound_id.to_string()).ok()?,
 
-            // Optional fields do NOT use '?' when calling the helper, 
-            // as the helper returns Option and we want to preserve 'None' if the property is missing.
-            end_time: parse_datetime("end_time", edge),
-            duration_minutes: parse_i64("duration_minutes", edge),
+            // Optional fields do NOT use '?' when calling the helper
+            readmission_reason: parse_string("readmission_reason", edge),
 
             additional_properties,
         })

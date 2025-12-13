@@ -9,6 +9,7 @@ pub mod mpi_identity_resolution;
 pub mod patient_journey;
 pub mod snomed_knowledge;
 pub mod patient;
+pub mod from_vertex;
 
 pub use clinical_encounters::*;
 pub use clinical_notes::*;
@@ -19,3 +20,4 @@ pub use mpi_identity_resolution::*;
 pub use patient_journey::*;
 pub use patient::*;
 pub use snomed_knowledge::*;
+pub use from_vertex::*;
