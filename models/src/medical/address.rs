@@ -1,3 +1,4 @@
+use bincode::{Encode, Decode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use crate::{
@@ -8,7 +9,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc}; // Keep DateTime, Utc as they are good general utilities for timestamps.
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize,)]
 pub struct Address {
     pub id: Uuid,
     pub address_line1: String,

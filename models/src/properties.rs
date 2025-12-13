@@ -46,6 +46,7 @@ impl std::hash::Hash for SerializableFloat {
 pub enum PropertyValue {
     Boolean(bool),
     Integer(i64),
+    I32(i32),
     Float(SerializableFloat),
     String(String),
     Uuid(crate::identifiers::SerializableUuid),
@@ -56,6 +57,18 @@ impl PropertyValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             PropertyValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn as_i32(&self) -> Option<&i32> {
+        match self {
+            PropertyValue::I32(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn as_i64(&self) -> Option<&i64> {
+        match self {
+            PropertyValue::Integer(v) => Some(v),
             _ => None,
         }
     }

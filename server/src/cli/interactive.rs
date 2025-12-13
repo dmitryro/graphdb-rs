@@ -12,6 +12,7 @@ use std::process;
 use std::path::PathBuf;
 use clap::CommandFactory;
 use std::collections::HashSet;
+use serde_json::{ from_str };
 use shlex;
 use log::{info, error, warn, debug};
 use uuid::Uuid;
@@ -31,9 +32,11 @@ use crate::cli::handlers_history::{
     resolve_history_user, 
 };
 use crate::cli::handlers_mpi::{ self, MPIHandlers };
+use crate::cli::handlers_patient::{ self, PatientHandlers };
 use crate::cli::handlers_utils::{parse_show_command, get_current_time_nanos};
 pub use lib::config::{StorageEngineType};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
+use models::medical::{ Patient };
 
 pub struct SharedState {
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
@@ -206,7 +209,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
 
     // Normal CLI command parsing
     let command_str = parts[0].to_lowercase();
-    let remaining_args = parts[1..].to_vec();
+    let mut remaining_args = parts[1..].to_vec();
 
     let top_level_commands = vec![
         "start", "stop", "status", "auth", "authenticate", "register", "version", "health",
@@ -1927,7 +1930,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                 }
             }
-        }
+        },
         // === NEW: Index & Full-Text Search Commands ===
         "index" => {
             if remaining_args.is_empty() {
@@ -2094,30 +2097,224 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                 }
             }
-        }
-
-        // === ALL CLINICAL COMMANDS — FULLY IMPLEMENTED ===
+        },
         "patient" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: patient <view|timeline|journey|care-gaps|problems|meds|alerts|allergies|search> [args...]");
+                eprintln!("Usage: patient <create|view|timeline|journey|care-gaps|problems|meds|alerts|allergies|search> [args...]");
                 return (CommandType::Unknown, remaining_args);
             }
-            match remaining_args[0].to_lowercase().as_str() {
-                "view" => {
-                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-                    CommandType::Patient(PatientCommand::View { patient_id })
+            
+            // FIX: Consume the subcommand name, mutating remaining_args to hold only the command arguments.
+            let subcommand = remaining_args.remove(0);
+            
+            match subcommand.to_lowercase().as_str() {
+                // === C R E A T E === 
+                "create" => {
+                    let mut first_name: Option<String> = None;
+                    let mut last_name: Option<String> = None;
+                    let mut name: Option<String> = None;     // Holds raw --name value
+                    let mut dob: Option<String> = None;
+                    let mut gender: Option<String> = None;
+                    let mut ssn: Option<String> = None;
+                    let mut mrn: Option<String> = None;
+                    let mut phone: Option<String> = None;    
+                    let mut address: Option<String> = None;  
+                    let mut batch_json: Option<String> = None;
+
+                    let mut i = 0; 
+                    let mut successfully_parsed = true;
+
+                    // --- 1. First Pass: Parse all arguments and store values in local variables ---
+                    // Note: Due to index-based iteration, the later flag overwrites the earlier one (e.g., --name then --first-name, the latter wins for first_name)
+                    while i < remaining_args.len() {
+                        match remaining_args[i].to_lowercase().as_str() {
+                            "--first-name" | "--last-name" | "--dob" | "--gender" | "--ssn" | "--mrn" | "--phone" | "--address" => {
+                                let flag = &remaining_args[i];
+                                if i + 1 < remaining_args.len() {
+                                    let value = remaining_args[i + 1].trim_matches('"').to_string();
+                                    match flag.to_lowercase().as_str() {
+                                        "--first-name" => first_name = Some(value),
+                                        "--last-name" => last_name = Some(value),
+                                        "--dob" => dob = Some(value),
+                                        "--gender" => gender = Some(value),
+                                        "--ssn" => ssn = Some(value),
+                                        "--mrn" => mrn = Some(value),
+                                        "--phone" => phone = Some(value),     
+                                        "--address" => address = Some(value),  
+                                        _ => unreachable!(),
+                                    }
+                                    i += 2;
+                                } else {
+                                    eprintln!("Error: Flag {} requires a value.", flag);
+                                    successfully_parsed = false;
+                                    break;
+                                }
+                            }
+                            "--name" => {
+                                let flag = &remaining_args[i];
+                                if i + 1 < remaining_args.len() {
+                                    name = Some(remaining_args[i + 1].trim_matches('"').to_string());
+                                    // Do not attempt to split here. Just store the raw value. 
+                                    // Splitting logic will occur in the next block.
+                                    i += 2;
+                                } else {
+                                    eprintln!("Error: Flag {} requires a value.", flag);
+                                    successfully_parsed = false;
+                                    break;
+                                }
+                            }
+                            "--batch" => {
+                                if i + 1 < remaining_args.len() {
+                                    let value = remaining_args[i + 1].trim().trim_matches('\'').trim_matches('"').to_string();
+                                    batch_json = Some(value);
+                                    i += 2;
+                                } else {
+                                    eprintln!("Error: Flag --batch requires a JSON string value.");
+                                    successfully_parsed = false;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                eprintln!("Error: Unexpected argument for create: {}", remaining_args[i]);
+                                successfully_parsed = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    // --- 2. Post-Parse Logic: Resolve Name Fields based on Priority ---
+                    if successfully_parsed && name.is_some() {
+                        // If --name was provided, check if the explicit fields should override.
+                        let name_from_flag = name.as_ref().unwrap();
+
+                        if first_name.is_some() && last_name.is_some() {
+                            // Priority Rule: If BOTH --first-name AND --last-name are present, they win.
+                            // Do nothing, the values collected in the loop are retained.
+                            
+                        } else {
+                            // If only --name or a partial combination was provided, use --name to fill gaps.
+                            let parts: Vec<&str> = name_from_flag.split_whitespace().collect();
+                            
+                            if parts.len() >= 2 {
+                                // Use parts from --name only if the dedicated field is currently unset.
+                                if first_name.is_none() {
+                                    first_name = Some(parts[0].to_string());
+                                }
+                                if last_name.is_none() {
+                                    // Take the last element as the last name.
+                                    last_name = Some(parts.last().unwrap().to_string());
+                                }
+                            } else if parts.len() == 1 && first_name.is_none() {
+                                 // If only one name, treat it as first name if not set
+                                 first_name = Some(parts[0].to_string());
+                            } else if parts.len() == 0 {
+                                eprintln!("Warning: --name flag provided no name value. Ignoring.");
+                                name = None;
+                            }
+                        }
+                    }
+                    
+                    // --- 3. Final Validation and Struct Construction ---
+                    if successfully_parsed {
+                        // Validation: Required fields are first_name (or name), dob, and gender.
+                        if (first_name.is_some() || name.is_some()) && dob.is_some() && gender.is_some() {
+                            // Success: Clear the original vector since all arguments were processed and consumed.
+                            remaining_args.clear();
+                            
+                            // Construct the CreatePatientArgs struct using all collected Option<String> variables.
+                            let create_args = CreatePatientArgs {
+                                first_name, // Now contains resolved first name
+                                last_name,  // Now contains resolved last name
+                                dob,
+                                gender,
+                                ssn,
+                                mrn,
+                                phone,
+                                address,
+                                batch: batch_json,
+                                name, // Raw name for completeness
+                            };
+
+                            CommandType::Patient(PatientCommand::Create(create_args))
+                        } else {
+                            eprintln!("Error: Missing mandatory fields for patient create. Required: (--first-name AND --last-name OR --name), --dob, AND --gender.");
+                            CommandType::Unknown
+                        }
+                    } else {
+                        CommandType::Unknown
+                    }
                 }
-                "timeline" => {
-                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-                    CommandType::Patient(PatientCommand::Timeline { patient_id })
+                // === SIMPLE COMMANDS (consume one argument: patient_id) ===
+                // Uses `remaining_args.remove(0)` to consume the argument on success.
+                "view" | "timeline" | "problems" | "meds" | "alerts" | "allergies" => {
+                    let patient_id = if remaining_args.is_empty() {
+                        0
+                    } else {
+                        // Remove the patient ID argument and try to parse it
+                        let arg = remaining_args.remove(0);
+                        arg.parse::<i32>().ok().unwrap_or_else(|| {
+                            eprintln!("Error: Could not parse patient ID '{}'. Using default '0'.", arg);
+                            0
+                        })
+                    };
+
+                    match subcommand.as_str() {
+                        "view" => CommandType::Patient(PatientCommand::View { patient_id }),
+                        "timeline" => CommandType::Patient(PatientCommand::Timeline { patient_id }),
+                        "problems" => CommandType::Patient(PatientCommand::Problems { patient_id }),
+                        "meds" => CommandType::Patient(PatientCommand::Meds { patient_id }),
+                        "alerts" => CommandType::Patient(PatientCommand::DrugAlerts {
+                            patient_id,
+                            drug_class: None,
+                            format: Default::default(),
+                            include_overridden: false,
+                            include_inactive: false,
+                            severity_filter: None,
+                            include_resolved: false,
+                            severity: None,
+                        }),
+                        "allergies" => CommandType::Patient(PatientCommand::Allergies { patient_id }),
+                        _ => CommandType::Unknown,
+                    }
                 }
+
+                // === CARE GAPS (Optional patient_id, must be Option<i32>) ===
+                "care-gaps" | "gaps" => {
+                    // FIX E0308: patient_id must be Option<i32>.
+                    let patient_id = if remaining_args.is_empty() {
+                        None
+                    } else {
+                        // Consume the argument via remove(0)
+                        let arg = remaining_args.remove(0);
+                        let parsed_id = arg.parse::<i32>().ok();
+                        if parsed_id.is_none() {
+                            eprintln!("Warning: Could not parse optional patient ID '{}'. Defaulting to None (all patients).", arg);
+                        }
+                        parsed_id
+                    };
+                    
+                    CommandType::Patient(PatientCommand::CareGaps { patient_id }) 
+                }
+
+                // === JOURNEY (Complex parsing, consumes patient_id and flags) ===
                 "journey" => {
-                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                    // Consume patient_id from the first argument if present
+                    let patient_id = if remaining_args.is_empty() {
+                        0
+                    } else {
+                        remaining_args.remove(0).parse::<i32>().ok().unwrap_or_else(|| {
+                            eprintln!("Error: Could not parse patient ID for journey. Using default '0'.");
+                            0
+                        })
+                    };
+                    
                     let mut show_completed = false;
                     let mut show_deviations_only = false;
                     let mut pathway = None;
                     let mut format = None;
-                    let mut i = 2;
+                    
+                    // `remaining_args` now contains only flags. Iterate and consume by index.
+                    let mut i = 0;
                     while i < remaining_args.len() {
                         match remaining_args[i].to_lowercase().as_str() {
                             "--show-completed" => {
@@ -2150,9 +2347,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                     i += 1;
                                 }
                             }
-                            _ => i += 1,
+                            _ => {
+                                eprintln!("Warning: Unknown argument '{}' for journey. Ignoring.", remaining_args[i]);
+                                i += 1;
+                            }
                         }
                     }
+                    // All flags consumed successfully: clear the remaining args vector.
+                    remaining_args.clear();
+                    
                     CommandType::Patient(PatientCommand::Journey {
                         patient_id,
                         show_completed,
@@ -2161,49 +2364,19 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         format,
                     })
                 }
-                "care-gaps" | "gaps" => {
-                    let patient_id = if remaining_args.len() > 1 {
-                        remaining_args[1].parse::<i32>().ok()
-                    } else {
-                        None
-                    };
-                    CommandType::Patient(PatientCommand::CareGaps { patient_id })
-                }
-                "problems" => {
-                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-                    CommandType::Patient(PatientCommand::Problems { patient_id })
-                }
-                "meds" => {
-                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-                    CommandType::Patient(PatientCommand::Meds { patient_id })
-                }
-                "alerts" => {
-                    let patient_id = remaining_args
-                        .get(1)
-                        .and_then(|s| s.parse::<i32>().ok())
-                        .unwrap_or(0);
 
-                    // ---- defaults for the new required fields ----
-                    CommandType::Patient(PatientCommand::DrugAlerts {
-                        patient_id,
-                        drug_class: None,            // Option<String>
-                        format: Default::default(),  // whatever your Format enum default is
-                        include_overridden: false,   // bool
-                        include_inactive: false,     // bool
-                        severity_filter: None,       // Option<Severity>
-                        include_resolved: false,
-                        severity: None,
-                    })
-                }
-                "allergies" => {
-                    let patient_id = remaining_args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-                    CommandType::Patient(PatientCommand::Allergies { patient_id })
-                }
+                // === SEARCH (consumes all remaining arguments) ===
                 "search" => {
-                    let query = remaining_args[1..].join(" ");
+                    // Use drain(..) to efficiently consume all remaining arguments and leave an empty vector behind.
+                    let query = remaining_args.drain(..).collect::<Vec<String>>().join(" ");
+                    
                     CommandType::Patient(PatientCommand::Search { query })
                 }
-                _ => CommandType::Unknown,
+                
+                _ => {
+                    eprintln!("Error: Unknown patient subcommand '{}'.", subcommand);
+                    CommandType::Unknown
+                }
             }
         },
         "encounter" => {
@@ -2994,6 +3167,9 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut dob: Option<String> = None;
             let mut address: Option<String> = None;
             let mut phone: Option<String> = None;
+            let mut name_algo: Option<String> = None; 
+
+            // Link/Merge/Audit variables
             let mut master_id: Option<String> = None;
             let mut external_id: Option<String> = None;
             let mut id_type: Option<String> = None;
@@ -3003,12 +3179,24 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut mpi_id: Option<String> = None;
             let mut timeframe: Option<String> = None;
             
+            // Split/GetGoldenRecord variables
+            let mut merged_id: Option<String> = None; 
+            let mut new_patient_data_json: Option<String> = None; 
+            let mut reason: Option<String> = None; 
+            let mut patient_id: Option<String> = None; 
+
+            // NEW: Index variables
+            let mut mrn: Option<String> = None;
+            let mut first_name: Option<String> = None;
+            let mut last_name: Option<String> = None;
+            
             let mut current_subcommand_index = 0;
             let mut explicit_subcommand: Option<String> = None;
             
             if !remaining_args.is_empty() {
                 match remaining_args[0].to_lowercase().as_str() {
-                    "match" | "link" | "merge" | "audit" => {
+                    // UPDATED: Added "index" subcommand
+                    "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" | "index" => {
                         explicit_subcommand = Some(remaining_args[0].to_lowercase());
                         current_subcommand_index = 1;
                     }
@@ -3028,7 +3216,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    "--dob" => {
+                    // UPDATED: Handle both --dob and --date_of_birth
+                    "--dob" | "--date_of_birth" => {
                         if i + 1 < remaining_args.len() {
                             dob = Some(remaining_args[i + 1].clone());
                             i += 2;
@@ -3055,6 +3244,53 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
+                    "--name-algo" => {
+                        if i + 1 < remaining_args.len() {
+                            let value = remaining_args[i + 1].to_lowercase();
+                            if value == "jaro-winkler" || value == "levenshtein" || value == "both" {
+                                name_algo = Some(value);
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Invalid value for '--name-algo'. Use 'jaro-winkler', 'levenshtein', or 'both'. Defaulting to 'jaro-winkler'.");
+                                i += 2;
+                            }
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    
+                    // NEW: Index Flags
+                    "--mrn" => {
+                        if i + 1 < remaining_args.len() {
+                            mrn = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--first-name" => {
+                        if i + 1 < remaining_args.len() {
+                            first_name = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--last-name" => {
+                        if i + 1 < remaining_args.len() {
+                            last_name = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    
+                    // ... existing link/merge/audit/split/getgoldenrecord flags ...
+                    
                     "--master-id" => {
                         if i + 1 < remaining_args.len() {
                             master_id = Some(remaining_args[i + 1].clone());
@@ -3127,6 +3363,42 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
+                    "--merged-id" => {
+                        if i + 1 < remaining_args.len() {
+                            merged_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--new-patient-data-json" => {
+                        if i + 1 < remaining_args.len() {
+                            new_patient_data_json = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--reason" => {
+                        if i + 1 < remaining_args.len() {
+                            reason = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--patient-id" => {
+                        if i + 1 < remaining_args.len() {
+                            patient_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
                     _ => {
                         eprintln!("Warning: Unknown argument for 'mpi': {}", remaining_args[i]);
                         i += 1;
@@ -3135,16 +3407,49 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
             
             match explicit_subcommand.as_deref() {
+                // NEW: Index Subcommand implementation
+                Some("index") => {
+                    if let Some(m) = mrn {
+                        // Check if either --name OR (--first-name AND --last-name) are present
+                        let name_ok = name.is_some() || (first_name.is_some() && last_name.is_some());
+                        
+                        if name_ok {
+                            CommandType::Mpi(MPICommand::Index {
+                                name,
+                                first_name,
+                                last_name,
+                                dob,
+                                mrn: m,
+                                address,
+                                phone,
+                            })
+                        } else {
+                            eprintln!("Error: 'mpi index' requires either --name OR both --first-name and --last-name.");
+                            CommandType::Unknown
+                        }
+                    } else {
+                        eprintln!("Error: 'mpi index' requires the mandatory flag --mrn.");
+                        CommandType::Unknown
+                    }
+                }
+                
                 Some("match") => {
-                    if let (Some(n), Some(d), Some(a)) = (name, dob, address) {
+                    if let Some(n) = name {
+                        let algo = match name_algo.as_deref() {
+                            Some("levenshtein") => NameMatchAlgorithm::Levenshtein,
+                            Some("both") => NameMatchAlgorithm::Both,
+                            _ => NameMatchAlgorithm::JaroWinkler,
+                        };
+
                         CommandType::Mpi(MPICommand::Match {
                             name: n,
-                            dob: d,
-                            address: a,
+                            dob,
+                            address,
                             phone,
+                            name_algo: algo,
                         })
                     } else {
-                        eprintln!("Error: 'mpi match' requires --name, --dob, and --address");
+                        eprintln!("Error: 'mpi match' requires the mandatory flag --name.");
                         CommandType::Unknown
                     }
                 }
@@ -3183,13 +3488,36 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::Unknown
                     }
                 }
+                Some("split") => {
+                    if let (Some(m), Some(d), Some(r)) = (merged_id, new_patient_data_json, reason) {
+                        CommandType::Mpi(MPICommand::Split {
+                            merged_id: m,
+                            new_patient_data_json: d,
+                            reason: r,
+                        })
+                    } else {
+                        eprintln!("Error: 'mpi split' requires --merged-id, --new-patient-data-json, and --reason");
+                        CommandType::Unknown
+                    }
+                }
+                Some("getgoldenrecord") => {
+                    if let Some(p) = patient_id {
+                        CommandType::Mpi(MPICommand::GetGoldenRecord {
+                            patient_id: p,
+                        })
+                    } else {
+                        eprintln!("Error: 'mpi getgoldenrecord' requires --patient-id");
+                        CommandType::Unknown
+                    }
+                }
                 None => {
-                    eprintln!("Error: 'mpi' requires a subcommand: match, link, merge, or audit");
+                    eprintln!("Error: 'mpi' requires a subcommand: index, match, link, merge, audit, split, or getgoldenrecord");
                     CommandType::Unknown
                 }
                 _ => CommandType::Unknown,
             }
         }
+        // --- END OF UPDATED MATCH ARM ---
         "triage" => {
             if remaining_args.is_empty() || remaining_args[0].to_lowercase() != "assess" {
                 eprintln!("Usage: triage assess --encounter <uuid> --level <ESI1-5> --complaint <text> [--symptoms] [--pain-score] [--notes]");
@@ -8492,25 +8820,48 @@ pub async fn handle_interactive_command(
             crate::cli::handlers_index::handle_index_command(action).await?;
             Ok(())
         }
-        // Add this match arm to the CommandType match in interactive.rs
         CommandType::Mpi(mpi_command) => {
             // 1. Ensure the MPI handlers are initialized (lazy initialization).
             state.ensure_mpi_handlers().await.map_err(|e| anyhow::anyhow!("MPI service initialization failed: {:?}", e))?;
             
-            // FIX: Removed the incorrect logging wrapper.
             println!("[INFO] Executing interactive MPI subcommand: {:?}", mpi_command);
 
             // FIX: Retrieve the entire state field (Arc<TokioMutex<Option<MPIHandlers>>>)
             // and pass it directly to the handlers to satisfy the type requirement.
             let mpi_handlers_state = state.mpi_handlers.clone();
-
+            
             match mpi_command {
-                MPICommand::Match { name, dob, address, phone } => {
+                // --- ADDED: Patient Indexing Operation ---
+                MPICommand::Index { 
+                    name, 
+                    first_name, 
+                    last_name, 
+                    dob, 
+                    mrn, 
+                    address, 
+                    phone 
+                } => {
+                    handlers_mpi::handle_mpi_index_interactive(
+                        name,
+                        first_name,
+                        last_name,
+                        dob,
+                        mrn, // Mandatory String
+                        address,
+                        phone,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI index failed: {}", e))
+                }
+
+                MPICommand::Match { name, dob, address, phone, name_algo } => {
                     handlers_mpi::handle_mpi_match_interactive(
                         name,
                         dob,
                         address,
                         phone,
+                        name_algo,
                         mpi_handlers_state, // Pass the required type
                     )
                     .await
@@ -8545,9 +8896,45 @@ pub async fn handle_interactive_command(
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))
                 }
+                // --- Identity Split/Unmerge Operation ---
+                MPICommand::Split { merged_id, new_patient_data_json, reason } => {
+                    // 1. Deserialize the JSON string provided by the CLI argument into the Patient struct.
+                    let new_patient_data: Patient = from_str(&new_patient_data_json)
+                        .map_err(|e| anyhow::anyhow!("Failed to parse Patient data JSON for Split command: {}", e))?;
+                        
+                    // 2. Call the interactive handler with the correctly typed Patient struct.
+                    handlers_mpi::handle_mpi_split_interactive(
+                        merged_id,
+                        new_patient_data, // Now correctly a Patient struct
+                        reason,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI split/unmerge failed: {}", e))
+                }
+                // --- Golden Record Retrieval ---
+                MPICommand::GetGoldenRecord { patient_id } => {
+                    handlers_mpi::handle_get_golden_record_interactive(
+                        patient_id,
+                        mpi_handlers_state, // Pass the required type
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI Golden Record retrieval failed: {}", e))
+                }
             }
         }
         CommandType::Patient(command) => {
+            // This arm handles all PatientCommands in INTERACTIVE mode (REPL/TUI).
+            
+            println!("[INFO] Executing interactive Patient subcommand: {:?}", command);
+
+            // 1. Call the existing interactive handler function.
+            // This function handles initialization, command dispatch, and printing the result.
+            handlers_patient::handle_patient_command_interactive(command)
+                .await
+                .map_err(|e| anyhow::anyhow!("Patient command execution failed: {}", e))?;
+
+            // The interactive function prints the output directly, so we just return Ok(()).
             Ok(())
         }
         CommandType::Encounter(command) => {

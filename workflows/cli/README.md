@@ -109,7 +109,7 @@ These commands are the foundation for managing patient visits, records, and orde
 | **note** | `add`, `list` | `patient_id`, `author_id`, `text`, `--note-type` | Clinical Documentation and Charting |
 | **nursing** | `task`, `document`, `shift-report` | `patient_id`, `task_type`, `notes` | Nursing Workflow and Documentation |
 | **order** | `admit`, `lab`, `imaging`, `medication` | `encounter_id`, *(specific order args)*, `--priority`, `--notes` | Physician/Provider Orders |
-| **patient** | `create`, `view`, `search`, `timeline` | `id`, `name`, `dob`, `mrn`, `--ssn`, `--mrn` | Patient Demographics & Records |
+| **patient** | `create`, `view`, `search`, `timeline` | `id`, `name`, `dob`, `mrn`, `--ssn`, `--mrn` , `--batch`| Patient Demographics & Records |
 | **procedure** | `order`, `perform`, `result`, `analytics` | `encounter_id`, `cpt_code`, `--scheduled-date`, `--location` | Surgical and Diagnostic Procedure Management |
 | **vitals** | `add`, `list` | `encounter_id`, `--bp`, `--hr`, `--temp`, `--pain-score`, `--spo2`, `--weight` | Patient Physiological Data Recording |
 | **observation** | `add`, `list` | `encounter_id`, `type`, `value`, `unit`, `--method` | General Clinical Observations |

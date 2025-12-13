@@ -52,6 +52,7 @@ fn _do_cleanup_request_sync(addr: &str, request_data: &[u8], timeout_ms: i32) ->
     serde_json::from_slice(&msg)
         .context("Failed to deserialize ZMQ response")
 }
+
 // -------------------------------------------------
 
 /// Ensures the storage daemon is running and initializes the GLOBAL_STORAGE_ENGINE_MANAGER
@@ -91,14 +92,14 @@ async fn initialize_storage_for_cleanup() -> Result<()> {
 /// Executes the ZMQ request to clean up orphaned edges on the specified daemon.
 pub async fn cleanup_orphaned_edges_zmq(engine_type: StorageEngineType) -> Result<()> {
     // --- Configuration Constants ---
-    const CONNECT_TIMEOUT_SECS: u64 = 3;
-    const REQUEST_TIMEOUT_SECS: u64 = 10;
-    const RECEIVE_TIMEOUT_SECS: u64 = 15;
+    const CONNECT_TIMEOUT_SECS: u64 = 5;  // Increased connection timeout
+    const REQUEST_TIMEOUT_SECS: u64 = 10; // Send request timeout
+    const RECEIVE_TIMEOUT_SECS: u64 = 50; // FIX: Greatly increased receive time for long database operation
     const MAX_RETRIES: u32 = 3;
-    const BASE_RETRY_DELAY_MS: u64 = 500;
+    const BASE_RETRY_DELAY_SECS: u64 = 2; // FIX: Changed base delay to seconds for effectiveness
     
     // Calculate total timeout for the async wrapper (u64 for Tokio Duration)
-    const TOTAL_TIMEOUT_SECS: u64 = CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS;
+    const TOTAL_TIMEOUT_SECS: u64 = CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS; // New total: 65 seconds
     // Calculate timeout for the synchronous ZMQ socket (i32 for ZMQ options)
     const SOCKET_TIMEOUT_MS: i32 = (TOTAL_TIMEOUT_SECS * 1000) as i32;
 
@@ -176,7 +177,7 @@ pub async fn cleanup_orphaned_edges_zmq(engine_type: StorageEngineType) -> Resul
                 // sync_result is Result<Value, anyhow::Error> from the synchronous call
                 match sync_result {
                     Ok(response_value) => {
-                        // response_value is now a plain serde_json::Value (FIX APPLIED HERE)
+                        // response_value is now a plain serde_json::Value
                         match response_value.get("status").and_then(|s| s.as_str()) {
                             Some("success") => {
                                 let deleted_edges = response_value.get("deleted_edges").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -215,8 +216,10 @@ pub async fn cleanup_orphaned_edges_zmq(engine_type: StorageEngineType) -> Resul
         }
         
         if attempt < MAX_RETRIES {
-            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
-            sleep(TokioDuration::from_millis(delay)).await;
+            // FIX: Use BASE_RETRY_DELAY_SECS and exponential backoff
+            let delay_secs = BASE_RETRY_DELAY_SECS * 2u64.pow(attempt - 1);
+            warn!("Retrying in {} seconds...", delay_secs);
+            sleep(TokioDuration::from_secs(delay_secs)).await;
         }
     }
     
@@ -224,7 +227,6 @@ pub async fn cleanup_orphaned_edges_zmq(engine_type: StorageEngineType) -> Resul
         anyhow!("Failed to complete ZMQ cleanup_orphaned_edges operation after {} attempts", MAX_RETRIES)
     }))
 }
-
 
 /// Triggers the automatic cleanup of orphaned graph edges via an asynchronous ZMQ call.
 pub fn trigger_async_graph_cleanup() {

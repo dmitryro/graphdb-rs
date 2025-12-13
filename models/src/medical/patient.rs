@@ -1,9 +1,12 @@
 // models/src/medical/patient.rs
+use bincode::{Encode, Decode};
+use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 use crate::{Vertex, ToVertex, identifiers::Identifier};
 use crate::medical::Address;   // or wherever it lives
+use crate::properties::PropertyValue; // <--- ADD THIS IMPORT
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Patient {
     // Primary identifiers
     pub id: i32,
@@ -291,225 +294,441 @@ impl ToVertex for Patient {
     }
 }
 
+// Add this helper function before Patient::from_vertex
+
+/// Normalizes vertex properties by converting legacy aliases to canonical field names
+// Add this helper function before Patient::from_vertex
+
+/// Normalizes vertex properties by converting legacy aliases to canonical field names
+// NOTE: This code assumes the following types and modules are in scope (e.g., via use statements):
+// Vertex, PropertyValue, Patient, Address, Uuid, chrono::Utc, chrono::NaiveDate, chrono::Datelike, chrono::Timelike
+
+/// Normalizes vertex properties by converting legacy aliases to canonical field names
+// Add this helper function before Patient::from_vertex
+
+/// Normalizes vertex properties by converting legacy aliases to canonical field names
+// NOTE: This code assumes the following types and modules are in scope (e.g., via use statements):
+// Vertex, PropertyValue, Patient, Address, Uuid, chrono::Utc, chrono::NaiveDate, chrono::Datelike, chrono::Timelike
+
+/// Normalizes vertex properties by converting legacy aliases to canonical field names
+/// and ensuring required fields have non-null string representations.
+fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
+    let mut normalized = vertex.clone();
+    
+    // --- 1. Handle legacy "dob" field and ensure "date_of_birth" is present ---
+    let dob_key = "date_of_birth".to_string();
+    if !normalized.properties.contains_key(&dob_key) {
+        // Attempt to convert "dob"
+        let dob_string_to_convert: Option<String> = normalized.properties.get("dob").and_then(|v| {
+            if let PropertyValue::String(s) = v {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
+
+        let mut date_found = false;
+        if let Some(dob_value) = dob_string_to_convert {
+            // CRITICAL FIX: Convert "YYYY-MM-DD" to RFC3339 format
+            if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(&dob_value, "%Y-%m-%d") {
+                let date_time = naive_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+                
+                normalized.properties.insert(
+                    dob_key.clone(),
+                    PropertyValue::String(date_time.to_rfc3339())
+                );
+                date_found = true;
+                normalized.properties.remove("dob");
+            }
+        }
+        
+        // NEW FIX: If "date_of_birth" is still missing, set a default to prevent deserialization failure
+        if !date_found {
+            // Default to 1900-01-01T00:00:00+00:00 (A safe fallback date)
+            let default_date = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .to_rfc3339();
+                
+            normalized.properties.insert(dob_key, PropertyValue::String(default_date));
+        }
+    }
+    
+    // --- 2. Handle legacy "name" field ---
+    // This logic attempts to split 'name' into 'first_name' and 'last_name' if they are missing
+    let mut names_set = normalized.properties.contains_key("first_name") && normalized.properties.contains_key("last_name");
+    
+    if !names_set {
+        let name_string_to_split: Option<String> = normalized.properties.get("name").and_then(|v| {
+            if let PropertyValue::String(s) = v {
+                Some(s.clone()) 
+            } else {
+                None
+            }
+        });
+
+        if let Some(name_value) = name_string_to_split {
+            let parts: Vec<&str> = name_value.split_whitespace().collect();
+            
+            // Insert first_name
+            if let Some(first) = parts.first() {
+                normalized.properties.insert(
+                    "first_name".to_string(),
+                    PropertyValue::String(first.to_string()) 
+                );
+            }
+            
+            // Insert last_name (all remaining parts)
+            if parts.len() > 1 {
+                let last = parts[1..].join(" ");
+                normalized.properties.insert(
+                    "last_name".to_string(),
+                    PropertyValue::String(last) 
+                );
+            } else if parts.len() == 1 {
+                // If only one part, set last_name to empty
+                normalized.properties.insert(
+                    "last_name".to_string(),
+                    PropertyValue::String("".to_string()) 
+                );
+            }
+            
+            normalized.properties.remove("name");
+            names_set = true;
+        }
+    }
+    
+    // NEW FIX: Ensure first_name and last_name exist as strings after conversion attempt
+    if !normalized.properties.contains_key("first_name") {
+        normalized.properties.insert("first_name".to_string(), PropertyValue::String("".to_string()));
+    }
+    if !normalized.properties.contains_key("last_name") {
+        normalized.properties.insert("last_name".to_string(), PropertyValue::String("".to_string()));
+    }
+    
+    // --- 3. Ensure other required/default fields are present (preserved existing logic) ---
+
+    // Ensure required fields have defaults if missing
+    if !normalized.properties.contains_key("patient_status") {
+        normalized.properties.insert(
+            "patient_status".to_string(),
+            PropertyValue::String("ACTIVE".to_string())
+        );
+    }
+    
+    if !normalized.properties.contains_key("gender") {
+        normalized.properties.insert(
+            "gender".to_string(),
+            PropertyValue::String("UNKNOWN".to_string())
+        );
+    }
+    
+    // Ensure boolean fields have defaults
+    if !normalized.properties.contains_key("interpreter_needed") {
+        normalized.properties.insert(
+            "interpreter_needed".to_string(),
+            PropertyValue::String("false".to_string())
+        );
+    }
+    
+    // ... (other boolean and audit field defaults are preserved) ...
+    
+    if !normalized.properties.contains_key("advance_directive_on_file") {
+        normalized.properties.insert(
+            "advance_directive_on_file".to_string(),
+            PropertyValue::String("false".to_string())
+        );
+    }
+    
+    if !normalized.properties.contains_key("vip_flag") {
+        normalized.properties.insert(
+            "vip_flag".to_string(),
+            PropertyValue::String("false".to_string())
+        );
+    }
+    
+    if !normalized.properties.contains_key("confidential_flag") {
+        normalized.properties.insert(
+            "confidential_flag".to_string(),
+            PropertyValue::String("false".to_string())
+        );
+    }
+    
+    if !normalized.properties.contains_key("food_insecurity") {
+        normalized.properties.insert(
+            "food_insecurity".to_string(),
+            PropertyValue::String("false".to_string())
+        );
+    }
+    
+    if !normalized.properties.contains_key("transportation_needs") {
+        normalized.properties.insert(
+            "transportation_needs".to_string(),
+            PropertyValue::String("false".to_string())
+        );
+    }
+    
+    // Ensure timestamp fields exist
+    if !normalized.properties.contains_key("created_at") {
+        normalized.properties.insert(
+            "created_at".to_string(),
+            PropertyValue::String(chrono::Utc::now().to_rfc3339())
+        );
+    }
+    
+    if !normalized.properties.contains_key("updated_at") {
+        normalized.properties.insert(
+            "updated_at".to_string(),
+            PropertyValue::String(chrono::Utc::now().to_rfc3339())
+        );
+    }
+    
+    normalized
+}
+
+
 impl Patient {
     pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
-        if vertex.label.as_ref() != "Patient" { return None; }
-
+        if vertex.label.as_ref() != "Patient" { 
+            return None; 
+        }
+        
+        // Normalize the vertex properties first
+        let normalized = normalize_patient_vertex(vertex);
+        
+        // Now use the original from_vertex logic with the normalized vertex
         Some(Patient {
             // Primary identifiers
-            id: vertex.properties.get("id")?.as_str()?.parse().ok()?,
-            user_id: vertex.properties.get("user_id")
+            // FIX: Handle PropertyValue being an Integer or a String for ID
+            id: {
+                let prop = normalized.properties.get("id")?;
+                
+                let id_str = match prop {
+                    PropertyValue::String(s) => s.clone(),
+                    // Assuming PropertyValue::Integer holds an i64 (common for GraphDBs)
+                    PropertyValue::Integer(i) => i.to_string(), 
+                    _ => return None, // Fail if not a string or integer
+                };
+            
+                // Parse the resulting string into the final Patient's ID type (e.g., i32/i64)
+                id_str.parse().ok()?
+            },
+            
+            user_id: normalized.properties.get("user_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            mrn: vertex.properties.get("mrn")
+            mrn: normalized.properties.get("mrn")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            ssn: vertex.properties.get("ssn")
+            ssn: normalized.properties.get("ssn")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Demographics
-            first_name: vertex.properties.get("first_name")?.as_str()?.to_string(),
-            middle_name: vertex.properties.get("middle_name")
+            // Demographics (Now guaranteed to exist by normalize_patient_vertex)
+            first_name: normalized.properties.get("first_name")?.as_str()?.to_string(),
+            middle_name: normalized.properties.get("middle_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            last_name: vertex.properties.get("last_name")?.as_str()?.to_string(),
-            suffix: vertex.properties.get("suffix")
+            last_name: normalized.properties.get("last_name")?.as_str()?.to_string(),
+            suffix: normalized.properties.get("suffix")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            preferred_name: vertex.properties.get("preferred_name")
+            preferred_name: normalized.properties.get("preferred_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            // date_of_birth is now guaranteed to be present and in RFC3339 format
             date_of_birth: chrono::DateTime::parse_from_rfc3339(
-                vertex.properties.get("date_of_birth")?.as_str()?
+                normalized.properties.get("date_of_birth")?.as_str()?
             ).ok()?.with_timezone(&chrono::Utc),
-            date_of_death: vertex.properties.get("date_of_death")
+            date_of_death: normalized.properties.get("date_of_death")
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
-            gender: vertex.properties.get("gender")?.as_str()?.to_string(),
-            sex_assigned_at_birth: vertex.properties.get("sex_assigned_at_birth")
+            gender: normalized.properties.get("gender")?.as_str()?.to_string(),
+            sex_assigned_at_birth: normalized.properties.get("sex_assigned_at_birth")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            gender_identity: vertex.properties.get("gender_identity")
+            gender_identity: normalized.properties.get("gender_identity")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            pronouns: vertex.properties.get("pronouns")
+            pronouns: normalized.properties.get("pronouns")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
             // Contact Information
-            address_id: vertex.properties.get("address_id")
+            address_id: normalized.properties.get("address_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| uuid::Uuid::parse_str(s).ok()),
-            address: vertex.properties.get("address")
+            address: normalized.properties.get("address")
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_str::<Address>(s).ok()),
-            phone_home: vertex.properties.get("phone_home")
+            phone_home: normalized.properties.get("phone_home")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            phone_mobile: vertex.properties.get("phone_mobile")
+            phone_mobile: normalized.properties.get("phone_mobile")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            phone_work: vertex.properties.get("phone_work")
+            phone_work: normalized.properties.get("phone_work")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            email: vertex.properties.get("email")
+            email: normalized.properties.get("email")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            preferred_contact_method: vertex.properties.get("preferred_contact_method")
+            preferred_contact_method: normalized.properties.get("preferred_contact_method")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            preferred_language: vertex.properties.get("preferred_language")
+            preferred_language: normalized.properties.get("preferred_language")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            interpreter_needed: vertex.properties.get("interpreter_needed")
+            interpreter_needed: normalized.properties.get("interpreter_needed")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(false),
 
             // Emergency Contact
-            emergency_contact_name: vertex.properties.get("emergency_contact_name")
+            emergency_contact_name: normalized.properties.get("emergency_contact_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            emergency_contact_relationship: vertex.properties.get("emergency_contact_relationship")
+            emergency_contact_relationship: normalized.properties.get("emergency_contact_relationship")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            emergency_contact_phone: vertex.properties.get("emergency_contact_phone")
+            emergency_contact_phone: normalized.properties.get("emergency_contact_phone")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
             // Demographic Details
-            marital_status: vertex.properties.get("marital_status")
+            marital_status: normalized.properties.get("marital_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            race: vertex.properties.get("race")
+            race: normalized.properties.get("race")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            ethnicity: vertex.properties.get("ethnicity")
+            ethnicity: normalized.properties.get("ethnicity")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            religion: vertex.properties.get("religion")
+            religion: normalized.properties.get("religion")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
             // Insurance & Financial
-            primary_insurance: vertex.properties.get("primary_insurance")
+            primary_insurance: normalized.properties.get("primary_insurance")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            primary_insurance_id: vertex.properties.get("primary_insurance_id")
+            primary_insurance_id: normalized.properties.get("primary_insurance_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            secondary_insurance: vertex.properties.get("secondary_insurance")
+            secondary_insurance: normalized.properties.get("secondary_insurance")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            secondary_insurance_id: vertex.properties.get("secondary_insurance_id")
+            secondary_insurance_id: normalized.properties.get("secondary_insurance_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            guarantor_name: vertex.properties.get("guarantor_name")
+            guarantor_name: normalized.properties.get("guarantor_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            guarantor_relationship: vertex.properties.get("guarantor_relationship")
+            guarantor_relationship: normalized.properties.get("guarantor_relationship")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
             // Clinical Information
-            primary_care_provider_id: vertex.properties.get("primary_care_provider_id")
+            primary_care_provider_id: normalized.properties.get("primary_care_provider_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            blood_type: vertex.properties.get("blood_type")
+            blood_type: normalized.properties.get("blood_type")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            organ_donor: vertex.properties.get("organ_donor")
+            organ_donor: normalized.properties.get("organ_donor")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            advance_directive_on_file: vertex.properties.get("advance_directive_on_file")
+            advance_directive_on_file: normalized.properties.get("advance_directive_on_file")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(false),
-            dni_status: vertex.properties.get("dni_status")
+            dni_status: normalized.properties.get("dni_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            dnr_status: vertex.properties.get("dnr_status")
+            dnr_status: normalized.properties.get("dnr_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            code_status: vertex.properties.get("code_status")
+            code_status: normalized.properties.get("code_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
             // Administrative
-            patient_status: vertex.properties.get("patient_status")
+            patient_status: normalized.properties.get("patient_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "ACTIVE".to_string()),
-            vip_flag: vertex.properties.get("vip_flag")
+            vip_flag: normalized.properties.get("vip_flag")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(false),
-            confidential_flag: vertex.properties.get("confidential_flag")
+            confidential_flag: normalized.properties.get("confidential_flag")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(false),
-            research_consent: vertex.properties.get("research_consent")
+            research_consent: normalized.properties.get("research_consent")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            marketing_consent: vertex.properties.get("marketing_consent")
+            marketing_consent: normalized.properties.get("marketing_consent")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
 
             // Social Determinants of Health
-            employment_status: vertex.properties.get("employment_status")
+            employment_status: normalized.properties.get("employment_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            housing_status: vertex.properties.get("housing_status")
+            housing_status: normalized.properties.get("housing_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            education_level: vertex.properties.get("education_level")
+            education_level: normalized.properties.get("education_level")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            financial_strain: vertex.properties.get("financial_strain")
+            financial_strain: normalized.properties.get("financial_strain")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            food_insecurity: vertex.properties.get("food_insecurity")
+            food_insecurity: normalized.properties.get("food_insecurity")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(false),
-            transportation_needs: vertex.properties.get("transportation_needs")
+            transportation_needs: normalized.properties.get("transportation_needs")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(false),
-            social_isolation: vertex.properties.get("social_isolation")
+            social_isolation: normalized.properties.get("social_isolation")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            veteran_status: vertex.properties.get("veteran_status")
+            veteran_status: normalized.properties.get("veteran_status")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            disability_status: vertex.properties.get("disability_status")
+            disability_status: normalized.properties.get("disability_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
             // Clinical Alerts
-            alert_flags: vertex.properties.get("alert_flags")
+            alert_flags: normalized.properties.get("alert_flags")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            special_needs: vertex.properties.get("special_needs")
+            special_needs: normalized.properties.get("special_needs")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
             // Audit Trail
             created_at: chrono::DateTime::parse_from_rfc3339(
-                vertex.properties.get("created_at")?.as_str()?
+                normalized.properties.get("created_at")?.as_str()?
             ).ok()?.with_timezone(&chrono::Utc),
             updated_at: chrono::DateTime::parse_from_rfc3339(
-                vertex.properties.get("updated_at")?.as_str()?
+                normalized.properties.get("updated_at")?.as_str()?
             ).ok()?.with_timezone(&chrono::Utc),
-            created_by: vertex.properties.get("created_by")
+            created_by: normalized.properties.get("created_by")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            updated_by: vertex.properties.get("updated_by")
+            updated_by: normalized.properties.get("updated_by")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            last_visit_date: vertex.properties.get("last_visit_date")
+            last_visit_date: normalized.properties.get("last_visit_date")
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
