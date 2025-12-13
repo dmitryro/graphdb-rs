@@ -1055,3 +1055,20 @@ pub async fn create_default_storage_yaml_config(yaml_path: &PathBuf, engine_type
     info!("Default YAML config created at {:?}", yaml_path);
     Ok(())
 }
+
+// Helper function to sanitize string values for Cypher
+pub fn sanitize_cypher_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+     .replace('\r', "\\r")
+     .replace('\t', "\\t")
+}
+
+// Helper function to format optional string values for Cypher
+pub fn format_optional_string(opt: &Option<String>) -> String {
+    match opt {
+        Some(s) => format!("\"{}\"", sanitize_cypher_string(s)),
+        None => "null".to_string(),
+    }
+}

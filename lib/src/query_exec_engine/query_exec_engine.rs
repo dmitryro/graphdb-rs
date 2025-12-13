@@ -2,16 +2,21 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::sync::Arc;
 use log::{info, debug, warn};
+use tokio::sync::OnceCell; 
 
 use crate::database::Database;
 use models::errors::GraphError;
 use crate::query_parser::cypher_parser::{is_cypher, parse_cypher, execute_cypher};
 
 // --- Added Imports for Index Command Handling ---
-// Assuming these types are defined in the project configuration and storage engine modules.
-use crate::config::QueryResult;
+// FIX: Import QueryResult, StorageConfig, and the config loading function.
+use crate::config::{QueryResult, StorageConfig, load_storage_config_from_yaml};
 use crate::storage_engine::storage_engine::GraphStorageEngine;
 // -----------------------------------------------
+
+// Global static variable for the QueryExecEngine singleton instance.
+// Use OnceCell::const_new() to fix E0015 error.
+pub static QUERY_EXEC_ENGINE_SINGLETON: OnceCell<Arc<QueryExecEngine>> = OnceCell::const_new();
 
 pub struct QueryExecEngine {
     db: Arc<Database>,
@@ -22,6 +27,46 @@ impl QueryExecEngine {
         Self { db }
     }
 
+    /// Initializes the global QueryExecEngine singleton.
+    /// This is typically called once during application startup by GraphService::global_init.
+    pub async fn global_init(
+        // The storage parameter is kept to match the expected GraphService contract,
+        // even though Database::new performs the storage setup.
+        _storage: Arc<dyn GraphStorageEngine + Send + Sync>, 
+    ) -> Result<(), GraphError> {
+        info!("Starting QueryExecEngine initialization...");
+
+        // Use get_or_try_init with the correct closure signature `|| async { ... }`
+        // to handle async initialization, fixing E0277.
+        QUERY_EXEC_ENGINE_SINGLETON.get_or_try_init(|| async { 
+            // 1. Load the StorageConfig using the legitimate async method.
+            let config = load_storage_config_from_yaml(None).await?;
+
+            // 2. Initialize the Database instance using its async constructor.
+            let db = Database::new(config).await?; 
+            let db_arc = Arc::new(db);
+            
+            // 3. Create and return the QueryExecEngine instance.
+            Ok(Arc::new(Self::new(db_arc)))
+        // FIX: Explicitly annotate the closure parameter `e` as `anyhow::Error`
+        // to resolve the E0282 type inference error.
+        }).await.map_err(|e: anyhow::Error| { 
+            // Map the anyhow::Error back to a GraphError.
+            GraphError::from(e)
+        })?;
+        
+        info!("QueryExecEngine initialized successfully.");
+        Ok(())
+    }
+
+    /// Retrieves the globally available singleton instance of the QueryExecEngine.
+    pub async fn get() -> Result<Arc<Self>, GraphError> {
+        QUERY_EXEC_ENGINE_SINGLETON
+            .get()
+            .cloned() // Clone the Arc for the return value
+            .ok_or_else(|| GraphError::InternalError("QueryExecEngine not initialized.".into()))
+    }
+    
     /// Executes a generic index command by routing it to the underlying storage 
     /// engine's ZMQ client for daemon execution (SledDaemon/RocksDBDaemon).
     /// 

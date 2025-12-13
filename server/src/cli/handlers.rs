@@ -82,6 +82,7 @@ pub use crate::cli::handlers_patient_journey::*;
 pub use crate::cli::handlers_encounters::*;
 pub use crate::cli::handlers_drug_interactions::*;
 pub use crate::cli::handlers_mpi::*;
+pub use crate::cli::handlers_patient::*;
 
 use daemon_api::{stop_daemon, start_daemon};
 use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
