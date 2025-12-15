@@ -12,10 +12,11 @@ use models::medical::*;
 use models::{Graph, Identifier, Edge, Vertex, ToVertex};
 use models::medical::{Patient, MasterPatientIndex, GoldenRecord };
 use models::identifiers::SerializableUuid;
-use models::properties::{ PropertyValue, SerializableFloat };
+use models::properties::{ PropertyValue, SerializableFloat, PropertyMap };
 use models::timestamp::BincodeDateTime;
 use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
+use rand::random; // Need this import (must be outside the block)
 use chrono::{DateTime, TimeZone, NaiveDate, Utc, Datelike};
 use log::{info, error, warn};
 use serde_json::{ self, Value, from_value }; // ADDED for JSON parsing in global_init
@@ -49,6 +50,57 @@ pub struct MpiIdentityResolutionService {
     name_dob_index: Arc<RwLock<HashMap<(String, String), Vec<Uuid>>>>,
     // Blocking index for probabilistic matching (The missing field)
     blocking_index: Arc<RwLock<HashMap<String, HashSet<Uuid>>>>, // <-- ADD THIS FIELD
+}
+
+type ConcretePropertyMap = std::collections::HashMap<String, PropertyValue>;
+
+// We must redefine these functions if they were defined earlier in the file.
+// FIX: Changed &PropertyMap to &ConcretePropertyMap (or the actual concrete type)
+fn parse_date_opt(props: &ConcretePropertyMap, key: &str) -> Option<DateTime<Utc>> {
+    props.get(key)
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+// FIX: Changed &PropertyMap to &ConcretePropertyMap
+fn parse_address_opt(props: &ConcretePropertyMap, key_line1: &str) -> Option<Address> {
+    props.get(key_line1) 
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            // ... (Address parsing logic remains the same, using &str keys)
+            let address_line2 = props.get("address_line2") 
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            
+            let city = props.get("city") 
+                .and_then(|v| v.as_str()).map(|s| s.to_string())
+                .unwrap_or_else(|| "UNKNOWN_CITY".to_string());
+            
+            let postal_code = props.get("postal_code") 
+                .and_then(|v| v.as_str()).map(|s| s.to_string())
+                .unwrap_or_else(|| "UNKNOWN_POSTAL".to_string());
+            
+            let country = props.get("country") 
+                .and_then(|v| v.as_str()).map(|s| s.to_string())
+                .unwrap_or_else(|| "UNKNOWN_COUNTRY".to_string());
+
+            let state_province = props.get("state_province") 
+                .and_then(|v| v.as_str())
+                .and_then(|s| Identifier::new(s.to_string()).ok())
+                .unwrap_or_else(|| Identifier::new("UNKNOWN_STATE".to_string())
+                    .expect("Failed to create placeholder Identifier"));
+
+            Some(Address {
+                id: Uuid::new_v4(), 
+                address_line1: s.to_string(),
+                address_line2,
+                city,
+                state_province,
+                postal_code,
+                country,
+            })
+        })
 }
 
 /// Helper to extract all Vertices from the graph query result, regardless of label.
@@ -941,33 +993,31 @@ impl MpiIdentityResolutionService {
         source_id_str: String,
         target_id_str: String,
         policy: String,
-        user_id: Option<String>, // ADDED NEW PARAMETER
-        reason: Option<String>   // ADDED NEW PARAMETER
+        user_id: Option<String>,
+        reason: Option<String>,
     ) -> Result<MasterPatientIndex, String> {
         
-        // 1. Clean and fetch source/target vertices using the robust helper
+        // --- Start Method Body ---
+
         let source_clean = source_id_str.trim_matches(|c| c == '\'' || c == '"').to_string();
         let target_clean = target_id_str.trim_matches(|c| c == '\'' || c == '"').to_string();
         
         let gs = &self.graph_service;
         
-        // Use the robust helper to get the vertex data
         let source_vertex = get_patient_vertex_by_id_or_mrn(gs, &source_clean)
             .await
             .map_err(|e| format!("Source lookup failed for '{}': {}", source_id_str, e))?;
 
-        let mut target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean)
+        let target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean)
             .await
             .map_err(|e| format!("Target lookup failed for '{}': {}", target_id_str, e))?;
 
-        // 🌟 Ensure the target patient is linked to a Golden Record.
-        // If not, a new GR is created and linked to the target.
+        // This call must succeed and ensure the target patient has a GR link. 
+        // We assume the implementation of this method is now correctly using simpler queries.
         self.ensure_golden_record_and_link(&target_vertex).await?;
         
-        // Re-fetch the target vertex (optional, but ensures we have the latest properties/labels)
-        target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean).await.unwrap_or(target_vertex);
+        let target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean).await.unwrap_or(target_vertex);
 
-        // Extract the primary internal IDs (the 'id' property which is used for the merge key)
         let source_id = source_vertex.properties.get("id")
             .and_then(|v| v.as_i64().cloned().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
             .ok_or_else(|| "Source vertex is missing a valid numeric 'id' property.".to_string())?;
@@ -976,63 +1026,93 @@ impl MpiIdentityResolutionService {
             .and_then(|v| v.as_i64().cloned().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
             .ok_or_else(|| "Target vertex is missing a valid numeric 'id' property.".to_string())?;
 
-        // Extract MRN for the merge relationship properties
         let target_mrn = target_vertex.properties.get("mrn")
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| target_clean.clone()); 
 
-        // Helper to generate the optional properties for Cypher
+        // FIX 1: Generate property strings without a leading comma
         let user_id_prop = user_id
-            .map(|id| format!(", user_id: \"{}\"", id))
+            .map(|id| format!("user_id: \"{}\"", id))
             .unwrap_or_default();
         
         let reason_prop = reason
-            .map(|r| format!(", reason: \"{}\"", r))
+            .map(|r| format!("reason: \"{}\"", r))
             .unwrap_or_default();
 
         println!("[MPI Debug] Source ID for merge: {}", source_id);
         println!("[MPI Debug] Target ID for merge: {}", target_id);
 
-        // --- The Cypher Merge (Link Source to Target's Golden Record) ---
-        
-        // Query 1: Link the source Patient to the Target Patient's Golden Record.
-        let create_gr_link_query = format!(
-            r#"
-            MATCH (source:Patient {{id: {}}})
-            OPTIONAL MATCH (source)-[old_rel:HAS_GOLDEN_RECORD]->(:GoldenRecord)
-            DELETE old_rel // Delete any old Golden Record link on the source patient
 
-            WITH source
-            MATCH (target:Patient {{id: {}}})-[:HAS_GOLDEN_RECORD]->(targetGR:GoldenRecord) // Find the GR that the target is linked to
-            
+        // --- Cypher Merge Steps (Atomized Queries for simpler execution) ---
+
+        // STEP 1: Find the target Patient's Golden Record ID (Simplified Query)
+        let get_gr_id_query = format!(
+            r#"
+            MATCH (p:Patient {{id: {}}})-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord) 
+            RETURN g.id AS gr_id
+            "#,
+            target_id
+        );
+
+        println!("[MPI Debug] Executing GET GR ID query: {}", get_gr_id_query);
+
+        let gr_result = gs.execute_cypher_read(&get_gr_id_query, Value::Null)
+            .await
+            .map_err(|e| format!("Failed to find target's Golden Record ID: {}", e))?;
+
+        let target_gr_id = gr_result.into_iter()
+            .flat_map(|val| val.get("gr_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .next()
+            .ok_or_else(|| format!("Target Patient (id: {}) is unexpectedly missing a Golden Record ID.", target_id))?;
+
+        // STEP 2 (Query 2): Delete any existing Golden Record link on the Source Patient (Simplified Query)
+        let delete_old_link_query = format!(
+            r#"
+            MATCH (source:Patient {{id: {}}})-[old_rel:HAS_GOLDEN_RECORD]->(:GoldenRecord)
+            DELETE old_rel
+            "#,
+            source_id
+        );
+
+        println!("[MPI Debug] Executing DELETE old GR link query: {}", delete_old_link_query);
+        let _ = gs.execute_cypher_write(&delete_old_link_query, Value::Null).await
+            .map_err(|e| format!("Graph merge transaction (DELETE old GR Link) failed: {}", e))?;
+        
+        // STEP 3 (Query 3): Create the NEW HAS_GOLDEN_RECORD link from Source to Target's GR (Simplified Query)
+        let create_new_link_query = format!(
+            r#"
+            MATCH (source:Patient {{id: {}}}), (targetGR:GoldenRecord {{id: "{}"}}) 
             CREATE (source)-[:HAS_GOLDEN_RECORD {{
                 policy: "{}", 
                 merged_at: timestamp(), 
                 target_id_numeric: {}, 
-                target_mrn: "{}"{} {} // ADDED user_id_prop and reason_prop
+                target_mrn: "{}"
+                // FIX: Removed one extra placeholder. Should be only two for user_id and reason.
+                {}{} 
             }}]->(targetGR)
-            RETURN targetGR
             "#,
-            source_id,
-            target_id, 
-            policy,
-            target_id,
-            target_mrn,
-            user_id_prop,  // <-- NEW
-            reason_prop    // <-- NEW
+            source_id, // Argument 1
+            target_gr_id, // Argument 2
+            policy, // Argument 3
+            target_id, // Argument 4
+            target_mrn, // Argument 5
+            // Insert user_id: Argument 6
+            if user_id_prop.is_empty() { "".to_string() } else { format!(", {}", user_id_prop) },
+            // Insert reason: Argument 7
+            if reason_prop.is_empty() { "".to_string() } else { format!(", {}", reason_prop) }
         );
-
-        println!("[MPI Debug] Executing CREATE GR link query: {}", create_gr_link_query);
         
-        let _result_rel = gs.execute_cypher_write(&create_gr_link_query, Value::Null)
-            .await
-            .map_err(|e| format!("Graph merge transaction (CREATE GR Link) failed: {}", e))?;
+        println!("[MPI Debug] Executing CREATE new GR link query: {}", create_new_link_query);
+        let _ = gs.execute_cypher_write(&create_new_link_query, Value::Null).await
+            .map_err(|e| format!("Graph merge transaction (CREATE new GR Link) failed: {}", e))?;
         
-        // Query 2: Mark the Source node as MERGED.
+        // STEP 4 (Query 4): Mark the Source node as MERGED (Simplified Query)
         let set_status_query = format!(
-            "MATCH (source:Patient {{id: {}}}) 
-            SET source.patient_status = \"MERGED\", source.updated_at = timestamp() 
-            RETURN source",
+            r#"
+            MATCH (source:Patient {{id: {}}}) 
+            SET source.patient_status = "MERGED", source.updated_at = timestamp() 
+            RETURN source
+            "#,
             source_id
         );
 
@@ -1040,30 +1120,41 @@ impl MpiIdentityResolutionService {
 
         let _result_status = gs.execute_cypher_write(&set_status_query, Value::Null)
             .await
-            .map_err(|e| format!("Graph merge transaction (SET) failed: {}", e))?;
+            .map_err(|e| format!("Graph merge transaction (SET status) failed: {}", e))?;
 
-        // --- Post-Merge and Return ---
+        // --- Post-Merge and Return (Full MasterPatientIndex Construction) ---
 
         info!("Manual merge successful: {} -> {}. Source redirected and retired.", source_clean, target_clean);
         
-        // We already have target_vertex, we can just return the MasterPatientIndex using its properties
-        // NOTE: The MasterPatientIndex model is assumed to contain a subset of Patient/GoldenRecord properties.
+        let props = &target_vertex.properties;
+
         Ok(MasterPatientIndex {
-            id: rand::random(),
+            id: random::<i32>(), 
+            
             patient_id: target_id.try_into().ok(),
-            first_name: target_vertex.properties.get("first_name")
+            first_name: props.get("first_name")
                 .and_then(|v| v.as_str()).map(|s| s.to_string()),
-            last_name: target_vertex.properties.get("last_name")
+            last_name: props.get("last_name")
                 .and_then(|v| v.as_str()).map(|s| s.to_string()),
-            date_of_birth: None, 
-            gender: None, 
-            address: None, 
-            contact_number: None, 
-            email: None, 
-            social_security_number: None,
+            
+            date_of_birth: parse_date_opt(props, "date_of_birth"),
+            
+            gender: props.get("gender")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            
+            address: parse_address_opt(props, "address_line1"), 
+            
+            contact_number: props.get("contact_number")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email: props.get("email")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            social_security_number: props.get("ssn")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            
             match_score: None, 
             match_date: None,
-            created_at: Utc::now(), 
+            
+            created_at: parse_date_opt(props, "created_at").unwrap_or_else(Utc::now), 
             updated_at: Utc::now(),
         })
     }

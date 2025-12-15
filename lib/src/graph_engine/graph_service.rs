@@ -19,6 +19,7 @@ use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
 use crate::graph_engine::medical::*;
 use crate::storage_engine::{ GraphStorageEngine, StorageEngine, GraphOp }; // Ensure this trait is in scope
 use crate::graph_engine::parse_patient::{ parse_patient_from_cypher_result };
+use crate::query_parser::query_types::*;
 
 /// Defines the event types for all graph mutations.
 /// This is the payload sent to observers.
@@ -789,6 +790,121 @@ impl GraphService {
     }
 
     // =========================================================================
+    // CYPHER PARSER MAPPING IMPLEMENTATION (New Helpers)
+    // =========================================================================
+
+    /// Maps Cypher node pattern resolution to GraphService::match_nodes.
+    /// Returns the UUID of the first matching node, if found.
+    pub async fn resolve_node_pattern(
+        &self,
+        label: Option<&str>,
+        query_props: &HashMap<String, Value>,
+    ) -> GraphResult<Option<Uuid>> {
+        // Convert serde_json::Value properties to internal PropertyValue format
+        let props_pv: HashMap<String, PropertyValue> = query_props
+            .iter()
+            .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+            .collect::<GraphResult<_>>()?;
+            
+        // Use the existing matching logic
+        let matched_nodes = self.match_nodes(label, &props_pv).await?;
+
+        Ok(matched_nodes.into_iter().next().map(|v| v.id.0))
+    }
+
+    /// Maps Cypher CREATE node to GraphService::create_vertex via a simple helper.
+    /// Returns the UUID of the newly created node.
+    pub async fn create_node(
+        &self,
+        label_opt: Option<&str>,
+        properties: &HashMap<String, Value>,
+    ) -> GraphResult<Uuid> {
+        let props_pv: HashMap<String, PropertyValue> = properties
+            .iter()
+            .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+            .collect::<GraphResult<_>>()?;
+
+        let label_str = label_opt.unwrap_or("Node");
+
+        let vertex = Vertex {
+            id: SerializableUuid(Uuid::new_v4()),
+            label: Identifier::new(label_str.to_string())?,
+            properties: props_pv,
+            created_at: BincodeDateTime(Utc::now()),
+            updated_at: BincodeDateTime(Utc::now()),
+        };
+        
+        // Centralized persistence and in-memory update
+        self.create_vertex(vertex.clone()).await?;
+
+        Ok(vertex.id.0)
+    }
+
+    /// Maps Cypher SET property to GraphService::update_vertex_properties.
+    pub async fn set_property(
+        &self,
+        node_id: Uuid,
+        prop_name: String,
+        value: Value,
+    ) -> GraphResult<()> {
+        let mut props_to_set = HashMap::new();
+        let prop_value = to_property_value(value)?;
+        props_to_set.insert(prop_name, prop_value);
+
+        // Use the existing partial update logic
+        self.update_vertex_properties(node_id, props_to_set).await
+            .map_err(|e| GraphError::StorageError(format!("Failed to set property for {}: {}", node_id, e)))
+    }
+
+    /// Fires the necessary GraphEvent for each committed mutation to notify observers.
+    /// This method ensures that the final state changes (CREATE/UPDATE/DELETE) 
+    /// are broadcast to any listening components.
+    pub async fn commit_mutations(
+        &self, 
+        mutations: Vec<Mutation>
+    ) -> GraphResult<()> {
+        for mutation in mutations {
+            match mutation {
+                // NOTE: The actual persistence and in-memory update for CREATE and SET
+                // should have happened in `create_node` and `set_property`.
+                // Here, we just ensure the event is fired if the previous steps missed it,
+                // or if we consider this the official "commit" signal.
+                
+                Mutation::CreateNode(id) | Mutation::UpdateNode(id) => {
+                    // For a proper event, we should retrieve the final state of the vertex.
+                    if let Some(vertex) = self.get_vertex(&id).await {
+                        let event = GraphEvent::InsertVertex(vertex); 
+                        self.notify_mutation(event);
+                    } else {
+                        // This could be an error if the node was supposed to exist.
+                        // For now, log a warning and skip.
+                        log::warn!("Committed mutation for node ID {} but vertex not found in memory.", id);
+                    }
+                },
+                
+                // Handle Edge mutations similarly if they exist in your Mutation enum:
+                // Mutation::CreateEdge(id) => { /* retrieve edge and notify InsertEdge */ }
+                
+                // If the mutation is a DELETE, we fire the Delete event here.
+                Mutation::DeleteNode(id) => {
+                    let identifier = Identifier::new(id.to_string())
+                        .map_err(|e| GraphError::ValidationError(e.to_string()))?;
+                    self.notify_mutation(GraphEvent::DeleteVertex(identifier));
+                }
+
+                // Fallback for other mutation types
+                _ => {
+                    log::trace!("Ignoring unimplemented mutation type during commit.");
+                }
+            }
+        }
+        
+        // The main execution thread proceeds after the signal is sent.
+        Ok(())
+    }
+
+
+    // =========================================================================
     // IN-MEMORY ONLY OPERATIONS (for observer pattern)
     // =========================================================================
 
@@ -840,6 +956,143 @@ impl GraphService {
         self.notify_mutation(GraphEvent::DeleteEdge(edge_id));
         Ok(())
     }
+
+    pub async fn execute_merge_query(
+        &self,
+        patterns: Vec<(Option<String>, Vec<NodePattern>, Vec<RelPattern>)>,
+        on_create_set: Vec<(String, String, Value)>,
+        on_match_set: Vec<(String, String, Value)>,
+    ) -> GraphResult<ExecutionResult> {
+        // --- Validation ---
+        if patterns.len() != 1 || patterns[0].1.len() != 1 || !patterns[0].2.is_empty() {
+            return Err(GraphError::NotImplemented(
+                "MERGE only supports a single node pattern (v:Label {prop: value}) for testing.".into()
+            ));
+        }
+        
+        let node_pattern: &NodePattern = &patterns[0].1[0];
+        
+        let label = node_pattern.1.clone().unwrap_or_default();
+        let node_properties = &node_pattern.2;
+
+        if node_properties.is_empty() {
+            return Err(GraphError::QueryError(
+                "MERGE requires properties to match or create identity (e.g., {id: '123'})".into()
+            ));
+        }
+
+        // --- 1. Try to MATCH the node by UUID (simplification due to trait limitation) ---
+        let match_id_value = node_properties.get("id");
+        let matched_uuid = match match_id_value.and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok()) {
+            Some(uuid) => Some(uuid),
+            None => None,
+        };
+
+        let match_result = if let Some(uuid) = matched_uuid {
+            self.storage.get_vertex(&uuid).await.map(|opt| {
+                // Return the Option<Vertex> result
+                opt
+            })
+        } else {
+            // If no matchable ID is provided, treat it as "not found"
+            Ok(None)
+        };
+
+        match match_result {
+            Ok(Some(mut vertex)) => {
+                // ON MATCH SET LOGIC
+                let mut match_mutations = Vec::new();
+                for (_var, prop_key, val) in &on_match_set {
+                    let property_value = to_property_value(val.clone())
+                        .map_err(|e| GraphError::QueryError(format!("Invalid property value in MERGE/ON MATCH: {}", e)))?;
+                    
+                    // Fix E0308: vertex.id is SerializableUuid, but GraphOp needs Identifier.
+                    // Assuming SerializableUuid can be cloned to an Identifier or converted.
+                    // For now, we assume vertex.id has a method to get the Identifier (e.g., to_identifier).
+                    // If not, we use the original Uuid to create a new Identifier.
+                    
+                    // FIX: Assuming vertex.id implements `to_identifier()` or Identifier::from_serializable_uuid()
+                    // If not, we rely on Identifier being constructible from the inner Uuid.
+                    // The safest bet is cloning the inner Uuid.
+                    let vertex_identifier = Identifier::from_uuid(vertex.id.0) 
+                        .map_err(|e| GraphError::InternalError(format!("Invalid Identifier from Uuid: {}", e)))?;
+                        
+                    let set_op = GraphOp::SetVertexProperty(
+                        vertex_identifier, // Use the Identifier
+                        Identifier::from(prop_key.as_str()),
+                        property_value
+                    );
+                    match_mutations.push(set_op);
+                }
+
+                // Apply mutations using trait method `append`
+                for op in match_mutations {
+                    self.storage.append(op).await?;
+                }
+                
+                let mut result = ExecutionResult::new();
+                // Fix E0308: add_updated_node expects Uuid, not String
+                result.add_updated_node(vertex.id.0); 
+                
+                Ok(result)
+            },
+            Ok(None) => {
+                // ON CREATE SET / CREATE LOGIC
+                
+                let new_uuid = Uuid::new_v4();
+                let new_id = Identifier::from_uuid(new_uuid)
+                    .map_err(|e| GraphError::InternalError(format!("Failed to create new Identifier: {}", e)))?;
+                
+                let mut properties_to_set = HashMap::new();
+                properties_to_set.extend(node_properties.clone());
+                
+                for (_var, prop_key, val) in &on_create_set {
+                    properties_to_set.insert(prop_key.clone(), val.clone());
+                }
+
+                // Build the Vertex object
+                let now_bincode: BincodeDateTime = Utc::now().into();
+                // Fix E0063: Missing fields `created_at` and `updated_at`
+                // Fix E0308: id must be SerializableUuid, label must be Identifier
+                let mut new_vertex = Vertex {
+                    id: SerializableUuid(new_uuid),
+                    label: Identifier::new(label.clone()) 
+                        .map_err(|e| GraphError::InternalError(format!("Invalid Identifier from label: {}", e)))?,
+                    properties: HashMap::new(),
+                    
+                    // FIX E0308: Use the BincodeDateTime type
+                    created_at: now_bincode.clone(), 
+                    updated_at: now_bincode,
+                };
+                
+                let mut create_mutations = Vec::new();
+
+                for (key, val) in properties_to_set {
+                    let property_value = to_property_value(val)
+                        .map_err(|e| GraphError::QueryError(format!("Invalid property value in MERGE/CREATE: {}", e)))?;
+                    
+                    new_vertex.properties.insert(key.clone(), property_value);
+                }
+                
+                // GraphOp::InsertVertex takes a Vertex
+                create_mutations.push(GraphOp::InsertVertex(new_vertex));
+                
+                // Apply mutations using trait method `append`
+                for op in create_mutations {
+                    self.storage.append(op).await?;
+                }
+                
+                let mut result = ExecutionResult::new();
+                // Fix E0308: add_created_node expects Uuid, not String
+                result.add_created_node(new_uuid); 
+                
+                Ok(result)
+            },
+            // Fix E0308: match arms must all resolve to the same type (GraphResult<ExecutionResult>)
+            Err(e) => Err(e), 
+        }
+    }
+
 
     // =========================================================================
     // READ & TRAVERSAL OPERATIONS
@@ -1206,6 +1459,7 @@ impl GraphService {
         self.graph.write().await
     }
 }
+
 
 // =========================================================================
 // HELPER FOR INITIALIZATION/RETRIEVAL

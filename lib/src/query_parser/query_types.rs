@@ -2,13 +2,22 @@
 // Complete — includes full WHERE evaluation, no external file needed
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashSet, HashMap};
 use uuid::Uuid;
+use serde::{Serialize, Deserialize};
 use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
 use models::properties::PropertyValue;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PATTERN TYPE ALIASES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// (variable_name_opt, label_opt, properties_map)
 pub type NodePattern = (Option<String>, Option<String>, HashMap<String, Value>);
+
+/// (variable_name_opt, label_opt, length_range_opt, properties_map, direction_opt)
+/// direction_opt: true for ->, false for <-, None for --
 pub type RelPattern = (
     Option<String>,
     Option<String>,
@@ -16,7 +25,14 @@ pub type RelPattern = (
     HashMap<String, Value>,
     Option<bool>,
 );
+
+/// (path_variable_name_opt, nodes_vec, relationships_vec)
+/// Represents a complex path structure, likely used for MATCH.
 pub type Pattern = (Option<String>, Vec<NodePattern>, Vec<RelPattern>);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUERY ENUMS & STRUCTS
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchPattern {
@@ -172,6 +188,188 @@ impl GraphMatch {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// EXECUTION RESULT (Comprehensive Implementation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Represents the final result of a write operation (CREATE, MERGE, SET, DELETE).
+/// It tracks the set of entities affected by the query.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ExecutionResult {
+    /// IDs of all nodes that were newly created.
+    pub created_nodes: HashSet<Uuid>,
+    /// IDs of all nodes that had properties or labels updated.
+    pub updated_nodes: HashSet<Uuid>,
+    /// IDs of all nodes that were deleted.
+    pub deleted_nodes: HashSet<Uuid>,
+    /// IDs of all edges that were newly created.
+    pub created_edges: HashSet<Uuid>,
+    /// IDs of all edges that were updated.
+    pub updated_edges: HashSet<Uuid>,
+    /// IDs of all edges that were deleted.
+    pub deleted_edges: HashSet<Uuid>,
+    /// Stores any key-value pairs that were updated (key)
+    pub updated_kv_keys: HashSet<String>,
+    
+    // Stores the results of any `RETURN` clause (for mixed read/write queries).
+    // Typically used for returning specific properties or computed values.
+    // pub return_data: Vec<HashMap<String, CypherValue>>, // Assuming CypherValue exists
+}
+
+impl ExecutionResult {
+    /// Creates a new, empty execution result.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a newly created node.
+    pub fn add_created_node(&mut self, id: Uuid) {
+        self.created_nodes.insert(id);
+    }
+
+    /// Records a node that was updated (e.g., via SET or ON MATCH SET).
+    pub fn add_updated_node(&mut self, id: Uuid) {
+        self.updated_nodes.insert(id);
+    }
+
+    /// Records a node that was deleted.
+    pub fn add_deleted_node(&mut self, id: Uuid) {
+        self.deleted_nodes.insert(id);
+    }
+
+    /// Records a newly created edge.
+    pub fn add_created_edge(&mut self, id: Uuid) {
+        self.created_edges.insert(id);
+    }
+
+    /// Records an edge that was updated.
+    pub fn add_updated_edge(&mut self, id: Uuid) {
+        self.updated_edges.insert(id);
+    }
+
+    /// Records an edge that was deleted.
+    pub fn add_deleted_edge(&mut self, id: Uuid) {
+        self.deleted_edges.insert(id);
+    }
+
+    /// Records a key-value pair update.
+    pub fn add_updated_kv_key(&mut self, key: String) {
+        self.updated_kv_keys.insert(key);
+    }
+    
+    /// Checks if any entity was affected by the query.
+    pub fn has_mutations(&self) -> bool {
+        !(self.created_nodes.is_empty()
+            && self.updated_nodes.is_empty()
+            && self.deleted_nodes.is_empty()
+            && self.created_edges.is_empty()
+            && self.updated_edges.is_empty()
+            && self.deleted_edges.is_empty()
+            && self.updated_kv_keys.is_empty())
+    }
+
+    /// Returns the total number of entities (nodes and edges) created.
+    pub fn created_count(&self) -> usize {
+        self.created_nodes.len() + self.created_edges.len()
+    }
+
+    /// Returns the total number of entities (nodes and edges) updated.
+    pub fn updated_count(&self) -> usize {
+        self.updated_nodes.len() + self.updated_edges.len()
+    }
+
+    /// Combines the results of another `ExecutionResult` into this one.
+    pub fn extend(&mut self, other: ExecutionResult) {
+        self.created_nodes.extend(other.created_nodes);
+        self.updated_nodes.extend(other.updated_nodes);
+        self.deleted_nodes.extend(other.deleted_nodes);
+        self.created_edges.extend(other.created_edges);
+        self.updated_edges.extend(other.updated_edges);
+        self.deleted_edges.extend(other.deleted_edges);
+        self.updated_kv_keys.extend(other.updated_kv_keys);
+        // If return_data existed, you would concatenate it here.
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MUTATION TYPE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Represents a single change operation that needs to be persisted to the database.
+/// This is typically generated during query execution and committed by the storage manager.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mutation {
+    /// Create a new node with the given UUID (Id)
+    CreateNode(Uuid),
+    /// Update an existing node (e.g., set properties)
+    UpdateNode(Uuid),
+    /// Delete a node (must include all attached edges)
+    DeleteNode(Uuid),
+    /// Create a new edge (relationship) with the given UUID (Id)
+    CreateEdge(Uuid),
+    /// Update an existing edge (e.g., set properties)
+    UpdateEdge(Uuid),
+    /// Delete an edge (relationship)
+    DeleteEdge(Uuid),
+    /// Set a key-value pair in the global Key-Value store
+    SetKeyValue(String),
+    /// Delete a key-value pair from the global Key-Value store
+    DeleteKeyValue(String),
+    /// Create a new index
+    CreateIndex(String),
+    /// Drop an existing index
+    DropIndex(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CYPHER QUERY ENUM (NEWLY ADDED)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Represents a parsed Cypher query statement.
+#[derive(Debug, Clone)]
+pub enum CypherQuery {
+    /// MATCH clause (nodes, relationships, where_clause_opt, skip_opt, limit_opt)
+    Match {
+        patterns: Vec<Pattern>,
+        where_clause: Option<WhereClause>,
+        skip: Option<i64>,
+        limit: Option<i64>,
+    },
+    /// CREATE clause (patterns)
+    Create {
+        patterns: Vec<Pattern>,
+    },
+    /// MERGE clause. This is typically a single path pattern.
+    Merge {
+        patterns: Vec<Pattern>,
+        // List of (variable_name, property_name, value) to SET on CREATE
+        on_create_set: Vec<(String, String, Value)>, 
+        // List of (variable_name, property_name, value) to SET on MATCH
+        on_match_set: Vec<(String, String, Value)>, 
+    },
+    /// DELETE/DETACH DELETE clause (variables_to_delete, detach)
+    Delete {
+        variables: Vec<String>,
+        detach: bool,
+    },
+    /// SET clause (updates)
+    Set {
+        updates: Vec<SetUpdate>, // Assuming SetUpdate is defined elsewhere, or use a simpler structure.
+    },
+    /// RETURN clause (expressions_to_return)
+    Return {
+        projections: Vec<String>, // Simplification: just return variables for now
+    },
+    /// Fallback for unsupported statements
+    Unsupported(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum SetUpdate {
+    Property(PropertyAccess, Expression),
+    // Add other types of SET updates if needed (e.g., set label)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WHERE EVALUATION — FULLY INTEGRATED
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -212,6 +410,9 @@ impl Expression {
                 }
                 PropertyAccess::Edge(var, prop) => {
                     if let Some(CypherValue::Edge(e)) = ctx.variables.get(var) {
+                        // NOTE: Edges currently don't support properties in models, but we'll assume they might here.
+                        // If `e.properties` does not exist, this will cause an error or need a fallback.
+                        // Based on the provided code, Edge has a properties map.
                         Ok(e.properties
                             .get(prop)
                             .map(property_value_to_cypher)

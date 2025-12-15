@@ -1356,6 +1356,9 @@ impl MPIHandlers {
     fn validate_resolution_policy(&self, policy: &str) -> Result<(), GraphError> {
         // ... (validate_resolution_policy implementation remains the same) ...
         let valid_policies = vec![
+            "MASTER_WINS",      // For conflicting properties (e.g., first name), the value from the Master MRN record (M12345) is used for the Golden Record.
+            "DUPLICATE_WINS",   // For conflicting properties, the value from the Duplicate MRN record (M54321) is used for the Golden Record.
+            "LATEST_WINS",      // For conflicting properties, the property with the most recent updated_at timestamp is used for the Golden Record.
             "MOST_RECENT",      // Use most recently updated values
             "MOST_COMPLETE",    // Prefer non-null values
             "SOURCE_PRIORITY",  // Always take source values
