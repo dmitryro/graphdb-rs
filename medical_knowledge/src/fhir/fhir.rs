@@ -469,6 +469,7 @@ impl FhirService {
             .given(vec![Some(patient.first_name.clone())])
             .build()
             .expect("Failed to build HumanName");
+
         // 2. Identifiers
         let mut identifiers = Vec::new();
         if let Some(mrn) = &patient.mrn {
@@ -489,27 +490,39 @@ impl FhirService {
                     .expect("Failed to build SSN Identifier"),
             ));
         }
+
         // 3. Gender
-        let gender = match patient.gender.to_uppercase().as_str() {
-            "MALE" => AdministrativeGender::Male,
-            "FEMALE" => AdministrativeGender::Female,
-            "OTHER" => AdministrativeGender::Other,
-            _ => AdministrativeGender::Unknown,
-        };
+        // FIX: Handle patient.gender as Option<String>
+        let gender = patient.gender
+            .as_ref() // Get a reference to the String inside the Option
+            .map(|g| g.to_uppercase()) // Map: If Some(g), convert to uppercase String
+            .as_deref() // Convert Option<String> to Option<&str>
+            .map(|g_str| match g_str {
+                "MALE" => AdministrativeGender::Male,
+                "FEMALE" => AdministrativeGender::Female,
+                "OTHER" => AdministrativeGender::Other,
+                _ => AdministrativeGender::Unknown,
+            })
+            .unwrap_or(AdministrativeGender::Unknown); // If None or invalid, default to Unknown
+
         // 4. Birth date (only supply if we parsed successfully)
         let birth_date_str = patient.date_of_birth.format("%Y-%m-%d").to_string();
-        let birth_date = birth_date_str.parse::<Date>().ok();
+        // Assuming Date is a FHIR date type that implements FromStr
+        let birth_date = birth_date_str.parse::<Date>().ok(); 
+
         // 5. Build Patient
         let mut builder = PatientBuilder::default()
             .id(patient.id.to_string())
             .identifier(identifiers)
             .active(true)
             .name(vec![Some(name)])
-            .gender(gender);
+            .gender(gender); // Now correctly passing the AdministrativeGender enum
+
         // birth_date is optional: only call setter when Some
         if let Some(date) = birth_date {
             builder = builder.birth_date(date);
         }
+
         // Build and return directly
         builder.build().expect("PatientBuilder failed")
     }

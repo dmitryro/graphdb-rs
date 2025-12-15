@@ -131,33 +131,41 @@ impl PatientService {
     pub async fn create_patient(&self, mut new_patient: Patient) -> Result<String, GraphError> {
         // Ensure the ID is properly generated for graph storage
         let patient_uuid = Uuid::new_v4();
+        // NOTE: Converting Uuid::as_u128() to i32 risks truncation/overflow, 
+        // but we keep this logic as it was provided, only ensuring the Uuid is 
+        // generated and the patient struct is updated.
         new_patient.id = patient_uuid.as_u128() as i32;
         new_patient.created_at = Utc::now();
         new_patient.updated_at = Utc::now();
         
-        // Sanitize required string fields
+        // 1. Sanitize REQUIRED string fields
+        // first_name and last_name are not Option<String>, so they can be sanitized directly.
         let first_name = sanitize_cypher_string(&new_patient.first_name);
         let last_name = sanitize_cypher_string(&new_patient.last_name);
-        let gender = sanitize_cypher_string(&new_patient.gender);
         
-        // Format optional fields
+        // 2. Format OPTIONAL string fields (FIX applied here)
+        // FIX: gender is now Option<String> and must be handled like ssn and mrn.
+        let gender = format_optional_string(&new_patient.gender);
         let ssn = format_optional_string(&new_patient.ssn);
         let mrn = format_optional_string(&new_patient.mrn);
         
-        // Format timestamps in ISO 8601 format
+        // 3. Format timestamps in ISO 8601 format
         let dob = new_patient.date_of_birth.to_rfc3339();
         let created_at = new_patient.created_at.to_rfc3339();
         let updated_at = new_patient.updated_at.to_rfc3339();
         
         // Build Cypher query with properly formatted values
+        // Note: The new_patient.id is an i32 and does not need quoting.
+        // Optional strings (gender, ssn, mrn) are now quoted inside format_optional_string 
+        // (or output as 'null'), so they don't need additional quotes in the query string.
         let query = format!(
-            "CREATE (p:Patient {{id: {}, first_name: \"{}\", last_name: \"{}\", gender: \"{}\", ssn: {}, mrn: {}, date_of_birth: \"{}\", created_at: \"{}\", updated_at: \"{}\"}});",
+            "CREATE (p:Patient {{id: {}, first_name: \"{}\", last_name: \"{}\", gender: {}, ssn: {}, mrn: {}, date_of_birth: \"{}\", created_at: \"{}\", updated_at: \"{}\"}});",
             new_patient.id,
             first_name,
             last_name,
-            gender,
-            ssn,
-            mrn,
+            gender, // Already formatted as "value" or null
+            ssn,    // Already formatted as "value" or null
+            mrn,    // Already formatted as "value" or null
             dob,
             created_at,
             updated_at

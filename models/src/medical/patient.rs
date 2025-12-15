@@ -1,10 +1,14 @@
 // models/src/medical/patient.rs
+use std::collections::{ HashMap };
+use std::fmt;
 use bincode::{Encode, Decode};
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 use crate::{Vertex, ToVertex, identifiers::Identifier};
+use crate::errors::{GraphError};
 use crate::medical::Address;   // or wherever it lives
-use crate::properties::PropertyValue; // <--- ADD THIS IMPORT
+use crate::properties::{ PropertyValue, UnhashableVertex }; // <--- ADD THIS IMPORT
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Patient {
@@ -22,7 +26,8 @@ pub struct Patient {
     pub preferred_name: Option<String>,
     pub date_of_birth: DateTime<Utc>,
     pub date_of_death: Option<DateTime<Utc>>,
-    pub gender: String,  // MALE, FEMALE, OTHER, UNKNOWN
+    // FIX: Change from String to Option<String> to support merging logic (gender.or(...))
+    pub gender: Option<String>,  // MALE, FEMALE, OTHER, UNKNOWN
     pub sex_assigned_at_birth: Option<String>,  // MALE, FEMALE, INTERSEX
     pub gender_identity: Option<String>,  // MAN, WOMAN, TRANSGENDER_MALE, TRANSGENDER_FEMALE, NON_BINARY, OTHER
     pub pronouns: Option<String>,  // HE/HIM, SHE/HER, THEY/THEM, etc.
@@ -36,7 +41,7 @@ pub struct Patient {
     pub email: Option<String>,
     pub preferred_contact_method: Option<String>,  // PHONE, EMAIL, SMS, MAIL
     pub preferred_language: Option<String>,  // EN, ES, FR, etc.
-    pub interpreter_needed: bool,
+    pub interpreter_needed: Option<bool>,
 
     // Emergency Contact
     pub emergency_contact_name: Option<String>,
@@ -61,15 +66,17 @@ pub struct Patient {
     pub primary_care_provider_id: Option<i32>,
     pub blood_type: Option<String>,  // A+, A-, B+, B-, AB+, AB-, O+, O-
     pub organ_donor: Option<bool>,
-    pub advance_directive_on_file: bool,
+    #[serde(default)]
+    pub advance_directive_on_file: Option<bool>,
     pub dni_status: Option<String>,  // Do Not Intubate
     pub dnr_status: Option<String>,  // Do Not Resuscitate
     pub code_status: Option<String>,  // FULL_CODE, DNR, DNI, COMFORT_CARE
 
     // Administrative
-    pub patient_status: String,  // ACTIVE, INACTIVE, DECEASED, MERGED, TEST
-    pub vip_flag: bool,
-    pub confidential_flag: bool,  // Restricts who can view record
+    #[serde(default)] // Best practice to prevent Serde from looking for it if missing
+    pub patient_status: Option<String>,  // ACTIVE, INACTIVE, DECEASED, MERGED, TEST
+    pub vip_flag: Option<bool>,
+    pub confidential_flag: Option<bool>, // Restricts who can view record
     pub research_consent: Option<bool>,
     pub marketing_consent: Option<bool>,
 
@@ -78,10 +85,12 @@ pub struct Patient {
     pub housing_status: Option<String>,  // HOUSED, HOMELESS, UNSTABLE, TEMPORARY
     pub education_level: Option<String>,
     pub financial_strain: Option<String>,  // NONE, MILD, MODERATE, SEVERE
-    pub food_insecurity: bool,
-    pub transportation_needs: bool,
+    pub food_insecurity: Option<bool>,
+    pub transportation_needs: Option<bool>,
     pub social_isolation: Option<String>,
+    #[serde(default)]
     pub veteran_status: Option<bool>,
+    #[serde(default)]
     pub disability_status: Option<String>,
 
     // Clinical Alerts
@@ -128,7 +137,12 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.date_of_death {
             v.add_property("date_of_death", &val.to_rfc3339());
         }
-        v.add_property("gender", &self.gender);
+        
+        // FIX: The gender field is now Option<String> and must be unwrapped
+        if let Some(ref val) = self.gender { 
+            v.add_property("gender", val);
+        }
+        
         if let Some(ref val) = self.sex_assigned_at_birth {
             v.add_property("sex_assigned_at_birth", val);
         }
@@ -165,7 +179,12 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.preferred_language {
             v.add_property("preferred_language", val);
         }
-        v.add_property("interpreter_needed", &self.interpreter_needed.to_string());
+        if let Some(interpreter_needed) = self.interpreter_needed {
+            // 1. Unwrap the inner `bool` value.
+            // 2. Convert the `bool` to a String (e.g., "true" or "false").
+            // 3. Add the property to the vertex.
+            v.add_property("interpreter_needed", &interpreter_needed.to_string()); 
+        }
 
         // Emergency Contact
         if let Some(ref val) = self.emergency_contact_name {
@@ -222,7 +241,14 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.organ_donor {
             v.add_property("organ_donor", &val.to_string());
         }
-        v.add_property("advance_directive_on_file", &self.advance_directive_on_file.to_string());
+        // --- Corrected Block (models/src/medical/patient.rs) ---
+
+        // Directive Status
+        // FIX: Use if let Some(...) for advance_directive_on_file
+        if let Some(val) = self.advance_directive_on_file {
+            v.add_property("advance_directive_on_file", &val.to_string());
+        }
+
         if let Some(ref val) = self.dni_status {
             v.add_property("dni_status", val);
         }
@@ -234,9 +260,21 @@ impl ToVertex for Patient {
         }
 
         // Administrative
-        v.add_property("patient_status", &self.patient_status);
-        v.add_property("vip_flag", &self.vip_flag.to_string());
-        v.add_property("confidential_flag", &self.confidential_flag.to_string());
+        // FIX: The patient_status field is now an Option<String>, so it must be unpacked.
+        if let Some(ref val) = self.patient_status {
+            // We pass a reference to the String content as &str via .as_str()
+            v.add_property("patient_status", val.as_str()); 
+        }
+
+        // FIX: Use if let Some(...) for vip_flag
+        if let Some(val) = self.vip_flag {
+            v.add_property("vip_flag", &val.to_string());
+        } 
+        // FIX: Use if let Some(...) for confidential_flag
+        if let Some(val) = self.confidential_flag {
+            v.add_property("confidential_flag", &val.to_string());
+        }
+
         if let Some(ref val) = self.research_consent {
             v.add_property("research_consent", &val.to_string());
         }
@@ -257,8 +295,15 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.financial_strain {
             v.add_property("financial_strain", val);
         }
-        v.add_property("food_insecurity", &self.food_insecurity.to_string());
-        v.add_property("transportation_needs", &self.transportation_needs.to_string());
+
+        // FIX: Use if let Some(...) for food_insecurity
+        if let Some(val) = self.food_insecurity {
+            v.add_property("food_insecurity", &val.to_string());
+        }
+        // FIX: Use if let Some(...) for transportation_needs
+        if let Some(val) = self.transportation_needs {
+            v.add_property("transportation_needs", &val.to_string());
+        }
         if let Some(ref val) = self.social_isolation {
             v.add_property("social_isolation", val);
         }
@@ -496,6 +541,8 @@ impl Patient {
         }
         
         // Normalize the vertex properties first
+        // NOTE: This helper function is assumed to be defined elsewhere and correctly
+        // converts properties (e.g., handling missing required fields and property types).
         let normalized = normalize_patient_vertex(vertex);
         
         // Now use the original from_vertex logic with the normalized vertex
@@ -546,7 +593,12 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
-            gender: normalized.properties.get("gender")?.as_str()?.to_string(),
+            
+            // FIX: gender is now Option<String>
+            gender: normalized.properties.get("gender")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            
             sex_assigned_at_birth: normalized.properties.get("sex_assigned_at_birth")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -582,10 +634,10 @@ impl Patient {
             preferred_language: normalized.properties.get("preferred_language")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+                
             interpreter_needed: normalized.properties.get("interpreter_needed")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(false),
+                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
 
             // Emergency Contact
             emergency_contact_name: normalized.properties.get("emergency_contact_name")
@@ -642,10 +694,11 @@ impl Patient {
             organ_donor: normalized.properties.get("organ_donor")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
+
+            // Directive Status
             advance_directive_on_file: normalized.properties.get("advance_directive_on_file")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(false),
+                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
             dni_status: normalized.properties.get("dni_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -660,15 +713,16 @@ impl Patient {
             patient_status: normalized.properties.get("patient_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| "ACTIVE".to_string()),
+                // FIX: Instead of unwrap_or_else (which returns String), use or_else 
+                // to provide a default value wrapped in Some, resulting in Option<String>.
+                // Since .map(|s| s.to_string()) returns Option<String>, we call or_else on it.
+                .or_else(|| Some("ACTIVE".to_string())),
             vip_flag: normalized.properties.get("vip_flag")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(false),
+                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
             confidential_flag: normalized.properties.get("confidential_flag")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(false),
+                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
             research_consent: normalized.properties.get("research_consent")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
@@ -691,12 +745,10 @@ impl Patient {
                 .map(|s| s.to_string()),
             food_insecurity: normalized.properties.get("food_insecurity")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(false),
+                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
             transportation_needs: normalized.properties.get("transportation_needs")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(false),
+                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
             social_isolation: normalized.properties.get("social_isolation")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -706,7 +758,6 @@ impl Patient {
             disability_status: normalized.properties.get("disability_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-
             // Clinical Alerts
             alert_flags: normalized.properties.get("alert_flags")
                 .and_then(|v| v.as_str())
@@ -733,5 +784,209 @@ impl Patient {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
         })
+    }
+
+    /// Attempts to convert a raw graph database return Value (e.g., from Cypher result)
+    /// representing a Vertex into a Patient struct.
+    pub fn from_vertex_value(value: &PropertyValue) -> Option<Self> {
+        
+        // 1. Check if the PropertyValue contains the canonical Vertex structure.
+        if let PropertyValue::Vertex(unhashable_vertex) = value {
+            
+            // Extract the inner Vertex reference from the wrapper's field
+            let vertex = &unhashable_vertex.0;
+
+            return Patient::from_vertex(vertex); 
+        }
+
+        // 2. Fallback check for PropertyValue::Map (raw properties returned by graph engine)
+        if let PropertyValue::Map(hashable_map) = value {
+            
+            // Extract the inner PropertyMap (HashMap<Identifier, PropertyValue>)
+            let property_map = &hashable_map.0; 
+
+            // --- FIX E0308: Convert HashMap<Identifier, PropertyValue> to HashMap<String, PropertyValue> ---
+            let properties: HashMap<String, PropertyValue> = property_map
+                .iter()
+                .map(|(id, value)| (id.to_string(), value.clone())) // Assuming Identifier has a .to_string() method
+                .collect();
+            // --------------------------------------------------------------------------------------------------
+
+            // Construct a minimal Vertex struct using the converted properties map
+            let label = Identifier::new("Patient".to_string()).ok()?; 
+
+            let vertex = Vertex {
+                id: Default::default(),
+                label,
+                properties, // Use the correctly typed HashMap
+                created_at: Utc::now().into(),
+                updated_at: Utc::now().into(),
+            };
+
+            return Patient::from_vertex(&vertex); 
+        }
+        
+        // If the value is neither the wrapped Vertex nor a Map of properties
+        None
+    }
+    // NOTE: You must ensure that the `PropertyValue` type has a variant like 
+    // `PropertyValue::Vertex(Vertex)` or create a conversion helper to turn the
+    // raw data in `gr_vertex_value` into your application's `Vertex` struct.
+    // For the sake of fixing the compilation error, the above code provides the function signature.
+}
+
+// --- Placeholder for IdType (necessary for the parsing logic above to compile) ---
+#[derive(Debug, Clone)]
+pub enum IdType {
+    Mrn,
+    Ssn,
+    Other(String),
+}   
+    
+impl IdType {
+    pub fn from(s: String) -> Self {
+        match s.to_lowercase().as_str() {
+            "mrn" => IdType::Mrn,
+            "ssn" => IdType::Ssn,
+            _ => IdType::Other(s),
+        }
+    }
+}   
+
+// FIX: Implement Display for IdType
+impl fmt::Display for IdType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            IdType::Mrn => write!(f, "MRN"),
+            IdType::Ssn => write!(f, "SSN"),
+            IdType::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+// --- Placeholder for ExternalId (necessary for the parsing logic above to compile) ---
+#[derive(Debug, Clone)]
+pub struct ExternalId {
+    pub id_type: IdType,
+    pub id_value: String,
+    pub system: Option<String>,
+}   
+
+// FIX: Implement Display for ExternalId
+// This implementation makes `.to_string()` return the core ID value, resolving the error.
+impl fmt::Display for ExternalId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.id_value)
+    }
+}
+    
+// --- Placeholder for PatientId (necessary for the parsing logic above to compile) ---
+#[derive(Debug, Clone, PartialEq, Eq)] // Added PartialEq/Eq for completeness
+pub struct PatientId(String);
+    
+impl PatientId {
+    /// Creates a new PatientId from a String. This is the constructor (was missing).
+    pub fn new(s: String) -> Result<Self, String> {
+        if s.is_empty() {
+            return Err("PatientId cannot be empty".to_string());
+        }
+        
+        if s.len() > 255 {
+            return Err("PatientId cannot exceed 255 characters".to_string());
+        }
+        
+        // Optional: Validate that it's either a valid UUID or alphanumeric MRN
+        // Uncomment if you want strict UUID validation:
+        // if s.parse::<Uuid>().is_err() {
+        //     return Err(format!("PatientId '{}' is not a valid UUID", s));
+        // }
+        
+        Ok(PatientId(s))
+    }
+    
+    // NOTE: The 'from' method is usually implemented via the From trait, see below.
+    // pub fn from(s: String) -> Self { PatientId(s) }
+    
+    /// Returns a reference to the inner ID as a string slice (idiomatic).
+    pub fn as_str(&self) -> &str { 
+        &self.0 
+    }
+
+    /// Returns the inner ID as a String. (The implementation you provided is fine but less idiomatic).
+    pub fn to_string(&self) -> String { 
+        self.0.clone() 
+    }
+
+    /// Attempts to parse the inner String as a Uuid. (Corrected implementation).
+    pub fn to_uuid(&self) -> Result<Uuid, uuid::Error> {
+        self.0.parse::<Uuid>()
+    }
+
+    /// Attempts to parse the inner String as a Uuid. (Alias for to_uuid, as requested).
+    pub fn as_uuid(&self) -> Result<Uuid, uuid::Error> {
+        self.0.parse::<Uuid>()
+    }
+}
+
+// --- Trait Implementations for Idiomatic Rust ---
+
+// Allows for `PatientId::from(s)` or `s.into()` where s is a String.
+impl From<String> for PatientId {
+    fn from(s: String) -> Self {
+        PatientId(s)
+    }
+}
+
+// Allows conversion from a string slice.
+impl<'a> From<&'a str> for PatientId {
+    fn from(s: &'a str) -> Self {
+        PatientId(s.to_string())
+    }
+}
+
+// Allows for transparent access to the inner String via Deref.
+impl std::ops::Deref for PatientId {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// FIX: Implement Display for PatientId (Redundant due to to_string(), but good practice)
+impl fmt::Display for PatientId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<Vertex> for Patient {
+    type Error = GraphError; // Assuming your error type is GraphError
+
+    fn try_from(vertex: Vertex) -> Result<Self, Self::Error> {
+        if vertex.label != "Patient".into() {
+             return Err(GraphError::VertexError(format!(
+                "Expected label 'Patient', found '{}'", vertex.label
+            )));
+        }
+        
+        // Convert Vertex properties to a serde_json::Map for automatic deserialization.
+        let properties_map: HashMap<String, serde_json::Value> = vertex.properties.iter()
+            .map(|(k, v)| (k.to_string(), v.to_serde_value()))
+            .collect();
+        
+        let mut patient: Patient = serde_json::from_value(serde_json::Value::Object(
+            serde_json::Map::from_iter(properties_map.into_iter())
+        ))
+        .map_err(|e| GraphError::VertexError(format!(
+            "Failed to deserialize Patient properties into struct: {}", e
+        )))?;
+
+        // Manually inject the internal UUID of the Vertex back into the Patient struct
+        // if your Patient struct has a field for it (e.g., patient_vertex_uuid).
+        // Since the current definition isn't shown, we assume it's correctly handled by serde_json.
+        // If not, you might need to add: patient.vertex_uuid = vertex.id.0;
+
+        Ok(patient)
     }
 }

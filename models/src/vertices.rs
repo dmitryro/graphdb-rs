@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use crate::{
     identifiers::{Identifier, SerializableUuid},
     properties::PropertyValue,
-    timestamp::BincodeDateTime,  // <-- ADD THIS LINE
+    timestamp::BincodeDateTime, // <-- ADD THIS LINE
 };
 
 // FIX 1: Added 'Default' to the derive list.
@@ -35,6 +35,22 @@ impl Vertex {
     }
 
     pub fn new_with_id(id: impl Into<SerializableUuid>, label: Identifier) -> Self {
+        let now = Utc::now().into();
+        Vertex {
+            id: id.into(),
+            label,
+            properties: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Creates a new Vertex using a specific ID and Label.
+    /// 
+    /// NOTE: This method is functionally identical to `new_with_id`.
+    /// It is added to satisfy the calling convention in `golden_record.rs` 
+    /// and to offer a clearer name when both ID and Label are provided.
+    pub fn new_with_label(id: impl Into<SerializableUuid>, label: Identifier) -> Self {
         let now = Utc::now().into();
         Vertex {
             id: id.into(),

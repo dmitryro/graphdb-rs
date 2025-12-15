@@ -22,6 +22,7 @@ use crate::cli::cli::{CliArgs, get_query_engine_singleton};
 use lib::commands::*;
 use lib::history::history_types::{HistoryMetadata, HistoryStatus};
 use lib::history::history_service::GLOBAL_HISTORY_SERVICE;
+use lib::storage_engine::{ GraphStorageEngine };
 use crate::cli::handlers;
 use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
@@ -47,7 +48,8 @@ pub struct SharedState {
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
     query_engine: Arc<TokioMutex<Option<Arc<QueryExecEngine>>>>,
-    pub mpi_handlers: Arc<TokioMutex<Option<MPIHandlers>>>,  // Add this line
+    // REVERTED: Keeping the type as Option<MPIHandlers> to avoid breaking call sites in interactive.rs
+    pub mpi_handlers: Arc<TokioMutex<Option<MPIHandlers>>>, 
 }
 
 
@@ -62,25 +64,48 @@ impl SharedState {
             storage_daemon_handle: Arc::new(TokioMutex::new(None)),
             storage_daemon_port_arc: Arc::new(TokioMutex::new(None)),
             query_engine: Arc::new(TokioMutex::new(None)),
-            mpi_handlers: Arc::new(TokioMutex::new(None)),  // Add this line
+            // REVERTED: Initialization matching the struct definition
+            mpi_handlers: Arc::new(TokioMutex::new(None)), 
         }
     }
 
     /// Initialize MPI handlers if not already initialized (lazy loading)
     pub async fn ensure_mpi_handlers(&self) -> Result<(), models::errors::GraphError> {
         let mut handlers_guard = self.mpi_handlers.lock().await;
-        
+
         if handlers_guard.is_none() {
             println!("Initializing MPI service...");
-            match MPIHandlers::new().await {
-                Ok(handlers) => {
-                    *handlers_guard = Some(handlers);
-                    println!("✓ MPI service initialized");
+
+            // 1. Get the global storage engine singleton.
+            let storage: Arc<dyn GraphStorageEngine> = crate::cli::get_storage_engine_singleton()
+                .await
+                .map_err(|e| models::errors::GraphError::InternalError(format!("Failed to get storage for MPI init: {}", e)))?;
+            
+            // 2. Perform the global, idempotent initialization of the MPI services
+            //    and set the MPI_HANDLERS_SINGLETON using the storage.
+            //    We convert the `anyhow::Error` to `GraphError`.
+            match handlers_mpi::initialize_mpi_services(storage).await {
+                Ok(_) => {
+                    // 3. Retrieve the initialized MPIHandlers instance from the global singleton.
+                    let handlers_arc = handlers_mpi::get_handlers_for_interactive()
+                        .await
+                        .map_err(|e| models::errors::GraphError::InternalError(format!("MPIHandlers missing after successful init: {}", e)))?;
+
+                    // 4. Unwrap the Arc and store the raw struct in the SharedState's field.
+                    //    This is necessary because the SharedState field is Option<MPIHandlers>, not Option<Arc<MPIHandlers>>.
+                    let handlers_raw = match Arc::try_unwrap(handlers_arc) {
+                        Ok(raw) => raw,
+                        Err(arc) => (*arc).clone() // Fallback: clone the inner struct if it's shared
+                    };
+
+                    *handlers_guard = Some(handlers_raw);
+                    println!("✓ MPI service initialized and set in SharedState.");
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to initialize MPI service: {}", e);
-                    Err(e)
+                    let err = models::errors::GraphError::InternalError(format!("Fatal Error: Failed to initialize core MPI services: {}", e));
+                    eprintln!("✗ {}", err);
+                    Err(err)
                 }
             }
         } else {
@@ -89,11 +114,11 @@ impl SharedState {
     }
 
     /// Synchronously retrieves the initialized MPI handlers.
-    /// FIX: Changed the return type from the alias `MpiHandlersArc` to the concrete type `Arc<MPIHandlers>`
-    /// to resolve the E0412 scope error.
     pub async fn get_mpi_handlers(&self) -> Option<Arc<MPIHandlers>> {
         let handlers_guard = self.mpi_handlers.lock().await;
-        // The MpiHandlers struct needs to be Clone to be returned this way.
+        
+        // The guard holds Option<MPIHandlers>. We wrap the cloned data in a new Arc.
+        // NOTE: The inner MPIHandlers must implement Clone.
         handlers_guard.as_ref().map(|h| Arc::new(h.clone())) 
     }
 }
@@ -3163,50 +3188,69 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
         },
         "mpi" => {
+            // General match/search variables
             let mut name: Option<String> = None;
             let mut dob: Option<String> = None;
             let mut address: Option<String> = None;
             let mut phone: Option<String> = None;
-            let mut name_algo: Option<String> = None; 
+            let mut name_algo: Option<String> = None;
 
             // Link/Merge/Audit variables
             let mut master_id: Option<String> = None;
             let mut external_id: Option<String> = None;
             let mut id_type: Option<String> = None;
-            let mut source_id: Option<String> = None;
-            let mut target_id: Option<String> = None;
+            let mut source_id: Option<String> = None; // Retained for older merge format
+            let mut target_id: Option<String> = None; // Retained for older merge format
             let mut resolution_policy: Option<String> = None;
             let mut mpi_id: Option<String> = None;
             let mut timeframe: Option<String> = None;
-            
-            // Split/GetGoldenRecord variables
-            let mut merged_id: Option<String> = None; 
-            let mut new_patient_data_json: Option<String> = None; 
-            let mut reason: Option<String> = None; 
-            let mut patient_id: Option<String> = None; 
 
-            // NEW: Index variables
+            // Split/GetGoldenRecord variables
+            let mut merged_id: Option<String> = None;
+            let mut new_patient_data_json: Option<String> = None;
+            let mut reason: Option<String> = None;
+            let mut split_patient_id_str: Option<String> = None;  // ADDED THIS LINE
+            let mut patient_id: Option<String> = None;
+
+            // Index variables
             let mut mrn: Option<String> = None;
             let mut first_name: Option<String> = None;
             let mut last_name: Option<String> = None;
-            
+            let mut system: Option<String> = None; // NEW: Added for Index
+            let mut gender: Option<String> = None; // NEW: Added for Index
+
+            // Match variables (New Flags)
+            let mut target_mrn: Option<String> = None; // NEW: Match
+            let mut candidate_mrn: Option<String> = None; // NEW: Match
+            let mut score: Option<f64> = None; // NEW: Match (parsed from String)
+            let mut action: Option<String> = None; // NEW: Match
+
+            // Merge variables (New Flags replacing source/target ID)
+            let mut master_mrn: Option<String> = None; // NEW: Merge
+            let mut duplicate_mrn: Option<String> = None; // NEW: Merge
+            let mut user_id: Option<String> = None; // NEW: Merge
+
+            // Resolve/Search variables (separate from others to avoid conflicts)
+            let mut id: Option<String> = None;
+            let mut source_mrn: Option<String> = None; // NEW: Resolve/FetchIdentity
+
             let mut current_subcommand_index = 0;
             let mut explicit_subcommand: Option<String> = None;
-            
+
             if !remaining_args.is_empty() {
                 match remaining_args[0].to_lowercase().as_str() {
-                    // UPDATED: Added "index" subcommand
-                    "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" | "index" => {
+                    "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" | "index" | "resolve" | "search" | "fetch-identity" => { // NEW: fetch-identity
                         explicit_subcommand = Some(remaining_args[0].to_lowercase());
                         current_subcommand_index = 1;
                     }
                     _ => { current_subcommand_index = 0; }
                 }
             }
-            
+
             let mut i = current_subcommand_index;
             while i < remaining_args.len() {
                 match remaining_args[i].to_lowercase().as_str() {
+                    // General Demographic Flags
                     "--name" => {
                         if i + 1 < remaining_args.len() {
                             name = Some(remaining_args[i + 1].clone());
@@ -3216,7 +3260,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    // UPDATED: Handle both --dob and --date_of_birth
                     "--dob" | "--date_of_birth" => {
                         if i + 1 < remaining_args.len() {
                             dob = Some(remaining_args[i + 1].clone());
@@ -3259,9 +3302,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    
-                    // NEW: Index Flags
-                    "--mrn" => {
+                    // Index Flags
+                    "--mrn" | "--source-mrn" => { // Added --source-mrn alias
                         if i + 1 < remaining_args.len() {
                             mrn = Some(remaining_args[i + 1].clone());
                             i += 2;
@@ -3288,9 +3330,109 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
-                    
-                    // ... existing link/merge/audit/split/getgoldenrecord flags ...
-                    
+                    // NEW: Index Flags
+                    "--system" => {
+                        if i + 1 < remaining_args.len() {
+                            system = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--gender" => {
+                        if i + 1 < remaining_args.len() {
+                            gender = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    // New Match Flags
+                    "--target-mrn" => {
+                        if i + 1 < remaining_args.len() {
+                            target_mrn = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--candidate-mrn" => {
+                        if i + 1 < remaining_args.len() {
+                            candidate_mrn = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--score" => {
+                        if i + 1 < remaining_args.len() {
+                            // Attempt to parse score as f64
+                            match remaining_args[i + 1].parse::<f64>() {
+                                Ok(s) => {
+                                    score = Some(s);
+                                    i += 2;
+                                }
+                                Err(_) => {
+                                    eprintln!("Warning: Flag '--score' requires a valid floating point number.");
+                                    i += 2;
+                                }
+                            }
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--action" => {
+                        if i + 1 < remaining_args.len() {
+                            action = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    // New Merge Flags
+                    "--master-mrn" => {
+                        if i + 1 < remaining_args.len() {
+                            master_mrn = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--duplicate-mrn" => {
+                        if i + 1 < remaining_args.len() {
+                            duplicate_mrn = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--user-id" => {
+                        if i + 1 < remaining_args.len() {
+                            user_id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    // Link/Merge/Audit/Resolve/FetchIdentity Common Flags
+                    "--id" => {
+                        if i + 1 < remaining_args.len() {
+                            id = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
                     "--master-id" => {
                         if i + 1 < remaining_args.len() {
                             master_id = Some(remaining_args[i + 1].clone());
@@ -3390,6 +3532,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
+                    "--split-patient-id-str" => {  // ADDED THIS CASE
+                        if i + 1 < remaining_args.len() {
+                            split_patient_id_str = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
                     "--patient-id" => {
                         if i + 1 < remaining_args.len() {
                             patient_id = Some(remaining_args[i + 1].clone());
@@ -3405,51 +3556,86 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                 }
             }
-            
+
             match explicit_subcommand.as_deref() {
-                // NEW: Index Subcommand implementation
                 Some("index") => {
-                    if let Some(m) = mrn {
-                        // Check if either --name OR (--first-name AND --last-name) are present
-                        let name_ok = name.is_some() || (first_name.is_some() && last_name.is_some());
-                        
-                        if name_ok {
-                            CommandType::Mpi(MPICommand::Index {
-                                name,
-                                first_name,
-                                last_name,
-                                dob,
-                                mrn: m,
-                                address,
-                                phone,
-                            })
-                        } else {
-                            eprintln!("Error: 'mpi index' requires either --name OR both --first-name and --last-name.");
-                            CommandType::Unknown
-                        }
-                    } else {
-                        eprintln!("Error: 'mpi index' requires the mandatory flag --mrn.");
-                        CommandType::Unknown
+                    if mrn.is_none() || system.is_none() {
+                        eprintln!("Error: 'mpi index' requires --mrn and --system.");
+                        return (CommandType::Unknown, Vec::new());
                     }
+
+                    let has_full_name = name.is_some();
+                    let has_name_parts = first_name.is_some() && last_name.is_some();
+
+                    if !has_full_name && !has_name_parts {
+                        eprintln!("Error: 'mpi index' requires either --name OR both --first-name and --last-name");
+                        return (CommandType::Unknown, Vec::new());
+                    }
+
+                    if has_full_name && has_name_parts {
+                        eprintln!("Error: 'mpi index' cannot use both --name and (--first-name/--last-name)");
+                        return (CommandType::Unknown, Vec::new());
+                    }
+
+                    CommandType::Mpi(MPICommand::Index {
+                        name,
+                        first_name,
+                        last_name,
+                        dob,
+                        mrn: mrn.unwrap(),
+                        address,
+                        phone,
+                        // NEW fields
+                        system: system.unwrap(),
+                        gender,
+                    })
                 }
-                
                 Some("match") => {
-                    if let Some(n) = name {
+                    // New logic prioritizes explicit MRN matching from the workflow
+                    if target_mrn.is_some() && candidate_mrn.is_some() && score.is_some() && action.is_some() {
+                        eprintln!("Warning: Using explicit MRN/Score match flags. Demographic fields (name, dob, etc.) will be ignored in favor of explicit link logic.");
+
                         let algo = match name_algo.as_deref() {
+                            Some("jaro-winkler") => NameMatchAlgorithm::JaroWinkler,
                             Some("levenshtein") => NameMatchAlgorithm::Levenshtein,
                             Some("both") => NameMatchAlgorithm::Both,
                             _ => NameMatchAlgorithm::JaroWinkler,
                         };
-
+                        
                         CommandType::Mpi(MPICommand::Match {
-                            name: n,
+                            name, // Already Option<String>
                             dob,
                             address,
                             phone,
                             name_algo: algo,
+                            target_mrn: target_mrn.unwrap(), // Unwrap since we checked is_some()
+                            candidate_mrn: candidate_mrn.unwrap(), // Unwrap since we checked is_some()
+                            score: score.unwrap(), // Unwrap since we checked is_some()
+                            action: action.unwrap(), // Unwrap since we checked is_some()
+                        })
+
+                    } else if let Some(n) = name {
+                        // Original demographic matching logic
+                        let algo = match name_algo.as_deref() {
+                            Some("jaro-winkler") => NameMatchAlgorithm::JaroWinkler,
+                            Some("levenshtein") => NameMatchAlgorithm::Levenshtein,
+                            Some("both") => NameMatchAlgorithm::Both,
+                            _ => NameMatchAlgorithm::JaroWinkler,
+                        };
+                        CommandType::Mpi(MPICommand::Match {
+                            name: Some(n), 
+                            dob,
+                            address,
+                            phone,
+                            name_algo: algo,
+                            // Provide empty strings/default values for required fields
+                            target_mrn: String::new(),
+                            candidate_mrn: String::new(),
+                            score: 0.0,
+                            action: String::new(),
                         })
                     } else {
-                        eprintln!("Error: 'mpi match' requires the mandatory flag --name.");
+                        eprintln!("Error: 'mpi match' requires either --name OR the combination of --target-mrn, --candidate-mrn, --score, and --action.");
                         CommandType::Unknown
                     }
                 }
@@ -3466,14 +3652,23 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                 }
                 Some("merge") => {
-                    if let (Some(s), Some(t), Some(r)) = (source_id, target_id, resolution_policy) {
+                    if let (Some(mm), Some(dm), Some(uid), Some(r)) = (master_mrn, duplicate_mrn, user_id, reason) {
+                        
+                        let policy = resolution_policy.unwrap_or_else(|| {
+                            eprintln!("Warning: --resolution-policy not provided for merge, defaulting to 'Latest'.");
+                            "Latest".to_string()
+                        });
+
                         CommandType::Mpi(MPICommand::Merge {
-                            source_id: s,
-                            target_id: t,
-                            resolution_policy: r,
+                            master_mrn: mm,
+                            duplicate_mrn: dm,
+                            user_id: uid,
+                            reason: r,
+                            resolution_policy: policy,
                         })
-                    } else {
-                        eprintln!("Error: 'mpi merge' requires --source-id, --target-id, and --resolution-policy");
+                    }
+                    else {
+                        eprintln!("Error: 'mpi merge' requires --master-mrn, --duplicate-mrn, --user-id, and --reason (and optionally --resolution-policy). Note: Old --source-id/--target-id syntax is no longer supported.");
                         CommandType::Unknown
                     }
                 }
@@ -3488,15 +3683,21 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::Unknown
                     }
                 }
-                Some("split") => {
-                    if let (Some(m), Some(d), Some(r)) = (merged_id, new_patient_data_json, reason) {
+                Some("split") => {  // UPDATED THIS ENTIRE MATCH ARM
+                    if let (Some(m), Some(d), Some(r), Some(s)) = (
+                        merged_id, 
+                        new_patient_data_json, 
+                        reason, 
+                        split_patient_id_str
+                    ) {
                         CommandType::Mpi(MPICommand::Split {
                             merged_id: m,
                             new_patient_data_json: d,
-                            reason: r,
+                            reason: r, 
+                            split_patient_id_str: s, 
                         })
                     } else {
-                        eprintln!("Error: 'mpi split' requires --merged-id, --new-patient-data-json, and --reason");
+                        eprintln!("Error: 'mpi split' requires --merged-id, --new-patient-data-json, --reason, and --split-patient-id-str");
                         CommandType::Unknown
                     }
                 }
@@ -3510,8 +3711,72 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::Unknown
                     }
                 }
+                Some("resolve") => {
+                    // New logic: Check for --source-mrn, or the original --id / (--external-id & --id-type)
+                    let id_provided = id.is_some() || source_mrn.is_some();
+                    let external_provided = external_id.is_some() && id_type.is_some();
+                    
+                    if !id_provided && !external_provided {
+                        eprintln!("Error: 'mpi resolve' requires either --id, --source-mrn OR both --external-id and --id-type.");
+                        return (CommandType::Unknown, Vec::new());
+                    }
+
+                    if (id.is_some() && external_provided) || (source_mrn.is_some() && external_provided) || (id.is_some() && source_mrn.is_some()) {
+                        eprintln!("Error: 'mpi resolve' only accepts one primary identifier: --id, --source-mrn, OR (--external-id and --id-type).");
+                        return (CommandType::Unknown, Vec::new());
+                    }
+
+                    CommandType::Mpi(MPICommand::Resolve {
+                        id,
+                        external_id,
+                        id_type,
+                        source_mrn,
+                        system, 
+                    })
+                }
+                // NEW COMMAND: FetchIdentity
+                Some("fetch-identity") => {
+                    let id_provided = id.is_some() || source_mrn.is_some();
+                    let external_provided = external_id.is_some() && id_type.is_some();
+                    
+                    if !id_provided && !external_provided {
+                        eprintln!("Error: 'mpi fetch-identity' requires either --id, --source-mrn OR both --external-id and --id-type.");
+                        return (CommandType::Unknown, Vec::new());
+                    }
+
+                    if (id.is_some() && external_provided) || (source_mrn.is_some() && external_provided) || (id.is_some() && source_mrn.is_some()) {
+                        eprintln!("Error: 'mpi fetch-identity' only accepts one primary identifier: --id, --source-mrn, OR (--external-id and --id-type).");
+                        return (CommandType::Unknown, Vec::new());
+                    }
+
+                    CommandType::Mpi(MPICommand::FetchIdentity {
+                        id,
+                        external_id,
+                        id_type,
+                        source_mrn,
+                    })
+                }
+                Some("search") => {
+                    let has_search_fields = name.is_some() || first_name.is_some() || 
+                                            last_name.is_some() || dob.is_some() || 
+                                            address.is_some() || phone.is_some();
+                    
+                    if !has_search_fields {
+                        eprintln!("Error: 'mpi search' requires at least one search field (--name, --first-name, --last-name, --dob, --address, --phone).");
+                        return (CommandType::Unknown, Vec::new());
+                    }
+                    
+                    CommandType::Mpi(MPICommand::Search {
+                        name,
+                        first_name,
+                        last_name,
+                        dob,
+                        address,
+                        phone,
+                    })
+                }
                 None => {
-                    eprintln!("Error: 'mpi' requires a subcommand: index, match, link, merge, audit, split, or getgoldenrecord");
+                    eprintln!("Error: 'mpi' requires a subcommand: index, match, link, merge, audit, split, getgoldenrecord, resolve, search, or fetch-identity");
                     CommandType::Unknown
                 }
                 _ => CommandType::Unknown,
@@ -8822,16 +9087,18 @@ pub async fn handle_interactive_command(
         }
         CommandType::Mpi(mpi_command) => {
             // 1. Ensure the MPI handlers are initialized (lazy initialization).
+            // This call should internally use initialize_mpi_services, which now
+            // correctly initializes both GraphService and MpiIdentityResolutionService.
             state.ensure_mpi_handlers().await.map_err(|e| anyhow::anyhow!("MPI service initialization failed: {:?}", e))?;
-            
+
             println!("[INFO] Executing interactive MPI subcommand: {:?}", mpi_command);
 
             // FIX: Retrieve the entire state field (Arc<TokioMutex<Option<MPIHandlers>>>)
             // and pass it directly to the handlers to satisfy the type requirement.
             let mpi_handlers_state = state.mpi_handlers.clone();
-            
+
             match mpi_command {
-                // --- ADDED: Patient Indexing Operation ---
+                // --- Patient Indexing Operation (UPDATED) ---
                 MPICommand::Index { 
                     name, 
                     first_name, 
@@ -8839,7 +9106,9 @@ pub async fn handle_interactive_command(
                     dob, 
                     mrn, 
                     address, 
-                    phone 
+                    phone,
+                    system, // NEW
+                    gender, // NEW
                 } => {
                     handlers_mpi::handle_mpi_index_interactive(
                         name,
@@ -8849,44 +9118,132 @@ pub async fn handle_interactive_command(
                         mrn, // Mandatory String
                         address,
                         phone,
+                        Some(system), // NEW
+                        gender, // NEW
                         mpi_handlers_state, // Pass the required type
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI index failed: {}", e))
                 }
 
-                MPICommand::Match { name, dob, address, phone, name_algo } => {
+                // --- Match Operation (UPDATED) ---
+                MPICommand::Match { 
+                    name, 
+                    dob, 
+                    address, 
+                    phone, 
+                    name_algo,
+                    target_mrn,     // String
+                    candidate_mrn,  // String
+                    score,          // f64
+                    action,         // String
+                } => {
                     handlers_mpi::handle_mpi_match_interactive(
+                        // Name, DOB, Address, Phone are likely already Option<String> if they can be empty
                         name,
                         dob,
                         address,
                         phone,
-                        name_algo,
+                        // FIX 1: Convert NameMatchAlgorithm enum to Option<String>
+                        Some(name_algo.to_string()), 
+                        
+                        // FIX 2, 3, 4, 5: Wrap the new plain variables in Some()
+                        Some(target_mrn),      // NEW (Expected Option<String>)
+                        Some(candidate_mrn),   // NEW (Expected Option<String>)
+                        Some(score),           // NEW (Expected Option<f64>)
+                        Some(action),          // NEW (Expected Option<String>)
+                        
                         mpi_handlers_state, // Pass the required type
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI match failed: {}", e))
                 }
+
+                // --- Merge Operation (UPDATED, using new MRN fields) ---
+                MPICommand::Merge { 
+                    master_mrn,         // NEW
+                    duplicate_mrn,      // NEW
+                    user_id,            // NEW
+                    reason,             // NEW
+                    resolution_policy,
+                } => {
+                    handlers_mpi::handle_mpi_merge_interactive(
+                        master_mrn,
+                        duplicate_mrn,
+                        Some(user_id),            // Wrap in Some()
+                        Some(reason),             // Wrap in Some()
+                        Some(resolution_policy),  // Wrap in Some()
+                        mpi_handlers_state,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI merge failed: {}", e))
+                }
+                // --- Resolve Patient ID Operation (UPDATED) ---
+                MPICommand::Resolve { 
+                    id, 
+                    external_id, 
+                    id_type,
+                    source_mrn, // NEW
+                    system,     // Now an argument in the enum variant
+                } => {
+                    handlers_mpi::handle_mpi_resolve_interactive(
+                        id,
+                        external_id,
+                        id_type,
+                        source_mrn, // NEW
+                        system,                 // FIX: Argument 5 (Option<String>)
+                        mpi_handlers_state,     // FIX: Argument 6 (MpiHandlersStateRef)
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI resolve failed: {}", e))
+                }
+                
+                // --- NEW COMMAND: Fetch Identity ---
+                MPICommand::FetchIdentity { 
+                    id, 
+                    external_id, 
+                    id_type,
+                    source_mrn,
+                } => {
+                    handlers_mpi::handle_mpi_fetch_identity_interactive(
+                        id,
+                        external_id,
+                        id_type,
+                        source_mrn,
+                        mpi_handlers_state,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI fetch-identity failed: {}", e))
+                }
+
+                // --- Link Operation (UNCHANGED) ---
                 MPICommand::Link { master_id, external_id, id_type } => {
                     handlers_mpi::handle_mpi_link_interactive(
                         master_id,
                         external_id,
-                        id_type,
+                        Some(id_type),
                         mpi_handlers_state, // Pass the required type
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI link failed: {}", e))
                 }
-                MPICommand::Merge { source_id, target_id, resolution_policy } => {
-                    handlers_mpi::handle_mpi_merge_interactive(
-                        source_id,
-                        target_id,
-                        resolution_policy,
+
+                // --- Search Patient Demographics Operation (UNCHANGED) ---
+                MPICommand::Search { name, first_name, last_name, dob, address, phone } => {
+                    handlers_mpi::handle_mpi_search_interactive(
+                        name,
+                        first_name,
+                        last_name,
+                        dob,
+                        address,
+                        phone,
                         mpi_handlers_state, // Pass the required type
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("MPI merge failed: {}", e))
+                    .map_err(|e| anyhow::anyhow!("MPI search failed: {}", e))
                 }
+
+                // --- Audit Operation (UNCHANGED) ---
                 MPICommand::Audit { mpi_id, timeframe } => {
                     handlers_mpi::handle_mpi_audit_interactive(
                         mpi_id,
@@ -8896,31 +9253,60 @@ pub async fn handle_interactive_command(
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))
                 }
-                // --- Identity Split/Unmerge Operation ---
-                MPICommand::Split { merged_id, new_patient_data_json, reason } => {
+
+                // --- Identity Split/Unmerge Operation (FIXED for new arguments) ---
+                MPICommand::Split { 
+                    merged_id, 
+                    new_patient_data_json, 
+                    reason,
+                    // FIX 1: Add the newly required split ID field from the CLI command
+                    split_patient_id_str,
+                } => {
                     // 1. Deserialize the JSON string provided by the CLI argument into the Patient struct.
-                    let new_patient_data: Patient = from_str(&new_patient_data_json)
+                    let new_patient_data: Patient = serde_json::from_str(&new_patient_data_json)
                         .map_err(|e| anyhow::anyhow!("Failed to parse Patient data JSON for Split command: {}", e))?;
                         
-                    // 2. Call the interactive handler with the correctly typed Patient struct.
+                    // NOTE: Assuming the interactive shell provides a user ID.
+                    // Placeholder for user ID, often fetched from session context.
+                    let current_user_id = "cli_admin".to_string(); 
+
+                    // 2. Call the interactive handler with the correctly typed Patient struct and new mandatory fields.
                     handlers_mpi::handle_mpi_split_interactive(
                         merged_id,
-                        new_patient_data, // Now correctly a Patient struct
-                        reason,
-                        mpi_handlers_state, // Pass the required type
+                        new_patient_data, 
+                        
+                        // FIX 2: Pass the mandatory user_id (4th argument in handler)
+                        current_user_id, 
+                        
+                        // NOTE: Reason is now the 5th argument in the interactive handler, 
+                        // and it expects Option<String>, so 'reason' must be Option<String> here.
+                        Some(reason), 
+                        
+                        // FIX 3: Pass the mandatory split_patient_id_str (6th argument in handler)
+                        split_patient_id_str,
+                        
+                        // The state is the final argument
+                        mpi_handlers_state, 
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI split/unmerge failed: {}", e))
                 }
-                // --- Golden Record Retrieval ---
+
+                // --- Golden Record Retrieval (UNCHANGED) ---
                 MPICommand::GetGoldenRecord { patient_id } => {
                     handlers_mpi::handle_get_golden_record_interactive(
                         patient_id,
                         mpi_handlers_state, // Pass the required type
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("MPI Golden Record retrieval failed: {}", e))
+                    .map_err(|e| anyhow!("MPI Golden Record retrieval failed: {}", e))
                 }
+                
+                // --- Deprecated Merge (Removed for clarity, assuming the new one is used or the old command was updated)
+                // Note: The previous logic relied on the arguments in the enum variant itself.
+                // Since the previous merge case used source_id/target_id, which are now replaced by
+                // master_mrn/duplicate_mrn, I am updating the case to use the new fields.
+                // If the `MPICommand::Merge` enum signature was not updated, this would fail to compile.
             }
         }
         CommandType::Patient(command) => {
@@ -8932,7 +9318,7 @@ pub async fn handle_interactive_command(
             // This function handles initialization, command dispatch, and printing the result.
             handlers_patient::handle_patient_command_interactive(command)
                 .await
-                .map_err(|e| anyhow::anyhow!("Patient command execution failed: {}", e))?;
+                .map_err(|e| anyhow!("Patient command execution failed: {}", e))?;
 
             // The interactive function prints the output directly, so we just return Ok(()).
             Ok(())

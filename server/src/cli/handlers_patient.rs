@@ -369,8 +369,8 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 
                 first_name, // Guaranteed Some
                 last_name,  // Guaranteed Some (or "UNSPECIFIED")
-                gender,     // Guaranteed Some (or "UNSPECIFIED")
-
+                // FIX: Correctly assign the wrapped value to the `gender` field.
+                gender: Some(gender),
                 address: address_opt, 
                 // FIX: Use the fixed (non-null) strings
                 phone_mobile: Some(phone_fixed),
@@ -380,7 +380,7 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
-                patient_status: "ACTIVE".to_string(), 
+                patient_status: Some("ACTIVE".to_string()), 
 
                 // Default/None fields (These must also be fixed if they are String properties in the DB, 
                 // but since we only fixed the command line ones, we'll assume the model fields are 
@@ -392,17 +392,17 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, phone_home: None,
                 phone_work: None, email: None, preferred_contact_method: None,
-                preferred_language: None, interpreter_needed: false, emergency_contact_name: None,
+                preferred_language: None, interpreter_needed: Some(false), emergency_contact_name: None,
                 emergency_contact_relationship: None, emergency_contact_phone: None,
                 marital_status: None, race: None, ethnicity: None, religion: None,
                 primary_insurance: None, primary_insurance_id: None, secondary_insurance: None,
                 secondary_insurance_id: None, guarantor_name: None, guarantor_relationship: None,
                 primary_care_provider_id: None, blood_type: None, organ_donor: None,
-                advance_directive_on_file: false, dni_status: None, dnr_status: None,
-                code_status: None, vip_flag: false,
-                confidential_flag: false, research_consent: None, marketing_consent: None,
+                advance_directive_on_file: Some(false), dni_status: None, dnr_status: None,
+                code_status: None, vip_flag: Some(false),
+                confidential_flag: Some(false), research_consent: None, marketing_consent: None,
                 employment_status: None, housing_status: None, education_level: None,
-                financial_strain: None, food_insecurity: false, transportation_needs: false,
+                financial_strain: None, food_insecurity: Some(false), transportation_needs: Some(false),
                 social_isolation: None, veteran_status: None, disability_status: None,
                 alert_flags: None, special_needs: None, created_by: None, updated_by: None, last_visit_date: None,
             };
@@ -557,7 +557,8 @@ pub async fn handle_patient_command_interactive(
                 
                 first_name, // Guaranteed Some
                 last_name,  // Guaranteed Some (or "UNSPECIFIED")
-                gender,     // Guaranteed Some (or "UNSPECIFIED")
+                // FIX: Correctly assign the wrapped value to the `gender` field.
+                gender: Some(gender),
                 
                 address: address_opt, 
                 // FIX: Use the fixed (non-null) strings
@@ -567,24 +568,24 @@ pub async fn handle_patient_command_interactive(
                 date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
-                patient_status: "ACTIVE".to_string(), 
+                patient_status: Some("ACTIVE".to_string()), 
 
                 user_id: None, middle_name: None, suffix: None,
                 preferred_name: None,
                 date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, phone_home: None,
                 phone_work: None, email: None, preferred_contact_method: None,
-                preferred_language: None, interpreter_needed: false, emergency_contact_name: None,
+                preferred_language: None, interpreter_needed: Some(false), emergency_contact_name: None,
                 emergency_contact_relationship: None, emergency_contact_phone: None,
                 marital_status: None, race: None, ethnicity: None, religion: None,
                 primary_insurance: None, primary_insurance_id: None, secondary_insurance: None,
                 secondary_insurance_id: None, guarantor_name: None, guarantor_relationship: None,
                 primary_care_provider_id: None, blood_type: None, organ_donor: None,
-                advance_directive_on_file: false, dni_status: None, dnr_status: None,
-                code_status: None, vip_flag: false,
-                confidential_flag: false, research_consent: None, marketing_consent: None,
+                advance_directive_on_file: Some(false), dni_status: None, dnr_status: None,
+                code_status: None, vip_flag: Some(false),
+                confidential_flag: Some(false), research_consent: None, marketing_consent: None,
                 employment_status: None, housing_status: None, education_level: None,
-                financial_strain: None, food_insecurity: false, transportation_needs: false,
+                financial_strain: None, food_insecurity: Some(false), transportation_needs: Some(false),
                 social_isolation: None, veteran_status: None, disability_status: None,
                 alert_flags: None, special_needs: None, created_by: None, updated_by: None, last_visit_date: None,
             };

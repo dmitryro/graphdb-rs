@@ -1,4 +1,3 @@
-
 use core::{hash::Hash, ops::Deref};
 use std::{cmp::Ordering, fmt, str::FromStr};
 
@@ -12,7 +11,6 @@ use crate::errors::{ValidationError, ValidationResult, GraphError, GraphResult};
 #[derive(Clone, Debug, Default, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SerializableUuid(pub Uuid);
-
 
 
 impl SerializableUuid {
@@ -76,6 +74,14 @@ impl From<SerializableUuid> for Uuid {
 #[serde(transparent)]
 pub struct SerializableInternString(pub Intern<String>);
 
+// FIX: Implement From<&str> for SerializableInternString
+impl From<&str> for SerializableInternString {
+    fn from(s: &str) -> Self {
+        // FIX: Convert the &str to String using .to_string() before passing to Intern::new
+        SerializableInternString(Intern::new(s.to_string()))
+    }
+}
+
 impl Encode for SerializableInternString {
     fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
         self.0.as_ref().encode(encoder)
@@ -129,6 +135,14 @@ impl fmt::Display for SerializableInternString {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize, Encode)]
 pub struct Identifier(pub SerializableInternString);
+
+// Implementation of From<&str> for Identifier
+impl From<&str> for Identifier {
+    fn from(s: &str) -> Self {
+        // This now succeeds because SerializableInternString implements From<&str>
+        Identifier(s.into()) 
+    }
+}
 
 impl<CTX> Decode<CTX> for Identifier {
     fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
@@ -255,4 +269,3 @@ impl EdgeId {
         EdgeId(id)
     }
 }
-
