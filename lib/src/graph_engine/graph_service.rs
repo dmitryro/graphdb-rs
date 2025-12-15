@@ -1,23 +1,24 @@
+use anyhow::{Result, Context, anyhow};
 use std::collections::{ HashSet, HashMap };
 use internment::Intern;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::result::Result;
 use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
 use anyhow::Error;
 use serde_json::{json, Value};
 use chrono::Utc;
 use log::{info, error, warn};
-use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
-use crate::graph_engine::medical::*;
-use crate::storage_engine::{ GraphStorageEngine, StorageEngine, GraphOp }; // Ensure this trait is in scope
 use models::identifiers::{ Identifier, SerializableUuid, SerializableInternString };
 use models::properties::{ PropertyValue, SerializableFloat };
 use models::medical::*;
 use models::{ Graph, Vertex, Edge, timestamp::BincodeDateTime };
 use models::errors::{GraphError, GraphResult};
+use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
+use crate::graph_engine::medical::*;
+use crate::storage_engine::{ GraphStorageEngine, StorageEngine, GraphOp }; // Ensure this trait is in scope
+use crate::graph_engine::parse_patient::{ parse_patient_from_cypher_result };
 
 /// Defines the event types for all graph mutations.
 /// This is the payload sent to observers.
@@ -38,11 +39,11 @@ pub static GRAPH_SERVICE: OnceCell<Arc<GraphService>> = OnceCell::const_new();
 #[derive(Clone)]
 pub struct GraphService {
     /// The in-memory graph structure, acting as the fast, refreshed view.
-    graph: Arc<RwLock<Graph>>,
+    pub graph: Arc<RwLock<Graph>>,
     /// The StorageEngine for persistence operations.
-    storage: Arc<dyn GraphStorageEngine + Send + Sync + 'static>,
+    pub storage: Arc<dyn GraphStorageEngine + Send + Sync + 'static>,
     /// Field to hold observers for all graph-level mutations/transactions.
-    mutation_observers: Arc<RwLock<Vec<MutationObserver>>>,
+    pub mutation_observers: Arc<RwLock<Vec<MutationObserver>>>,
 }
 
 /// Helper to convert a Cypher Node (represented as serde_json::Value) into our Rust Vertex model.
@@ -100,6 +101,15 @@ fn try_parse_cypher_node_to_vertex(cypher_node: Value) -> Result<Vertex, GraphEr
         
         properties,
     })
+}
+
+// Placeholder helper function (must be implemented elsewhere)
+// This is necessary to satisfy the `execute_demographic_search` implementation.
+fn sanitize_cypher_string(s: &str) -> String {
+    // Basic sanitization: escape single quotes and trim whitespace
+    s.replace('\'', "\\'")
+        .trim()
+        .to_string()
 }
 
 // Helper function to create the correct Identifier type for GraphError::NotFound
@@ -528,10 +538,151 @@ impl GraphService {
         self.get_vertex_from_storage(vertex_id).await
     }
 
+    // --- Corrected High-Level Methods ---
+
+    /// **Resolves an external identifier to a canonical PatientId (Golden Record ID).**
+    pub async fn find_canonical_id_by_external_id(
+        &self,
+        external_id_value: &str,
+        id_type: &IdType,
+    ) -> Result<Option<PatientId>> {
+        
+        // Sanitize inputs before embedding in the query string
+        let safe_id_value = sanitize_cypher_string(external_id_value);
+        let safe_id_type = format!("{:?}", id_type); // Use debug format as Display is missing
+
+        let query = format!(
+            "MATCH (e:ExternalId {{value: '{safe_id_value}', type: '{safe_id_type}'}})-[:LINKS_TO]->(p:Patient:GoldenRecord) 
+             RETURN p.id AS canonical_id",
+        );
+        
+        let raw_results_vec_of_value = self.execute_cypher_read(&query, Value::Null)
+            .await
+            .context("GraphService failed to execute canonical ID lookup query")?;
+
+        let raw_result_set = raw_results_vec_of_value.into_iter().next()
+            .unwrap_or_else(|| Value::Array(Vec::new())); 
+
+        // The result set is expected to be an array of maps ({ "canonical_id": "..." })
+        if let Some(row_value) = raw_result_set.as_array().and_then(|arr| arr.get(0)) {
+            if let Some(id_str) = row_value.get("canonical_id").and_then(|v| v.as_str()) {
+                return Ok(Some(PatientId::from(id_str.to_string())));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// **Retrieves the complete Patient Golden Record by its canonical ID.**
+    ///
+    /// NOTE: We must ensure this returns the entire node properties for the parser,
+    /// by returning the node `p` itself, which the engine is assumed to serialize into a map.
+    pub async fn get_patient_by_id(&self, canonical_id: &str) -> Result<Option<Patient>> {
+        
+        let safe_id = sanitize_cypher_string(canonical_id);
+        
+        // Match only the Golden Record using the ID
+        let query = format!(
+            "MATCH (p:Patient:GoldenRecord {{id: '{safe_id}'}}) 
+             RETURN p", // Return the node 'p' itself, assumed to be serialized as a map/Value
+        );
+        
+        let raw_results_vec_of_value = self.execute_cypher_read(&query, Value::Null)
+            .await
+            .context("GraphService failed to execute patient retrieval query")?;
+
+        let raw_result_set = raw_results_vec_of_value.into_iter().next()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+
+        // The result set is expected to be an array of a single patient node map.
+        if let Some(patient_map) = raw_result_set.as_array().and_then(|arr| arr.get(0)) {
+            
+            // The result is the raw patient node map, pass it directly to the parser
+            return Ok(Some(parse_patient_from_cypher_result(patient_map.clone())?));
+        }
+
+        Ok(None)
+    }
+
+    /// Executes a demographic search by constructing a dynamic Cypher query.
+    ///
+    /// It builds a MATCH clause targeting only Golden Record nodes (`:Patient:GoldenRecord`)
+    /// and applies `WHERE` filters for each provided demographic criteria.
+    pub async fn execute_demographic_search(
+        &self,
+        criteria: HashMap<String, String>,
+    ) -> Result<Vec<Patient>> {
+        if criteria.is_empty() {
+            return Ok(Vec::new()); // No criteria, no search.
+        }
+
+        // --- 1. Query Construction (Reintroducing GoldenRecord and logic) ---
+        let mut where_clauses = Vec::new();
+        
+        // 
+        
+        for (key, value) in criteria.iter() {
+            // Sanitize input to prevent Cypher injection attacks
+            let sanitized_value = sanitize_cypher_string(value);
+            
+            // Construct a WHERE clause for each field.
+            let clause = match key.as_str() {
+                // Fuzzy/Substring search for common fields
+                "name" | "first_name" | "last_name" | "address" | "phone" => {
+                    // Using CONTAINS for simple substring search on string fields
+                    format!("p.{key} CONTAINS '{sanitized_value}'")
+                }
+                // Exact match fields
+                "dob" | "gender" | "patient_status" => {
+                    format!("p.{key} = '{sanitized_value}'")
+                }
+                _ => {
+                    // Ignore unrecognized keys
+                    continue;
+                }
+            };
+            where_clauses.push(clause);
+        }
+
+        // Combine clauses with AND
+        let where_clause_str = where_clauses.join(" AND ");
+
+        // Ensure the Cypher query only returns Golden Records.
+        let cypher_query = format!(
+            "MATCH (p:Patient:GoldenRecord) WHERE {where_clause_str} RETURN p" // Return the node 'p'
+        );
+
+        // --- 2. Query Execution ---
+        println!("===> Executing demographic search query: {}", cypher_query);
+
+        // Execute the read query using the existing execution method.
+        let raw_results_vec_of_value = self.execute_cypher_read(&cypher_query, Value::Null).await
+            .map_err(|e| anyhow::anyhow!("Graph search query failed: {}", e))?;
+        
+        // Extract the actual result set (which is the first/only element of the returned vector)
+        let raw_result_set = raw_results_vec_of_value.into_iter().next()
+            .context("QueryExecEngine returned empty result vector.")?;
+
+        // --- 3. Result Parsing ---
+        // The raw_result_set (Value) should contain an array of patient nodes/maps.
+        let results_array = raw_result_set.as_array()
+            .context("Expected Cypher result to be an array for patient parsing.")?;
+
+        let mut patients = Vec::new();
+        for result_item in results_array {
+            // result_item is the 'p' node map returned by the Cypher query
+            match parse_patient_from_cypher_result(result_item.clone()) {
+                Ok(patient) => patients.push(patient),
+                Err(e) => log::warn!("Failed to parse patient from Cypher result: {}", e),
+            }
+        }
+
+        Ok(patients)
+    }
+
     // =========================================================================
     // DECLARATIVE QUERY EXECUTION (via QueryExecEngine)
     // =========================================================================
-
     /// Executes a declarative read-only Cypher query against the graph.
     /// 
     /// NOTE: Assumes QueryExecEngine is a singleton accessible via QueryExecEngine::get().
@@ -580,7 +731,6 @@ impl GraphService {
     pub async fn get_patient_by_mrn(&self, mrn: &str) -> Result<Option<Vertex>, GraphError> {
         
         // Construct the Cypher query
-        // NOTE: Parameterized queries should be used in production to prevent injection.
         let query = format!(
             "MATCH (p:Patient {{mrn: '{}'}}) RETURN p",
             // Use basic escaping for the single quote within the MRN value
@@ -588,7 +738,6 @@ impl GraphService {
         );
 
         // Execute the read query.
-        // Assuming execute_cypher_read returns Result<Vec<Value>, GraphError>.
         let results_vec = self.execute_cypher_read(&query, json!({})).await?;
         
         // The immediate Vec<Value> (results_vec) returned by execute_cypher_read 
@@ -596,7 +745,7 @@ impl GraphService {
         let cypher_json_value = results_vec.into_iter().next()
             .ok_or_else(|| GraphError::DeserializationError("Cypher execution returned an empty top-level array.".into()))?;
 
-        // --- Start Parsing the Actual Query Engine Result Structure ---
+        // --- Start Robust Parsing of the Query Engine Result Structure ---
         
         // 1. Get the 'results' array from the top-level JSON object.
         let results_array = cypher_json_value.as_object()
@@ -629,8 +778,7 @@ impl GraphService {
             .ok_or_else(|| GraphError::DeserializationError("Vertices array was unexpectedly empty.".into()))?;
 
         // 6. Convert the extracted node structure into our Rust Vertex model.
-        // Since the structure of the JSON returned in the 'vertices' array already matches 
-        // your Vertex model's serialization format, we can directly deserialize it.
+        // We use serde_json::from_value to safely deserialize.
         match serde_json::from_value(vertex_json_value.clone()) {
             Ok(vertex) => Ok(Some(vertex)),
             Err(e) => {
@@ -843,18 +991,6 @@ impl GraphService {
         let graph = self.read().await;
         let vertex = graph.get_vertex(&patient_vertex_id)?;
         Patient::from_vertex(vertex)
-    }
-
-    pub async fn patient_by_id(&self, patient_id: i32) -> Option<Patient> {
-        let graph = self.read().await;
-        graph.vertices.values()
-            .find(|v| {
-                v.label.as_ref() == "Patient" &&
-                v.properties.get("id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<i32>().ok()) == Some(patient_id)
-            })
-            .and_then(|v| Patient::from_vertex(v))
     }
 
     pub async fn all_patients(&self) -> Vec<Patient> {
