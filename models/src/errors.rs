@@ -97,6 +97,10 @@ pub enum GraphError {
     Serialization(String),
     #[error("Storage error: {0}")]
     Storage(String),
+    #[error("Vertex error: {0}")]
+    VertexError(String),
+    #[error("Edge error: {0}")]
+    EdgeError(String),
 }
 
 // Implement the From trait for &str

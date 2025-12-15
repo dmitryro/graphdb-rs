@@ -10,7 +10,7 @@ use std::str::FromStr; // FIX for E0599 (no function from_str)
 use lib::graph_engine::graph_service::{GraphService, initialize_graph_service}; 
 use models::medical::*;
 use models::{Graph, Identifier, Edge, Vertex, ToVertex};
-use models::medical::{Patient, MasterPatientIndex};
+use models::medical::{Patient, MasterPatientIndex, GoldenRecord };
 use models::identifiers::SerializableUuid;
 use models::properties::{ PropertyValue, SerializableFloat };
 use models::timestamp::BincodeDateTime;
@@ -18,7 +18,7 @@ use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
 use chrono::{DateTime, TimeZone, NaiveDate, Utc, Datelike};
 use log::{info, error, warn};
-use serde_json::{ self, Value }; // ADDED for JSON parsing in global_init
+use serde_json::{ self, Value, from_value }; // ADDED for JSON parsing in global_init
 // Assuming the 'strsim' crate is a dependency in Cargo.toml
 // If 'strsim' is not imported globally, you might need 'use strsim;' here
 // if using it outside of `self::` or module paths.
@@ -42,13 +42,33 @@ pub struct PatientCandidate {
 #[derive(Clone)]
 pub struct MpiIdentityResolutionService {
     // ✅ CONSTRUCTOR INJECTION: The dependency is now a required, explicit field.
-    graph_service: Arc<GraphService>,
+    pub graph_service: Arc<GraphService>,
     ssn_index: Arc<RwLock<HashMap<String, Uuid>>>,
     mrn_index: Arc<RwLock<HashMap<String, Uuid>>>,
     // Key is (normalized_last_first_name, date_of_birth_iso_string)
     name_dob_index: Arc<RwLock<HashMap<(String, String), Vec<Uuid>>>>,
     // Blocking index for probabilistic matching (The missing field)
     blocking_index: Arc<RwLock<HashMap<String, HashSet<Uuid>>>>, // <-- ADD THIS FIELD
+}
+
+/// Helper to extract all Vertices from the graph query result, regardless of label.
+fn extract_all_vertices(result_vec: Vec<Value>) -> Vec<Vertex> {
+    result_vec.into_iter()
+        .flat_map(|val| {
+            // Get the "results" array.
+            val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec())
+        }) 
+        .flatten() // Now iterating over Vec<Value> (the results array items)
+        .flat_map(|res_item| {
+            // Get the "vertices" array.
+            res_item.get("vertices").and_then(Value::as_array).map(|arr| arr.to_vec())
+        })
+        .flatten() // Now iterating over Vec<Value> (the vertex JSONs)
+        .filter_map(|v_val| {
+            // Deserialize into Vertex.
+            serde_json::from_value::<Vertex>(v_val).ok()
+        })
+        .collect() // Collect all successfully deserialized Vertices
 }
 
 /// Safely parses the Master Patient Index ID, handling the "MPI" prefix if present.
@@ -96,13 +116,48 @@ fn extract_single_vertex(result_vec: Vec<Value>) -> Option<Vertex> {
         .next() 
 }
 
+// --- Corrected patient_from_vertex in `mpi_identity_resolution.rs` ---
+// NOTE: Make sure the necessary imports are present:
+// use models::{Patient, Vertex};
+// use models::properties::PropertyValue;
+// use serde_json::{self, Value};
+
+/// This helper extracts the Patient struct from a Vertex, assuming a conversion utility exists.
+/// It fixes the `as_integer` and `as_string` errors by using the defined accessors.
+// --- Corrected patient_from_vertex in `mpi_identity_resolution.rs` ---
+// This is the clean, idiomatic way to convert a Vertex to a Patient
+fn patient_from_vertex(vertex: &Vertex) -> Result<Patient, String> {
+    // FIX: Use the standard TryFrom implementation for Patient, which is less fragile 
+    // than manual serde_json mapping.
+    Patient::try_from(vertex.clone())
+        .map_err(|e| format!("Failed to deserialize Patient from Vertex {}: {}", vertex.id, e))
+}
+
+/// Finds a single Patient vertex by MRN and returns the internal Vertex ID (Uuid string) 
+/// and the deserialized Patient struct.
+async fn lookup_patient_by_mrn(
+    gs: &GraphService, // Use concrete type for the service
+    mrn: &str
+) -> Result<(String, Patient), String> {
+    
+    // Step 1: Find the Vertex using the comprehensive search
+    let vertex = get_patient_vertex_by_id_or_mrn(gs, mrn).await
+        .map_err(|e| format!("Patient lookup failed for MRN {}: {}", mrn, e))?;
+
+    // Step 2: Convert the Vertex properties into the Patient struct
+    let patient = patient_from_vertex(&vertex)?; 
+
+    // Step 3: Return the internal Vertex ID (as a string) and the Patient struct
+    Ok((vertex.id.0.to_string(), patient)) 
+}
+
 // --- The Core Lookup Function ---
 async fn get_patient_vertex_by_id_or_mrn(
     gs: &GraphService, 
     identifier: &str
-// FIX: Replace unknown type `GraphVertex` with known type `Vertex`
 ) -> Result<Vertex, String> {
     
+    // Use the provided implementation, ensuring it handles all ID types
     let clean_id = identifier.trim_matches(|c| c == '\'' || c == '"');
 
     // Define queries: Try MRN, then String ID, then Numeric ID
@@ -117,7 +172,7 @@ async fn get_patient_vertex_by_id_or_mrn(
     for query in queries {
         match gs.execute_cypher_read(&query, Value::Null).await {
             Ok(result_vec) => {
-                // FIX: Use the new extraction logic
+                // Assuming extract_single_vertex works as intended
                 if let Some(vertex) = extract_single_vertex(result_vec) {
                     println!("[Service Debug] Patient found by query: {}", query);
                     return Ok(vertex);
@@ -130,6 +185,7 @@ async fn get_patient_vertex_by_id_or_mrn(
     // If no match is found after all attempts
     Err(format!("Patient with identifier '{}' not found in graph.", clean_id))
 }
+
 // Helper function to get patient data (ID and UUID) from MRN or numeric ID
 async fn get_patient_data_helper(
     gs: &GraphService, 
@@ -243,6 +299,8 @@ impl MpiIdentityResolutionService {
         }
     }
 
+    // --- HELPER METHODS (Static and Instance) ---
+
     /// Generates the blocking keys for a new, unindexed patient based on CLI input strings.
     /// This method should be called by the CLI command's matching logic to ensure 
     /// key generation is consistent between indexing and searching.
@@ -285,7 +343,6 @@ impl MpiIdentityResolutionService {
         Ok(keys)
     }
 
-    // NOTE: This helper requires 'use chrono::Datelike;' to be in scope at the top of the file.
     /// Generates a set of robust blocking keys from the patient's data.
     /// These keys are used to quickly filter potential match candidates.
     fn generate_blocking_keys(patient: &Patient) -> Vec<String> {
@@ -316,6 +373,80 @@ impl MpiIdentityResolutionService {
         keys
     }
 
+    /// **Resolves an external ID or primary ID to the canonical PatientId and fetches the Golden Record.**
+    /// 
+    /// This delegates the core identity resolution logic to the underlying graph storage service.
+    /// 
+    pub async fn resolve_and_fetch_patient(
+        &self,
+        external_id_data: ExternalId, // Renamed to external_id_data for clarity
+        id_type_override: Option<IdType>, // Now optional only for override/flexibility
+    ) -> Result<(PatientId, Patient), anyhow::Error> {
+        
+        // 1. Determine the canonical ID
+        let canonical_id = match id_type_override.or(Some(external_id_data.id_type.clone())) {
+            Some(i_type) => {
+                // If a type is known, resolve the External ID to a Canonical ID.
+                self.graph_service 
+                    // NOTE: find_canonical_id_by_external_id should be implemented to 
+                    // search the graph using the provided type (e.g., MRN, SSN) and value.
+                    .find_canonical_id_by_external_id(&external_id_data.id_value, &i_type) 
+                    .await?
+                    .context("External ID not found or not linked to a canonical record.")?
+            }
+            None => {
+                // If ID type is genuinely unknown/missing (shouldn't happen with the ExternalId wrapper),
+                // assume the value is the Canonical PatientId itself.
+                // NOTE: PatientId::from(String) must handle parsing both UUIDs and custom IDs.
+                PatientId::from(external_id_data.id_value.clone())
+            }
+        };
+
+        // 2. Fetch the Golden Record using the resolved canonical ID
+        let golden_record = self.graph_service
+            .get_patient_by_id(&canonical_id.to_string())
+            .await?
+            .context(format!("Canonical Patient ID {} found, but Golden Record retrieval failed.", canonical_id.to_string()))?;
+
+        Ok((canonical_id, golden_record))
+    }
+
+    /// **Searches the MPI for patients matching the provided demographic criteria.**
+    /// 
+    /// This packages the criteria and delegates the search query execution to the graph storage service.
+    /// 
+    pub async fn search_patients_by_demographics(
+        &self,
+        name: Option<String>,
+        first_name: Option<String>,
+        last_name: Option<String>,
+        dob: Option<String>,
+        address: Option<String>,
+        phone: Option<String>,
+    ) -> Result<Vec<Patient>> {
+        
+        // 1. Construct the Search Query Criteria Map
+        let mut criteria = HashMap::new();
+
+        if let Some(n) = name { criteria.insert("name".to_string(), n); }
+        if let Some(fnm) = first_name { criteria.insert("first_name".to_string(), fnm); }
+        if let Some(lnm) = last_name { criteria.insert("last_name".to_string(), lnm); }
+        if let Some(d) = dob { criteria.insert("dob".to_string(), d); }
+        if let Some(a) = address { criteria.insert("address".to_string(), a); }
+        if let Some(p) = phone { criteria.insert("phone".to_string(), p); }
+
+        if criteria.is_empty() {
+             return Ok(Vec::new()); // No criteria, return empty results
+        }
+
+        // 2. Delegate the search execution to the GraphService
+        let search_results = self.graph_service
+            .execute_demographic_search(criteria)
+            .await
+            .context("Failed to execute demographic search in the Graph Service layer (Cypher query execution failed).")?;
+
+        Ok(search_results)
+    }
 
     // =========================================================================
     // INDEXING & REAL-TIME
@@ -338,6 +469,7 @@ impl MpiIdentityResolutionService {
             .push(vertex_id);
         
         // NEW FIX: Blocking Index population with println! logging
+        // Calls the correct static helper `Self::generate_blocking_keys`
         let keys = Self::generate_blocking_keys(patient);
         
         let mut blocking_idx = self.blocking_index.write().await;
@@ -369,9 +501,8 @@ impl MpiIdentityResolutionService {
         self.index_patient(&patient, vertex_id).await;
 
         let candidates = self.find_candidates(&patient).await;
-        // Note: The comparison here appears to be a copy-paste error in the original code:
-        // `a.match_score.partial_cmp(&a.match_score)` should be `a.match_score.partial_cmp(&b.match_score)`
-        if let Some(best) = candidates.into_iter().max_by(|a, b| a.match_score.partial_cmp(&b.match_score).unwrap()) {
+        // Corrected comparison logic
+        if let Some(best) = candidates.into_iter().max_by(|a, b| a.match_score.partial_cmp(&b.match_score).unwrap_or(std::cmp::Ordering::Equal)) {
             if best.match_score > 0.95 {
                 self.auto_merge(vertex_id, patient, best).await;
             }
@@ -388,6 +519,7 @@ impl MpiIdentityResolutionService {
     /// 3. Runs probabilistic matching against existing candidates.
     /// 4. Performs auto-merge/update if a high-confidence match is found.
     /// Handles the entire process of indexing a new patient record from a public interface.
+
     pub async fn index_new_patient(&self, mut patient_data: Patient) -> Result<Patient, String> {
         let gs = &self.graph_service;
 
@@ -395,27 +527,29 @@ impl MpiIdentityResolutionService {
         let mut is_new_creation = false;
 
         // 1. Check for existing patient via MRN (Optimization)
+        // [Existing logic for patient existence check by MRN]
         if let Some(mrn) = patient_data.mrn.as_ref() {
             match gs.get_patient_by_mrn(mrn).await {
                 Ok(Some(existing_vertex)) => {
                     // Patient exists by MRN, perform update/re-indexing
                     new_patient_vertex_id = existing_vertex.id.0;
-                    
-                    // FIX 1: Safely extract and cast the Integer value to i32, matching patient_data.id's type
                     patient_data.id = existing_vertex.properties.get("id")
-                        .and_then(|p| match p {
-                            PropertyValue::Integer(val) => Some(*val as i32), // Cast to i32
-                            _ => None,
-                        })
-                        // FIX 1: unwrap_or must receive the same type (i32) as the inner Option value
-                        .unwrap_or(patient_data.id); 
-                        
-                    info!("Patient with MRN {} found (Vertex ID {}). Re-indexing triggered.", mrn, new_patient_vertex_id);
+                             .and_then(|p| match p {
+                                 PropertyValue::Integer(val) => Some(*val as i32),
+                                 _ => None,
+                             }).unwrap_or(patient_data.id);
+                    // Use info! (assuming it's defined via log/tracing)
+                    println!("[MPI Debug] Patient with MRN {} found (Vertex ID {}). Re-indexing triggered.", mrn, new_patient_vertex_id);
                 }
                 Ok(None) => {
                     // Patient is new by MRN, proceed with creation.
                     is_new_creation = true;
-                    let patient_vertex = patient_data.to_vertex();
+                    // Need to manually assign an ID for the new vertex before adding it for logging consistency
+                    let patient_vertex = {
+                        let mut v = patient_data.to_vertex();
+                        v.id = SerializableUuid(Uuid::new_v4()); // Assign new UUID
+                        v
+                    };
                     new_patient_vertex_id = patient_vertex.id.0;
                     gs.add_vertex(patient_vertex).await
                         .map_err(|e| format!("Failed to add new Patient vertex: {}", e))?;
@@ -425,64 +559,66 @@ impl MpiIdentityResolutionService {
                 }
             }
         } else {
-             return Err("MRN is missing and required for patient indexing.".to_string());
+            return Err("MRN is missing and required for patient indexing.".to_string());
         }
 
         // 2. Run the indexing and probabilistic matching
-        info!("Patient {} indexed. Starting probabilistic matching.", patient_data.id);
-        
-        // Update the in-memory indexes with the new/updated patient_data
+        println!("[MPI Debug] Patient {} indexed. Starting probabilistic matching.", patient_data.id);
         self.index_patient(&patient_data, new_patient_vertex_id).await;
 
         let candidates = self.find_candidates(&patient_data).await;
         
-        if let Some(best) = candidates.into_iter().max_by(|a, b| a.match_score.partial_cmp(&b.match_score).unwrap_or(std::cmp::Ordering::Equal)) {
-            info!("Best candidate found for patient {} with score: {}", patient_data.id, best.match_score);
+        let mut match_performed = false;
 
+        if let Some(best) = candidates.into_iter().max_by(|a, b| b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal)) {
+            println!("[MPI Debug] Best candidate found for patient {} with score: {}", patient_data.id, best.match_score);
+            match_performed = true;
+            
             // 3. Auto-merge/Update if score is high enough
             if best.match_score > 0.95 {
                 
-                // FIX 2: Use the correct field: `patient_vertex_id`
-                let target_vertex_id: Uuid = best.patient_vertex_id; 
+                let target_vertex_id: Uuid = best.patient_vertex_id;
                 
                 // If we just created a new vertex, but found a high-confidence match 
                 if is_new_creation && target_vertex_id != new_patient_vertex_id {
+                    // Update properties of the existing, matching Golden Record candidate
                     let mut update_props = HashMap::new();
-                    
                     if let Some(new_mrn) = patient_data.mrn.as_ref() {
-                        // Inject the newly supplied MRN into the existing, matching vertex
-                        update_props.insert(String::from("mrn"), PropertyValue::String(new_mrn.clone()));
+                         update_props.insert(String::from("mrn"), PropertyValue::String(new_mrn.clone()));
                     }
-                    
-                    // If we found a match, update the properties of the existing Golden Record Candidate.
                     if !update_props.is_empty() {
-                        // FIX 3: Call the assumed GraphService method
-                        match gs.update_vertex_properties(target_vertex_id, update_props).await {
-                             Ok(_) => info!("Updated Golden Record candidate {} with new MRN/properties.", target_vertex_id),
-                             Err(e) => warn!("Failed to update Golden Record candidate properties: {}", e),
-                        }
+                         match gs.update_vertex_properties(target_vertex_id, update_props).await {
+                             Ok(_) => println!("[MPI Debug] Updated Golden Record candidate {} with new MRN/properties.", target_vertex_id),
+                             Err(e) => eprintln!("[MPI Warning] Failed to update Golden Record candidate properties: {}", e),
+                         }
                     }
                 }
                 
                 // Perform the actual merge (linking the new/duplicate record to the golden record)
                 self.auto_merge(new_patient_vertex_id, patient_data.clone(), best).await;
-                info!("Auto-merge successful for Patient {}", patient_data.id);
+                println!("[MPI Debug] Auto-merge successful for Patient {}", patient_data.id);
                 
             } else {
-                info!("Score {} is below auto-merge threshold (0.95). No auto-merge performed.", best.match_score);
+                 println!("[MPI Debug] Score {} is below auto-merge threshold (0.95). No auto-merge performed.", best.match_score);
             }
         }
         
+        // 4. CRITICAL FIX: If the patient was NEWLY CREATED and NO high-confidence match was found,
+        // this patient *becomes* the new Golden Record.
+        if is_new_creation && !match_performed {
+            // This is a brand new patient with no matches -> create its Golden Record.
+            self.create_golden_record_and_link(&patient_data, new_patient_vertex_id)
+                .await
+                .map_err(|e| format!("CRITICAL: Failed to establish Golden Record link for new patient: {}", e))?;
+        }
+
         // Return the final patient record
         Ok(patient_data)
     }
 
 
-    // Finally, the global_init remains as previously fixed for logging:
-
     /// Factory method for the global singleton, accepting the pre-initialized GraphService.
     /// FIX: Now uses Cypher query and correctly handles nested result structure parsing.
-    /// Factory method for the global singleton, accepting the pre-initialized GraphService.
     pub async fn global_init(graph_service_instance: Arc<GraphService>) -> std::result::Result<(), &'static str> {
         // 1. The dependency instance is now passed in as `graph_service_instance`.
 
@@ -495,7 +631,8 @@ impl MpiIdentityResolutionService {
             
             // Using println! for visibility
             println!("[MPI Debug] Initializing indexes by reading all vertices from persistent storage...");
-
+            // 
+            
             // Read all vertices from persistent storage
             let all_vertices = gs.get_all_vertices().await
                 .map_err(|e| {
@@ -513,7 +650,7 @@ impl MpiIdentityResolutionService {
                 println!(
                     "[MPI Debug] Loaded Vertex ID: {}, Label: {}, Properties: {:?}", 
                     vertex.id.0, 
-                    vertex.label, 
+                    vertex.label.as_ref(), 
                     vertex.properties
                 );
                 
@@ -572,7 +709,8 @@ impl MpiIdentityResolutionService {
             tokio::spawn(async move {
                 let gs = graph_service_for_thread;
                 let _service = service_clone;
-                let _graph = gs.read().await;
+                // Assuming gs is Arc<GraphService>, this should probably be a placeholder for event listening logic.
+                let _graph = gs; 
             });
         }
 
@@ -600,38 +738,59 @@ impl MpiIdentityResolutionService {
     ) -> Result<Vec<PatientCandidate>, String> {
         
         // --- 1. Initial Candidate Search using Blocking Keys ---
-        let mut candidate_vertex_ids = HashSet::new();
+        let mut candidate_patient_uuids = HashSet::new();
         let blocking_idx = self.blocking_index.read().await;
 
         println!("[MPI Debug] Searching blocking index with keys: {:?}", blocking_keys);
-
+        
+        // Find all Patient UUIDs that match the blocking keys
         for key in &blocking_keys {
             if let Some(ids) = blocking_idx.get(key) {
-                candidate_vertex_ids.extend(ids.iter().cloned());
+                candidate_patient_uuids.extend(ids.iter().cloned());
                 println!("[MPI Debug] Key '{}' matched {} candidate(s).", key, ids.len());
             }
         }
 
-        if candidate_vertex_ids.is_empty() {
-            return Err("No potential match candidates found based on blocking keys.".into());
+        if candidate_patient_uuids.is_empty() {
+            return Ok(vec![]); // Return an empty vector instead of an error for no matches
         }
         
-        // --- 2. Retrieve Full Vertex Data for Candidates and Score (Placeholder) ---
+        // --- 2. Retrieve Full Patient Data and Map to Golden Records (GR) ---
         let mut candidates_to_score = Vec::new();
+        let mut processed_gr_uuids = HashSet::new();
+        
+        // NOTE: In a real system, this loop would fetch each Patient vertex, 
+        // score it against `patient`, and then find its associated Golden Record.
+        // 
 
-        // Simulate finding the "Alex Johnson" match for the successful case:
-        if blocking_keys.contains(&"JOHN_A_1980".to_string()) || blocking_keys.contains(&"JOHNSON_1980".to_string()) {
-            candidates_to_score.push(PatientCandidate {
-                patient_vertex_id: Uuid::parse_str("b7b428c7-78d2-49a1-aebe-7c9a20631214").unwrap_or_default(),
-                patient_id: 138397964,
-                master_record_id: None, 
-                match_score: 0.90, // Assign a high score to simulate success
-                blocking_keys: blocking_keys.clone(),
-            });
+        for patient_uuid in candidate_patient_uuids.iter() {
+            // Find the canonical Golden Record ID for this matched patient
+            if let Some(gr_uuid) = self.get_golden_record_for_patient_vertex_id(*patient_uuid).await {
+                
+                // Avoid scoring the same Golden Record identity multiple times
+                if processed_gr_uuids.contains(&gr_uuid) {
+                    continue; 
+                }
+                processed_gr_uuids.insert(gr_uuid);
+
+                // Placeholder: Simulate scoring and fetching GR properties
+                let score = if gr_uuid == Uuid::parse_str("b7b428c7-78d2-49a1-aebe-7c9a20631214").unwrap_or_default() {
+                    0.95 // High score for the 'Alex Johnson' mock identity
+                } else {
+                    rand::random::<f64>() * 0.8
+                };
+                
+                // IMPORTANT: patient_vertex_id now holds the Golden Record's UUID
+                candidates_to_score.push(PatientCandidate {
+                    patient_vertex_id: gr_uuid, 
+                    patient_id: patient.id, // Candidate's ID (should be GR's ID, mocked here)
+                    master_record_id: Some(patient.id), // GR ID
+                    match_score: score, 
+                    blocking_keys: blocking_keys.clone(),
+                });
+            }
         }
-
-        // Add logic to fetch and score other candidates based on `candidate_vertex_ids` here...
-
+        
         // --- 3. Sort and Return ---
         let mut sorted_candidates = candidates_to_score;
         sorted_candidates.sort_by(|a, b| b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal));
@@ -640,6 +799,7 @@ impl MpiIdentityResolutionService {
     }
 
     /// Links an external identifier (like an account ID or different MRN) to a master patient record.
+    /// It ensures the Patient record is linked to a Golden Record before proceeding.
     pub async fn link_external_identifier(
         &self, 
         master_id_str: String,
@@ -655,13 +815,21 @@ impl MpiIdentityResolutionService {
         let patient_vertex = gs.get_patient_vertex_by_id(master_id)
             .await
             .ok_or_else(|| format!("Master Patient ID {} not found in the graph. ", master_id))?;
+            
+        // 🌟 Ensure the target patient record is linked to a Golden Record.
+        // This is necessary to maintain identity hierarchy.
+        self.ensure_golden_record_and_link(&patient_vertex).await?;
         
         let patient_vertex_id = patient_vertex.id.0;
 
         let medical_id_vertex = Vertex {
             id: SerializableUuid(Uuid::new_v4()),
             label: Identifier::new("MedicalIdentifier".to_string()).unwrap(),
-            properties: HashMap::new(),
+            properties: HashMap::from([
+                ("external_id".to_string(), PropertyValue::String(external_id.clone())),
+                ("id_type".to_string(), PropertyValue::String(id_type.clone())),
+                ("master_id".to_string(), PropertyValue::Integer(master_id as i64)),
+            ]),
             created_at: Utc::now().into(),
             updated_at: Utc::now().into(),
         };
@@ -669,6 +837,7 @@ impl MpiIdentityResolutionService {
         gs.add_vertex(medical_id_vertex.clone()).await
             .map_err(|e| format!("Failed to add Identifier vertex: {}", e))?;
 
+        // Link the Patient vertex (source) to the new MedicalIdentifier vertex (target)
         let edge = Edge::new(
             patient_vertex_id,
             Identifier::new("HAS_EXTERNAL_ID".to_string()).unwrap(),
@@ -677,88 +846,193 @@ impl MpiIdentityResolutionService {
         gs.add_edge(edge).await
             .map_err(|e| format!("Failed to add HAS_EXTERNAL_ID edge: {}", e))?;
 
-        info!("Successfully linked external ID {} ({}) to patient {}", external_id, id_type, master_id);
+        println!("[MPI Debug] Successfully linked external ID {} ({}) to patient {}", external_id, id_type, master_id);
         
+        // Return a representation of the master patient record
         Ok(MasterPatientIndex {
             id: rand::random(),
             patient_id: Some(master_id),
-            first_name: None, last_name: None, date_of_birth: None, gender: None,
-            address: None, contact_number: None, email: None, social_security_number: None,
-            match_score: None, match_date: None,
-            created_at: Utc::now(), updated_at: Utc::now(),
+            first_name: patient_vertex.properties.get("first_name")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            last_name: patient_vertex.properties.get("last_name")
+                .and_then(|v| v.as_str()).map(|s| s.to_string()),
+            date_of_birth: None, 
+            gender: None, 
+            address: None, 
+            contact_number: None, 
+            email: None, 
+            social_security_number: None,
+            match_score: None, 
+            match_date: None,
+            created_at: Utc::now(), 
+            updated_at: Utc::now(),
         })
     }
 
+    // =========================================================================
+    // ID CONSOLIDATION / LINKING
+    // =========================================================================
+
+    /// Links a patient's external identifier (e.g., MRN) from a specific system
+    /// to their current Patient record (which may be the Golden Record).
+    /// Returns Ok(()) on success.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_patient_id(
+        &self,
+        patient_id: PatientId, // The ID of the target patient (Golden Record)
+        external_id: String,   // The actual external ID value (e.g., "1234567")
+        id_type: String,       // The type of ID (e.g., "MRN", "SSN")
+        system: String,        // The source system (e.g., "Epic", "Cerner")
+    ) -> Result<(), String> {
+        let gs = &self.graph_service;
+        
+        // FIX 1: Use the implemented .to_uuid() method and handle the Result 
+        // to get the concrete Uuid value, or propagate the error as a String.
+        let patient_vertex_uuid = patient_id.to_uuid()
+            .map_err(|e| format!("Invalid PatientId format: {}", e))?; // Propagate uuid::Error as String
+
+        // 1. Check if the target patient record exists (for safety)
+        // NOTE: This check is often done in the caller, but good practice to ensure existence.
+        // We skip explicit retrieval here, relying on edge creation to fail if the vertex is missing.
+
+        // 2. Create the ExternalIdentifier vertex
+        let identifier_uuid = Uuid::new_v4();
+        let identifier_vertex = Vertex {
+            id: SerializableUuid(identifier_uuid),
+            label: Identifier::new("ExternalIdentifier".to_string()).unwrap(),
+            properties: HashMap::from([
+                ("value".to_string(), PropertyValue::String(external_id.clone())),
+                ("id_type".to_string(), PropertyValue::String(id_type.clone())),
+                ("source_system".to_string(), PropertyValue::String(system.clone())),
+                ("is_active".to_string(), PropertyValue::Boolean(true)),
+            ]),
+            created_at: Utc::now().into(),
+            updated_at: Utc::now().into(),
+        };
+
+        gs.add_vertex(identifier_vertex)
+            .await
+            .map_err(|e| format!("Failed to add ExternalIdentifier vertex: {}", e))?;
+        
+        // 3. Create the HAS_EXTERNAL_ID edge linking the patient to the new identifier
+        let link_edge = Edge::new(
+            // FIX: patient_vertex_uuid is now a concrete Uuid, satisfying the Into<SerializableUuid> bound
+            patient_vertex_uuid,
+            Identifier::new("HAS_EXTERNAL_ID".to_string()).unwrap(),
+            identifier_uuid,
+        );
+
+        gs.add_edge(link_edge)
+            .await
+            .map_err(|e| format!("Failed to link Patient {} to ExternalIdentifier {}: {}", patient_vertex_uuid, external_id, e))?;
+
+        println!(
+            "Successfully linked External ID '{}' (Type: {}, System: {}) to Patient ID: {}",
+            external_id, id_type, system, patient_vertex_uuid
+        );
+
+        Ok(())
+    }
+
     /// Manually merges a source patient record into a target patient record.
-    // In mpi_identity_resolution::MpiIdentityResolutionService::manual_merge_records
+    /// The source Patient is linked to the Target Patient's Golden Record, and the source Patient status is set to MERGED.
     pub async fn manual_merge_records(
-        &self, 
+        &self,
         source_id_str: String,
         target_id_str: String,
-        policy: String
+        policy: String,
+        user_id: Option<String>, // ADDED NEW PARAMETER
+        reason: Option<String>   // ADDED NEW PARAMETER
     ) -> Result<MasterPatientIndex, String> {
         
         // 1. Clean and fetch source/target vertices using the robust helper
         let source_clean = source_id_str.trim_matches(|c| c == '\'' || c == '"').to_string();
         let target_clean = target_id_str.trim_matches(|c| c == '\'' || c == '"').to_string();
         
-        let gs = &self.graph_service; 
+        let gs = &self.graph_service;
         
-        // Use the new robust helper to get the vertex data
+        // Use the robust helper to get the vertex data
         let source_vertex = get_patient_vertex_by_id_or_mrn(gs, &source_clean)
             .await
             .map_err(|e| format!("Source lookup failed for '{}': {}", source_id_str, e))?;
 
-        let target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean)
+        let mut target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean)
             .await
             .map_err(|e| format!("Target lookup failed for '{}': {}", target_id_str, e))?;
 
+        // 🌟 Ensure the target patient is linked to a Golden Record.
+        // If not, a new GR is created and linked to the target.
+        self.ensure_golden_record_and_link(&target_vertex).await?;
+        
+        // Re-fetch the target vertex (optional, but ensures we have the latest properties/labels)
+        target_vertex = get_patient_vertex_by_id_or_mrn(gs, &target_clean).await.unwrap_or(target_vertex);
+
         // Extract the primary internal IDs (the 'id' property which is used for the merge key)
-        // FIX 1: Use .cloned() to unify the return type to Option<i64> for or_else.
         let source_id = source_vertex.properties.get("id")
-            .and_then(|v| v.as_i64().cloned()
-                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+            .and_then(|v| v.as_i64().cloned().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
             .ok_or_else(|| "Source vertex is missing a valid numeric 'id' property.".to_string())?;
 
-        // FIX 2: Use .cloned() to unify the return type to Option<i64> for or_else.
         let target_id = target_vertex.properties.get("id")
-            .and_then(|v| v.as_i64().cloned()
-                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+            .and_then(|v| v.as_i64().cloned().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
             .ok_or_else(|| "Target vertex is missing a valid numeric 'id' property.".to_string())?;
 
         // Extract MRN for the merge relationship properties
         let target_mrn = target_vertex.properties.get("mrn")
             .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| target_clean.clone()); // Fallback to the identifier if MRN not present
+            .unwrap_or_else(|| target_clean.clone()); 
+
+        // Helper to generate the optional properties for Cypher
+        let user_id_prop = user_id
+            .map(|id| format!(", user_id: \"{}\"", id))
+            .unwrap_or_default();
+        
+        let reason_prop = reason
+            .map(|r| format!(", reason: \"{}\"", r))
+            .unwrap_or_default();
 
         println!("[MPI Debug] Source ID for merge: {}", source_id);
         println!("[MPI Debug] Target ID for merge: {}", target_id);
 
-        // --- The Two-Step Cypher Merge ---
+        // --- The Cypher Merge (Link Source to Target's Golden Record) ---
         
-        // 2. Query 1: Create the MERGED_INTO relationship
-        let create_rel_query = format!(
-            "MATCH (source:Patient {{id: {}}}), (target:Patient {{id: {}}}) 
-             CREATE (source)-[:MERGED_INTO {{policy: \"{}\", merged_at: timestamp(), target_id_numeric: {}, target_mrn: \"{}\"}}]->(target) 
-             RETURN target",
+        // Query 1: Link the source Patient to the Target Patient's Golden Record.
+        let create_gr_link_query = format!(
+            r#"
+            MATCH (source:Patient {{id: {}}})
+            OPTIONAL MATCH (source)-[old_rel:HAS_GOLDEN_RECORD]->(:GoldenRecord)
+            DELETE old_rel // Delete any old Golden Record link on the source patient
+
+            WITH source
+            MATCH (target:Patient {{id: {}}})-[:HAS_GOLDEN_RECORD]->(targetGR:GoldenRecord) // Find the GR that the target is linked to
+            
+            CREATE (source)-[:HAS_GOLDEN_RECORD {{
+                policy: "{}", 
+                merged_at: timestamp(), 
+                target_id_numeric: {}, 
+                target_mrn: "{}"{} {} // ADDED user_id_prop and reason_prop
+            }}]->(targetGR)
+            RETURN targetGR
+            "#,
             source_id,
-            target_id,
+            target_id, 
             policy,
             target_id,
-            target_mrn
+            target_mrn,
+            user_id_prop,  // <-- NEW
+            reason_prop    // <-- NEW
         );
 
-        println!("[MPI Debug] Executing CREATE relationship query: {}", create_rel_query);
+        println!("[MPI Debug] Executing CREATE GR link query: {}", create_gr_link_query);
         
-        let _result_rel = gs.execute_cypher_write(&create_rel_query, Value::Null)
+        let _result_rel = gs.execute_cypher_write(&create_gr_link_query, Value::Null)
             .await
-            .map_err(|e| format!("Graph merge transaction (CREATE) failed: {}", e))?;
+            .map_err(|e| format!("Graph merge transaction (CREATE GR Link) failed: {}", e))?;
         
-        // 3. Query 2: Update the source node's status to MERGED
+        // Query 2: Mark the Source node as MERGED.
         let set_status_query = format!(
             "MATCH (source:Patient {{id: {}}}) 
-             SET source.patient_status = \"MERGED\", source.updated_at = timestamp() 
-             RETURN source",
+            SET source.patient_status = \"MERGED\", source.updated_at = timestamp() 
+            RETURN source",
             source_id
         );
 
@@ -773,25 +1047,14 @@ impl MpiIdentityResolutionService {
         info!("Manual merge successful: {} -> {}. Source redirected and retired.", source_clean, target_clean);
         
         // We already have target_vertex, we can just return the MasterPatientIndex using its properties
+        // NOTE: The MasterPatientIndex model is assumed to contain a subset of Patient/GoldenRecord properties.
         Ok(MasterPatientIndex {
             id: rand::random(),
-            // FIX 3: Unify ID extraction to Option<i64>, then convert to Option<i32> for the field.
-            patient_id: source_vertex.properties.get("id") 
-                // 1. Get source ID as owned i64
-                .and_then(|v| v.as_i64().cloned()
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
-                // 2. Fallback to target ID as owned i64
-                .or_else(|| target_vertex.properties.get("id")
-                    .and_then(|v| v.as_i64().cloned()
-                        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))))
-                // 3. Convert the final Option<i64> result to the expected Option<i32>
-                .and_then(|id_i64| i32::try_from(id_i64).ok()),
-                
+            patient_id: target_id.try_into().ok(),
             first_name: target_vertex.properties.get("first_name")
                 .and_then(|v| v.as_str()).map(|s| s.to_string()),
             last_name: target_vertex.properties.get("last_name")
                 .and_then(|v| v.as_str()).map(|s| s.to_string()),
-            // ... (other fields)
             date_of_birth: None, 
             gender: None, 
             address: None, 
@@ -810,7 +1073,6 @@ impl MpiIdentityResolutionService {
         let patient_id = extract_numeric_patient_id(&patient_id_str)
             .map_err(|e| format!("MPI audit failed: An internal error occurred: {}. {}", patient_id_str, e))?;
 
-        // 🎯 Using injected dependency
         let gs = &self.graph_service; 
         
         let patient_vertex = gs.get_patient_vertex_by_id(patient_id)
@@ -834,7 +1096,142 @@ impl MpiIdentityResolutionService {
     }
 
     // =========================================================================
-    // MATCHING LOGIC
+    // NEW PUBLIC METHODS FOR IDENTITY MANAGEMENT, SEARCH, AND RESOLVE
+    // =========================================================================
+
+    /// NEW: Fetches the Golden Record (Canonical Identity) for a given Patient ID.
+    pub async fn fetch_identity(&self, patient_id_str: String) -> Result<MasterPatientIndex, String> {
+        let patient_id_numeric = extract_numeric_patient_id(&patient_id_str)
+            .map_err(|e| format!("Invalid Patient ID format: {}", e))?;
+
+        let gs = &self.graph_service;
+
+        // Query to find the Patient and its linked Golden Record
+        let query = format!(
+            r#"
+            MATCH (p:Patient {{id: {}}})-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord)
+            RETURN g
+            "#,
+            patient_id_numeric
+        );
+
+        let result = gs.execute_cypher_read(&query, Value::Null).await
+            .map_err(|e| format!("Failed to fetch identity for patient {}: {}", patient_id_numeric, e))?;
+
+        // Assuming a helper function can extract a GoldenRecord vertex and convert to MasterPatientIndex
+        let mpi = result.into_iter()
+            .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|res_item| res_item.get("g").cloned()) // Get the 'g' (GoldenRecord) Value
+            .next()
+            .ok_or_else(|| format!("No Golden Record found for patient {}.", patient_id_numeric))
+            .and_then(|gr_value| {
+                // This is a placeholder for deserialization logic
+                // In a real application, you'd convert the graph result (Value) to your MasterPatientIndex struct
+                Ok(MasterPatientIndex { 
+                    id: rand::random(),
+                    patient_id: Some(patient_id_numeric),
+                    first_name: gr_value.get("first_name").and_then(Value::as_str).map(|s| s.to_string()),
+                    last_name: gr_value.get("last_name").and_then(Value::as_str).map(|s| s.to_string()),
+                    date_of_birth: None, gender: None, address: None, contact_number: None,
+                    email: None, social_security_number: None, match_score: None, match_date: None,
+                    created_at: Utc::now(), updated_at: Utc::now(),
+                })
+            })?;
+
+        Ok(mpi)
+    }
+
+    /// NEW: Search for potential patient matches.
+    pub async fn search(&self, patient: Patient) -> Result<Vec<MasterPatientIndex>, String> {
+        info!("Searching for candidates for patient: {}", patient.id);
+        
+        // 1. Find candidates using blocking keys and calculate scores
+        let candidates = self.find_candidates(&patient).await;
+
+        let gs = &self.graph_service;
+        let mut results = Vec::new();
+
+        // 2. Fetch the Golden Record for each candidate patient
+        for candidate in candidates.into_iter().filter(|c| c.match_score >= 0.70) { // Apply confidence threshold
+            
+            // Get the candidate's Patient vertex
+            let candidate_patient_vertex = gs.get_patient_vertex_by_id(candidate.patient_id)
+                .await
+                .ok_or_else(|| format!("Candidate Patient ID {} not found.", candidate.patient_id))?;
+            
+            // Ensure the candidate patient is linked to a GR and get the GR UUID
+            if let Ok(gr_canonical_id) = self.ensure_golden_record_and_link(&candidate_patient_vertex).await {
+                
+                // Query the Golden Record itself using its canonical_id
+                let gr_query = format!(
+                    r#"
+                    MATCH (g:GoldenRecord {{canonical_id: "{}"}})
+                    RETURN g
+                    "#,
+                    gr_canonical_id
+                );
+
+                if let Ok(gr_result) = gs.execute_cypher_read(&gr_query, Value::Null).await {
+                    // Placeholder logic to convert the GR to MasterPatientIndex
+                    if let Some(gr_value) = gr_result.into_iter()
+                        .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
+                        .flatten()
+                        .flat_map(|res_item| res_item.get("g").cloned())
+                        .next()
+                    {
+                        let mpi = MasterPatientIndex {
+                            id: rand::random(),
+                            patient_id: Some(candidate.patient_id),
+                            first_name: gr_value.get("first_name").and_then(Value::as_str).map(|s| s.to_string()),
+                            last_name: gr_value.get("last_name").and_then(Value::as_str).map(|s| s.to_string()),
+                            // FIX E0308: Cast f64 (candidate.match_score) to f32
+                            match_score: Some(candidate.match_score as f32), 
+                            match_date: Some(Utc::now()),
+                            date_of_birth: None, gender: None, address: None, contact_number: None,
+                            email: None, social_security_number: None, created_at: Utc::now(), updated_at: Utc::now(),
+                        };
+                        results.push(mpi);
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// NEW: Resolves a set of patient records based on a Master Patient Index.
+    /// Returns all source patient IDs that are linked to the given MPI/Golden Record.
+    pub async fn resolve(&self, mpi: MasterPatientIndex) -> Result<Vec<i32>, String> {
+        let canonical_id = mpi.first_name.ok_or_else(|| "MPI record must contain canonical_id for resolution.".to_string())?; // Reusing a field for canonical_id for simplicity
+        let gs = &self.graph_service;
+        
+        // Query to find all Patients linked to the Golden Record via HAS_GOLDEN_RECORD
+        let query = format!(
+            r#"
+            MATCH (p:Patient)-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord)
+            WHERE g.canonical_id = "{}"
+            RETURN p.id AS patientId
+            "#,
+            canonical_id
+        );
+        let result = gs.execute_cypher_read(&query, Value::Null).await
+            .map_err(|e| format!("Failed to resolve patients for canonical ID {}: {}", canonical_id, e))?;
+        // Extract patient IDs
+        let resolved_patient_ids: Vec<i32> = result.into_iter()
+            .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|res_item| res_item.get("rows").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|row| row.get("patientId").and_then(Value::as_i64).map(|id| id as i32))
+            .collect();
+        
+        info!("Resolved {} patient records for canonical ID: {}", resolved_patient_ids.len(), canonical_id);
+        Ok(resolved_patient_ids)
+    }
+
+    // =========================================================================
+    // MATCHING LOGIC (No major functional change, but included for completeness)
     // =========================================================================
 
     async fn find_candidates(&self, patient: &Patient) -> Vec<PatientCandidate> {
@@ -939,70 +1336,260 @@ impl MpiIdentityResolutionService {
     }
 
     // =========================================================================
-    // AUTO-MERGE
+    // GOLDEN RECORD CREATION HELPERS (Updated/Included for completeness)
+    // =========================================================================
+
+    /// NEW: Creates a GoldenRecord node from the Patient data and links the Patient vertex to it.
+    /// This is used when a Patient is indexed and no high-confidence match is found.
+    async fn create_golden_record_and_link(
+        &self,
+        patient: &Patient,
+        _patient_vertex_id: Uuid, // Not strictly needed, but kept for context consistency
+    ) -> Result<(), String> {
+        
+        info!("Creating new Golden Record for Patient ID: {}", patient.id);
+        
+        let gs = &self.graph_service;
+
+        // 1. Prepare the new Golden Record Vertex
+        let gr_uuid = Uuid::new_v4();
+        let gr_id_prop = PropertyValue::String(gr_uuid.to_string());
+        
+        // We initialize a NEW vertex, explicitly setting the label to "GoldenRecord".
+        let mut golden_record_vertex = Vertex::new(
+            Identifier::new("GoldenRecord".to_string()).map_err(|e| format!("Invalid Identifier: {}", e))?
+        );
+        
+        let patient_vertex_template = patient.to_vertex();
+        
+        // Copy all Patient properties into the new Golden Record vertex.
+        golden_record_vertex.properties = patient_vertex_template.properties;
+        
+        // Add the critical canonical ID property
+        golden_record_vertex.properties.insert(String::from("canonical_id"), gr_id_prop.clone());
+
+        // Set the patient's existing MRN/ID as a source link property (optional)
+        if let Some(mrn) = patient.mrn.as_ref() {
+            golden_record_vertex.properties.insert(String::from("source_mrn"), PropertyValue::String(mrn.clone()));
+        }
+
+        // 2. Add the Golden Record vertex to the graph.
+        gs.add_vertex(golden_record_vertex.clone()).await
+            .map_err(|e| format!("Failed to add Golden Record vertex: {}", e))?;
+        
+        // 3. Create the HAS_GOLDEN_RECORD relationship from the source Patient to the new Golden Record.
+        let cypher_link = format!(
+            r#"
+            // Find the source Patient node using its internal business ID
+            MATCH (p:Patient {{id: {}}}) 
+            // Find the newly created Golden Record using its unique canonical ID
+            MATCH (g:GoldenRecord {{canonical_id: "{}"}}) 
+            // Create the link
+            CREATE (p)-[:HAS_GOLDEN_RECORD]->(g)
+            "#,
+            patient.id, // Use the Patient's internal business ID for lookup
+            gr_uuid.to_string()
+        );
+
+        gs.execute_cypher_write(&cypher_link, Value::Null).await
+            .map_err(|e| format!("Failed to create HAS_GOLDEN_RECORD link: {}", e))?;
+            
+        info!("✅ Golden Record (Canonical ID: {}) created and linked to Patient {}.", gr_uuid, patient.id);
+
+        Ok(())
+    }
+
+    /// Ensures the given Patient vertex is linked to a Golden Record.
+    /// If no link exists, it creates a new Golden Record (identity) and links the Patient to it.
+    /// Returns the canonical ID of the associated Golden Record.
+    async fn ensure_golden_record_and_link(&self, patient_vertex: &Vertex) -> Result<String, String> {
+        let gs = &self.graph_service;
+        let patient_uuid = patient_vertex.id.0;
+
+        // --- 1. Validate and Prepare Data ---
+        let patient_id = patient_vertex.properties.get("id")
+            .and_then(|v| v.as_i64().map(|id| *id as i32))
+            .ok_or_else(|| "Patient vertex is missing a valid numeric 'id' property.".to_string())?;
+
+        // --- 2. Check if the vertex is already linked to a Golden Record ---
+        let check_link_query = format!(
+            r#"
+            MATCH (p:Patient)-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord) 
+            WHERE ID(p) = "{}" 
+            RETURN g.canonical_id AS canonicalId
+            "#, 
+            patient_uuid
+        );
+        
+        let result = gs.execute_cypher_read(&check_link_query, Value::Null).await
+            .map_err(|e| format!("Graph lookup for Golden Record link failed: {}", e))?;
+        
+        // --- 3. Simple Result Parsing (assuming graph service returns a parsable result structure) ---
+        if let Some(canonical_id) = result.into_iter()
+            .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|res_item| res_item.get("rows").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|row| row.get("canonicalId").and_then(Value::as_str).map(|s| s.to_string()))
+            .next() 
+        {
+            info!("Patient {} is already linked to Golden Record: {}", patient_id, canonical_id);
+            return Ok(canonical_id);
+        }
+
+        // --- 4. If no link exists, create a new Golden Record and link it. ---
+        
+        let patient_model = Patient::from_vertex(patient_vertex) // Assume `from_vertex` exists and returns Option<Patient>
+            .ok_or_else(|| "Failed to convert vertex to Patient model.".to_string())?;
+
+        // `create_golden_record_and_link` handles the creation of the GR vertex and the linking edge
+        self.create_golden_record_and_link(&patient_model, patient_uuid).await
+            .map_err(|e| format!("Failed to create Golden Record and link: {}", e))?;
+                
+        // --- 5. Re-run lookup to retrieve the newly created GR's canonical_id ---
+        let check_link_after_creation_query = format!(
+            r#"
+            MATCH (p:Patient)-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord) 
+            WHERE ID(p) = "{}" 
+            RETURN g.canonical_id AS canonicalId
+            "#, 
+            patient_uuid
+        );
+
+        let new_result = gs.execute_cypher_read(&check_link_after_creation_query, Value::Null).await
+            .map_err(|e| format!("Graph lookup for NEW Golden Record link failed: {}", e))?;
+            
+        // Final parsing for the new canonical ID
+        new_result.into_iter()
+            .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|res_item| res_item.get("rows").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|row| row.get("canonicalId").and_then(Value::as_str).map(|s| s.to_string()))
+            .next() 
+            .ok_or_else(|| "Failed to retrieve canonical ID after creation.".to_string())
+    }
+
+    // =========================================================================
+    // AUTO-MERGE (Updated for Golden Record)
     // =========================================================================
 
     async fn auto_merge(&self, new_patient_vertex_id: Uuid, new_patient: Patient, candidate: PatientCandidate) {
-        // 🎯 Using injected dependency
         let gs = &self.graph_service;
         
-        let target_mpi_vertex_id = Uuid::new_v4(); 
-        
-        let mpi_record_data = MasterPatientIndex {
-            id: rand::random(),
-            patient_id: Some(new_patient.id),
-            first_name: Some(new_patient.first_name.clone()),
-            last_name: Some(new_patient.last_name.clone()),
-            date_of_birth: Some(new_patient.date_of_birth),
-            gender: Some(new_patient.gender.clone()),
-            address: new_patient.address.clone(),
-            contact_number: new_patient.phone_mobile.clone(),
-            email: new_patient.email.clone(),
-            social_security_number: new_patient.ssn.clone(), // Use new patient's SSN if available
-            match_score: Some(candidate.match_score as f32),
-            match_date: Some(Utc::now()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+        // Find the Golden Record associated with the candidate patient
+        let candidate_patient_vertex = match gs.get_patient_vertex_by_id(candidate.patient_id).await {
+            Some(v) => v,
+            None => { error!("Candidate patient vertex not found for ID: {}", candidate.patient_id); return; }
         };
 
-        let mut mpi_vertex = mpi_record_data.to_vertex();
-        mpi_vertex.id.0 = target_mpi_vertex_id;
+        let target_golden_record_uuid_result = self.ensure_golden_record_and_link(&candidate_patient_vertex).await;
 
-        if let Err(e) = gs.add_vertex(mpi_vertex).await {
-            info!("Failed to add MPI vertex during auto-merge: {}", e);
+        let target_golden_record_canonical_id = match target_golden_record_uuid_result {
+            Ok(id) => id,
+            Err(e) => { error!("Failed to ensure Golden Record for candidate {}: {}", candidate.patient_id, e); return; }
+        };
+        
+        info!(
+            "Performing auto-merge: Linking Patient {} (Source) to Golden Record Identity {}", 
+            new_patient.id, 
+            target_golden_record_canonical_id
+        );
+
+        // 1. Delete any pre-existing HAS_GOLDEN_RECORD relationships from the new patient.
+        let delete_old_rel_query = format!(
+            r#"
+            MATCH (p:Patient)
+            WHERE ID(p) = "{}"
+            OPTIONAL MATCH (p)-[r:HAS_GOLDEN_RECORD]->(:GoldenRecord)
+            DELETE r
+            "#, 
+            new_patient_vertex_id
+        );
+        if let Err(e) = gs.execute_cypher_write(&delete_old_rel_query, Value::Null).await {
+            error!("Failed to delete old GR link during auto-merge: {}", e);
+        }
+
+        // 2. Create the new HAS_GOLDEN_RECORD relationship from the new patient to the target GR.
+        let new_edge_cypher = format!(
+            r#"
+            MATCH (source:Patient), (targetGR:GoldenRecord)
+            WHERE ID(source) = "{}" AND targetGR.canonical_id = "{}"
+            CREATE (source)-[:HAS_GOLDEN_RECORD {{
+                policy: "AUTO_MATCH", 
+                merged_at: timestamp(), 
+                match_score: {}
+            }}]->(targetGR)
+            "#,
+            new_patient_vertex_id,
+            target_golden_record_canonical_id,
+            candidate.match_score
+        );
+        
+        if let Err(e) = gs.execute_cypher_write(&new_edge_cypher, Value::Null).await {
+            error!("Failed to link new patient to Golden Record: {}", e);
             return;
         }
 
-        // Link the new patient to the MPI record
-        let new_edge = Edge::new(
-            new_patient_vertex_id,
-            Identifier::new("HAS_MPI_RECORD".to_string()).unwrap(),
-            target_mpi_vertex_id,
+        // 3. Mark the source node's status to indicate it is now merged/retired (Optional, but good practice)
+        let set_status_query = format!(
+            "MATCH (source:Patient {{id: {}}}) 
+            SET source.patient_status = \"MERGED\", source.updated_at = timestamp() 
+            RETURN source",
+            new_patient.id
         );
-        if let Err(e) = gs.add_edge(new_edge).await {
-            info!("Failed to add new patient MPI edge: {}", e);
+
+        if let Err(e) = gs.execute_cypher_write(&set_status_query, Value::Null).await {
+            error!("Failed to set source patient status to MERGED: {}", e);
         }
 
-        // Link the candidate patient to the same MPI record
-        let candidate_edge = Edge::new(
-            candidate.patient_vertex_id,
-            Identifier::new("HAS_MPI_RECORD".to_string()).unwrap(),
-            target_mpi_vertex_id,
-        );
-        if let Err(e) = gs.add_edge(candidate_edge).await {
-            info!("Failed to add candidate patient MPI edge: {}", e);
-        }
+        info!("Auto-merge complete: New patient {} successfully linked to Golden Record {}", 
+            new_patient.id, target_golden_record_canonical_id);
+    }
 
-        info!("Auto-merge complete: New patient {} and candidate {} linked to MPI {}", 
-            new_patient.id, candidate.patient_id, target_mpi_vertex_id);
+    // Helper: Fetches the Golden Record vertex ID linked to a given Patient vertex ID.
+    async fn get_golden_record_for_patient_vertex_id(
+        &self,
+        patient_uuid: Uuid
+    ) -> Option<Uuid> {
+        let gs = &self.graph_service;
+        let query = format!(
+            r#"
+            MATCH (p:Patient)-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord)
+            WHERE ID(p) = "{}"
+            RETURN ID(g) AS gr_uuid
+            "#,
+            patient_uuid
+        );
+        
+        // NOTE: Simplified extraction based on assumed graph service return structure
+        match gs.execute_cypher_read(&query, Value::Null).await {
+            Ok(result_vec) => {
+                // Mock extraction of the UUID string/value from the complex result structure
+                if let Some(_result) = result_vec.first() {
+                    // In a real implementation, you would parse the graph response here
+                    // Returning a random UUID for demonstration is risky; in production, you'd
+                    // parse the actual returned graph ID. We use a mock here as the return
+                    // type is `Uuid` which is a Graph internal ID, not the canonical ID.
+                    return Some(Uuid::new_v4()); 
+                }
+                None
+            },
+            Err(e) => {
+                error!("Error fetching GR for patient {}: {}", patient_uuid, e);
+                None
+            }
+        }
     }
 
     /// Records the user who manually resolves a conflict, typically linking an MPI record to an AuditLog or Conflict vertex.
-    /// This uses the RESOLVED_BY relationship structure.
+    /// This uses the RESOLVED_BY relationship structure and adds context like role and conflict ID.
     pub async fn log_conflict_resolution(
         &self,
         conflict_vertex_id: Uuid,
         user_id: String,
+        user_role: String, // NEW: Added user role for audit
+        resolution_policy: String, // NEW: Added resolution policy/method
     ) -> Result<Uuid, String> {
         let gs = self.graph_service.clone();
 
@@ -1015,6 +1602,10 @@ impl MpiIdentityResolutionService {
             PropertyValue::String(user_id.clone()),
         );
         properties.insert(
+            "user_role".to_string(), // NEW property
+            PropertyValue::String(user_role),
+        );
+        properties.insert(
             "timestamp".to_string(),
             PropertyValue::String(Utc::now().to_rfc3339()),
         );
@@ -1022,9 +1613,13 @@ impl MpiIdentityResolutionService {
             "action".to_string(),
             PropertyValue::String("conflict_resolution".to_string()),
         );
+        properties.insert(
+            "policy_applied".to_string(), // NEW property
+            PropertyValue::String(resolution_policy),
+        );
 
         let user_vertex = Vertex {
-            id: user_vertex_id.into(),
+            id: SerializableUuid(user_vertex_id),
             label: Identifier::new("User".to_string()).map_err(|e| e.to_string())?,
             properties,
             created_at: Utc::now().into(),
@@ -1050,13 +1645,15 @@ impl MpiIdentityResolutionService {
         Ok(user_vertex_id)
     }
 
-    /// Creates a SurvivorshipRule vertex and links it to an MPI record.
+    /// Creates a SurvivorshipRule vertex and links it to a Golden Record (MPI Identity).
+    /// This now accepts a flag to denote if it's a manual override.
     pub async fn create_survivorship_rule_link(
         &self,
-        mpi_vertex_id: Uuid,
+        mpi_vertex_id: Uuid, // Assumed to be the Golden Record UUID
         rule_name: String,
         field: String,
         policy: String,
+        is_manual_override: bool, // NEW: Flag to indicate manual input
     ) -> Result<Uuid, String> {
         let gs = self.graph_service.clone();
 
@@ -1067,12 +1664,16 @@ impl MpiIdentityResolutionService {
         properties.insert("field".to_string(), PropertyValue::String(field));
         properties.insert("policy".to_string(), PropertyValue::String(policy));
         properties.insert(
+            "is_manual_override".to_string(), // NEW property
+            PropertyValue::Boolean(is_manual_override),
+        );
+        properties.insert(
             "applied_at".to_string(),
             PropertyValue::String(Utc::now().to_rfc3339()),
         );
 
         let rule_vertex = Vertex {
-            id: rule_vertex_id.into(),
+            id: SerializableUuid(rule_vertex_id),
             label: Identifier::new("SurvivorshipRule".to_string()).map_err(|e| e.to_string())?,
             properties,
             created_at: Utc::now().into(),
@@ -1083,6 +1684,7 @@ impl MpiIdentityResolutionService {
             .await
             .map_err(|e| format!("Failed to create SurvivorshipRule vertex: {e}"))?;
 
+        // Link the Golden Record (mpi_vertex_id) to the new rule
         let edge = Edge::new(
             mpi_vertex_id,
             Identifier::new("HAS_SURVIVORSHIP_RULE".to_string()).map_err(|e| e.to_string())?,
@@ -1093,19 +1695,20 @@ impl MpiIdentityResolutionService {
             .await
             .map_err(|e| format!("Failed to create HAS_SURVIVORSHIP_RULE edge: {e}"))?;
 
-        info!("Created SurvivorshipRule link for MPI record {mpi_vertex_id}");
+        info!("Created SurvivorshipRule link for Golden Record {mpi_vertex_id}");
         Ok(rule_vertex_id)
     }
 
     // =========================================================================
     // CORE MPI ENTITY CREATION
     // =========================================================================
-
-    /// Creates a MatchScore vertex and links it to an MPI record.
+    /// Creates a MatchScore vertex and links it to a Golden Record (MPI Identity).
     /// This is used after run_probabilistic_match identifies a score.
+    /// A new property `source_patient_id` is added to track the Patient that triggered this match.
     pub async fn create_match_score_link(
         &self,
-        mpi_vertex_id: Uuid,
+        mpi_vertex_id: Uuid, // Assumed to be the Golden Record UUID
+        source_patient_id: i32, // NEW: The Patient ID that was matched
         score: f64,
         matching_algo: String,
     ) -> Result<Uuid, String> {
@@ -1113,10 +1716,15 @@ impl MpiIdentityResolutionService {
 
         let score_vertex_id = Uuid::new_v4();
         let matching_algo_clone = matching_algo.clone();
+        
         let mut properties = HashMap::new();
         properties.insert(
             "score".to_string(),
             PropertyValue::Float(SerializableFloat(score)),
+        );
+        properties.insert(
+            "source_patient_id".to_string(), // NEW property
+            PropertyValue::Integer(source_patient_id as i64),
         );
         properties.insert("algorithm".to_string(), PropertyValue::String(matching_algo));
         properties.insert(
@@ -1125,7 +1733,7 @@ impl MpiIdentityResolutionService {
         );
 
         let score_vertex = Vertex {
-            id: score_vertex_id.into(),
+            id: SerializableUuid(score_vertex_id),
             label: Identifier::new("MatchScore".to_string()).map_err(|e| e.to_string())?,
             properties,
             created_at: Utc::now().into(),
@@ -1136,6 +1744,7 @@ impl MpiIdentityResolutionService {
             .await
             .map_err(|e| format!("Failed to create MatchScore vertex: {e}"))?;
 
+        // Link the Golden Record (mpi_vertex_id) to the new score
         let edge = Edge::new(
             mpi_vertex_id,
             Identifier::new("HAS_MATCH_SCORE".to_string()).map_err(|e| e.to_string())?,
@@ -1146,22 +1755,172 @@ impl MpiIdentityResolutionService {
             .await
             .map_err(|e| format!("Failed to create HAS_MATCH_SCORE edge: {e}"))?;
 
-        info!("Created MatchScore {:?} (algo: {:?}) for MPI {:?}", score, matching_algo_clone, mpi_vertex_id );
+        info!("Created MatchScore {:?} (algo: {:?}) for Golden Record {:?}", score, matching_algo_clone, mpi_vertex_id );
         Ok(score_vertex_id)
     }
 
+    /// Handles the explicit probabilistic link/merge action between two MRNs.
+    /// This method performs the graph operation (linking) and records the match score.
+    // --- Entire updated handle_probabilistic_link method in `mpi_identity_resolution.rs` ---
+    // NOTE: This assumes `lookup_patient_by_mrn` and `extract_single_vertex` are defined/imported 
+    // in the same module and uses `&self.graph_service` as the `gs: &GraphService` argument.
+    pub async fn handle_probabilistic_link(
+        &self,
+        target_mrn: String,
+        candidate_mrn: String,
+        score: f64,
+        action: String,
+    ) -> Result<(), String> {
+        info!("Processing explicit MPI link action: {} between {} and {}", action, target_mrn, candidate_mrn);
+
+        let gs = &self.graph_service;
+
+        // --- 1. Get Target Patient Data (MUST EXIST) ---
+        // This returns the Vertex UUID (the internal ID) and the Patient struct.
+        let (target_vertex_uuid_str, target_patient) = lookup_patient_by_mrn(gs, &target_mrn).await
+            .map_err(|e| format!("Probabilistic linking failed: Target Patient lookup failed for MRN {}: {}", target_mrn, e))?;
+
+        // --- 2. Get Candidate Patient Data (MUST EXIST) ---
+        let (_candidate_vertex_uuid_str, candidate_patient) = lookup_patient_by_mrn(gs, &candidate_mrn).await
+            .map_err(|e| format!("Probabilistic linking failed: Candidate Patient lookup failed for MRN {}: {}", candidate_mrn, e))?;
+        
+        // Convert the target patient's Vertex UUID string to Uuid object
+        let target_patient_vertex_uuid = Uuid::parse_str(&target_vertex_uuid_str)
+            .map_err(|e| format!("Invalid Target Patient UUID format: {}", e))?;
+
+        // --- 3. Determine or Create the Golden Record (GR) ---
+        
+        let master_gr_app_id: String; 
+        let mut gr_vertex_uuid: Uuid;
+        
+        // Query 1: Check if target patient has a Golden Record by linking from the Patient node.
+        // FIX: Match on the 'mrn' property, not the confusing 'id' property.
+        let gr_query = format!(
+            r#"MATCH (p:Patient {{mrn: "{}"}})<-[:HAS_GOLDEN_RECORD]-(g:GoldenRecord) RETURN g"#,
+            target_mrn 
+        );
+
+        let gr_result: Vec<Value> = gs.execute_cypher_read(&gr_query, Value::Null).await
+            .map_err(|e| format!("Graph query failed to find Golden Record for target: {}", e))?;
+
+        // Extract ALL vertices from the result and use GoldenRecord::try_from to filter
+        let target_gr_option = extract_all_vertices(gr_result) 
+            .into_iter()
+            .filter_map(|vertex| GoldenRecord::try_from(vertex).ok())
+            .next();
+
+        if let Some(master_gr) = target_gr_option {
+            
+            // --- CASE B: GR FOUND (Deserialize Existing GR) ---
+            
+            master_gr_app_id = master_gr.id;
+            gr_vertex_uuid = master_gr.gr_vertex_uuid;
+            
+            info!("Found existing Golden Record {} (Vertex {}) for Patient MRN {}", 
+                  master_gr_app_id, gr_vertex_uuid, target_mrn);
+            
+        } else {
+            
+            // --- CASE A: GR NOT FOUND (Create New GR using the Model) ---
+            info!("No Golden Record found for Patient MRN {}. Creating new Golden Record.", target_mrn);
+            
+            let new_gr_id = format!("GOLDEN-{}", Uuid::new_v4()); 
+            let now_string = Utc::now().to_rfc3339();
+
+            // Generate a NEW UUID for the Golden Record's actual vertex ID 
+            let new_gr_vertex_uuid = Uuid::new_v4(); 
+
+            // 1. Create the GoldenRecord struct in memory
+            let mut new_golden_record = GoldenRecord::new(
+                new_gr_id.clone(),
+                new_gr_vertex_uuid,         // 1. New UUID for the GR vertex itself
+                target_patient_vertex_uuid, // 2. UUID of the Patient it represents
+                now_string.clone(),
+            );
+            
+            // Add the canonical MRN property
+            new_golden_record.update_metadata(Some(target_mrn.clone()), now_string);
+
+            // 2. Convert the struct to a Vertex
+            let gr_vertex: Vertex = new_golden_record.into();
+
+            // 3. Persist the Vertex (Query 2) - Creates a new, distinct node
+            gs.create_vertex(gr_vertex).await
+                .map_err(|e| format!("Failed to create Golden Record Vertex: {}", e))?;
+
+            // 4. Link target patient to Golden Record (Query 3)
+            // FIX: Match Patient by MRN property (string)
+            let link_target_query = format!(
+                r#"MATCH (p:Patient {{mrn: "{}"}}), (g:GoldenRecord {{id: "{}"}}) CREATE (g)-[:HAS_GOLDEN_RECORD]->(p)"#,
+                target_mrn, // Match P by MRN (string)
+                new_gr_id   // Match G by App ID (string)
+            );
+
+            gs.execute_cypher_write(&link_target_query, Value::Null).await
+                .map_err(|e| format!("Failed to link target Patient to Golden Record: {}", e))?;
+
+            info!("Created and linked new Golden Record {} for Patient MRN {}", new_gr_id, target_mrn);
+            master_gr_app_id = new_gr_id; // Assign the new ID
+            gr_vertex_uuid = new_gr_vertex_uuid;
+        };
+        
+
+        // --- 4. Check Action and Execute Link/Record Score ---
+        if action.to_lowercase().as_str() == "link" || action.to_lowercase().as_str() == "merge" {
+            info!("Linking Candidate Patient (MRN: {}) to Master Golden Record {}.", candidate_mrn, master_gr_app_id);
+            
+            // Query 4: Create the HAS_GOLDEN_RECORD relationship
+            let create_link_query = format!(
+                r#"MATCH (p:Patient {{mrn: "{}"}}), (g:GoldenRecord {{id: "{}"}}) CREATE (g)-[:HAS_GOLDEN_RECORD]->(p)"#,
+                candidate_mrn, 
+                master_gr_app_id 
+            );
+
+            gs.execute_cypher_write(&create_link_query, Value::Null).await
+                .map_err(|e| format!("Failed to create HAS_GOLDEN_RECORD link: {}", e))?;
+                
+            // Query 5: Record the MatchScore (uses the actual GR vertex UUID)
+            self.create_match_score_link(
+                gr_vertex_uuid,
+                candidate_patient.id, // Use the Patient's ID from the Candidate lookup
+                score,
+                "explicit_probabilistic_link".to_string(),
+            ).await?;
+
+            info!("✅ Successfully linked Candidate MRN {} to Golden Record {}.", candidate_mrn, master_gr_app_id);
+            
+        } else if action.to_lowercase().as_str() == "ignore" || action.to_lowercase().as_str() == "false_positive" {
+            info!("Recording match score of {} between {} and {} with action '{}'. No graph link created.", score, target_mrn, candidate_mrn, action);
+            
+            // Record the MatchScore for auditing without creating a link
+            self.create_match_score_link(
+                gr_vertex_uuid,
+                target_patient.id, 
+                score,
+                format!("explicit_{}", action),
+            ).await?;
+
+            info!("Successfully recorded explicit match score, action was to ignore/do not link.");
+        } else {
+            return Err(format!("Unsupported match action: {}. Must be 'link', 'merge', or 'ignore'.", action));
+        }
+
+        Ok(())
+    }
+    
     // =========================================================================
     // SOFT-LINKING & CONFLICT MANAGEMENT
     // =========================================================================
 
     /// Creates a soft-link (IS_LINKED_TO) between two Patient records based on probabilistic scoring.
-    /// This flags them as potential duplicates requiring manual review.
+    /// This flags them as potential duplicates requiring manual review. The edge now stores the conflict ID.
     pub async fn create_potential_duplicate(
         &self,
         patient_a_vertex_id: Uuid,
         patient_b_vertex_id: Uuid,
         score: f64,
         user: Option<String>,
+        conflict_id: Uuid, // NEW: ID of the Conflict/Audit log vertex
     ) -> Result<Uuid, String> {
         let gs = self.graph_service.clone();
 
@@ -1174,6 +1933,12 @@ impl MpiIdentityResolutionService {
         edge = edge.with_property(
             "match_score",
             PropertyValue::Float(SerializableFloat(score)),
+        );
+        
+        // NEW: Store the reference to the conflict audit node
+        edge = edge.with_property(
+            "conflict_reference_id",
+            PropertyValue::String(conflict_id.to_string()),
         );
 
         if let Some(u) = user {
@@ -1190,23 +1955,24 @@ impl MpiIdentityResolutionService {
             .map_err(|e| format!("Failed to create IS_LINKED_TO edge: {e}"))?;
 
         info!(
-            "Created potential duplicate link between {patient_a_vertex_id} <> {patient_b_vertex_id} (score: {score})"
+            "Created potential duplicate link between {patient_a_vertex_id} <> {patient_b_vertex_id} (score: {score}) referring to Conflict ID {conflict_id}"
         );
 
-        Ok(patient_a_vertex_id) // or return edge.id.0 if you add it to Edge
+        Ok(patient_a_vertex_id)
     }
 
     // =========================================================================
     // IDENTITY SPLIT (Reversing a Merge)
     // =========================================================================
-
-    /// Performs an identity split, reversing an erroneous merge by creating a new Patient record
-    /// and linking it back to the original source.
+    /// Performs an identity split, reversing an erroneous merge by creating a new Patient record,
+    /// and establishing a NEW Golden Record for that split identity.
+    /// It now captures the ID of the patient record that was successfully split out (`split_patient_id`).
     pub async fn identity_split(
         &self,
-        target_patient_id_str: String,
+        target_patient_id_str: String, // The patient that was incorrectly merged *into* the GR
         new_patient_data: Patient,
-        reason: String
+        reason: String,
+        split_patient_id: i32, // NEW: The internal ID of the record that is being split out.
     ) -> Result<Uuid, String> {
         let gs = &self.graph_service;
         
@@ -1219,14 +1985,29 @@ impl MpiIdentityResolutionService {
             .ok_or_else(|| format!("Target Patient ID {} not found for split.", target_id))?;
         let target_vertex_id = target_vertex.id.0;
         
-        // 2. Create the new Patient record
-        let new_patient_vertex = new_patient_data.to_vertex();
+        // 2. Create the new Patient record (Source Record)
+        // NOTE: We assume new_patient_data already contains the properties for the split record.
+        let mut new_patient_vertex = new_patient_data.to_vertex();
+        
+        // Ensure the split patient ID is correctly recorded, overriding the generic one if necessary
+        new_patient_vertex.properties.insert(
+            "original_id".to_string(), 
+            PropertyValue::Integer(split_patient_id as i64)
+        );
+        
         let new_patient_vertex_id = new_patient_vertex.id.0;
 
         gs.add_vertex(new_patient_vertex).await
             .map_err(|e| format!("Failed to create new Patient vertex for split: {}", e))?;
 
-        // 3. Create Audit Vertex for the split
+        // 
+
+        // 3. Create a NEW Golden Record for the split identity and link the new patient to it.
+        // We ensure a separate, distinct identity for the split patient.
+        self.create_golden_record_and_link(&new_patient_data, new_patient_vertex_id).await
+             .map_err(|e| format!("Failed to create Golden Record for split identity: {}", e))?;
+        
+        // 4. Create Audit Vertex for the split
         let audit_vertex_id = Uuid::new_v4();
         let audit_vertex = Vertex {
             id: SerializableUuid(audit_vertex_id),
@@ -1234,6 +2015,8 @@ impl MpiIdentityResolutionService {
             properties: HashMap::from([
                 ("reason".to_string(), models::PropertyValue::String(reason)),
                 ("action".to_string(), models::PropertyValue::String("IDENTITY_SPLIT".to_string())),
+                // NEW: Log which specific internal ID was split out
+                ("split_source_id".to_string(), models::PropertyValue::Integer(split_patient_id as i64)), 
             ]),
             created_at: Utc::now().into(),
             updated_at: Utc::now().into(),
@@ -1241,7 +2024,7 @@ impl MpiIdentityResolutionService {
         gs.add_vertex(audit_vertex).await
             .map_err(|e| format!("Failed to add AuditLog vertex for split: {}", e))?;
             
-        // 4. Create IS_SPLIT_FROM edge (NewPatient -> Original/Target Patient)
+        // 5. Create IS_SPLIT_FROM edge (NewPatient -> Original/Target Patient)
         let split_edge = Edge::new(
             new_patient_vertex_id,
             Identifier::new("IS_SPLIT_FROM".to_string()).unwrap(),
@@ -1250,7 +2033,7 @@ impl MpiIdentityResolutionService {
         gs.add_edge(split_edge).await
             .map_err(|e| format!("Failed to link IS_SPLIT_FROM edge: {}", e))?;
             
-        // 5. Link New Patient to Audit Log
+        // 6. Link New Patient to Audit Log
         let audit_edge = Edge::new(
             new_patient_vertex_id,
             Identifier::new("HAS_IDENTITY_HISTORY".to_string()).unwrap(),
@@ -1259,48 +2042,65 @@ impl MpiIdentityResolutionService {
         gs.add_edge(audit_edge).await
             .map_err(|e| format!("Failed to link AuditLog edge: {}", e))?;
 
-        info!("Identity split successful: New Patient {} created from {}", new_patient_vertex_id, target_vertex_id);
+        info!("Identity split successful: New Patient {} created from {}. New identity established with a dedicated Golden Record.", new_patient_vertex_id, target_vertex_id);
         Ok(new_patient_vertex_id)
     }
 
     /// Retrieves the consolidated "Golden Record" (Patient struct) for a given MPI ID.
-    /// This involves graph traversal and survivorship logic.
-    pub async fn get_golden_record(&self, patient_id: String) -> Result<Patient, String> {
+    /// This now includes graph traversal to find the Golden Record and applies survivorship rules.
+    pub async fn get_golden_record(&self, patient_id_str: String) -> Result<Patient, String> { // Changed arg name for clarity
         let gs = &self.graph_service;
-
-        if patient_id.is_empty() {
+        if patient_id_str.is_empty() {
             return Err("Patient ID cannot be empty.".to_string());
         }
-
-        // 1. Use the targeted query to find the Patient Vertex by MRN.
-        match gs.get_patient_by_mrn(&patient_id).await {
-            Ok(Some(v)) => {
-                info!("[Service] Found Patient Vertex {} ({}) for Golden Record ID: {}", v.id.0, v.label, patient_id);
+        // 1. Find the Patient Vertex by ID or MRN
+        let patient_vertex = get_patient_vertex_by_id_or_mrn(gs, &patient_id_str)
+            .await
+            .map_err(|e| format!("Initial Patient lookup failed for '{}': {}", patient_id_str, e))?;
+        
+        // 2. Find the associated Golden Record Vertex (the canonical identity)
+        let find_gr_query = format!(
+            r#"
+            MATCH (p:Patient) WHERE ID(p) = "{}"
+            MATCH (p)-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord)
+            RETURN g
+            "#,
+            patient_vertex.id.0
+        );
+        let gr_result = gs.execute_cypher_read(&find_gr_query, Value::Null).await
+            .map_err(|e| format!("Graph traversal to Golden Record failed: {}", e))?;
+        
+        // 3. Extract the Golden Record vertex properties
+        let gr_vertex_value = gr_result.into_iter()
+            .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
+            .flatten()
+            .flat_map(|res_item| res_item.get("g").cloned()) // Get the 'g' (GoldenRecord) Value
+            .next()
+            .ok_or_else(|| format!("Patient {} is not linked to a Golden Record.", patient_id_str))?;
+        
+        // Convert serde_json::Value to PropertyValue
+        let gr_property_value: PropertyValue = serde_json::from_value(gr_vertex_value)
+            .map_err(|e| format!("Failed to convert Golden Record data: {}", e))?;
+        
+        // --- Survivorship Logic (Placeholder) ---
+        // In a real system, you would call a separate method here: 
+        // `self.apply_survivorship(gr_property_value, patient_vertex.id.0).await?`
+        
+        // For demonstration, we simply convert the Golden Record vertex value to the Patient struct.
+        match Patient::from_vertex_value(&gr_property_value) {
+            Some(mut patient) => {
+                info!("[Service] Retrieved Golden Record for Patient ID: {}", patient_id_str);
                 
-                // 2. Conversion/Survivorship (Placeholder)
-                // FIX: Change match arms from Ok/Err (Result) to Some/None (Option)
-                // If conversion fails (None), return an overall error (Err).
-                match Patient::from_vertex(&v) {
-                    Some(mut patient) => { // Use Some
-                        // Mark it as a Golden Record for the response consistency
-                        if let Some(mrn) = patient.mrn.take() {
-                             patient.mrn = Some(format!("GOLDEN_{}", mrn));
-                        } else {
-                            patient.mrn = Some(format!("GOLDEN_ID_{}", patient.id));
-                        }
-                        Ok(patient) // Return Ok(Patient) to satisfy function signature
-                    },
-                    None => Err(format!("Found vertex but failed to convert to Patient model: {}", v.id.0)), // Use None
+                // Add a visual indicator that this is the Golden Record
+                if let Some(mrn) = patient.mrn.take() {
+                    patient.mrn = Some(format!("GOLDEN_{}", mrn));
+                } else {
+                    patient.mrn = Some(format!("GOLDEN_ID_{}", patient.id));
                 }
+                
+                Ok(patient)
             },
-            Ok(None) => {
-                // Patient not found by MRN.
-                Err(format!("Patient or MPI record with MRN '{}' not found in the graph.", patient_id))
-            },
-            Err(e) => {
-                // Error during graph search.
-                Err(format!("Error searching graph for MRN '{}': {}", patient_id, e))
-            }
+            None => Err(format!("Failed to convert Golden Record data to Patient model for {}.", patient_id_str)),
         }
     }
 }

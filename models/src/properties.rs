@@ -1,10 +1,12 @@
-
 // models/src/properties.rs
 use crate::{edges::Edge, identifiers::Identifier, json::Json, vertices::Vertex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 use bincode::{Encode, Decode};
+use std::hash::{Hash, Hasher};
+use std::cmp::Ordering;
+use serde_json::{json, Value };
 
 /// --- NEW STRUCT FOR F64 WRAPPER ---
 /// f64 does not implement `Eq` or `Hash` directly.
@@ -37,6 +39,99 @@ impl std::hash::Hash for SerializableFloat {
 }
 /// --- END NEW STRUCT ---
 
+/// A map of property names to their values.
+pub type PropertyMap = HashMap<Identifier, PropertyValue>;
+
+// =========================================================================
+// --- WRAPPERS FOR TRAIT COMPLIANCE ---
+
+/// This wrapper allows Vertex to be contained in PropertyValue without breaking derives.
+/// It implements Hash, PartialOrd, and Ord based on the inner Vertex's ID for stability.
+#[derive(Clone, Debug, Serialize, Deserialize, Encode, Decode)]
+pub struct UnhashableVertex(pub Vertex);
+
+impl PartialEq for UnhashableVertex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+impl Eq for UnhashableVertex {}
+
+impl Hash for UnhashableVertex {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.id.hash(state); 
+    }
+}
+
+impl PartialOrd for UnhashableVertex {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.id.partial_cmp(&other.0.id)
+    }
+}
+
+impl Ord for UnhashableVertex {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.id.cmp(&other.0.id)
+    }
+}
+
+
+/// Wraps PropertyMap to implement Hash, PartialOrd, and Ord deterministically,
+/// which is necessary because HashMap does not implement these traits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct HashablePropertyMap(pub PropertyMap);
+
+impl Hash for HashablePropertyMap {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // To hash deterministically, we must sort the key-value pairs by key.
+        let mut sorted_pairs: Vec<(&Identifier, &PropertyValue)> = self.0.iter().collect();
+        sorted_pairs.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+
+        for (key, value) in sorted_pairs {
+            key.hash(state);
+            value.hash(state);
+        }
+    }
+}
+
+impl PartialOrd for HashablePropertyMap {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HashablePropertyMap {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // 1. Compare lengths.
+        let len_cmp = self.0.len().cmp(&other.0.len());
+        if len_cmp != Ordering::Equal {
+            return len_cmp;
+        }
+
+        // 2. Sort key-value pairs and compare element by element.
+        let mut self_pairs: Vec<(&Identifier, &PropertyValue)> = self.0.iter().collect();
+        let mut other_pairs: Vec<(&Identifier, &PropertyValue)> = other.0.iter().collect();
+        
+        self_pairs.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+        other_pairs.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+
+        for ((k1, v1), (k2, v2)) in self_pairs.iter().zip(other_pairs.iter()) {
+            let key_cmp = k1.cmp(k2);
+            if key_cmp != Ordering::Equal {
+                return key_cmp;
+            }
+            let value_cmp = v1.cmp(v2);
+            if value_cmp != Ordering::Equal {
+                return value_cmp;
+            }
+        }
+        
+        Ordering::Equal
+    }
+}
+
+// =========================================================================
+
 /// Represents a generic property value.
 ///
 /// NOTE: Only types supported by bincode derive Encode/Decode.
@@ -51,6 +146,11 @@ pub enum PropertyValue {
     String(String),
     Uuid(crate::identifiers::SerializableUuid),
     Byte(u8),
+    
+    // --- UPDATED VARIANTS USING WRAPPERS ---
+    // These variants now hold types that correctly implement Hash, PartialOrd, and Ord.
+    Map(HashablePropertyMap),
+    Vertex(UnhashableVertex), 
 }
 
 impl PropertyValue {
@@ -70,6 +170,29 @@ impl PropertyValue {
         match self {
             PropertyValue::Integer(v) => Some(v),
             _ => None,
+        }
+    }
+    pub fn to_serde_value(&self) -> serde_json::Value {
+        use serde_json::Value;
+        match self {
+            PropertyValue::Boolean(b) => Value::Bool(*b),
+            PropertyValue::Integer(i) => Value::Number((*i).into()),
+            PropertyValue::I32(i) => Value::Number((*i).into()),
+            PropertyValue::Float(f) => Value::from(f.0),
+            PropertyValue::String(s) => Value::String(s.clone()),
+            PropertyValue::Byte(b) => Value::Number((*b as i64).into()),
+            PropertyValue::Uuid(u) => Value::String(u.0.to_string()),
+            PropertyValue::Map(m) => {
+                let map = m.0.iter()
+                    // FIX: Assuming k is &Identifier, which implements Display/ToString
+                    // or dereferences to &str, allowing direct .to_string().
+                    .map(|(k, v)| (k.to_string(), v.to_serde_value())) 
+                    .collect::<serde_json::Map<String, Value>>();
+                Value::Object(map)
+            },
+            PropertyValue::Vertex(v) => {
+                serde_json::to_value(&v.0).unwrap_or(Value::Null) 
+            },
         }
     }
 }
@@ -96,8 +219,6 @@ impl From<crate::identifiers::SerializableUuid> for PropertyValue {
     fn from(u: crate::identifiers::SerializableUuid) -> Self { PropertyValue::Uuid(u) }
 }
 
-/// A map of property names to their values.
-pub type PropertyMap = HashMap<Identifier, PropertyValue>;
 
 /// Represents a vertex property.
 /// NOT bincode-Encode/Decode as Json (serde_json::Value) is not bincode compatible.
@@ -179,4 +300,3 @@ impl EdgePropertyUpdate {
         Self { edge, property, value }
     }
 }
-
