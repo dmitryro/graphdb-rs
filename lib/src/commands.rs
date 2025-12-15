@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use std::fmt;
+use std::str::FromStr;
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
 pub use models::medical::{ Patient };
@@ -1255,6 +1256,23 @@ impl fmt::Display for NameMatchAlgorithm {
     }
 }
 
+// Add this FromStr implementation
+impl FromStr for NameMatchAlgorithm {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "jaro-winkler" => Ok(NameMatchAlgorithm::JaroWinkler),
+            "levenshtein" => Ok(NameMatchAlgorithm::Levenshtein),
+            "both" => Ok(NameMatchAlgorithm::Both),
+            _ => Err(format!(
+                "Invalid name matching algorithm: '{}'. Valid options are: jaro-winkler, levenshtein, both",
+                s
+            )),
+        }
+    }
+}
+
 // --- MASTER PATIENT INDEX COMMANDS ---
 #[derive(Subcommand, Debug, PartialEq, Clone,)]
 /// Commands for Master Patient Index (MPI) operations, including matching, linking, and merging patient identities.
@@ -1262,7 +1280,7 @@ pub enum MPICommand {
     /// Indexes a new patient record into the MPI for future matching and retrieval.
     /// Requires either --name OR the combination of --first-name and --last-name.
     Index {
-        /// Patient's full name (e.g., "Alex Johnson"). Conflicts with --first-name and --last-name.
+        /// Patient's full name (e.g., "Alex Johnson"). Conflicts with --first-name and --last_name.
         #[arg(long, conflicts_with_all = ["first_name", "last_name"])]
         name: Option<String>,
 
@@ -1278,8 +1296,8 @@ pub enum MPICommand {
         #[arg(long, aliases = ["date_of_birth"])]
         dob: Option<String>,
 
-        /// Mandatory: Patient's Medical Record Number (MRN).
-        #[arg(long)]
+        /// Mandatory: Patient's Medical Record Number (MRN). Used as the source identifier.
+        #[arg(long, aliases = ["source-mrn"])]
         mrn: String,
         
         /// Optional: Patient's address (street/city/zip).
@@ -1289,6 +1307,16 @@ pub enum MPICommand {
         /// Optional: Patient's phone number.
         #[arg(long)]
         phone: Option<String>,
+
+        // --- MISSING FLAGS ADDED HERE ---
+        /// Mandatory: The system submitting this patient record (e.g., "SourceSystemA").
+        #[arg(long)]
+        system: String,
+
+        /// Optional: Patient's gender (M, F, O, U).
+        #[arg(long)]
+        gender: Option<String>,
+        // --- END ADDED FLAGS ---
     },
     
     /// Runs probabilistic matching logic to find potential duplicate patient records.
@@ -1297,8 +1325,26 @@ pub enum MPICommand {
     Match {
         /// Patient's full name (MANDATORY: required for any probabilistic match)
         #[arg(long)]
-        name: String,
-        
+        name: Option<String>, // Changed to Option<String> for flexibility, though logic may enforce it.
+
+        // --- FLAGS UPDATED/ADDED HERE ---
+        /// Mandatory: The MRN of the master patient identity to match against (Target).
+        #[arg(long)]
+        target_mrn: String,
+
+        /// Mandatory: The MRN of the patient candidate being evaluated (Candidate).
+        #[arg(long)]
+        candidate_mrn: String,
+
+        /// Mandatory: The probabilistic match score calculated between the two identities (0.0 to 1.0).
+        #[arg(long)]
+        score: f64,
+
+        /// Mandatory: The action to take based on the match (e.g., "link", "no-link").
+        #[arg(long)]
+        action: String,
+        // --- END ADDED/UPDATED FLAGS ---
+
         /// Optional: Patient's date of birth (YYYY-MM-DD). If provided, significantly increases score weight.
         #[arg(long)]
         dob: Option<String>,
@@ -1332,12 +1378,22 @@ pub enum MPICommand {
 
     /// Merges a duplicate patient record (source-id) into the master record (target-id).
     Merge {
-        /// The ID of the duplicate record to be consolidated and retired
+        // --- FLAGS UPDATED/ADDED HERE ---
+        /// The MRN of the master record (the identity that remains active).
         #[arg(long)]
-        source_id: String,
-        /// The ID of the canonical master record that will remain active
+        master_mrn: String,
+        /// The MRN of the duplicate record to be consolidated and retired.
         #[arg(long)]
-        target_id: String,
+        duplicate_mrn: String,
+        /// The ID of the user performing the manual merge operation (required for audit).
+        #[arg(long)]
+        user_id: String,
+        /// The reason for the manual merge (required for audit).
+        #[arg(long)]
+        reason: String,
+        // The previous source_id/target_id flags are replaced by the MRNs for clarity.
+        // --- END ADDED FLAGS ---
+        
         /// Policy for data resolution (e.g., "Latest", "SourceWins", "TargetWins")
         #[arg(long)]
         resolution_policy: String,
@@ -1360,12 +1416,17 @@ pub enum MPICommand {
         merged_id: String,
         
         /// The complete data for the new Patient record being split out (provided as a JSON string).
-        #[arg(long)] 
-        new_patient_data_json: String, 
+        #[arg(long)]
+        new_patient_data_json: String,
         
         /// The reason for the identity split (required for audit).
         #[arg(long)]
         reason: String,
+        
+        // FIX: Add the new mandatory internal ID of the record being split out.
+        /// Mandatory: The internal ID (i32) of the patient record that is being split out.
+        #[arg(long)]
+        split_patient_id_str: String, 
     },
 
     /// Retrieves the consolidated "Golden Record" (single source of truth) for a given patient.
@@ -1373,6 +1434,86 @@ pub enum MPICommand {
         /// The canonical MPI ID of the patient to retrieve.
         #[arg(long)]
         patient_id: String,
+    },
+    
+    // --- ADDED COMMAND: FETCH IDENTITY (structurally identical to Resolve) ---
+    /// Alias for Resolve: Retrieves the Golden Record using a known source identifier (MRN, SSN, etc.).
+    FetchIdentity {
+        /// The internal MPI ID or the primary external ID (MRN, SSN) to resolve.
+        #[arg(long, conflicts_with = "external_id")]
+        id: Option<String>,
+        
+        /// An external ID value (e.g., "98765") that is not the primary ID. Must be used with --id_type.
+        #[arg(long, conflicts_with = "id")]
+        external_id: Option<String>,
+        
+        /// The type of ID being provided (e.g., "MRN", "SSN", "InternalID", "ForeignMRN").
+        /// Required if using --external-id.
+        #[arg(long)]
+        id_type: Option<String>,
+
+        // --- MISSING FLAG ADDED HERE ---
+        /// Mandatory: The primary source MRN for the identity to fetch.
+        #[arg(long, aliases = ["source-mrn"], conflicts_with_all = ["id", "external_id", "id_type"])]
+        source_mrn: Option<String>,
+        // --- END ADDED FLAG ---
+    },
+    
+    // --- UPDATED COMMAND: RESOLVE (adding the source_mrn and system flags for completeness) ---
+    /// Resolves any patient identifier (MRN, old ID, SSN, etc.) to the canonical, active MPI record.
+    Resolve {
+        /// The internal MPI ID or the primary external ID (MRN, SSN) to resolve.
+        #[arg(long, conflicts_with = "external_id")]
+        id: Option<String>,
+        
+        /// An external ID value (e.g., "98765") that is not the primary ID. Must be used with --id_type.
+        #[arg(long, conflicts_with = "id")]
+        external_id: Option<String>,
+        
+        /// The type of ID being provided (e.g., "MRN", "SSN", "InternalID", "ForeignMRN").
+        /// Required if using --external-id.
+        #[arg(long)]
+        id_type: Option<String>,
+
+        // --- SOURCE_MRN FLAG (Logic for conflicts_with_all removed for flexibility) ---
+        /// The primary source MRN for the identity to resolve, if different from --id/--external-id.
+        #[arg(long, aliases = ["source-mrn"])]
+        source_mrn: Option<String>,
+        // --- END SOURCE_MRN FLAG ---
+
+        // --- MISSING SYSTEM FLAG ADDED HERE (To satisfy handle_mpi_resolve 5th argument) ---
+        /// The system or source that the external ID originates from (e.g., "Epic", "Cerner").
+        /// Required if using --external-id.
+        #[arg(long)]
+        system: Option<String>,
+        // --- END MISSING FLAG ---
+    },
+
+    /// Performs an indexed, fast search for patient records based on key demographics.
+    Search {
+        /// Optional: Patient's full name (e.g., "Alex Johnson"). Conflicts with --first-name and --last-name.
+        #[arg(long, conflicts_with_all = ["first_name", "last_name"])]
+        name: Option<String>,
+
+        /// Optional: Patient's first name.
+        #[arg(long)]
+        first_name: Option<String>,
+
+        /// Optional: Patient's last name.
+        #[arg(long)]
+        last_name: Option<String>,
+
+        /// Optional: Patient's date of birth (YYYY-MM-DD).
+        #[arg(long)]
+        dob: Option<String>,
+
+        /// Optional: Patient's address (street/city/zip).
+        #[arg(long)]
+        address: Option<String>,
+        
+        /// Optional: Patient's phone number.
+        #[arg(long)]
+        phone: Option<String>,
     },
 }
 
