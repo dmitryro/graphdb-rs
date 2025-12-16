@@ -164,7 +164,7 @@ pub enum CypherValue {
     Map(HashMap<String, CypherValue>),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq,)]
 pub enum CypherQuery {
     CreateNode {
         label: String,
