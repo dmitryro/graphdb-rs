@@ -5,13 +5,11 @@ use serde_json::{json, Value};
 use std::collections::{HashSet, HashMap};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
+use crate::config::QueryResult; 
 use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
 use models::properties::PropertyValue;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PATTERN TYPE ALIASES
-// ─────────────────────────────────────────────────────────────────────────────
+use models::identifiers::SerializableUuid;
 
 /// (variable_name_opt, label_opt, properties_map)
 pub type NodePattern = (Option<String>, Option<String>, HashMap<String, Value>);
@@ -26,19 +24,132 @@ pub type RelPattern = (
     Option<bool>,
 );
 
+/// Represents the possible outcomes of executing a Cypher query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CypherResponse {
+    /// Indicates successful completion of a mutation (CREATE, SET, DELETE, etc.)
+    /// The inner Value typically holds a status object (e.g., { "message": "Success" }).
+    Success(Value),
+
+    /// Represents the structured data returned by a read query (MATCH ... RETURN).
+    /// The inner Value is typically an array of result rows.
+    ResultSet(Value),
+
+    /// Returns a list of the created entities (Nodes/Edges).
+    /// Used for CREATE statements where no explicit RETURN is specified.
+    CreatedEntities(Value), 
+
+    /// General error wrapper (often preferred to let the external function handle the error,
+    /// but useful if you want to explicitly wrap errors that are not GraphError).
+    Error(String),
+}
+
+/// An internal wrapper to parse and manipulate the opaque String data 
+/// inside the QueryResult enum, treating it as a JSON array of result rows.
+pub struct InternalQueryResult {
+    pub data: Value, 
+}
+
+impl InternalQueryResult {
+    /// Initializes an empty result set for the start of a CHAIN operation.
+    fn empty() -> Self {
+        InternalQueryResult { data: Value::Array(vec![]) }
+    }
+    
+    /// Parses the opaque QueryResult::Success(String) into a manipulable JSON Value.
+    fn from_query_result(qr: QueryResult) -> GraphResult<Self> {
+        match qr {
+            QueryResult::Success(s) => serde_json::from_str(&s)
+                .map(|data| InternalQueryResult { data })
+                .map_err(|e| GraphError::DeserializationError(
+                    format!("Failed to parse query result string as JSON: {}", e)
+                )),
+            QueryResult::Null => Ok(Self::empty()),
+        }
+    }
+    
+    /// Serializes the JSON Value back into QueryResult::Success(String) or Null.
+    fn to_query_result(self) -> GraphResult<QueryResult> {
+        if self.data.is_array() && self.data.as_array().map_or(true, |a| a.is_empty()) {
+            Ok(QueryResult::Null)
+        } else {
+            serde_json::to_string(&self.data)
+                .map(QueryResult::Success)
+                .map_err(|e| GraphError::SerializationError(
+                    format!("Failed to serialize result back to string: {}", e)
+                ))
+        }
+    }
+    
+    /// Checks for minimal compatibility (i.e., both results are JSON arrays).
+    fn check_compatibility(&self, other: &Self) -> GraphResult<()> {
+        if !self.data.is_array() || !other.data.is_array() {
+            return Err(GraphError::QueryExecutionError(
+                "UNION operands must produce structured, compatible data (JSON array expected).".to_string(),
+            ));
+        }
+        // In a real database, detailed schema comparison (column names/types) would happen here.
+        Ok(())
+    }
+    
+    /// Logic for UNION ALL: combines results and retains duplicates.
+    fn union_all(self, other: Self) -> Self {
+        let mut combined_array = Vec::new();
+        if let Some(arr) = self.data.as_array() { combined_array.extend_from_slice(arr); }
+        if let Some(arr) = other.data.as_array() { combined_array.extend_from_slice(arr); }
+        InternalQueryResult { data: Value::Array(combined_array) }
+    }
+    
+    /// Logic for UNION (DISTINCT): combines results and removes duplicates.
+    fn union_distinct(self, other: Self) -> Self {
+        let mut distinct_set: HashSet<Value> = HashSet::new();
+        let mut combined_array = Vec::new();
+
+        let process_array = |data: Value, set: &mut HashSet<Value>, vec: &mut Vec<Value>| {
+            if let Some(arr) = data.as_array() {
+                for item in arr {
+                    // Assumes the result rows (JSON objects) are hashable
+                    if set.insert(item.clone()) {
+                        vec.push(item.clone());
+                    }
+                }
+            }
+        };
+
+        process_array(self.data, &mut distinct_set, &mut combined_array);
+        process_array(other.data, &mut distinct_set, &mut combined_array);
+
+        InternalQueryResult { data: Value::Array(combined_array) }
+    }
+}
+
 /// (path_variable_name_opt, nodes_vec, relationships_vec)
 /// Represents a complex path structure, likely used for MATCH.
 pub type Pattern = (Option<String>, Vec<NodePattern>, Vec<RelPattern>);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// QUERY ENUMS & STRUCTS
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchPattern {
     pub nodes: Vec<NodePattern>,
     pub relationships: Vec<RelPattern>,
 }
+
+// The complex type that parse_match_clause_patterns returns.
+// This type is derived from the previous log and is used as the O (Output) type in IResult.
+pub type PatternsReturnType = std::vec::Vec<(
+    std::option::Option<std::string::String>,
+    std::vec::Vec<(
+        std::option::Option<std::string::String>,
+        std::option::Option<std::string::String>,
+        std::collections::HashMap<std::string::String, serde_json::Value>,
+    )>,
+    std::vec::Vec<(
+        std::option::Option<std::string::String>,
+        std::option::Option<std::string::String>,
+        std::option::Option<(std::option::Option<u32>, std::option::Option<u32>)>,
+        std::collections::HashMap<std::string::String, serde_json::Value>,
+        std::option::Option<bool>,
+    )>,
+)>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CypherValue {
@@ -51,6 +162,128 @@ pub enum CypherValue {
     Edge(Edge),
     List(Vec<CypherValue>),
     Map(HashMap<String, CypherValue>),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum CypherQuery {
+    CreateNode {
+        label: String,
+        properties: HashMap<String, Value>,
+    },
+    CreateNodes {
+        nodes: Vec<(String, HashMap<String, Value>)>,
+    },
+    MatchNode {
+        label: Option<String>,
+        properties: HashMap<String, Value>,
+    },
+    MatchMultipleNodes {
+        nodes: Vec<NodePattern>,
+    },
+    MatchRemove {
+        match_patterns: Vec<Pattern>,
+        remove_clauses: Vec<(String, String)>,
+    },
+    CreateComplexPattern {
+        nodes: Vec<NodePattern>,
+        relationships: Vec<RelPattern>,
+    },
+    CreateStatement {
+        patterns: Vec<Pattern>,
+        return_items: Vec<String>,
+    },
+    MatchPattern {
+        patterns: Vec<Pattern>,
+    },
+    MatchSet {
+        match_patterns: Vec<Pattern>,
+        set_clauses: Vec<(String, String, Value)>,
+    },
+    MatchCreateSet {
+        match_patterns: Vec<Pattern>,
+        create_patterns: Vec<Pattern>,
+        set_clauses: Vec<(String, String, Value)>,
+    },
+    MatchCreate {
+        match_patterns: Vec<Pattern>,
+        create_patterns: Vec<Pattern>,
+    },
+    CreateEdgeBetweenExisting {
+        source_var: String,
+        rel_type: String,
+        properties: HashMap<String, Value>,
+        target_var: String,
+    },
+    CreateEdge {
+        from_id: SerializableUuid,
+        edge_type: String,
+        to_id: SerializableUuid,
+    },
+    SetNode {
+        id: SerializableUuid,
+        properties: HashMap<String, Value>,
+    },
+    DeleteNode {
+        id: SerializableUuid,
+    },
+    SetKeyValue {
+        key: String,
+        value: String,
+    },
+    GetKeyValue {
+        key: String,
+    },
+    DeleteKeyValue {
+        key: String,
+    },
+    CreateIndex {
+        label: String,
+        properties: Vec<String>,
+    },
+    MatchPath {
+        path_var: String,
+        left_node: String,
+        right_node: String,
+        return_clause: String,
+    },
+    DeleteEdges {
+        edge_variable: String,
+        pattern: MatchPattern,
+        where_clause: Option<WhereClause>,
+    },
+    DetachDeleteNodes {
+        node_variable: String,
+        label: Option<String>,
+    },
+    Merge {
+        patterns: Vec<Pattern>,
+        on_create_set: Vec<(String, String, Value)>,
+        on_match_set: Vec<(String, String, Value)>,
+    },
+    ReturnStatement {
+        projection_string: String,
+        order_by: Option<String>, // Placeholder for ORDER BY expressions
+        skip: Option<i64>,        // Parsed value for SKIP
+        limit: Option<i64>,       // Parsed value for LIMIT
+    },
+    // NEW: Standalone SET clause for chaining
+    SetStatement { 
+        assignments: Vec<(String, String, Value)>, 
+    },
+    
+    // NEW: Standalone DELETE/DETACH DELETE clause
+    DeleteStatement { 
+        variables: Vec<String>, // List of variable names to delete
+        detach: bool,
+    },
+    
+    // NEW: Standalone REMOVE clause
+    RemoveStatement { 
+        removals: Vec<(String, String)>, // e.g., ("n", "label") or ("n", "property")
+    },
+    Batch(Vec<CypherQuery>),
+    Chain(Vec<CypherQuery>),
+    Union(Box<CypherQuery>, bool, Box<CypherQuery>),
 }
 
 impl From<&Value> for CypherValue {
@@ -117,10 +350,25 @@ pub enum Expression {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinaryOp {
-    Eq, Neq, Lt, Lte, Gt, Gte,
-    And, Or, Xor,
-    Plus, Minus, Mul, Div, Mod,
-    In, Contains, StartsWith, EndsWith, Regex,
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    And,
+    Or,
+    Xor,
+    Plus,
+    Minus,
+    Mul,
+    Div,
+    Mod,
+    In,
+    Contains,
+    StartsWith,
+    EndsWith,
+    Regex,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,76 +435,51 @@ impl GraphMatch {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXECUTION RESULT (Comprehensive Implementation)
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Represents the final result of a write operation (CREATE, MERGE, SET, DELETE).
-/// It tracks the set of entities affected by the query.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ExecutionResult {
-    /// IDs of all nodes that were newly created.
     pub created_nodes: HashSet<Uuid>,
-    /// IDs of all nodes that had properties or labels updated.
     pub updated_nodes: HashSet<Uuid>,
-    /// IDs of all nodes that were deleted.
     pub deleted_nodes: HashSet<Uuid>,
-    /// IDs of all edges that were newly created.
     pub created_edges: HashSet<Uuid>,
-    /// IDs of all edges that were updated.
     pub updated_edges: HashSet<Uuid>,
-    /// IDs of all edges that were deleted.
     pub deleted_edges: HashSet<Uuid>,
-    /// Stores any key-value pairs that were updated (key)
     pub updated_kv_keys: HashSet<String>,
-    
-    // Stores the results of any `RETURN` clause (for mixed read/write queries).
-    // Typically used for returning specific properties or computed values.
-    // pub return_data: Vec<HashMap<String, CypherValue>>, // Assuming CypherValue exists
 }
 
 impl ExecutionResult {
-    /// Creates a new, empty execution result.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Records a newly created node.
     pub fn add_created_node(&mut self, id: Uuid) {
         self.created_nodes.insert(id);
     }
 
-    /// Records a node that was updated (e.g., via SET or ON MATCH SET).
     pub fn add_updated_node(&mut self, id: Uuid) {
         self.updated_nodes.insert(id);
     }
 
-    /// Records a node that was deleted.
     pub fn add_deleted_node(&mut self, id: Uuid) {
         self.deleted_nodes.insert(id);
     }
 
-    /// Records a newly created edge.
     pub fn add_created_edge(&mut self, id: Uuid) {
         self.created_edges.insert(id);
     }
 
-    /// Records an edge that was updated.
     pub fn add_updated_edge(&mut self, id: Uuid) {
         self.updated_edges.insert(id);
     }
 
-    /// Records an edge that was deleted.
     pub fn add_deleted_edge(&mut self, id: Uuid) {
         self.deleted_edges.insert(id);
     }
 
-    /// Records a key-value pair update.
     pub fn add_updated_kv_key(&mut self, key: String) {
         self.updated_kv_keys.insert(key);
     }
-    
-    /// Checks if any entity was affected by the query.
+
     pub fn has_mutations(&self) -> bool {
         !(self.created_nodes.is_empty()
             && self.updated_nodes.is_empty()
@@ -267,17 +490,14 @@ impl ExecutionResult {
             && self.updated_kv_keys.is_empty())
     }
 
-    /// Returns the total number of entities (nodes and edges) created.
     pub fn created_count(&self) -> usize {
         self.created_nodes.len() + self.created_edges.len()
     }
 
-    /// Returns the total number of entities (nodes and edges) updated.
     pub fn updated_count(&self) -> usize {
         self.updated_nodes.len() + self.updated_edges.len()
     }
 
-    /// Combines the results of another `ExecutionResult` into this one.
     pub fn extend(&mut self, other: ExecutionResult) {
         self.created_nodes.extend(other.created_nodes);
         self.updated_nodes.extend(other.updated_nodes);
@@ -286,92 +506,23 @@ impl ExecutionResult {
         self.updated_edges.extend(other.updated_edges);
         self.deleted_edges.extend(other.deleted_edges);
         self.updated_kv_keys.extend(other.updated_kv_keys);
-        // If return_data existed, you would concatenate it here.
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MUTATION TYPE
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Represents a single change operation that needs to be persisted to the database.
-/// This is typically generated during query execution and committed by the storage manager.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mutation {
-    /// Create a new node with the given UUID (Id)
     CreateNode(Uuid),
-    /// Update an existing node (e.g., set properties)
     UpdateNode(Uuid),
-    /// Delete a node (must include all attached edges)
     DeleteNode(Uuid),
-    /// Create a new edge (relationship) with the given UUID (Id)
     CreateEdge(Uuid),
-    /// Update an existing edge (e.g., set properties)
     UpdateEdge(Uuid),
-    /// Delete an edge (relationship)
     DeleteEdge(Uuid),
-    /// Set a key-value pair in the global Key-Value store
     SetKeyValue(String),
-    /// Delete a key-value pair from the global Key-Value store
     DeleteKeyValue(String),
-    /// Create a new index
     CreateIndex(String),
-    /// Drop an existing index
     DropIndex(String),
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CYPHER QUERY ENUM (NEWLY ADDED)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Represents a parsed Cypher query statement.
-#[derive(Debug, Clone)]
-pub enum CypherQuery {
-    /// MATCH clause (nodes, relationships, where_clause_opt, skip_opt, limit_opt)
-    Match {
-        patterns: Vec<Pattern>,
-        where_clause: Option<WhereClause>,
-        skip: Option<i64>,
-        limit: Option<i64>,
-    },
-    /// CREATE clause (patterns)
-    Create {
-        patterns: Vec<Pattern>,
-    },
-    /// MERGE clause. This is typically a single path pattern.
-    Merge {
-        patterns: Vec<Pattern>,
-        // List of (variable_name, property_name, value) to SET on CREATE
-        on_create_set: Vec<(String, String, Value)>, 
-        // List of (variable_name, property_name, value) to SET on MATCH
-        on_match_set: Vec<(String, String, Value)>, 
-    },
-    /// DELETE/DETACH DELETE clause (variables_to_delete, detach)
-    Delete {
-        variables: Vec<String>,
-        detach: bool,
-    },
-    /// SET clause (updates)
-    Set {
-        updates: Vec<SetUpdate>, // Assuming SetUpdate is defined elsewhere, or use a simpler structure.
-    },
-    /// RETURN clause (expressions_to_return)
-    Return {
-        projections: Vec<String>, // Simplification: just return variables for now
-    },
-    /// Fallback for unsupported statements
-    Unsupported(String),
-}
-
-#[derive(Debug, Clone)]
-pub enum SetUpdate {
-    Property(PropertyAccess, Expression),
-    // Add other types of SET updates if needed (e.g., set label)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WHERE EVALUATION — FULLY INTEGRATED
-// ─────────────────────────────────────────────────────────────────────────────
 
 impl WhereClause {
     pub fn evaluate(&self, ctx: &EvaluationContext) -> GraphResult<bool> {
@@ -390,13 +541,11 @@ impl Expression {
     pub fn evaluate(&self, ctx: &EvaluationContext) -> GraphResult<CypherValue> {
         match self {
             Expression::Literal(val) => Ok(val.clone()),
-
             Expression::Variable(name) => ctx
                 .variables
                 .get(name)
                 .cloned()
                 .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{name}' not found"))),
-
             Expression::Property(access) => match access {
                 PropertyAccess::Vertex(var, prop) => {
                     if let Some(CypherValue::Vertex(v)) = ctx.variables.get(var) {
@@ -410,9 +559,6 @@ impl Expression {
                 }
                 PropertyAccess::Edge(var, prop) => {
                     if let Some(CypherValue::Edge(e)) = ctx.variables.get(var) {
-                        // NOTE: Edges currently don't support properties in models, but we'll assume they might here.
-                        // If `e.properties` does not exist, this will cause an error or need a fallback.
-                        // Based on the provided code, Edge has a properties map.
                         Ok(e.properties
                             .get(prop)
                             .map(property_value_to_cypher)
@@ -427,13 +573,11 @@ impl Expression {
                     .cloned()
                     .ok_or_else(|| GraphError::EvaluationError(format!("Parameter '${name}' not provided"))),
             },
-
             Expression::Binary { op, left, right } => {
                 let l = left.evaluate(ctx)?;
                 let r = right.evaluate(ctx)?;
                 op.apply(&l, &r)
             }
-
             Expression::Unary { op, expr } => op.apply(&expr.evaluate(ctx)?),
         }
     }
@@ -472,7 +616,6 @@ impl UnaryOp {
     }
 }
 
-// Helpers
 fn to_bool(v: &CypherValue) -> GraphResult<bool> {
     match v {
         CypherValue::Bool(b) => Ok(*b),

@@ -6,7 +6,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_while1, take_until, take_till, take_while,},
     character::complete::{char, multispace0, multispace1, alphanumeric1},
-    combinator::{map, opt, recognize, value},
+    combinator::{map, opt, recognize, value, map_res, peek},
     multi::{separated_list0, separated_list1, many0}, 
     number::complete::double,
     sequence::{delimited, pair, preceded, tuple, terminated, separated_pair},
@@ -16,6 +16,8 @@ use nom::{
     error as NomError,
     error::Error as NomErrorType, 
 };
+use std::pin::Pin;
+use std::future::Future;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet,};
 use std::sync::Arc;
@@ -24,145 +26,60 @@ use chrono::Utc;
 use models::identifiers::{Identifier, SerializableUuid};
 use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
-use models::properties::{ PropertyValue, SerializableFloat };
+use models::properties::{ PropertyValue, SerializableFloat, HashablePropertyMap };
 use crate::graph_engine::graph_service::{ GraphService, GRAPH_SERVICE, initialize_graph_service, GraphEvent,}; 
 use crate::graph_engine::traversal::TraverseExt;
 use crate::graph_engine::pattern_match::node_matches_constraints; 
 use crate::database::Database;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
-use crate::config::StorageConfig;
+use crate::config::{ StorageConfig, QueryResult };
 use crate::query_parser::query_types::*;
 use crate::query_parser::parser_zmq::trigger_async_graph_cleanup;
 use crate::storage_engine::GraphOp; // Fixes E0433: use of undeclared type `GraphOp`
 
-// --------------------------------------------------------------------------
-// This function must be placed outside of full_statement_parser.
-// --------------------------------------------------------------------------
+type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-// The complex type that parse_match_clause_patterns returns.
-// This type is derived from the previous log and is used as the O (Output) type in IResult.
-type PatternsReturnType = std::vec::Vec<(
-    std::option::Option<std::string::String>,
-    std::vec::Vec<(
-        std::option::Option<std::string::String>,
-        std::option::Option<std::string::String>,
-        std::collections::HashMap<std::string::String, serde_json::Value>,
-    )>,
-    std::vec::Vec<(
-        std::option::Option<std::string::String>,
-        std::option::Option<std::string::String>,
-        std::option::Option<(std::option::Option<u32>, std::option::Option<u32>)>,
-        std::collections::HashMap<std::string::String, serde_json::Value>,
-        std::option::Option<bool>,
-    )>,
-)>;
+// Helper function (must be defined in or accessible to QueryExecEngine)
+// Converts Result<QueryResult, GraphError> into Result<Value, GraphError>
+// --- Assuming this helper function is defined/accessible within QueryExecEngine scope ---
+// It handles the conversion from the internal QueryResult type to the public serde_json::Value type.
+fn query_result_to_value(qr_result: GraphResult<QueryResult>) -> GraphResult<Value> {
+    use serde_json::Value;
+    // Note: GraphResult is Result<T, GraphError>
+    let qr = qr_result?; // Propagate GraphError
+    match qr {
+        // Deserialize the JSON string inside QueryResult::Success
+        QueryResult::Success(s) => serde_json::from_str(&s)
+            .map_err(|e| GraphError::DeserializationError(format!("Failed to parse QueryResult string to Value: {}", e))),
+        // Treat Null result as an empty JSON array, typical for no result set
+        QueryResult::Null => Ok(Value::Array(Vec::new())),
+        // Handle other possible results
+        _ => Err(GraphError::InternalError("Unsupported QueryResult type encountered.".into())),
+    }
+}
 
-#[derive(Debug, PartialEq)]
-pub enum CypherQuery {
-    CreateNode {
-        label: String,
-        properties: HashMap<String, Value>,
-    },
-    CreateNodes {
-        nodes: Vec<(String, HashMap<String, Value>)>,
-    },
-    MatchNode {
-        label: Option<String>,
-        properties: HashMap<String, Value>,
-    },
-    MatchMultipleNodes {
-        nodes: Vec<NodePattern>,
-    },
-    MatchRemove {
-        match_patterns: Vec<Pattern>,
-        remove_clauses: Vec<(String, String)>,
-    },
-    CreateComplexPattern {
-        nodes: Vec<NodePattern>,
-        relationships: Vec<RelPattern>,
-    },
-    // NEW VARIANT: Handles general CREATE statements with RETURN clause
-    CreateStatement {
-        patterns: Vec<Pattern>,      // List of all comma-separated patterns
-        return_items: Vec<String>,   // List of variables to return (u, p1, p2)
-    },
-    MatchPattern {
-        patterns: Vec<Pattern>,
-    },
-    MatchSet {
-        match_patterns: Vec<Pattern>,
-        set_clauses: Vec<(String, String, Value)>, // (variable, property, value)
-    },
-    MatchCreateSet {
-        match_patterns: Vec<Pattern>,
-        create_patterns: Vec<Pattern>,
-        set_clauses: Vec<(String, String, Value)>,
-    },
-    MatchCreate {
-        match_patterns: Vec<Pattern>,
-        create_patterns: Vec<Pattern>,
-    },
-    CreateEdgeBetweenExisting {
-        source_var: String,
-        rel_type: String,
-        properties: HashMap<String, Value>,
-        target_var: String,
-    },
-    CreateEdge {
-        from_id: SerializableUuid,
-        edge_type: String,
-        to_id: SerializableUuid,
-    },
-    SetNode {
-        id: SerializableUuid,
-        properties: HashMap<String, Value>,
-    },
-    DeleteNode {
-        id: SerializableUuid,
-    },
-    SetKeyValue {
-        key: String,
-        value: String,
-    },
-    GetKeyValue {
-        key: String,
-    },
-    DeleteKeyValue {
-        key: String,
-    },
-    CreateIndex {
-        label: String,
-        properties: Vec<String>,
-    },
-    // ---------- NEW ----------
-    MatchPath {
-        path_var: String,      //  e.g.  path
-        left_node: String,     //  e.g.  (p:Patient {id: "12345"})
-        right_node: String,    //  e.g.  (related)
-        return_clause: String, //  e.g.  collect(DISTINCT …
-    },
-    /// DELETE edges matched by pattern
-    DeleteEdges {
-        edge_variable: String,
-        pattern: MatchPattern,
-        where_clause: Option<WhereClause>,
-    },
-    DetachDeleteNodes {
-        /// The variable name used in the MATCH clause, e.g. "n" in MATCH (n)
-        node_variable: String,
-        /// Optional label filter, e.g. Some("Person") in MATCH (n:Person)
-        label: Option<String>,
-    },
-    Merge {
-        patterns: Vec<Pattern>,
-        // List of (variable_name, property_name, value) to SET on CREATE
-        on_create_set: Vec<(String, String, Value)>, // Using concrete tuple type 
-        // List of (variable_name, property_name, value) to SET on MATCH
-        on_match_set: Vec<(String, String, Value)>, // Using concrete tuple type
-    },
-    Batch(Vec<CypherQuery>),
+async fn execute_chain_internal(
+    clauses: Vec<CypherQuery>,
+    db: &Database, // Pass the Database reference
+    storage: Arc<dyn GraphStorageEngine + Send + Sync>, // Pass the Storage Arc
+) -> GraphResult<Value> {
+    
+    let mut final_value_result: GraphResult<Value> = Ok(Value::Array(Vec::new()));
+    
+    for clause in clauses.into_iter() {
+        // Execute each clause sequentially.
+        let clause_value_result = execute_cypher(clause, db, storage.clone()).await;
+        
+        if clause_value_result.is_err() {
+            // If any clause fails, abort the chain and return the error.
+            return clause_value_result;
+        }
+        // Keep track of the result from the last successful clause.
+        final_value_result = clause_value_result;
+    }
 
+    final_value_result
 }
 
 // Add this helper function before execute_cypher
@@ -850,6 +767,71 @@ fn parse_create_node(input: &str) -> IResult<&str, CypherQuery> {
     }))
 }
 
+// Helper function to convert PropertyValue to serde_json::Value
+fn property_value_to_json(prop_val: PropertyValue) -> Value {
+    match prop_val {
+        PropertyValue::String(s) => Value::String(s),
+        PropertyValue::Integer(i) => Value::Number(i.into()),
+        PropertyValue::I32(i) => Value::Number(i.into()),
+        PropertyValue::Float(f) => Value::Number(serde_json::Number::from_f64(f.0).unwrap_or(serde_json::Number::from(0))),
+        PropertyValue::Boolean(b) => Value::Bool(b),
+        PropertyValue::Uuid(uuid) => Value::String(uuid.to_string()),
+        PropertyValue::Byte(b) => Value::Number(b.into()),
+        PropertyValue::Vertex(v) => {
+            // Convert vertex to a JSON representation using Debug format
+            Value::String(format!("Vertex({:?})", v.0))
+        },
+        PropertyValue::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (key, val) in map.0.into_iter() {
+                obj.insert(key.0.to_string(), property_value_to_json(val));
+            }
+            Value::Object(obj)
+        }
+    }
+}
+
+// Required to parse key=value assignments for SET and MERGE clauses: `n.name = 'Joe'`
+// Returns (String, String, Value) because that's what the rest of the code expects
+fn parse_set_assignment_tuple(input: &str) -> IResult<&str, (String, String, Value)> {
+    map(
+        tuple((
+            // Variable (e.g., n)
+            parse_identifier, 
+            // .Property (e.g., .name)
+            preceded(char('.'), parse_identifier), 
+            // = Value
+            preceded(tuple((multispace0::<&str, NomErrorType<&str>>, tag("="), multispace0::<&str, NomErrorType<&str>>)), parse_property), 
+        )),
+        |(var, prop_name, (_, value))| (var.to_string(), prop_name.to_string(), value),
+    ).parse(input)
+}
+
+pub fn parse_merge(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        tuple((
+            preceded(
+                terminated(tag_no_case("MERGE"), multispace1),
+                separated_list1(preceded(multispace0::<&str, NomErrorType<&str>>, char(',')), parse_pattern),
+            ),
+            opt(preceded(multispace1, parse_on_set_clause("ON CREATE"))),
+            opt(preceded(multispace1, parse_on_set_clause("ON MATCH"))),
+        )),
+        |(patterns, on_create, on_match)| {
+            // parse_on_set_clause already returns Vec<(String, String, Value)>
+            // so no conversion needed
+            let on_create_set = on_create.unwrap_or_default();
+            let on_match_set = on_match.unwrap_or_default();
+            
+            CypherQuery::Merge {
+                patterns,
+                on_create_set,
+                on_match_set,
+            }
+        },
+    ).parse(input)
+}
+
 fn parse_merge_statement(input: &str) -> IResult<&str, CypherQuery> {
     let (input, _) = tag_no_case("MERGE")(input)?;
     let (input, _) = multispace0(input)?;
@@ -921,6 +903,7 @@ fn parse_merge_statement(input: &str) -> IResult<&str, CypherQuery> {
         on_match_set,
     }))
 }
+
 
 fn parse_match_multiple_nodes(input: &str) -> IResult<&str, CypherQuery> {
     map(
@@ -2253,6 +2236,109 @@ fn parse_single_set_assignment(input: &str) -> IResult<&str, (String, String, Va
     ).parse(input)
 }
 
+// New function: Parses a BATCH statement: BATCH { ...; ...; }
+fn parse_batch(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        preceded(
+            terminated(tag_no_case("BATCH"), multispace1),
+            // Uses many1 for required one-or-more statements
+            delimited(
+                char('{'), 
+                many1(preceded(multispace0, terminated(parse_cypher_query_chain, char(';')))), 
+                preceded(multispace0, char('}'))
+            ),
+        ),
+        |statements| CypherQuery::Batch(statements),
+    ).parse(input)
+}
+
+fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
+    // Try each parser directly without peek checks
+    
+    // 1. Try parse_merge 
+    if let Ok(result) = parse_merge(input) {
+        return Ok(result);
+    }
+
+    // 2. Try parse_match_clause (Handles MATCH and OPTIONAL MATCH)
+    if let Ok((remaining, patterns)) = parse_match_clause(input) {
+        return Ok((remaining, CypherQuery::MatchPattern { patterns }));
+    }
+    
+    // 3. Try parse_with_clause
+    if let Ok(result) = parse_with_clause(input) {
+        return Ok(result);
+    }
+
+    // 4. Try parse_create_clause and wrap it
+    if let Ok((remaining, patterns)) = parse_create_clause(input) {
+        return Ok((remaining, CypherQuery::CreateStatement { 
+            patterns, 
+            return_items: vec![] 
+        }));
+    }
+    
+    // 5. Try modifying clauses (SET, DELETE, REMOVE)
+    if let Ok(result) = parse_modifying_clause(input) {
+        return Ok(result);
+    }
+
+    // If nothing matches, return an error
+    Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Alt)))
+}
+
+pub fn parse_cypher_query_chain(input: &str) -> IResult<&str, CypherQuery> {
+    use nom::multi::many0;
+    // 1. Parse the initial query block (e.g., MATCH...CREATE or just MATCH...RETURN)
+    
+    // Parse multiple preceding modifying clauses (MATCH, MERGE, WITH, etc.), separated by mandatory whitespace
+    let (input, clauses) = many0(terminated(parse_single_query_clause, multispace1)).parse(input)?;
+    
+    // Parse the final, optional RETURN clause - should return CypherQuery
+    let (input, return_clause_opt) = opt(parse_return_clause).parse(input)?;
+    
+    // Combine clauses with return clause if present
+    let all_clauses = if let Some(ret) = return_clause_opt {
+        // Only push if ret is actually a CypherQuery (not ())
+        // This check helps if parse_return_clause has implementation issues
+        let mut combined = clauses;
+        combined.push(ret);
+        combined
+    } else {
+        clauses
+    };
+    
+    // Determine the base query structure
+    let initial_query = if all_clauses.len() == 1 {
+        // If only one clause, return it directly
+        all_clauses.into_iter().next().unwrap()
+    } else if all_clauses.is_empty() {
+        // If no clauses found, try to parse BATCH
+        return parse_batch(input);
+    } else {
+        // If multiple clauses (MATCH...MERGE...CREATE), chain them
+        CypherQuery::Chain(all_clauses)
+    };
+    
+    // 2. Handle subsequent UNION/UNION ALL parts recursively
+    let union_block_parser = pair(
+        preceded(multispace1, alt((
+            map(terminated(tag_no_case::<_, _, NomErrorType<&str>>("UNION ALL"), multispace1), |_| true),
+            map(terminated(tag_no_case::<_, _, NomErrorType<&str>>("UNION"), multispace1), |_| false),
+        ))),
+        parse_cypher_query_chain // Recursive call
+    );
+    let (input, union_parts) = many0(union_block_parser).parse(input)?;
+    
+    // 3. Assemble the result recursively: Left-associative Union structure
+    let mut current_query = initial_query;
+    for (is_all, next_query) in union_parts {
+        // The Union variant must store the sub-queries in Box<CypherQuery>
+        current_query = CypherQuery::Union(Box::new(current_query), is_all, Box::new(next_query));
+    }
+    Ok((input, current_query))
+}
+
 // CRITICAL FIX:
 // 1. Make sure "use nom::Parser;" is at the top of your file
 // 2. Use .parse(input)? syntax everywhere (this is Nom 8 with Parser trait)
@@ -2652,28 +2738,47 @@ fn parse_node_pattern(input: &str) -> GraphResult<(Option<String>, HashMap<Strin
 // 4. Paste them into your file where the old full_statement_parser was
 // 5. Make sure parse_return_clause exists and looks like this:
 // Helper to consume RETURN ... [ORDER BY ...]
-fn parse_return_clause(input: &str) -> IResult<&str, ()> {
+
+fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
     // 1. Consume 'RETURN' keyword
     let (input, _) = preceded(
-        multispace0,
+        multispace0::<&str, NomErrorType<&str>>,
         tag_no_case("RETURN"),
     ).parse(input)?;
-
-    // 2. Consume the projection list (everything until ORDER BY or the end)
-    let (input, _) = recognize(
+    
+    // 2. Consume the projection list (everything until ORDER BY, SKIP, LIMIT, or end)
+    let (input, projection_items_str) = recognize(
         pair(
-            // Projection items (e.g., p.name, p.age)
-            take_while1(|c: char| c != 'O' && c != ';'), 
-            // Optional ORDER BY clause
-            opt(preceded(
-                tuple((multispace0, tag_no_case("ORDER BY"), multispace1)),
-                take_while(|c: char| c != ';'),
-            )),
+            // Projection items (e.g., p.name, p.age, *) - take everything until a next major clause or ';'
+            take_while1(|c: char| {
+                !matches!(c.to_ascii_uppercase(), 'O' | 'W' | 'L' | 'S' | 'D' | ';')
+            }),
+            // Optional ORDER BY/SKIP/LIMIT clauses
+            opt(alt((
+                // ORDER BY
+                preceded(
+                    tuple((multispace0::<&str, NomErrorType<&str>>, tag_no_case("ORDER BY"), multispace1)),
+                    take_while(|c: char| c != ';'),
+                ),
+                // SKIP/LIMIT
+                preceded(
+                    tuple((multispace0::<&str, NomErrorType<&str>>, alt((tag_no_case::<_, _, NomErrorType<&str>>("SKIP"), tag_no_case::<_, _, NomErrorType<&str>>("LIMIT"))), multispace1)),
+                    take_while(|c: char| c != ';'),
+                ),
+            )))
         )
     ).parse(input)?;
-
-    // Return the remainder
-    Ok((input, ()))
+    
+    // 3. Create and return the CypherQuery variant
+    let return_query = CypherQuery::ReturnStatement { 
+        projection_string: projection_items_str.trim().to_string(),
+        order_by: None,  // TODO: Parse ORDER BY clause properly
+        skip: None,      // TODO: Parse SKIP clause properly
+        limit: None,     // TODO: Parse LIMIT clause properly
+    };
+    
+    // Return the remainder and the query
+    Ok((input, return_query))
 }
 
 // Conceptual Helper method on NodePattern, Vertex (or similar)
@@ -3104,6 +3209,94 @@ async fn exec_cypher_pattern(
     Ok((final_vertices, final_edges))
 }
 
+
+
+/// Parses simple standalone modifying clauses (CREATE, DELETE, SET, REMOVE).
+pub fn parse_modifying_clause(input: &str) -> IResult<&str, CypherQuery> {
+    use nom::{
+        branch::alt, bytes::complete::tag_no_case, character::complete::{char, multispace0, multispace1}, 
+        combinator::{map, opt}, multi::separated_list1, sequence::{preceded, terminated, tuple, pair}, IResult, Parser
+    };
+    
+    // Use manual if-let approach since Choice doesn't work with .parse()
+    // 1. CREATE Clause
+    if let Ok(result) = preceded(
+        terminated(tag_no_case("CREATE"), multispace1),
+        map(
+            parse_match_clause_patterns, 
+            |patterns| CypherQuery::CreateStatement { 
+                patterns, 
+                return_items: vec![]
+            }
+        )
+    ).parse(input) {
+        return Ok(result);
+    }
+    
+    // 2. SET Clause
+    if let Ok(result) = preceded(
+        terminated(tag_no_case("SET"), multispace1),
+        map(
+            separated_list1(
+                tuple((multispace0::<&str, NomErrorType<&str>>, char::<_, NomErrorType<&str>>(','), multispace0::<&str, NomErrorType<&str>>)),
+                parse_single_set_assignment
+            ), 
+            |assignments| CypherQuery::SetStatement { assignments }
+        )
+    ).parse(input) {
+        return Ok(result);
+    }
+    
+    // 3. DELETE Clause - handle both DETACH DELETE and simple DELETE
+    // First check for DETACH keyword
+    let detach_check = opt(terminated(tag_no_case::<_, _, NomErrorType<&str>>("DETACH"), multispace1)).parse(input);
+    if let Ok((after_detach, detach_opt)) = detach_check {
+        let is_detach = detach_opt.is_some();
+        
+        // Now check for DELETE keyword
+        if let Ok((after_delete, _)) = terminated(tag_no_case::<_, _, NomErrorType<&str>>("DELETE"), multispace1).parse(after_detach) {
+            // Parse the variable list
+            if let Ok((final_input, variables)) = separated_list1(
+                tuple((multispace0::<&str, NomErrorType<&str>>, char::<_, NomErrorType<&str>>(','), multispace0::<&str, NomErrorType<&str>>)),
+                nom::bytes::complete::take_while1(|c: char| !c.is_whitespace() && c != ',')
+            ).parse(after_delete) {
+                let vars: Vec<String> = variables.into_iter().map(String::from).collect();
+                return Ok((final_input, CypherQuery::DeleteStatement { 
+                    variables: vars,
+                    detach: is_detach,
+                }));
+            }
+        }
+    }
+    
+    // 4. REMOVE Clause
+    if let Ok(result) = preceded(
+        terminated(tag_no_case("REMOVE"), multispace1),
+        map(
+            separated_list1(
+                tuple((multispace0::<&str, NomErrorType<&str>>, char::<_, NomErrorType<&str>>(','), multispace0::<&str, NomErrorType<&str>>)),
+                parse_remove_clause
+            ), 
+            |removals| CypherQuery::RemoveStatement { removals }
+        )
+    ).parse(input) {
+        return Ok(result);
+    }
+    
+    Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Alt)))
+}
+
+
+pub fn parse_with_clause(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        preceded(
+            terminated(tag_no_case("WITH"), multispace1),
+            separated_list1(preceded(multispace0, char(',')), parse_identifier),
+        ),
+        |_| CypherQuery::Chain(vec![/* WITH placeholder */]),
+    ).parse(input)
+}
+
 // Must be defined in scope or imported:
 // use models::properties::PropertyValue; 
 // use models::errors::{GraphError, GraphResult}; 
@@ -3124,8 +3317,6 @@ async fn resolve_var(
     label: &Option<String>,
     properties: &HashMap<String, Value>,
 ) -> GraphResult<SerializableUuid> {
-    use crate::graph_core::data_structures::PropertyValue; // Assuming path
-    
     println!("===>       resolve_var: Looking for var='{}', label={:?}, {} properties", 
              var, label, properties.len());
     
@@ -3273,748 +3464,655 @@ pub async fn execute_cypher(
     _db: &Database,
     storage: Arc<dyn GraphStorageEngine + Send + Sync>,
 ) -> GraphResult<Value> {
-    let graph_service = initialize_graph_service(storage.clone()).await?;
-    match query {
-        // ----------  NEW  ----------
-        CypherQuery::Batch(stmts) => {
-             use futures::future::try_join_all;
+    // This public function remains simple and non-recursive
+    execute_cypher_sync_wrapper(query, _db, storage).await
+}
 
-             let tasks = stmts.into_iter().map(|stmt| {
-                 let db  = _db;      // copy the references you need
-                 let stg = storage.clone();
-                 async move { execute_cypher(stmt, db, stg).await }
-             });
-
-             let results = try_join_all(tasks).await?;
-             Ok(json!({ "results": results }))
-        }
-        // --- UPDATED MATCH PATTERN ---
-        // Handles pure MATCH ... RETURN, relying on a full pattern matcher.
-        CypherQuery::MatchPattern { patterns } => {
-            info!("===> EXECUTING MatchPattern with {} patterns", patterns.len());
-            
-            // This helper function must implement the core graph traversal logic (e.g., BFS/DFS).
-            // *** DELEGATION FIX: Call exec_cypher_pattern with graph_service ***
-            let (final_vertices, final_edges) = exec_cypher_pattern(patterns, &graph_service).await?;
-
-            Ok(json!({
-                "vertices": final_vertices,
-                "edges": final_edges,
-                "stats": {
-                    "vertices_matched": final_vertices.len(),
-                    "edges_matched": final_edges.len()
-                }
-            }))
-        }
-        CypherQuery::MatchCreateSet { match_patterns, create_patterns, set_clauses } => {
-            info!("===> EXECUTING MatchCreateSet: {} match patterns, {} create patterns, {} set clauses",
-                  match_patterns.len(), create_patterns.len(), set_clauses.len());
-            
-            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
-            let mut created_vertices = Vec::new();
-            let mut created_edges = Vec::new();
-            let mut updated_vertices = Vec::new();
-            
-            // 1. Resolve MATCH patterns
-            var_to_id.extend(
-                resolve_match_patterns(&graph_service, match_patterns).await?
-            );
-            
-            // 2. Process CREATE patterns (same as MatchCreate)
-            for pat in create_patterns.iter() {
-                // Create nodes
-                for (var_opt, label_opt, properties) in &pat.1 {
-                    if let Some(v) = var_opt.as_ref() {
-                        if !var_to_id.contains_key(v) {
-                            let props: GraphResult<HashMap<String, PropertyValue>> = properties
-                                .iter()
-                                .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
-                                .collect();
-                            
-                            let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
-                            let new_id = SerializableUuid(Uuid::new_v4());
-                            
-                            let vertex = Vertex {
-                                id: new_id,
-                                label: Identifier::new(final_label)?,
-                                properties: props?,
-                                created_at: Utc::now().into(),
-                                updated_at: Utc::now().into(),
-                            };
-                            
-                            graph_service.create_vertex(vertex.clone()).await?;
-                            var_to_id.insert(v.clone(), new_id);
-                            created_vertices.push(vertex);
-                        }
-                    }
-                }
-                
-                // Create edges
-                for (i, rel_tuple) in pat.2.iter().enumerate() {
-                    let from_var = pat.1[i].0.as_ref().ok_or(GraphError::ValidationError("No from var".into()))?;
-                    let to_var = pat.1[i + 1].0.as_ref().ok_or(GraphError::ValidationError("No to var".into()))?;
-                    
-                    let from_id = *var_to_id.get(from_var).unwrap();
-                    let to_id = *var_to_id.get(to_var).unwrap();
-                    
-                    let (_rel_var, label_opt, _len_range, properties, direction_opt) = rel_tuple;
-                    
-                    let (outbound_id, inbound_id) = match direction_opt {
-                        Some(true) => (to_id, from_id), // <-
-                        _ => (from_id, to_id),
-                    };
-                    
-                    let edge_type_str = label_opt.as_ref().cloned().unwrap_or("RELATED".to_string());
-                    
-                    let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
-                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
-                        .collect();
-                    
-                    let edge = Edge {
-                        id: SerializableUuid(Uuid::new_v4()),
-                        outbound_id,
-                        inbound_id,
-                        edge_type: Identifier::new(edge_type_str.clone())?,
-                        label: edge_type_str,
-                        properties: props?,
-                    };
-                    
-                    graph_service.create_edge(edge.clone()).await?;
-                    created_edges.push(edge);
-                }
-            }
-            
-            // 3. Apply SET clauses
-            for (var, prop, val) in set_clauses {
-                let id = var_to_id.get(&var)
-                    .ok_or(GraphError::ValidationError(format!("Unbound var in SET: {}", var)))?
-                    .0;
-                
-                let mut vertex = graph_service.get_vertex(&id).await
-                    .ok_or_else(|| {
-                        let id_str = format!("vertex_{}", id);
-                        GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) })
-                    })?;
-                
-                let prop_value = to_property_value(val)?;
-                vertex.properties.insert(prop, prop_value);
-                vertex.updated_at = Utc::now().into();
-                
-                graph_service.update_vertex(vertex.clone()).await?;
-                updated_vertices.push(vertex);
-            }
-
-            Ok(json!({
-                "status": "success",
-                "created_vertices": created_vertices,
-                "created_edges": created_edges,
-                "updated_vertices": updated_vertices,
-                "stats": {
-                    "vertices_created": created_vertices.len(),
-                    "relationships_created": created_edges.len(),
-                    "vertices_updated": updated_vertices.len()
-                }
-            }))
-        },
-        CypherQuery::MatchSet { match_patterns, set_clauses } => {
-            info!("===> EXECUTING MatchSet: {} patterns, {} SET clauses", 
-                match_patterns.len(), set_clauses.len());
-            
-            // 1. Find the vertices to update
-            let (matched_vertices, _) = exec_cypher_pattern(match_patterns, &graph_service).await?;
-            
-            if matched_vertices.is_empty() {
-                return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
-            }
-            
-            // 2. Apply SET operations to each matched vertex
-            let mut updated_vertices = Vec::new();
-            
-            for mut vertex in matched_vertices {
-                for (var, prop_name, new_value) in &set_clauses {
-                    // Convert the value
-                    let prop_value = to_property_value(new_value.clone())?;
-                    
-                    // Update the property
-                    vertex.properties.insert(prop_name.clone(), prop_value);
-                    vertex.updated_at = Utc::now().into();
-                }
-                
-                // Persist the update
-                graph_service.update_vertex(vertex.clone()).await?;
-                updated_vertices.push(vertex);
-            }
-            
-            Ok(json!({ 
-                "vertices": updated_vertices,
-                "stats": {
-                    "vertices_updated": updated_vertices.len()
-                }
-            }))
-        }
-        // --- SIGNIFICANTLY UPDATED MATCH/CREATE (MERGE-like) ---
-        // 1. MATCH nodes to resolve their IDs (populates var_to_id).
-        // 2. CREATE nodes whose variables are not in var_to_id (populates var_to_id and created_vertices).
-        // 3. CREATE relationships between the now-resolved/created nodes.
-        CypherQuery::MatchCreate { match_patterns, create_patterns } => {
-            // NOTE: graph_service is now confirmed to be an Arc<GraphService> 
-            // in this scope based on the compiler error.
-            
-            // 0. Initial Logging and Setup
-            println!("===> MATCH patterns: {}", match_patterns.len());
-            for (i, pat) in match_patterns.iter().enumerate() {
-                println!("===>     Match pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
-            }
-            
-            println!("===> CREATE patterns: {}", create_patterns.len());
-            for (i, pat) in create_patterns.iter().enumerate() {
-                println!("===>     Create pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
-                for (j, node) in pat.1.iter().enumerate() {
-                    println!("===>       Node {}: var={:?}, label={:?}", j, node.0, node.1);
-                }
-                for (j, rel) in pat.2.iter().enumerate() {
-                    println!("===>       Rel {}: var={:?}, label={:?}", j, rel.0, rel.1);
-                }
-            }
-            
-            info!("===> EXECUTING MatchCreate: {} match patterns, {} create patterns", 
-                         match_patterns.len(), create_patterns.len());
-            
-            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
-            let mut created_vertices = Vec::new();
-            let mut created_edges = Vec::new();
-
-            // 1. Resolve (MATCH) nodes
-            println!("===> BEFORE resolve_match_patterns call");
-            // FIX: Use &*graph_service to pass a &GraphService reference, not the Arc<GraphService> itself.
-            var_to_id.extend(
-                resolve_match_patterns(&*graph_service, match_patterns).await? 
-            );
-            
-            // DIAGNOSTIC LOGGING
-            println!("===> AFTER resolve_match_patterns: var_to_id has {} entries", var_to_id.len());
-            for (var, id) in &var_to_id {
-                println!("===>     Bound: {} -> {}", var, id.0);
-            }
-            println!("===> ABOUT TO PROCESS {} CREATE PATTERNS", create_patterns.len());
-
-            // 2. Process CREATE patterns
-            for (pat_idx, pat) in create_patterns.iter().enumerate() {
-                println!("===> PROCESSING CREATE PATTERN {}: {} nodes, {} rels", 
-                                 pat_idx, pat.1.len(), pat.2.len());
-                
-                // a. Create/Resolve Nodes in the CREATE pattern
-                for (node_idx, (var_opt, label_opt, properties)) in pat.1.iter().enumerate() {
-                    println!("===>     CREATE pattern node {}: var={:?}, label={:?}", 
-                                     node_idx, var_opt, label_opt);
-                    
-                    if let Some(v) = var_opt.as_ref() {
-                        // If the variable is not bound (from MATCH), it's a NEW node to be created.
-                        if !var_to_id.contains_key(v) {
-                            println!("===>       Variable '{}' not bound, creating new vertex", v);
-                            
-                            let props: GraphResult<HashMap<String, PropertyValue>> = properties
-                                .iter()
-                                .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
-                                .collect();
-                            
-                            let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
-                            let new_id = SerializableUuid(Uuid::new_v4());
-                            
-                            let vertex = Vertex {
-                                id: new_id,
-                                label: Identifier::new(final_label)?,
-                                properties: props?,
-                                created_at: Utc::now().into(),  
-                                updated_at: Utc::now().into(),  
-                            };
-                            
-                            // DELEGATION FIX: Use graph_service.create_vertex for unified handling
-                            // This method must now encapsulate storage persistence and in-memory updates.
-                            // FIX: Since graph_service is Arc, we must dereference or call .as_ref()
-                            graph_service.create_vertex(vertex.clone()).await?;
-
-                            var_to_id.insert(v.clone(), new_id);
-                            created_vertices.push(vertex);
-                            
-                            println!("===>       Created new vertex with id {}", new_id.0);
-                        } else {
-                            println!("===>       Variable '{}' already bound to {}", v, var_to_id[v].0);
-                        }
-                    } else {
-                        if !properties.is_empty() {
-                            warn!("CREATE pattern contains a node with properties but no variable/label: {:?}", properties);
-                        }
-                    }
-                }
-
-                // b. Create Edges in the CREATE pattern (sequential relationships)
-                println!("===>     Checking edge creation: {} nodes, {} relationships", pat.1.len(), pat.2.len());
-                
-                if pat.1.len().saturating_sub(1) != pat.2.len() {
-                    return Err(GraphError::ValidationError(format!(
-                        "Mismatched number of nodes ({}) and relationships ({}) in CREATE pattern path.", 
-                        pat.1.len(), pat.2.len()
-                    )));
-                }
-
-                println!("===>     About to create {} edges", pat.2.len());
-                
-                for (i, rel_tuple) in pat.2.iter().enumerate() {
-                    println!("===>     Processing edge {}", i);
-                    
-                    // Get node variables from the sequence
-                    let from_var_opt = pat.1.get(i).and_then(|node_pattern| node_pattern.0.as_ref());
-                    let to_var_opt = pat.1.get(i + 1).and_then(|node_pattern| node_pattern.0.as_ref());
-
-                    println!("===>       from_var_opt: {:?}, to_var_opt: {:?}", from_var_opt, to_var_opt);
-
-                    let from_var = from_var_opt.ok_or_else(|| {
-                        GraphError::ValidationError(format!(
-                            "Node at index {} in CREATE pattern has no variable for edge creation", i
-                        ))
-                    })?;
-                    let to_var = to_var_opt.ok_or_else(|| {
-                        GraphError::ValidationError(format!(
-                            "Node at index {} in CREATE pattern has no variable for edge creation", i + 1
-                        ))
-                    })?;
-
-                    println!("===>       from_var: '{}', to_var: '{}'", from_var, to_var);
-
-                    // Resolve IDs from the bound map (matched or newly created)
-                    let from_id = *var_to_id.get(from_var).ok_or_else(|| {
-                        println!("===>       ERROR: Unbound source variable '{}'", from_var);
-                        println!("===>       Available variables: {:?}", var_to_id.keys().collect::<Vec<_>>());
-                        GraphError::ValidationError(format!("Unbound source var for edge: {}", from_var))
-                    })?;
-                    
-                    let to_id = *var_to_id.get(to_var).ok_or_else(|| {
-                        println!("===>       ERROR: Unbound target variable '{}'", to_var);
-                        println!("===>       Available variables: {:?}", var_to_id.keys().collect::<Vec<_>>());
-                        GraphError::ValidationError(format!("Unbound target var for edge: {}", to_var))
-                    })?;
-
-                    println!("===>       Resolved IDs: from={}, to={}", from_id.0, to_id.0);
-
-                    // rel_tuple is (_rel_var, label, len_range, properties, direction)
-                    let (_rel_var, label_opt, _len_range, properties, direction_opt) = rel_tuple;
-
-                    // Handle direction: Some(false) is inbound.
-                    let (outbound_id, inbound_id) = match direction_opt {
-                        Some(false) => (to_id, from_id), // (B)<-[R]-(A) where A is from, B is to
-                        _ => (from_id, to_id),           // (A)-[R]->(B)
-                    };
-
-                    let edge_type_str = label_opt.as_ref().cloned().unwrap_or("RELATED".to_string());
-                    
-                    println!("===>       Creating edge: {} -[:{}]-> {}", outbound_id.0, edge_type_str, inbound_id.0);
-                    
-                    let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
-                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
-                        .collect();
-                    
-                    let edge = Edge {
-                        id: SerializableUuid(Uuid::new_v4()),
-                        outbound_id,
-                        inbound_id,
-                        edge_type: Identifier::new(edge_type_str.clone())?,
-                        label: edge_type_str.clone(),
-                        properties: props?,
-                    };
-                    
-                    println!("===>       Calling graph_service.create_edge()");
-                    
-                    // DELEGATION FIX: Use graph_service.create_edge for unified handling
-                    // FIX: Since graph_service is Arc, we must dereference or call .as_ref()
-                    graph_service.create_edge(edge.clone()).await?;
-                    
-                    println!("===>       Edge created successfully with id {}", edge.id.0);
-                    
-                    created_edges.push(edge);
-                }
-            }
-
-            println!("===> MatchCreate COMPLETE: {} vertices, {} edges created", 
-                          created_vertices.len(), created_edges.len());
-
-            Ok(json!({
-                "status": "success",
-                "created_vertices": created_vertices,
-                "created_edges": created_edges,
-                "stats": {
-                    "vertices_created": created_vertices.len(),
-                    "relationships_created": created_edges.len()
-                }
-            }))
-        }
-
-        // Handles CREATE (a:Label {props})
-        CypherQuery::CreateNode { label, properties } => {
-            // 1. Prepare Vertex data structure
-            let props: HashMap<_, _> = properties.into_iter()
-                .map(|(k, v)| Ok((k, to_property_value(v)?)))
-                .collect::<GraphResult<_>>()?;
-
-            let v = Vertex {
-                id: SerializableUuid(Uuid::new_v4()),
-                label: Identifier::new(label)?,
-                properties: props,
-                created_at: Utc::now().into(),  
-                updated_at: Utc::now().into(), 
-            };
-
-            // *** DELEGATE TO graph_service ***
-            // graph_service.create_vertex handles both storage and in-memory graph update.
-            graph_service.create_vertex(v.clone()).await?;
-
-            Ok(json!({ "vertex": v }))
-        }
+//    Define a non-async helper that contains the original logic
+//    (using a different name, or an internal private function)
+fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
+    query: CypherQuery,
+    _db: &'a Database, // 2. Apply lifetime 'a to the reference
+    storage: Arc<dyn GraphStorageEngine + Send + Sync>,
+) -> BoxedFuture<'a, GraphResult<Value>> { // 3. Apply lifetime 'a to the return type
+    
+    // Box the async block that contains the original logic
+    Box::pin(async move {
+        // NOTE: The entire original body of the old execute_cypher function goes here.
         
-        // Handles CREATE (n1:L1), (n2:L2)
-        CypherQuery::CreateNodes { nodes } => {
-            // FIX: Map the input 'nodes' structure (String label) to the structure
-            // expected by 'create_node_batch' (Option<String> label).
-            let nodes_for_batch = nodes.into_iter().map(|(label, properties)| {
-                // Wrap the mandatory String label into an Option<String>
-                (Some(label), properties)
-            }).collect::<Vec<_>>();
+        // Inside this async block, when you hit the recursive call, 
+        // you must use the same boxing pattern:
+        let graph_service = initialize_graph_service(storage.clone()).await?;
 
-            // *** DELEGATE TO graph_service ***
-            let created_vertices = graph_service.create_node_batch(nodes_for_batch).await?;
-            
-            Ok(json!({ "vertices": created_vertices }))
-        }
+        match query {
+            // ----------  NEW  ----------
+            CypherQuery::Batch(stmts) => {
+                use futures::future::try_join_all;
+                // Assuming `json!` is available in scope.
 
-        CypherQuery::MatchNode { label, properties } => {
-            // 1. Convert properties to a mutable PropertyValue map
-            let mut query_props: HashMap<String, PropertyValue> = properties
-                .into_iter()
-                .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
-                .collect::<GraphResult<_>>()?;
-            
-            // --- START FIX: Indexed lookup for internal 'id' property ---
-            if let Some(prop_value) = query_props.remove("id") {
-                let internal_id: Option<i32> = match prop_value {
-                    PropertyValue::Integer(val) => Some(val as i32), 
-                    PropertyValue::I32(val) => Some(val),
-                    _ => None,
-                };
+                let tasks = stmts.into_iter().map(|stmt| {
+                    // Clone the immutable references needed for the parallel async block
+                    let db_ref = _db; 
+                    let stg = storage.clone();
+                    // Execute each statement in the batch using the main executor.
+                    async move { execute_cypher(stmt, db_ref, stg).await }
+                });
 
-                if let Some(internal_id) = internal_id {
-                    // Use direct lookup to avoid recursion
-                    match get_vertex_by_internal_id_direct(&graph_service, internal_id).await? {
-                        Some(v) => {
-                            let matches_label = label.as_ref().map_or(true, |l| {
-                                let vl = v.label.as_ref();
-                                vl == l || vl.starts_with(&format!("{}:", l))
-                            });
-                            
-                            let matches_remaining_props = query_props.iter().all(|(k, expected_val)| {
-                                v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
-                            });
+                // Execute all statements in parallel (using try_join_all)
+                let results = try_join_all(tasks).await?;
+                
+                // Return the collected results wrapped as a single JSON object.
+                Ok(json!({ "results": results }))
+            }
+            // --- UPDATED MATCH PATTERN ---
+            // Handles pure MATCH ... RETURN, relying on a full pattern matcher.
+            CypherQuery::MatchPattern { patterns } => {
+                info!("===> EXECUTING MatchPattern with {} patterns", patterns.len());
+                
+                // This helper function must implement the core graph traversal logic (e.g., BFS/DFS).
+                // *** DELEGATION FIX: Call exec_cypher_pattern with graph_service ***
+                let (final_vertices, final_edges) = exec_cypher_pattern(patterns, &graph_service).await?;
 
-                            if matches_label && matches_remaining_props {
-                                return Ok(json!({ "vertices": vec![v] }));
-                            } else {
-                                return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
+                Ok(json!({
+                    "vertices": final_vertices,
+                    "edges": final_edges,
+                    "stats": {
+                        "vertices_matched": final_vertices.len(),
+                        "edges_matched": final_edges.len()
+                    }
+                }))
+            }
+            CypherQuery::MatchCreateSet { match_patterns, create_patterns, set_clauses } => {
+                info!("===> EXECUTING MatchCreateSet: {} match patterns, {} create patterns, {} set clauses",
+                      match_patterns.len(), create_patterns.len(), set_clauses.len());
+                
+                let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
+                let mut created_vertices = Vec::new();
+                let mut created_edges = Vec::new();
+                let mut updated_vertices = Vec::new();
+                
+                // 1. Resolve MATCH patterns
+                var_to_id.extend(
+                    resolve_match_patterns(&graph_service, match_patterns).await?
+                );
+                
+                // 2. Process CREATE patterns (same as MatchCreate)
+                for pat in create_patterns.iter() {
+                    // Create nodes
+                    for (var_opt, label_opt, properties) in &pat.1 {
+                        if let Some(v) = var_opt.as_ref() {
+                            if !var_to_id.contains_key(v) {
+                                let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                                    .iter()
+                                    .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
+                                    .collect();
+                                
+                                let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                                let new_id = SerializableUuid(Uuid::new_v4());
+                                
+                                let vertex = Vertex {
+                                    id: new_id,
+                                    label: Identifier::new(final_label)?,
+                                    properties: props?,
+                                    created_at: Utc::now().into(),
+                                    updated_at: Utc::now().into(),
+                                };
+                                
+                                graph_service.create_vertex(vertex.clone()).await?;
+                                var_to_id.insert(v.clone(), new_id);
+                                created_vertices.push(vertex);
                             }
                         }
-                        None => {
-                            return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
-                        }
+                    }
+                    
+                    // Create edges
+                    for (i, rel_tuple) in pat.2.iter().enumerate() {
+                        let from_var = pat.1[i].0.as_ref().ok_or(GraphError::ValidationError("No from var".into()))?;
+                        let to_var = pat.1[i + 1].0.as_ref().ok_or(GraphError::ValidationError("No to var".into()))?;
+                        
+                        let from_id = *var_to_id.get(from_var).unwrap();
+                        let to_id = *var_to_id.get(to_var).unwrap();
+                        
+                        let (_rel_var, label_opt, _len_range, properties, direction_opt) = rel_tuple;
+                        
+                        let (outbound_id, inbound_id) = match direction_opt {
+                            Some(true) => (to_id, from_id), // <-
+                            _ => (from_id, to_id),
+                        };
+                        
+                        let edge_type_str = label_opt.as_ref().cloned().unwrap_or("RELATED".to_string());
+                        
+                        let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
+                            .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                            .collect();
+                        
+                        let edge = Edge {
+                            id: SerializableUuid(Uuid::new_v4()),
+                            outbound_id,
+                            inbound_id,
+                            edge_type: Identifier::new(edge_type_str.clone())?,
+                            label: edge_type_str,
+                            properties: props?,
+                        };
+                        
+                        graph_service.create_edge(edge.clone()).await?;
+                        created_edges.push(edge);
                     }
                 }
+                
+                // 3. Apply SET clauses
+                for (var, prop, val) in set_clauses {
+                    let id = var_to_id.get(&var)
+                        .ok_or(GraphError::ValidationError(format!("Unbound var in SET: {}", var)))?
+                        .0;
+                    
+                    let mut vertex = graph_service.get_vertex(&id).await
+                        .ok_or_else(|| {
+                            let id_str = format!("vertex_{}", id);
+                            GraphError::NotFound(unsafe { Identifier::new_unchecked(id_str) })
+                        })?;
+                    
+                    let prop_value = to_property_value(val)?;
+                    vertex.properties.insert(prop, prop_value);
+                    vertex.updated_at = Utc::now().into();
+                    
+                    graph_service.update_vertex(vertex.clone()).await?;
+                    updated_vertices.push(vertex);
+                }
+
+                Ok(json!({
+                    "status": "success",
+                    "created_vertices": created_vertices,
+                    "created_edges": created_edges,
+                    "updated_vertices": updated_vertices,
+                    "stats": {
+                        "vertices_created": created_vertices.len(),
+                        "relationships_created": created_edges.len(),
+                        "vertices_updated": updated_vertices.len()
+                    }
+                }))
+            },
+            CypherQuery::MatchSet { match_patterns, set_clauses } => {
+                info!("===> EXECUTING MatchSet: {} patterns, {} SET clauses", 
+                    match_patterns.len(), set_clauses.len());
+                
+                // 1. Find the vertices to update
+                let (matched_vertices, _) = exec_cypher_pattern(match_patterns, &graph_service).await?;
+                
+                if matched_vertices.is_empty() {
+                    return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
+                }
+                
+                // 2. Apply SET operations to each matched vertex
+                let mut updated_vertices = Vec::new();
+                
+                for mut vertex in matched_vertices {
+                    for (var, prop_name, new_value) in &set_clauses {
+                        // Convert the value
+                        let prop_value = to_property_value(new_value.clone())?;
+                        
+                        // Update the property
+                        vertex.properties.insert(prop_name.clone(), prop_value);
+                        vertex.updated_at = Utc::now().into();
+                    }
+                    
+                    // Persist the update
+                    graph_service.update_vertex(vertex.clone()).await?;
+                    updated_vertices.push(vertex);
+                }
+                
+                Ok(json!({ 
+                    "vertices": updated_vertices,
+                    "stats": {
+                        "vertices_updated": updated_vertices.len()
+                    }
+                }))
             }
-            // --- END FIX ---
-
-            // Fallback/Standard path: Full scan 
-            let vertices = graph_service.get_all_vertices().await?;
-            
-            let filtered = vertices.into_iter().filter(|v| {
-                let matches_label = if let Some(query_label) = &label {
-                    let vertex_label_str = v.label.as_ref();
-                    vertex_label_str == query_label ||
-                        vertex_label_str.starts_with(&format!("{}:", query_label))
-                } else {
-                    true
-                };
+            // --- SIGNIFICANTLY UPDATED MATCH/CREATE (MERGE-like) ---
+            // 1. MATCH nodes to resolve their IDs (populates var_to_id).
+            // 2. CREATE nodes whose variables are not in var_to_id (populates var_to_id and created_vertices).
+            // 3. CREATE relationships between the now-resolved/created nodes.
+            CypherQuery::MatchCreate { match_patterns, create_patterns } => {
+                // NOTE: graph_service is now confirmed to be an Arc<GraphService> 
+                // in this scope based on the compiler error.
                 
-                let matches_props = if query_props.is_empty() {
-                    true
-                } else {
-                    query_props.iter().all(|(k, expected_val)| {
-                        v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
-                    })
-                };
+                // 0. Initial Logging and Setup
+                println!("===> MATCH patterns: {}", match_patterns.len());
+                for (i, pat) in match_patterns.iter().enumerate() {
+                    println!("===>     Match pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
+                }
                 
-                matches_label && matches_props
-            }).collect::<Vec<_>>();
-            
-            Ok(json!({ "vertices": filtered }))
-        }
+                println!("===> CREATE patterns: {}", create_patterns.len());
+                for (i, pat) in create_patterns.iter().enumerate() {
+                    println!("===>     Create pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
+                    for (j, node) in pat.1.iter().enumerate() {
+                        println!("===>       Node {}: var={:?}, label={:?}", j, node.0, node.1);
+                    }
+                    for (j, rel) in pat.2.iter().enumerate() {
+                        println!("===>       Rel {}: var={:?}, label={:?}", j, rel.0, rel.1);
+                    }
+                }
+                
+                info!("===> EXECUTING MatchCreate: {} match patterns, {} create patterns", 
+                             match_patterns.len(), create_patterns.len());
+                
+                let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
+                let mut created_vertices = Vec::new();
+                let mut created_edges = Vec::new();
 
-        CypherQuery::MatchMultipleNodes { nodes } => {
-            let mut result_vertices = Vec::new();
-            let mut matched_ids = HashSet::new();
-            
-            let all_vertices = graph_service.get_all_vertices().await?;
+                // 1. Resolve (MATCH) nodes
+                println!("===> BEFORE resolve_match_patterns call");
+                // FIX: Use &*graph_service to pass a &GraphService reference, not the Arc<GraphService> itself.
+                var_to_id.extend(
+                    resolve_match_patterns(&*graph_service, match_patterns).await? 
+                );
+                
+                // DIAGNOSTIC LOGGING
+                println!("===> AFTER resolve_match_patterns: var_to_id has {} entries", var_to_id.len());
+                for (var, id) in &var_to_id {
+                    println!("===>     Bound: {} -> {}", var, id.0);
+                }
+                println!("===> ABOUT TO PROCESS {} CREATE PATTERNS", create_patterns.len());
 
-            for (_var, label, properties) in nodes {
-                let mut props: HashMap<String, PropertyValue> = properties
-                    .iter()
-                    .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                // 2. Process CREATE patterns
+                for (pat_idx, pat) in create_patterns.iter().enumerate() {
+                    println!("===> PROCESSING CREATE PATTERN {}: {} nodes, {} rels", 
+                                     pat_idx, pat.1.len(), pat.2.len());
+                    
+                    // a. Create/Resolve Nodes in the CREATE pattern
+                    for (node_idx, (var_opt, label_opt, properties)) in pat.1.iter().enumerate() {
+                        println!("===>     CREATE pattern node {}: var={:?}, label={:?}", 
+                                         node_idx, var_opt, label_opt);
+                        
+                        if let Some(v) = var_opt.as_ref() {
+                            // If the variable is not bound (from MATCH), it's a NEW node to be created.
+                            if !var_to_id.contains_key(v) {
+                                println!("===>       Variable '{}' not bound, creating new vertex", v);
+                                
+                                let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                                    .iter()
+                                    .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
+                                    .collect();
+                                
+                                let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                                let new_id = SerializableUuid(Uuid::new_v4());
+                                
+                                let vertex = Vertex {
+                                    id: new_id,
+                                    label: Identifier::new(final_label)?,
+                                    properties: props?,
+                                    created_at: Utc::now().into(),  
+                                    updated_at: Utc::now().into(),  
+                                };
+                                
+                                // DELEGATION FIX: Use graph_service.create_vertex for unified handling
+                                // This method must now encapsulate storage persistence and in-memory updates.
+                                // FIX: Since graph_service is Arc, we must dereference or call .as_ref()
+                                graph_service.create_vertex(vertex.clone()).await?;
+
+                                var_to_id.insert(v.clone(), new_id);
+                                created_vertices.push(vertex);
+                                
+                                println!("===>       Created new vertex with id {}", new_id.0);
+                            } else {
+                                println!("===>       Variable '{}' already bound to {}", v, var_to_id[v].0);
+                            }
+                        } else {
+                            if !properties.is_empty() {
+                                warn!("CREATE pattern contains a node with properties but no variable/label: {:?}", properties);
+                            }
+                        }
+                    }
+
+                    // b. Create Edges in the CREATE pattern (sequential relationships)
+                    println!("===>     Checking edge creation: {} nodes, {} relationships", pat.1.len(), pat.2.len());
+                    
+                    if pat.1.len().saturating_sub(1) != pat.2.len() {
+                        return Err(GraphError::ValidationError(format!(
+                            "Mismatched number of nodes ({}) and relationships ({}) in CREATE pattern path.", 
+                            pat.1.len(), pat.2.len()
+                        )));
+                    }
+
+                    println!("===>     About to create {} edges", pat.2.len());
+                    
+                    for (i, rel_tuple) in pat.2.iter().enumerate() {
+                        println!("===>     Processing edge {}", i);
+                        
+                        // Get node variables from the sequence
+                        let from_var_opt = pat.1.get(i).and_then(|node_pattern| node_pattern.0.as_ref());
+                        let to_var_opt = pat.1.get(i + 1).and_then(|node_pattern| node_pattern.0.as_ref());
+
+                        println!("===>       from_var_opt: {:?}, to_var_opt: {:?}", from_var_opt, to_var_opt);
+
+                        let from_var = from_var_opt.ok_or_else(|| {
+                            GraphError::ValidationError(format!(
+                                "Node at index {} in CREATE pattern has no variable for edge creation", i
+                            ))
+                        })?;
+                        let to_var = to_var_opt.ok_or_else(|| {
+                            GraphError::ValidationError(format!(
+                                "Node at index {} in CREATE pattern has no variable for edge creation", i + 1
+                            ))
+                        })?;
+
+                        println!("===>       from_var: '{}', to_var: '{}'", from_var, to_var);
+
+                        // Resolve IDs from the bound map (matched or newly created)
+                        let from_id = *var_to_id.get(from_var).ok_or_else(|| {
+                            println!("===>       ERROR: Unbound source variable '{}'", from_var);
+                            println!("===>       Available variables: {:?}", var_to_id.keys().collect::<Vec<_>>());
+                            GraphError::ValidationError(format!("Unbound source var for edge: {}", from_var))
+                        })?;
+                        
+                        let to_id = *var_to_id.get(to_var).ok_or_else(|| {
+                            println!("===>       ERROR: Unbound target variable '{}'", to_var);
+                            println!("===>       Available variables: {:?}", var_to_id.keys().collect::<Vec<_>>());
+                            GraphError::ValidationError(format!("Unbound target var for edge: {}", to_var))
+                        })?;
+
+                        println!("===>       Resolved IDs: from={}, to={}", from_id.0, to_id.0);
+
+                        // rel_tuple is (_rel_var, label, len_range, properties, direction)
+                        let (_rel_var, label_opt, _len_range, properties, direction_opt) = rel_tuple;
+
+                        // Handle direction: Some(false) is inbound.
+                        let (outbound_id, inbound_id) = match direction_opt {
+                            Some(false) => (to_id, from_id), // (B)<-[R]-(A) where A is from, B is to
+                            _ => (from_id, to_id),           // (A)-[R]->(B)
+                        };
+
+                        let edge_type_str = label_opt.as_ref().cloned().unwrap_or("RELATED".to_string());
+                        
+                        println!("===>       Creating edge: {} -[:{}]-> {}", outbound_id.0, edge_type_str, inbound_id.0);
+                        
+                        let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
+                            .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                            .collect();
+                        
+                        let edge = Edge {
+                            id: SerializableUuid(Uuid::new_v4()),
+                            outbound_id,
+                            inbound_id,
+                            edge_type: Identifier::new(edge_type_str.clone())?,
+                            label: edge_type_str.clone(),
+                            properties: props?,
+                        };
+                        
+                        println!("===>       Calling graph_service.create_edge()");
+                        
+                        // DELEGATION FIX: Use graph_service.create_edge for unified handling
+                        // FIX: Since graph_service is Arc, we must dereference or call .as_ref()
+                        graph_service.create_edge(edge.clone()).await?;
+                        
+                        println!("===>       Edge created successfully with id {}", edge.id.0);
+                        
+                        created_edges.push(edge);
+                    }
+                }
+
+                println!("===> MatchCreate COMPLETE: {} vertices, {} edges created", 
+                              created_vertices.len(), created_edges.len());
+
+                Ok(json!({
+                    "status": "success",
+                    "created_vertices": created_vertices,
+                    "created_edges": created_edges,
+                    "stats": {
+                        "vertices_created": created_vertices.len(),
+                        "relationships_created": created_edges.len()
+                    }
+                }))
+            }
+
+            // Handles CREATE (a:Label {props})
+            CypherQuery::CreateNode { label, properties } => {
+                // 1. Prepare Vertex data structure
+                let props: HashMap<_, _> = properties.into_iter()
+                    .map(|(k, v)| Ok((k, to_property_value(v)?)))
+                    .collect::<GraphResult<_>>()?;
+
+                let v = Vertex {
+                    id: SerializableUuid(Uuid::new_v4()),
+                    label: Identifier::new(label)?,
+                    properties: props,
+                    created_at: Utc::now().into(),  
+                    updated_at: Utc::now().into(), 
+                };
+
+                // *** DELEGATE TO graph_service ***
+                // graph_service.create_vertex handles both storage and in-memory graph update.
+                graph_service.create_vertex(v.clone()).await?;
+
+                Ok(json!({ "vertex": v }))
+            }
+            
+            // Handles CREATE (n1:L1), (n2:L2)
+            CypherQuery::CreateNodes { nodes } => {
+                // FIX: Map the input 'nodes' structure (String label) to the structure
+                // expected by 'create_node_batch' (Option<String> label).
+                let nodes_for_batch = nodes.into_iter().map(|(label, properties)| {
+                    // Wrap the mandatory String label into an Option<String>
+                    (Some(label), properties)
+                }).collect::<Vec<_>>();
+
+                // *** DELEGATE TO graph_service ***
+                let created_vertices = graph_service.create_node_batch(nodes_for_batch).await?;
+                
+                Ok(json!({ "vertices": created_vertices }))
+            }
+
+            CypherQuery::MatchNode { label, properties } => {
+                // 1. Convert properties to a mutable PropertyValue map
+                let mut query_props: HashMap<String, PropertyValue> = properties
+                    .into_iter()
+                    .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                     .collect::<GraphResult<_>>()?;
                 
-                let mut handled_by_id_constraint = false;
-                
                 // --- START FIX: Indexed lookup for internal 'id' property ---
-                if let Some(prop_value) = props.remove("id") {
-                    let internal_id = match prop_value {
+                if let Some(prop_value) = query_props.remove("id") {
+                    let internal_id: Option<i32> = match prop_value {
                         PropertyValue::Integer(val) => Some(val as i32), 
-                        PropertyValue::I32(val) => Some(val), 
+                        PropertyValue::I32(val) => Some(val),
                         _ => None,
                     };
-                    
+
                     if let Some(internal_id) = internal_id {
-                        handled_by_id_constraint = true; 
-                    
                         // Use direct lookup to avoid recursion
-                        if let Some(v) = get_vertex_by_internal_id_direct(&graph_service, internal_id).await? {
-                            let matches_label = label.as_ref().map_or(true, |l| {
-                                let vl = v.label.as_ref();
-                                vl == l || vl.starts_with(&format!("{}:", l))
-                            });
+                        match get_vertex_by_internal_id_direct(&graph_service, internal_id).await? {
+                            Some(v) => {
+                                let matches_label = label.as_ref().map_or(true, |l| {
+                                    let vl = v.label.as_ref();
+                                    vl == l || vl.starts_with(&format!("{}:", l))
+                                });
+                                
+                                let matches_remaining_props = query_props.iter().all(|(k, expected_val)| {
+                                    v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+                                });
 
-                            let matches_remaining_props = props.iter().all(|(k, expected_val)| {
-                                v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
-                            });
-
-                            if matches_label && matches_remaining_props && !matched_ids.contains(&v.id) {
-                                result_vertices.push(v.clone());
-                                matched_ids.insert(v.id);
+                                if matches_label && matches_remaining_props {
+                                    return Ok(json!({ "vertices": vec![v] }));
+                                } else {
+                                    return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
+                                }
+                            }
+                            None => {
+                                return Ok(json!({ "vertices": Vec::<models::Vertex>::new() }));
                             }
                         }
                     }
                 }
                 // --- END FIX ---
 
-                if handled_by_id_constraint {
-                    continue;
-                }
-
-                // Fallback/Standard path: Full scan
-                let label_ref = label.as_ref();
+                // Fallback/Standard path: Full scan 
+                let vertices = graph_service.get_all_vertices().await?;
                 
-                for v in &all_vertices {
-                    let matches_label = label_ref.map_or(true, |l| {
-                        let vl = v.label.as_ref();
-                        vl == l || vl.starts_with(&format!("{}:", l))
-                    });
+                let filtered = vertices.into_iter().filter(|v| {
+                    let matches_label = if let Some(query_label) = &label {
+                        let vertex_label_str = v.label.as_ref();
+                        vertex_label_str == query_label ||
+                            vertex_label_str.starts_with(&format!("{}:", query_label))
+                    } else {
+                        true
+                    };
                     
-                    let matches_props = props.iter().all(|(k, expected_val)| {
-                        v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
-                    });
+                    let matches_props = if query_props.is_empty() {
+                        true
+                    } else {
+                        query_props.iter().all(|(k, expected_val)| {
+                            v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+                        })
+                    };
                     
-                    if matches_label && matches_props && !matched_ids.contains(&v.id) {
-                        result_vertices.push(v.clone());
-                        matched_ids.insert(v.id);
+                    matches_label && matches_props
+                }).collect::<Vec<_>>();
+                
+                Ok(json!({ "vertices": filtered }))
+            }
+
+            CypherQuery::MatchMultipleNodes { nodes } => {
+                let mut result_vertices = Vec::new();
+                let mut matched_ids = HashSet::new();
+                
+                let all_vertices = graph_service.get_all_vertices().await?;
+
+                for (_var, label, properties) in nodes {
+                    let mut props: HashMap<String, PropertyValue> = properties
+                        .iter()
+                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                        .collect::<GraphResult<_>>()?;
+                    
+                    let mut handled_by_id_constraint = false;
+                    
+                    // --- START FIX: Indexed lookup for internal 'id' property ---
+                    if let Some(prop_value) = props.remove("id") {
+                        let internal_id = match prop_value {
+                            PropertyValue::Integer(val) => Some(val as i32), 
+                            PropertyValue::I32(val) => Some(val), 
+                            _ => None,
+                        };
+                        
+                        if let Some(internal_id) = internal_id {
+                            handled_by_id_constraint = true; 
+                        
+                            // Use direct lookup to avoid recursion
+                            if let Some(v) = get_vertex_by_internal_id_direct(&graph_service, internal_id).await? {
+                                let matches_label = label.as_ref().map_or(true, |l| {
+                                    let vl = v.label.as_ref();
+                                    vl == l || vl.starts_with(&format!("{}:", l))
+                                });
+
+                                let matches_remaining_props = props.iter().all(|(k, expected_val)| {
+                                    v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+                                });
+
+                                if matches_label && matches_remaining_props && !matched_ids.contains(&v.id) {
+                                    result_vertices.push(v.clone());
+                                    matched_ids.insert(v.id);
+                                }
+                            }
+                        }
+                    }
+                    // --- END FIX ---
+
+                    if handled_by_id_constraint {
+                        continue;
+                    }
+
+                    // Fallback/Standard path: Full scan
+                    let label_ref = label.as_ref();
+                    
+                    for v in &all_vertices {
+                        let matches_label = label_ref.map_or(true, |l| {
+                            let vl = v.label.as_ref();
+                            vl == l || vl.starts_with(&format!("{}:", l))
+                        });
+                        
+                        let matches_props = props.iter().all(|(k, expected_val)| {
+                            v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+                        });
+                        
+                        if matches_label && matches_props && !matched_ids.contains(&v.id) {
+                            result_vertices.push(v.clone());
+                            matched_ids.insert(v.id);
+                        }
                     }
                 }
-            }
-            
-            Ok(json!({ "vertices": result_vertices, "count": result_vertices.len() }))
-        }
-
-
-        // --- UPDATED CREATE COMPLEX PATTERN (Pure CREATE of a Path) ---
-        // This is structurally similar to the CREATE part of MatchCreate, 
-        // but all nodes *must* be new, so they are unconditionally created.
-        CypherQuery::CreateComplexPattern { nodes, relationships } => {
-            info!("===> EXECUTING CreateComplexPattern: {} nodes, {} relationships", nodes.len(), relationships.len());
-            
-            let mut created_vertices = Vec::new();
-            // Map to link the variables in the pattern to the newly created UUIDs.
-            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new(); 
-            let mut created_edges = Vec::new();
-
-            // 1. Create all vertices and populate var_to_id map
-            if nodes.is_empty() {
-                return Err(GraphError::ValidationError("CREATE pattern must contain at least one node.".into()));
+                
+                Ok(json!({ "vertices": result_vertices, "count": result_vertices.len() }))
             }
 
-            for (var_opt, label_opt, properties) in nodes.iter() {
-                let props: GraphResult<HashMap<String, PropertyValue>> = properties
-                    .iter()
-                    .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
-                    .collect();
-                
-                let new_id = SerializableUuid(Uuid::new_v4());
-                let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
-                
-                let vertex = Vertex {
-                    id: new_id,
-                    label: Identifier::new(final_label)?,
-                    properties: props?,
-                    created_at: Utc::now().into(),
-                    updated_at: Utc::now().into(), 
-                };
-                
-                // *** RELY ON graph_service.create_vertex ***
-                // Replaces: storage.create_vertex(vertex.clone()).await?;
-                // Replaces: graph_service.add_vertex(vertex.clone()).await?;
-                graph_service.create_vertex(vertex.clone()).await?;
-                
-                if let Some(v) = var_opt.as_ref() {
-                    var_to_id.insert(v.clone(), new_id);
-                }
-                created_vertices.push(vertex);
-            }
-            
-            // 2. Create edges based on the relationships list and sequential nodes.
-            if relationships.len() != nodes.len().saturating_sub(1) {
-                return Err(GraphError::ValidationError("Mismatched number of nodes and relationships in complex CREATE pattern.".into()));
-            }
 
-            // Iterate over the relationships
-            for (i, rel_tuple) in relationships.into_iter().enumerate() {
+            // --- UPDATED CREATE COMPLEX PATTERN (Pure CREATE of a Path) ---
+            // This is structurally similar to the CREATE part of MatchCreate, 
+            // but all nodes *must* be new, so they are unconditionally created.
+            CypherQuery::CreateComplexPattern { nodes, relationships } => {
+                info!("===> EXECUTING CreateComplexPattern: {} nodes, {} relationships", nodes.len(), relationships.len());
                 
-                // Get the variables of the connected nodes (from the nodes vector)
-                let from_var_opt = nodes[i].0.as_ref();
-                let to_var_opt = nodes[i + 1].0.as_ref();
+                let mut created_vertices = Vec::new();
+                // Map to link the variables in the pattern to the newly created UUIDs.
+                let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new(); 
+                let mut created_edges = Vec::new();
 
-                let from_var = from_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable", i)))?;
-                let to_var = to_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable", i + 1)))?;
-
-                // Resolve IDs using the map of newly created nodes
-                let from_id = *var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound from var: {}", from_var)))?;
-                let to_id = *var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound to var: {}", to_var)))?;
-
-                // Destructure the 5-tuple
-                let (
-                    _rel_var,     
-                    label_opt,     // Index 1: Relationship Label
-                    _len_range,    
-                    properties,    // Index 3: Properties Map
-                    direction_opt, // Index 4: Direction (Option<bool>)
-                ) = rel_tuple;
-
-                // Handle direction: Some(false) is inbound.
-                let (outbound_id, inbound_id) = match direction_opt {
-                    Some(false) => (to_id, from_id), // (from_id)<-[R]-(to_id)
-                    _ => (from_id, to_id),           // (from_id)-[R]->(to_id) or (from_id)-[R]-(to_id)
-                };
-
-                let edge_type_str = label_opt.clone().unwrap_or("RELATED".to_string());
-                
-                // Properties
-                let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
-                    .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
-                    .collect();
-                
-                let edge = Edge {
-                    id: SerializableUuid(Uuid::new_v4()),
-                    outbound_id,
-                    inbound_id,
-                    edge_type: Identifier::new(edge_type_str.clone())?,
-                    label: edge_type_str,
-                    properties: props?,
-                };
-                
-                // *** RELY ON graph_service.create_edge ***
-                // Replaces: storage.create_edge(edge.clone()).await?;
-                // Replaces: graph_service.add_edge(edge.clone()).await?;
-                graph_service.create_edge(edge.clone()).await?;
-                created_edges.push(edge);
-            }
-
-            Ok(json!({
-                "vertices": created_vertices,
-                "edges": created_edges,
-                "stats": {
-                    "vertices_created": created_vertices.len(),
-                    "relationships_created": created_edges.len(),
-                }
-            }))
-        }
-        // New match arm in the query execution logic (e.g., in execute_cypher_query)
-        CypherQuery::CreateStatement { patterns, return_items } => {
-            info!("===> EXECUTING CreateStatement: {} patterns, returning: {:?}", patterns.len(), return_items);
-
-            let mut created_vertices = Vec::new();
-            let mut created_edges = Vec::new();
-            let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
-            
-            // --- Phase 1: Create all vertices and populate var_to_id map ---
-            
-            // Gather all unique NodePatterns from all patterns
-            let mut unique_nodes = HashMap::new();
-            for (_, nodes, _) in patterns.iter() {
-                for node_pattern in nodes {
-                    if let Some(var) = node_pattern.0.as_ref() {
-                        // Use the variable as the key to ensure we only create each node once
-                        unique_nodes.entry(var.clone()).or_insert(node_pattern);
-                    }
-                }
-            }
-            
-            for (var, node_pattern) in unique_nodes {
-                let (var_opt, label_opt, properties) = node_pattern;
-                
-                let props: GraphResult<HashMap<String, PropertyValue>> = properties
-                    .iter()
-                    .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
-                    .collect();
-                
-                let new_id = SerializableUuid(Uuid::new_v4());
-                let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
-                
-                let vertex = Vertex {
-                    id: new_id,
-                    label: Identifier::new(final_label)?,
-                    properties: props?,
-                    created_at: Utc::now().into(),  
-                    updated_at: Utc::now().into(),  
-                };
-                
-                // *** RELY ON graph_service.create_vertex ***
-                // Replaces: storage.create_vertex(vertex.clone()).await?;
-                // Replaces: graph_service.add_vertex(vertex.clone()).await?;
-                graph_service.create_vertex(vertex.clone()).await?;
-                
-                var_to_id.insert(var.clone(), new_id);
-                created_vertices.push(vertex);
-            }
-            
-            // --- Phase 2: Create all edges from all patterns ---
-
-            for (_, nodes, relationships) in patterns.into_iter() {
-                if relationships.is_empty() {
-                    continue;
+                // 1. Create all vertices and populate var_to_id map
+                if nodes.is_empty() {
+                    return Err(GraphError::ValidationError("CREATE pattern must contain at least one node.".into()));
                 }
 
-                // Iterate over (from_node, rel, to_node) segments
-                for i in 0..relationships.len() {
-                    let rel_tuple = &relationships[i]; 
+                for (var_opt, label_opt, properties) in nodes.iter() {
+                    let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                        .iter()
+                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                        .collect();
                     
-                    // Nodes are stored sequentially in the Pattern tuple, matching rel[i] with node[i] -> node[i+1]
+                    let new_id = SerializableUuid(Uuid::new_v4());
+                    let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                    
+                    let vertex = Vertex {
+                        id: new_id,
+                        label: Identifier::new(final_label)?,
+                        properties: props?,
+                        created_at: Utc::now().into(),
+                        updated_at: Utc::now().into(), 
+                    };
+                    
+                    // *** RELY ON graph_service.create_vertex ***
+                    // Replaces: storage.create_vertex(vertex.clone()).await?;
+                    // Replaces: graph_service.add_vertex(vertex.clone()).await?;
+                    graph_service.create_vertex(vertex.clone()).await?;
+                    
+                    if let Some(v) = var_opt.as_ref() {
+                        var_to_id.insert(v.clone(), new_id);
+                    }
+                    created_vertices.push(vertex);
+                }
+                
+                // 2. Create edges based on the relationships list and sequential nodes.
+                if relationships.len() != nodes.len().saturating_sub(1) {
+                    return Err(GraphError::ValidationError("Mismatched number of nodes and relationships in complex CREATE pattern.".into()));
+                }
+
+                // Iterate over the relationships
+                for (i, rel_tuple) in relationships.into_iter().enumerate() {
+                    
+                    // Get the variables of the connected nodes (from the nodes vector)
                     let from_var_opt = nodes[i].0.as_ref();
                     let to_var_opt = nodes[i + 1].0.as_ref();
 
-                    let from_var = from_var_opt.ok_or(GraphError::ValidationError(format!("Relationship source node at index {} has no variable.", i)))?;
-                    let to_var = to_var_opt.ok_or(GraphError::ValidationError(format!("Relationship target node at index {} has no variable.", i + 1)))?;
+                    let from_var = from_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable", i)))?;
+                    let to_var = to_var_opt.ok_or(GraphError::ValidationError(format!("Node at index {} in CREATE pattern has no variable", i + 1)))?;
 
-                    // Resolve IDs using the map of newly created nodes (var_to_id)
-                    let from_id = *var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound source variable: {}", from_var)))?;
-                    let to_id = *var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound target variable: {}", to_var)))?;
+                    // Resolve IDs using the map of newly created nodes
+                    let from_id = *var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound from var: {}", from_var)))?;
+                    let to_id = *var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound to var: {}", to_var)))?;
 
-                    // Destructure the BORROWED 5-tuple, cloning the owned parts
+                    // Destructure the 5-tuple
                     let (
                         _rel_var,     
-                        label_opt,      // Index 1: Relationship Label
-                        _len_range,     
-                        properties,     // Index 3: Properties Map
-                        direction_opt,  // Index 4: Direction (Option<bool>)
+                        label_opt,     // Index 1: Relationship Label
+                        _len_range,    
+                        properties,    // Index 3: Properties Map
+                        direction_opt, // Index 4: Direction (Option<bool>)
                     ) = rel_tuple;
 
                     // Handle direction: Some(false) is inbound.
@@ -4045,454 +4143,675 @@ pub async fn execute_cypher(
                     graph_service.create_edge(edge.clone()).await?;
                     created_edges.push(edge);
                 }
-            }
-            
-            // --- Phase 3: Shape the result based on return_items ---
-            let all_return_variables: HashSet<String> = return_items.into_iter().collect();
-            let created_vertex_map: HashMap<SerializableUuid, &Vertex> = created_vertices.iter().map(|v| (v.id, v)).collect();
 
-            // The final result should be a single JSON object containing the returned variables as keys
-            let returned_data: HashMap<String, Value> = var_to_id.iter()
-                .filter(|(var, _)| all_return_variables.contains(*var))
-                .filter_map(|(var, id)| {
-                    created_vertex_map.get(id)
-                        .and_then(|v| serde_json::to_value(v).ok())
-                        .map(|v_json| (var.clone(), v_json))
-                })
-                .collect();
-
-            Ok(serde_json::to_value(returned_data)?)
-        }
-
-        CypherQuery::CreateEdge { from_id, edge_type, to_id } => {
-            let edge = Edge {
-                id: SerializableUuid(Uuid::new_v4()),
-                outbound_id: from_id,
-                edge_type: Identifier::new(edge_type.clone())?,
-                inbound_id: to_id,
-                label: edge_type,
-                properties: BTreeMap::new(),
-            };
-            
-            // Use the centralized graph_service.create_edge, which handles
-            // 1. storage.create_edge
-            // 2. graph_service.add_edge (in-memory update & notify)
-            graph_service.create_edge(edge.clone()).await?;
-            
-            Ok(json!({ "edge": edge }))
-        }
-                        
-        CypherQuery::SetNode { id, properties } => {
-            // 1. Get the current state of the vertex (using graph_service methods)
-            let mut vertex = graph_service.get_vertex_from_storage(&id.0).await?.ok_or_else(|| {
-                // Must read from storage here if the command is designed to update existing only
-                // based on persistent state, otherwise read from memory (graph_service.get_vertex).
-                // Assuming it must exist in storage to be updated.
-                GraphError::StorageError(format!("Vertex not found: {:?}", id))
-            })?;
-            
-            // 2. Apply property changes
-            let props: GraphResult<HashMap<String, PropertyValue>> = properties
-                .into_iter()
-                .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
-                .collect();
-            vertex.properties.extend(props?);
-            vertex.updated_at = Utc::now().into(); // Assuming Utc::now() is in scope
-            
-            // 3. Use the centralized graph_service.update_vertex, which handles
-            // 1. storage.update_vertex
-            // 2. graph_service.add_vertex (in-memory update & notify)
-            graph_service.update_vertex(vertex.clone()).await?;
-            
-            Ok(json!({ "vertex": vertex }))
-        }
-                
-        CypherQuery::DeleteNode { id } => {
-            // Use the centralized graph_service.delete_vertex_by_uuid, which handles:
-            // 1. storage.delete_vertex
-            // 2. graph_service.delete_vertex_from_memory (in-memory update & notify)
-            graph_service.delete_vertex_by_uuid(id.0).await?;
-            
-            // NOTE: graph_service.delete_vertex_from_memory handles edge cleanup in memory.
-            // We assume the cleanup trigger handles flushing/async tasks.
-            trigger_async_graph_cleanup(); 
-            
-            Ok(json!({ "deleted": id }))
-        }
-        
-        CypherQuery::SetKeyValue { key, value } => {
-            let kv_key = key.clone().into_bytes();
-            let kv_value = value.as_bytes().to_vec();
-
-            // Use graph_service for key-value persistence
-            graph_service.kv_insert(kv_key, kv_value).await?;
-            graph_service.flush_storage().await?;
-            
-            Ok(json!({ "key": key, "value": value }))
-        }
-        
-        CypherQuery::GetKeyValue { key } => {
-            let kv_key = key.clone().into_bytes();
-            
-            // Use graph_service for key-value retrieval
-            let value = graph_service.kv_retrieve(&kv_key).await?;
-            
-            Ok(json!({ "key": key, "value": value.map(|v| String::from_utf8_lossy(&v).to_string()) }))
-        }
-        
-        CypherQuery::DeleteKeyValue { key } => {
-            let kv_key = key.clone().into_bytes();
-            
-            // Use graph_service for key-value operations
-            let value = graph_service.kv_retrieve(&kv_key).await?;
-            let existed = value.is_some();
-            
-            if existed {
-                graph_service.kv_delete(&kv_key).await?;
-                graph_service.flush_storage().await?;
-            }
-            
-            Ok(json!({ "key": key, "deleted": existed }))
-        }
-
-        CypherQuery::CreateIndex { label, properties } => {
-            warn!("CREATE INDEX command is not implemented yet. Index for label '{:?}' on properties {:?} ignored.", label, &properties);
-            Ok(json!({ "status": "success", "message": "Index creation not implemented", "label": label, "properties": properties }))
-        }
-
-        CypherQuery::CreateEdgeBetweenExisting { source_var, rel_type, properties, target_var } => {
-            let properties_clone = properties.clone();
-            
-            // 1. Parse IDs and properties, same as before
-            let from_id = Uuid::parse_str(&source_var)
-                .map_err(|_| GraphError::ValidationError(format!("Invalid source vertex ID: {}", source_var)))?;
-            let to_id = Uuid::parse_str(&target_var)
-                .map_err(|_| GraphError::ValidationError(format!("Invalid target vertex ID: {}", target_var)))?;
-            let props: GraphResult<BTreeMap<String, PropertyValue>> = properties
-                .into_iter()
-                .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
-                .collect();
-            let label = properties_clone
-                .get("label")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| rel_type.clone());
-            
-            // 2. Construct the Edge object
-            let edge = Edge {
-                id: SerializableUuid(Uuid::new_v4()),
-                outbound_id: SerializableUuid(from_id),
-                inbound_id: SerializableUuid(to_id),
-                edge_type: Identifier::new(rel_type)?,
-                label,
-                properties: props?,
-            };
-            
-            // 3. Centralize creation via GraphService
-            // This single call replaces:
-            // - storage.create_edge(edge.clone()).await?;
-            // - graph_service.add_edge(edge.clone()).await?;
-            graph_service.create_edge(edge.clone()).await
-                .map_err(|e| GraphError::InternalError(format!("Failed to create edge via GraphService: {}", e)))?;
-            
-            Ok(json!({ "edge": edge }))
-        }
-
-        // ----------------------------------------------------------------------------------------------------------------------
-        CypherQuery::DetachDeleteNodes { node_variable: _, label } => {
-            // 1. Fetch all vertices matching the filter.
-            // FIX: Use GraphService to get vertices from the in-memory graph view.
-            let all_vertices = graph_service.get_all_vertices().await?;
-            
-            let nodes_to_delete: Vec<Vertex> = all_vertices
-                .into_iter()
-                .filter(|v| {
-                    // Filter by label constraint if present
-                    label.as_ref().map_or(true, |l| v.label.as_ref() == l.as_str())
-                })
-                .collect();
-            
-            if nodes_to_delete.is_empty() {
-                return Ok(json!({"deleted_vertices": 0, "deleted_edges": 0}));
-            }
-            
-            let vertex_ids: Vec<Uuid> = nodes_to_delete.iter().map(|v| v.id.0).collect();
-            
-            // 2. Use the atomic GraphService method for DETACH DELETE.
-            let deleted_edges = graph_service.detach_delete_vertices(&vertex_ids).await?;
-            
-            // Note: The count of deleted vertices is the length of `nodes_to_delete`.
-            let deleted_vertices = nodes_to_delete.len();
-
-            // 3. Flush storage
-            graph_service.flush_storage().await?;
-            trigger_async_graph_cleanup();
-            
-            Ok(json!({
-                "deleted_vertices": deleted_vertices,
-                "deleted_edges": deleted_edges
-            }))
-        }
-        
-        // ----------------------------------------------------------------------------------------------------------------------
-        CypherQuery::DeleteEdges {
-            edge_variable,
-            pattern,
-            where_clause,
-        } => {
-            // --- STEP 1: MATCH (READ) ---
-            
-            // Re-evaluating the variable-length check based on the provided pattern structure
-            let is_variable_length = pattern.relationships.len() == 1
-                && pattern.nodes.len() == 2
-                && pattern.relationships[0].2.map_or(false, |(min, max)| {
-                    // Check if the range is not exactly 1..1 or implicit 1
-                    min.map_or(1, |m| m) != 1 || max.map_or(1, |m| m) != 1
-                });
-
-            let edges_to_delete: Vec<Edge> = if is_variable_length {
-                // Keep the existing complex variable-length path (VLP) logic for now.
-                // NOTE: The `exec_cypher_pattern` is designed for single-hop and must be 
-                // re-used carefully if VLP logic isn't fully integrated into it.
-                // Assuming `graph_service.match_variable_length_path` exists:
-                // ... (Original VLP logic using graph_service.get_graph().await for traversal) ...
-                
-                // --- Re-using the provided VLP logic from the prompt ---
-                let graph = graph_service.get_graph().await;
-                let rel_pat = &pattern.relationships[0];
-                let start_node_pat = &pattern.nodes[0];
-                let end_node_pat = &pattern.nodes[1];
-                
-                let start_vertices: Vec<&Vertex> = graph.vertices.values()
-                    // Assuming node_matches_constraints is available
-                    .filter(|v| node_matches_constraints(v, &start_node_pat.1, &start_node_pat.2))
-                    .collect();
-                
-                let mut all_matched_edge_ids: HashSet<Uuid> = HashSet::new();
-                
-                for start_v in start_vertices {
-                    // This method relies on the private methods of Graph (match_variable_length_path)
-                    let (_, matched_e_ids) = graph.match_variable_length_path(
-                        start_v.id.0,
-                        rel_pat,
-                        end_node_pat
-                    );
-                    all_matched_edge_ids.extend(matched_e_ids);
-                }
-                
-                graph.edges.values()
-                    .filter(|e| all_matched_edge_ids.contains(&e.id.0))
-                    .cloned()
-                    .collect()
-            } else {
-                // FIX: Use the shared helper function for single-hop pattern matching.
-                // This replaces the old `exec_cypher_pattern(&storage)`.
-                let (_, edges) = exec_cypher_pattern(
-                    vec![(None, pattern.nodes.clone(), pattern.relationships.clone())],
-                    &(*graph_service) // <-- FIX: Dereference the Arc to get &GraphService
-                ).await?;
-                
-                edges
-            };
-            
-            // --- STEP 2: DELETE (WRITE) ---
-            let mut deleted = 0usize;
-            
-            for edge in edges_to_delete {
-                // Where clause evaluation and deletion logic remains the same:
-                let mut variables = HashMap::new();
-                variables.insert(edge_variable.clone(), CypherValue::Edge(edge.clone()));
-                
-                let ctx = EvaluationContext {
-                    variables,
-                    parameters: HashMap::new(),
-                };
-                
-                let should_delete = match where_clause.as_ref() {
-                    Some(where_clause) => where_clause.evaluate(&ctx)?,
-                    None => true,
-                };
-                
-                if should_delete {
-                    // FIX: Use the atomic method implemented on GraphService
-                    graph_service.delete_edge_by_uuid(edge.id.0).await?;
-                    deleted += 1;
-                }
-            }
-            
-            graph_service.flush_storage().await?;
-            trigger_async_graph_cleanup();
-            
-            Ok(json!({
-                "status": "success",
-                "deleted_edges": deleted,
-                "message": format!("Successfully deleted {deleted} edge(s)")
-            }))
-        }
-
-        CypherQuery::MatchRemove { match_patterns, remove_clauses } => {
-            let (matched_vertices, _) = exec_cypher_pattern(match_patterns, &graph_service).await?;
-            if matched_vertices.is_empty() {
-                return Ok(json!({ "vertices": Vec::<Vertex>::new() }));
-            }
-            let mut updated_vertices = Vec::new();
-            for mut vertex in matched_vertices {
-                for (var, prop_name) in &remove_clauses {
-                    // Remove the property - prop_name is already &String, so use it directly
-                    vertex.properties.remove(prop_name.as_str());
-                    vertex.updated_at = Utc::now().into();
-                }
-                graph_service.update_vertex(vertex.clone()).await?;
-                updated_vertices.push(vertex);
-            }
-            Ok(json!({
-                "vertices": updated_vertices,
-                "stats": {
-                    "vertices_updated": updated_vertices.len()
-                }
-            }))
-        }
-        CypherQuery::Merge { patterns, on_create_set, on_match_set } => {
-            info!("===> EXECUTING MERGE: {} patterns, {} ON CREATE SET, {} ON MATCH SET",
-                patterns.len(), on_create_set.len(), on_match_set.len());
-
-            // FIX: Delegate the complex MERGE logic entirely to the dedicated GraphService method.
-            let result = graph_service.execute_merge_query(
-                patterns,
-                on_create_set,
-                on_match_set,
-            ).await?;
-
-            // Convert the ExecutionResult into the expected serde_json::Value response format.
-            // NOTE: ExecutionResult contains only the IDs (Uuids) of created/updated nodes,
-            // so the final output structure is simplified compared to the manual logic, 
-            // which previously included the full Vertex object.
-
-            let status_json = if !result.updated_nodes.is_empty() {
-                // Matched and Updated
-                json!({
-                    "status": "matched",
-                    "updated_vertex_ids": result.updated_nodes, // List of Uuid
-                    "stats": { 
-                        "vertices_matched": result.updated_nodes.len(), 
-                        "vertices_updated": result.updated_nodes.len() 
+                Ok(json!({
+                    "vertices": created_vertices,
+                    "edges": created_edges,
+                    "stats": {
+                        "vertices_created": created_vertices.len(),
+                        "relationships_created": created_edges.len(),
                     }
-                })
-            } else if !result.created_nodes.is_empty() {
-                // Not Matched, Created
-                json!({
-                    "status": "created",
-                    "created_vertex_ids": result.created_nodes, // List of Uuid
-                    "stats": { "vertices_created": result.created_nodes.len() }
-                })
-            } else {
-                // Matched but no SET clauses applied (assuming single-node MERGE for stats)
-                json!({
-                    "status": "matched",
-                    "updated_vertex_ids": Vec::<uuid::Uuid>::new(),
-                    "stats": { "vertices_matched": 1, "vertices_updated": 0 }
-                })
-            };
-            
-            Ok(status_json)
-        },
-        CypherQuery::MatchPath { path_var: _, left_node, right_node, return_clause: _ } => {
-            let left_pat = parse_node_pattern(&left_node)?;
-            let right_pat = parse_node_pattern(&right_node)?;
-
-            // Reworked to use GraphService's read guard for in-memory access (preferred for performance)
-            let graph_read_guard = graph_service.read().await;
-
-            // Use references to the in-memory graph's internal collections
-            // The keys here are SerializableUuid
-            let all_vertices_ref = &graph_read_guard.vertices;
-            let all_edges_ref = &graph_read_guard.edges;
-
-            // These HashSets correctly contain SerializableUuid
-            let mut left_ids = HashSet::new();
-            let mut right_ids = HashSet::new();
-
-            // The matching function remains the same, operating on a Vertex reference.
-            let matches = |v: &Vertex, (label, props): &(Option<String>, HashMap<String, Value>)| {
-                let label_ok = label.as_ref().map_or(true, |l| {
-                    let vl = v.label.as_ref();
-                    vl == l || vl.starts_with(&format!("{}:", l))
-                });
-                let props_ok = props.iter().all(|(k, expected)| {
-                    v.properties.get(k).map_or(false, |actual| {
-                        // Assuming to_property_value is available in scope
-                        to_property_value(expected.clone()).ok().map_or(false, |pv| actual == &pv)
-                    })
-                });
-                label_ok && props_ok
-            };
-
-            // 1. Identify starting and ending vertices from the in-memory collection
-            for v in all_vertices_ref.values() {
-                if matches(v, &left_pat) { left_ids.insert(v.id); }
-                if matches(v, &right_pat) { right_ids.insert(v.id); }
+                }))
             }
+            // New match arm in the query execution logic (e.g., in execute_cypher_query)
+            CypherQuery::CreateStatement { patterns, return_items } => {
+                info!("===> EXECUTING CreateStatement: {} patterns, returning: {:?}", patterns.len(), return_items);
 
-            let mut matched_edge_ids = HashSet::new();
-            // matched_vertex_ids correctly contains SerializableUuid
-            let mut matched_vertex_ids = left_ids.union(&right_ids).copied().collect::<HashSet<_>>();
-
-            // 2. Perform the Breadth-First Search (BFS) for paths (up to 2 hops, as per original logic)
-            // FIX 1: The queue must store the underlying Uuid, not SerializableUuid, 
-            // or the queue must be Vec<(SerializableUuid, u32)>. 
-            // Since the matched_vertex_ids uses SerializableUuid, we'll keep the queue consistent.
-            let mut queue: Vec<(SerializableUuid, u32)> = matched_vertex_ids.iter().map(|&id| (id, 0)).collect();
-            let mut visited_edges = HashSet::new();
-
-            while let Some((current_id, hop)) = queue.pop() {
-                if hop >= 2 { continue; }
-
-                // Iterate over all edges in the graph
-                for edge in all_edges_ref.values() {
-                    if visited_edges.contains(&edge.id.0) { continue; }
-
-                    // These are Uuid
-                    let (from_id_uuid, to_id_uuid) = (edge.outbound_id.0, edge.inbound_id.0);
-                    
-                    // This is SerializableUuid
-                    let current_id_uuid = current_id.0; 
-
-                    let next_id_uuid = if from_id_uuid == current_id_uuid {
-                        Some(to_id_uuid)
-                    } else if to_id_uuid == current_id_uuid {
-                        Some(from_id_uuid)
-                    } else {
-                        None
-                    };
-
-                    if let Some(next_uuid) = next_id_uuid {
-                        // FIX 2: Convert the raw Uuid back to SerializableUuid before insertion
-                        let next_id = SerializableUuid(next_uuid);
-                        
-                        visited_edges.insert(edge.id.0);
-                        matched_edge_ids.insert(edge.id.0);
-                        matched_vertex_ids.insert(next_id); // Insert the SerializableUuid
-                        
-                        if hop < 1 { 
-                            queue.push((next_id, hop + 1)); // Push the SerializableUuid
+                let mut created_vertices = Vec::new();
+                let mut created_edges = Vec::new();
+                let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
+                
+                // --- Phase 1: Create all vertices and populate var_to_id map ---
+                
+                // Gather all unique NodePatterns from all patterns
+                let mut unique_nodes = HashMap::new();
+                for (_, nodes, _) in patterns.iter() {
+                    for node_pattern in nodes {
+                        if let Some(var) = node_pattern.0.as_ref() {
+                            // Use the variable as the key to ensure we only create each node once
+                            unique_nodes.entry(var.clone()).or_insert(node_pattern);
                         }
                     }
                 }
+                
+                for (var, node_pattern) in unique_nodes {
+                    let (var_opt, label_opt, properties) = node_pattern;
+                    
+                    let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                        .iter()
+                        .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                        .collect();
+                    
+                    let new_id = SerializableUuid(Uuid::new_v4());
+                    let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                    
+                    let vertex = Vertex {
+                        id: new_id,
+                        label: Identifier::new(final_label)?,
+                        properties: props?,
+                        created_at: Utc::now().into(),  
+                        updated_at: Utc::now().into(),  
+                    };
+                    
+                    // *** RELY ON graph_service.create_vertex ***
+                    // Replaces: storage.create_vertex(vertex.clone()).await?;
+                    // Replaces: graph_service.add_vertex(vertex.clone()).await?;
+                    graph_service.create_vertex(vertex.clone()).await?;
+                    
+                    var_to_id.insert(var.clone(), new_id);
+                    created_vertices.push(vertex);
+                }
+                
+                // --- Phase 2: Create all edges from all patterns ---
+
+                for (_, nodes, relationships) in patterns.into_iter() {
+                    if relationships.is_empty() {
+                        continue;
+                    }
+
+                    // Iterate over (from_node, rel, to_node) segments
+                    for i in 0..relationships.len() {
+                        let rel_tuple = &relationships[i]; 
+                        
+                        // Nodes are stored sequentially in the Pattern tuple, matching rel[i] with node[i] -> node[i+1]
+                        let from_var_opt = nodes[i].0.as_ref();
+                        let to_var_opt = nodes[i + 1].0.as_ref();
+
+                        let from_var = from_var_opt.ok_or(GraphError::ValidationError(format!("Relationship source node at index {} has no variable.", i)))?;
+                        let to_var = to_var_opt.ok_or(GraphError::ValidationError(format!("Relationship target node at index {} has no variable.", i + 1)))?;
+
+                        // Resolve IDs using the map of newly created nodes (var_to_id)
+                        let from_id = *var_to_id.get(from_var).ok_or(GraphError::ValidationError(format!("Unbound source variable: {}", from_var)))?;
+                        let to_id = *var_to_id.get(to_var).ok_or(GraphError::ValidationError(format!("Unbound target variable: {}", to_var)))?;
+
+                        // Destructure the BORROWED 5-tuple, cloning the owned parts
+                        let (
+                            _rel_var,     
+                            label_opt,      // Index 1: Relationship Label
+                            _len_range,     
+                            properties,     // Index 3: Properties Map
+                            direction_opt,  // Index 4: Direction (Option<bool>)
+                        ) = rel_tuple;
+
+                        // Handle direction: Some(false) is inbound.
+                        let (outbound_id, inbound_id) = match direction_opt {
+                            Some(false) => (to_id, from_id), // (from_id)<-[R]-(to_id)
+                            _ => (from_id, to_id),           // (from_id)-[R]->(to_id) or (from_id)-[R]-(to_id)
+                        };
+
+                        let edge_type_str = label_opt.clone().unwrap_or("RELATED".to_string());
+                        
+                        // Properties
+                        let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
+                            .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
+                            .collect();
+                        
+                        let edge = Edge {
+                            id: SerializableUuid(Uuid::new_v4()),
+                            outbound_id,
+                            inbound_id,
+                            edge_type: Identifier::new(edge_type_str.clone())?,
+                            label: edge_type_str,
+                            properties: props?,
+                        };
+                        
+                        // *** RELY ON graph_service.create_edge ***
+                        // Replaces: storage.create_edge(edge.clone()).await?;
+                        // Replaces: graph_service.add_edge(edge.clone()).await?;
+                        graph_service.create_edge(edge.clone()).await?;
+                        created_edges.push(edge);
+                    }
+                }
+                
+                // --- Phase 3: Shape the result based on return_items ---
+                let all_return_variables: HashSet<String> = return_items.into_iter().collect();
+                let created_vertex_map: HashMap<SerializableUuid, &Vertex> = created_vertices.iter().map(|v| (v.id, v)).collect();
+
+                // The final result should be a single JSON object containing the returned variables as keys
+                let returned_data: HashMap<String, Value> = var_to_id.iter()
+                    .filter(|(var, _)| all_return_variables.contains(*var))
+                    .filter_map(|(var, id)| {
+                        created_vertex_map.get(id)
+                            .and_then(|v| serde_json::to_value(v).ok())
+                            .map(|v_json| (var.clone(), v_json))
+                    })
+                    .collect();
+
+                Ok(serde_json::to_value(returned_data)?)
             }
 
-            let vertices: Vec<Vertex> = matched_vertex_ids.into_iter()
-                // FIX: Extract the inner Uuid from the SerializableUuid before lookup.
-                // Assuming SerializableUuid is a newtype wrapper like struct SerializableUuid(pub Uuid);
-                .filter_map(|id| all_vertices_ref.get(&id.0).cloned()) 
-                .collect();
+            CypherQuery::CreateEdge { from_id, edge_type, to_id } => {
+                let edge = Edge {
+                    id: SerializableUuid(Uuid::new_v4()),
+                    outbound_id: from_id,
+                    edge_type: Identifier::new(edge_type.clone())?,
+                    inbound_id: to_id,
+                    label: edge_type,
+                    properties: BTreeMap::new(),
+                };
+                
+                // Use the centralized graph_service.create_edge, which handles
+                // 1. storage.create_edge
+                // 2. graph_service.add_edge (in-memory update & notify)
+                graph_service.create_edge(edge.clone()).await?;
+                
+                Ok(json!({ "edge": edge }))
+            }
+                            
+            CypherQuery::SetNode { id, properties } => {
+                // 1. Get the current state of the vertex (using graph_service methods)
+                let mut vertex = graph_service.get_vertex_from_storage(&id.0).await?.ok_or_else(|| {
+                    // Must read from storage here if the command is designed to update existing only
+                    // based on persistent state, otherwise read from memory (graph_service.get_vertex).
+                    // Assuming it must exist in storage to be updated.
+                    GraphError::StorageError(format!("Vertex not found: {:?}", id))
+                })?;
+                
+                // 2. Apply property changes
+                let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                    .into_iter()
+                    .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
+                    .collect();
+                vertex.properties.extend(props?);
+                vertex.updated_at = Utc::now().into(); // Assuming Utc::now() is in scope
+                
+                // 3. Use the centralized graph_service.update_vertex, which handles
+                // 1. storage.update_vertex
+                // 2. graph_service.add_vertex (in-memory update & notify)
+                graph_service.update_vertex(vertex.clone()).await?;
+                
+                Ok(json!({ "vertex": vertex }))
+            }
+                    
+            CypherQuery::DeleteNode { id } => {
+                // Use the centralized graph_service.delete_vertex_by_uuid, which handles:
+                // 1. storage.delete_vertex
+                // 2. graph_service.delete_vertex_from_memory (in-memory update & notify)
+                graph_service.delete_vertex_by_uuid(id.0).await?;
+                
+                // NOTE: graph_service.delete_vertex_from_memory handles edge cleanup in memory.
+                // We assume the cleanup trigger handles flushing/async tasks.
+                trigger_async_graph_cleanup(); 
+                
+                Ok(json!({ "deleted": id }))
+            }
+            
+            CypherQuery::SetKeyValue { key, value } => {
+                let kv_key = key.clone().into_bytes();
+                let kv_value = value.as_bytes().to_vec();
 
-            let edges: Vec<Edge> = matched_edge_ids.into_iter()
-                .filter_map(|id| all_edges_ref.get(&id).cloned())
-                .collect();
+                // Use graph_service for key-value persistence
+                graph_service.kv_insert(kv_key, kv_value).await?;
+                graph_service.flush_storage().await?;
+                
+                Ok(json!({ "key": key, "value": value }))
+            }
+            
+            CypherQuery::GetKeyValue { key } => {
+                let kv_key = key.clone().into_bytes();
+                
+                // Use graph_service for key-value retrieval
+                let value = graph_service.kv_retrieve(&kv_key).await?;
+                
+                Ok(json!({ "key": key, "value": value.map(|v| String::from_utf8_lossy(&v).to_string()) }))
+            }
+            
+            CypherQuery::DeleteKeyValue { key } => {
+                let kv_key = key.clone().into_bytes();
+                
+                // Use graph_service for key-value operations
+                let value = graph_service.kv_retrieve(&kv_key).await?;
+                let existed = value.is_some();
+                
+                if existed {
+                    graph_service.kv_delete(&kv_key).await?;
+                    graph_service.flush_storage().await?;
+                }
+                
+                Ok(json!({ "key": key, "deleted": existed }))
+            }
 
-            // Read guard dropped here
+            CypherQuery::CreateIndex { label, properties } => {
+                warn!("CREATE INDEX command is not implemented yet. Index for label '{:?}' on properties {:?} ignored.", label, &properties);
+                Ok(json!({ "status": "success", "message": "Index creation not implemented", "label": label, "properties": properties }))
+            }
 
-            Ok(json!({ "vertices": vertices, "edges": edges }))
+            CypherQuery::CreateEdgeBetweenExisting { source_var, rel_type, properties, target_var } => {
+                let properties_clone = properties.clone();
+                
+                // 1. Parse IDs and properties, same as before
+                let from_id = Uuid::parse_str(&source_var)
+                    .map_err(|_| GraphError::ValidationError(format!("Invalid source vertex ID: {}", source_var)))?;
+                let to_id = Uuid::parse_str(&target_var)
+                    .map_err(|_| GraphError::ValidationError(format!("Invalid target vertex ID: {}", target_var)))?;
+                let props: GraphResult<BTreeMap<String, PropertyValue>> = properties
+                    .into_iter()
+                    .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
+                    .collect();
+                let label = properties_clone
+                    .get("label")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| rel_type.clone());
+                
+                // 2. Construct the Edge object
+                let edge = Edge {
+                    id: SerializableUuid(Uuid::new_v4()),
+                    outbound_id: SerializableUuid(from_id),
+                    inbound_id: SerializableUuid(to_id),
+                    edge_type: Identifier::new(rel_type)?,
+                    label,
+                    properties: props?,
+                };
+                
+                // 3. Centralize creation via GraphService
+                // This single call replaces:
+                // - storage.create_edge(edge.clone()).await?;
+                // - graph_service.add_edge(edge.clone()).await?;
+                graph_service.create_edge(edge.clone()).await
+                    .map_err(|e| GraphError::InternalError(format!("Failed to create edge via GraphService: {}", e)))?;
+                
+                Ok(json!({ "edge": edge }))
+            }
+
+            // ----------------------------------------------------------------------------------------------------------------------
+            CypherQuery::DetachDeleteNodes { node_variable: _, label } => {
+                // 1. Fetch all vertices matching the filter.
+                // FIX: Use GraphService to get vertices from the in-memory graph view.
+                let all_vertices = graph_service.get_all_vertices().await?;
+                
+                let nodes_to_delete: Vec<Vertex> = all_vertices
+                    .into_iter()
+                    .filter(|v| {
+                        // Filter by label constraint if present
+                        label.as_ref().map_or(true, |l| v.label.as_ref() == l.as_str())
+                    })
+                    .collect();
+                
+                if nodes_to_delete.is_empty() {
+                    return Ok(json!({"deleted_vertices": 0, "deleted_edges": 0}));
+                }
+                
+                let vertex_ids: Vec<Uuid> = nodes_to_delete.iter().map(|v| v.id.0).collect();
+                
+                // 2. Use the atomic GraphService method for DETACH DELETE.
+                let deleted_edges = graph_service.detach_delete_vertices(&vertex_ids).await?;
+                
+                // Note: The count of deleted vertices is the length of `nodes_to_delete`.
+                let deleted_vertices = nodes_to_delete.len();
+
+                // 3. Flush storage
+                graph_service.flush_storage().await?;
+                trigger_async_graph_cleanup();
+                
+                Ok(json!({
+                    "deleted_vertices": deleted_vertices,
+                    "deleted_edges": deleted_edges
+                }))
+            }
+            
+            // ----------------------------------------------------------------------------------------------------------------------
+            CypherQuery::DeleteEdges {
+                edge_variable,
+                pattern,
+                where_clause,
+            } => {
+                // --- STEP 1: MATCH (READ) ---
+                
+                // Re-evaluating the variable-length check based on the provided pattern structure
+                let is_variable_length = pattern.relationships.len() == 1
+                    && pattern.nodes.len() == 2
+                    && pattern.relationships[0].2.map_or(false, |(min, max)| {
+                        // Check if the range is not exactly 1..1 or implicit 1
+                        min.map_or(1, |m| m) != 1 || max.map_or(1, |m| m) != 1
+                    });
+
+                let edges_to_delete: Vec<Edge> = if is_variable_length {
+                    // Keep the existing complex variable-length path (VLP) logic for now.
+                    // NOTE: The `exec_cypher_pattern` is designed for single-hop and must be 
+                    // re-used carefully if VLP logic isn't fully integrated into it.
+                    // Assuming `graph_service.match_variable_length_path` exists:
+                    // ... (Original VLP logic using graph_service.get_graph().await for traversal) ...
+                    
+                    // --- Re-using the provided VLP logic from the prompt ---
+                    let graph = graph_service.get_graph().await;
+                    let rel_pat = &pattern.relationships[0];
+                    let start_node_pat = &pattern.nodes[0];
+                    let end_node_pat = &pattern.nodes[1];
+                    
+                    let start_vertices: Vec<&Vertex> = graph.vertices.values()
+                        // Assuming node_matches_constraints is available
+                        .filter(|v| node_matches_constraints(v, &start_node_pat.1, &start_node_pat.2))
+                        .collect();
+                    
+                    let mut all_matched_edge_ids: HashSet<Uuid> = HashSet::new();
+                    
+                    for start_v in start_vertices {
+                        // This method relies on the private methods of Graph (match_variable_length_path)
+                        let (_, matched_e_ids) = graph.match_variable_length_path(
+                            start_v.id.0,
+                            rel_pat,
+                            end_node_pat
+                        );
+                        all_matched_edge_ids.extend(matched_e_ids);
+                    }
+                    
+                    graph.edges.values()
+                        .filter(|e| all_matched_edge_ids.contains(&e.id.0))
+                        .cloned()
+                        .collect()
+                } else {
+                    // FIX: Use the shared helper function for single-hop pattern matching.
+                    // This replaces the old `exec_cypher_pattern(&storage)`.
+                    let (_, edges) = exec_cypher_pattern(
+                        vec![(None, pattern.nodes.clone(), pattern.relationships.clone())],
+                        &(*graph_service) // <-- FIX: Dereference the Arc to get &GraphService
+                    ).await?;
+                    
+                    edges
+                };
+                
+                // --- STEP 2: DELETE (WRITE) ---
+                let mut deleted = 0usize;
+                
+                for edge in edges_to_delete {
+                    // Where clause evaluation and deletion logic remains the same:
+                    let mut variables = HashMap::new();
+                    variables.insert(edge_variable.clone(), CypherValue::Edge(edge.clone()));
+                    
+                    let ctx = EvaluationContext {
+                        variables,
+                        parameters: HashMap::new(),
+                    };
+                    
+                    let should_delete = match where_clause.as_ref() {
+                        Some(where_clause) => where_clause.evaluate(&ctx)?,
+                        None => true,
+                    };
+                    
+                    if should_delete {
+                        // FIX: Use the atomic method implemented on GraphService
+                        graph_service.delete_edge_by_uuid(edge.id.0).await?;
+                        deleted += 1;
+                    }
+                }
+                
+                graph_service.flush_storage().await?;
+                trigger_async_graph_cleanup();
+                
+                Ok(json!({
+                    "status": "success",
+                    "deleted_edges": deleted,
+                    "message": format!("Successfully deleted {deleted} edge(s)")
+                }))
+            }
+
+            CypherQuery::MatchRemove { match_patterns, remove_clauses } => {
+                let (matched_vertices, _) = exec_cypher_pattern(match_patterns, &graph_service).await?;
+                if matched_vertices.is_empty() {
+                    return Ok(json!({ "vertices": Vec::<Vertex>::new() }));
+                }
+                let mut updated_vertices = Vec::new();
+                for mut vertex in matched_vertices {
+                    for (var, prop_name) in &remove_clauses {
+                        // Remove the property - prop_name is already &String, so use it directly
+                        vertex.properties.remove(prop_name.as_str());
+                        vertex.updated_at = Utc::now().into();
+                    }
+                    graph_service.update_vertex(vertex.clone()).await?;
+                    updated_vertices.push(vertex);
+                }
+                Ok(json!({
+                    "vertices": updated_vertices,
+                    "stats": {
+                        "vertices_updated": updated_vertices.len()
+                    }
+                }))
+            }
+            CypherQuery::Merge { patterns, on_create_set, on_match_set } => {
+                info!("===> EXECUTING MERGE: {} patterns, {} ON CREATE SET, {} ON MATCH SET",
+                    patterns.len(), on_create_set.len(), on_match_set.len());
+
+                // FIX: Delegate the complex MERGE logic entirely to the dedicated GraphService method.
+                let result = graph_service.execute_merge_query(
+                    patterns,
+                    on_create_set,
+                    on_match_set,
+                ).await?;
+
+                // Convert the ExecutionResult into the expected serde_json::Value response format.
+                // NOTE: ExecutionResult contains only the IDs (Uuids) of created/updated nodes,
+                // so the final output structure is simplified compared to the manual logic, 
+                // which previously included the full Vertex object.
+
+                let status_json = if !result.updated_nodes.is_empty() {
+                    // Matched and Updated
+                    json!({
+                        "status": "matched",
+                        "updated_vertex_ids": result.updated_nodes, // List of Uuid
+                        "stats": { 
+                            "vertices_matched": result.updated_nodes.len(), 
+                            "vertices_updated": result.updated_nodes.len() 
+                        }
+                    })
+                } else if !result.created_nodes.is_empty() {
+                    // Not Matched, Created
+                    json!({
+                        "status": "created",
+                        "created_vertex_ids": result.created_nodes, // List of Uuid
+                        "stats": { "vertices_created": result.created_nodes.len() }
+                    })
+                } else {
+                    // Matched but no SET clauses applied (assuming single-node MERGE for stats)
+                    json!({
+                        "status": "matched",
+                        "updated_vertex_ids": Vec::<uuid::Uuid>::new(),
+                        "stats": { "vertices_matched": 1, "vertices_updated": 0 }
+                    })
+                };
+                
+                Ok(status_json)
+            },
+            // 1. Handle Query Chains (Multiple clauses like MATCH...CREATE...RETURN)
+            CypherQuery::Chain(clauses) => {
+                // FIX: Restore the required logic to box clauses and call the high-level service method.
+                // This service method is assumed to handle the state/context of sequential execution,
+                // internally relying on the logic provided by `execute_chain_internal`.
+                let boxed_clauses = clauses.into_iter().map(Box::new).collect();
+                
+                let chain_qr_result = graph_service.execute_chain(boxed_clauses)
+                    .await;
+
+                // The service method returns GraphResult<QueryResult>, so convert the result 
+                // to the final required type, Value.
+                graph_service.query_result_to_value(chain_qr_result)
+            }
+
+            // 2. Handle Union Queries
+            // Assuming the original structure: CypherQuery::Union(q1, q2, is_all)
+            CypherQuery::Union(q1, q2, is_all) => {
+                // q1 and q2 are already Box<CypherQuery> as bound in the match pattern.
+                // We pass them directly to the service method without dereferencing (*q1, *q2)
+                // which was causing the type mismatch (expected Box, found raw enum).
+                let union_qr_result = graph_service.union_results(q1, q2, is_all)
+                    .await;
+
+                // Convert the QueryResult returned by the service into the final Value.
+                graph_service.query_result_to_value(union_qr_result)
+            }
+            // 3. Handle RETURN Statements (The final step in a query chain)
+            CypherQuery::ReturnStatement { 
+                projection_string,
+                // Assuming these fields are present in the variant to hold parsed sub-clauses
+                // or are placeholders to be filled later by refining the parser.
+                order_by,
+                skip,
+                limit,
+            } => {
+                // The service method is responsible for executing the projection 
+                // and applying any modifiers (ORDER BY, SKIP, LIMIT) based on the 
+                // current execution context (e.g., intermediate results from MATCH/WITH).
+
+                // This is the actual GraphService method call, passing the decomposed components:
+                let return_qr_result = graph_service.execute_return_statement(
+                    projection_string,
+                    order_by,
+                    skip,
+                    limit,
+                ).await;
+
+                // Convert the QueryResult (containing columns and rows) into the final required Value structure.
+                graph_service.query_result_to_value(return_qr_result)
+            }
+            // NEW: Handles the standalone SET clause for chaining (e.g., `MATCH (n) SET n.prop = 'new'`)
+            CypherQuery::SetStatement { assignments } => {
+                // Assignments is Vec<(String, String, Value)>: (variable, property, new_value)
+                
+                // This is a complex operation typically requiring a match context.
+                // In a standalone SET, it implies a pre-matched context or a simple property update.
+                // Since there's no context, we rely on the service to interpret the assignments.
+                
+                // Assuming GraphService has a method to apply SET assignments
+                graph_service.apply_set_assignments(assignments).await?;
+                
+                Ok(json!({"message": "Properties set successfully."}))
+            }
+            // NEW: Handles the standalone DELETE clause (e.g., `MATCH (n) DELETE n`)
+            CypherQuery::DeleteStatement { variables, detach } => {
+                // variables is Vec<String>: list of variables to delete
+                
+                // The service is responsible for finding nodes/relationships bound to these 
+                // variables in the current transaction context and performing the deletion.
+                
+                graph_service.delete_variables(variables, detach).await?;
+                Ok(json!({"message": "Variables deleted successfully."}))
+            },
+
+            // NEW: Handles the standalone REMOVE clause (e.g., `MATCH (n) REMOVE n:Label`)
+            CypherQuery::RemoveStatement { removals } => {
+                // Removals is Vec<(String, String)>: (variable, label_or_property)
+                
+                // The service iterates through the removals and applies them to the context 
+                // bound variables (removing a label, or setting a property to null).
+                graph_service.remove_labels_or_properties(removals).await?;
+                
+                Ok(json!({"message": "Labels/properties removed successfully."}))
+            },
+            CypherQuery::MatchPath { path_var: _, left_node, right_node, return_clause: _ } => {
+                let left_pat = parse_node_pattern(&left_node)?;
+                let right_pat = parse_node_pattern(&right_node)?;
+
+                // Reworked to use GraphService's read guard for in-memory access (preferred for performance)
+                let graph_read_guard = graph_service.read().await;
+
+                // Use references to the in-memory graph's internal collections
+                // The keys here are SerializableUuid
+                let all_vertices_ref = &graph_read_guard.vertices;
+                let all_edges_ref = &graph_read_guard.edges;
+
+                // These HashSets correctly contain SerializableUuid
+                let mut left_ids = HashSet::new();
+                let mut right_ids = HashSet::new();
+
+                // The matching function remains the same, operating on a Vertex reference.
+                let matches = |v: &Vertex, (label, props): &(Option<String>, HashMap<String, Value>)| {
+                    let label_ok = label.as_ref().map_or(true, |l| {
+                        let vl = v.label.as_ref();
+                        vl == l || vl.starts_with(&format!("{}:", l))
+                    });
+                    let props_ok = props.iter().all(|(k, expected)| {
+                        v.properties.get(k).map_or(false, |actual| {
+                            // Assuming to_property_value is available in scope
+                            to_property_value(expected.clone()).ok().map_or(false, |pv| actual == &pv)
+                        })
+                    });
+                    label_ok && props_ok
+                };
+
+                // 1. Identify starting and ending vertices from the in-memory collection
+                for v in all_vertices_ref.values() {
+                    if matches(v, &left_pat) { left_ids.insert(v.id); }
+                    if matches(v, &right_pat) { right_ids.insert(v.id); }
+                }
+
+                let mut matched_edge_ids = HashSet::new();
+                // matched_vertex_ids correctly contains SerializableUuid
+                let mut matched_vertex_ids = left_ids.union(&right_ids).copied().collect::<HashSet<_>>();
+
+                // 2. Perform the Breadth-First Search (BFS) for paths (up to 2 hops, as per original logic)
+                // FIX 1: The queue must store the underlying Uuid, not SerializableUuid, 
+                // or the queue must be Vec<(SerializableUuid, u32)>. 
+                // Since the matched_vertex_ids uses SerializableUuid, we'll keep the queue consistent.
+                let mut queue: Vec<(SerializableUuid, u32)> = matched_vertex_ids.iter().map(|&id| (id, 0)).collect();
+                let mut visited_edges = HashSet::new();
+
+                while let Some((current_id, hop)) = queue.pop() {
+                    if hop >= 2 { continue; }
+
+                    // Iterate over all edges in the graph
+                    for edge in all_edges_ref.values() {
+                        if visited_edges.contains(&edge.id.0) { continue; }
+
+                        // These are Uuid
+                        let (from_id_uuid, to_id_uuid) = (edge.outbound_id.0, edge.inbound_id.0);
+                        
+                        // This is SerializableUuid
+                        let current_id_uuid = current_id.0; 
+
+                        let next_id_uuid = if from_id_uuid == current_id_uuid {
+                            Some(to_id_uuid)
+                        } else if to_id_uuid == current_id_uuid {
+                            Some(from_id_uuid)
+                        } else {
+                            None
+                        };
+
+                        if let Some(next_uuid) = next_id_uuid {
+                            // FIX 2: Convert the raw Uuid back to SerializableUuid before insertion
+                            let next_id = SerializableUuid(next_uuid);
+                            
+                            visited_edges.insert(edge.id.0);
+                            matched_edge_ids.insert(edge.id.0);
+                            matched_vertex_ids.insert(next_id); // Insert the SerializableUuid
+                            
+                            if hop < 1 { 
+                                queue.push((next_id, hop + 1)); // Push the SerializableUuid
+                            }
+                        }
+                    }
+                }
+
+                let vertices: Vec<Vertex> = matched_vertex_ids.into_iter()
+                    // FIX: Extract the inner Uuid from the SerializableUuid before lookup.
+                    // Assuming SerializableUuid is a newtype wrapper like struct SerializableUuid(pub Uuid);
+                    .filter_map(|id| all_vertices_ref.get(&id.0).cloned()) 
+                    .collect();
+
+                let edges: Vec<Edge> = matched_edge_ids.into_iter()
+                    .filter_map(|id| all_edges_ref.get(&id).cloned())
+                    .collect();
+
+                // Read guard dropped here
+
+                Ok(json!({ "vertices": vertices, "edges": edges }))
+            }
         }
+    })
+}
+
+// Required to parse the ON CREATE SET / ON MATCH SET sub-clauses in MERGE.
+// Returns a parser function defined by the given keyword ("ON CREATE" or "ON MATCH").
+// --- 1. Fix: parse_on_set_clause (Cypher MERGE Clause) ---
+// FIX 1: Change return type from Value to PropertyValue
+fn parse_on_set_clause(on_type: &str) -> impl Fn(&str) -> IResult<&str, Vec<(String, String, Value)>> {
+    move |input| {
+        map(
+            preceded(
+                pair(tag_no_case(on_type), terminated(tag_no_case("SET"), multispace1)),
+                // parse_set_assignment_tuple returns (String, String, Value)
+                separated_list1(preceded(multispace0::<&str, NomErrorType<&str>>, char(',')), parse_set_assignment_tuple),
+            ),
+            |assignments| assignments,
+        ).parse(input)
     }
 }
 

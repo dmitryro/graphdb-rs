@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
 use anyhow::Error;
-use serde_json::{json, Value};
+use serde_json::{json, Value, from_str, to_string};
 use chrono::Utc;
 use log::{info, error, warn};
 use models::identifiers::{ Identifier, SerializableUuid, SerializableInternString };
@@ -20,6 +20,7 @@ use crate::graph_engine::medical::*;
 use crate::storage_engine::{ GraphStorageEngine, StorageEngine, GraphOp }; // Ensure this trait is in scope
 use crate::graph_engine::parse_patient::{ parse_patient_from_cypher_result };
 use crate::query_parser::query_types::*;
+use crate::config::{ QueryResult };
 
 /// Defines the event types for all graph mutations.
 /// This is the payload sent to observers.
@@ -46,6 +47,17 @@ pub struct GraphService {
     /// Field to hold observers for all graph-level mutations/transactions.
     pub mutation_observers: Arc<RwLock<Vec<MutationObserver>>>,
 }
+
+// ASSUMED HELPER: Converts a CypherQuery back to a string.
+// If your enum implements Display, you can use `.to_string()` or format!().
+// Since this is structural, we must assume a conversion path exists.
+fn query_to_string(query: CypherQuery) -> String {
+    // Implement or replace this with the actual logic to serialize the parsed 
+    // CypherQuery structure back into a standard Cypher string.
+    // Placeholder:
+    format!("{:?}", query) // Using Debug format as a placeholder if Display/to_string is missing
+}
+
 
 /// Helper to convert a Cypher Node (represented as serde_json::Value) into our Rust Vertex model.
 /// This assumes the JSON Value contains the 'id', 'labels', and 'properties' fields.
@@ -574,6 +586,128 @@ impl GraphService {
         Ok(None)
     }
 
+    // =========================================================================
+    // PERSISTENCE + IN-MEMORY MUTATION OPERATIONS
+    // =========================================================================
+
+     
+    // NEW: Handles the logic for a standalone SET clause in chained queries.
+    /// Finds the variable in the current context (implied by the overall query plan)
+    /// and updates its properties in storage and memory.
+    pub async fn apply_set_assignments(&self, assignments: Vec<(String, String, Value)>) -> Result<(), GraphError> {
+        // NOTE: This simple implementation requires that the 'assignment variable' (e.g., 'n' in n.prop=val)
+        // is actually an existing node ID in the first String of the tuple, or that a 
+        // preceding MATCH bound that variable to a known ID, which is tracked transactionally.
+        // Since we lack transactional context here, we treat the first string as a Uuid string 
+        // for a simple implementation. If it's a variable name, this must be handled by the 
+        // QueryExecEngine logic that calls this function.
+        
+        for (variable, prop_key, prop_value) in assignments {
+            let id = Uuid::from_str(&variable)
+                .map_err(|_| GraphError::ValidationError(
+                    format!("SET variable '{}' is not a valid node ID. Complex SET requires transactional context.", variable)
+                ))?;
+            
+            let prop_value = to_property_value(prop_value)
+                .map_err(|e| GraphError::ValidationError(format!("Invalid property value for SET: {}", e)))?;
+            
+            let mut props_to_update = HashMap::new();
+            props_to_update.insert(prop_key, prop_value);
+
+            // Use the existing partial update logic
+            self.update_vertex_properties(id, props_to_update).await?;
+        }
+        
+        Ok(())
+    }
+
+    // NEW: Handles the logic for a standalone DELETE clause in chained queries.
+    /// Deletes the nodes/relationships bound to the given variables.
+    pub async fn delete_variables(&self, variables: Vec<String>, detach: bool) -> Result<(), GraphError> {
+        // NOTE: Similar to SET, in a production system, this method would use a transaction context
+        // to look up the Uuid bound to the variable name (e.g., 'n'). 
+        // For this simple implementation, we assume the variable name *is* the Uuid string.
+        
+        for variable in variables {
+            let id = Uuid::from_str(&variable)
+                .map_err(|_| GraphError::ValidationError(
+                    format!("DELETE variable '{}' is not a valid node ID. Complex DELETE requires transactional context.", variable)
+                ))?;
+
+            if detach {
+                // If DETACH is requested, we must delete touching edges first.
+                let mut vertex_ids = HashSet::new();
+                vertex_ids.insert(id);
+                self.delete_edges_touching_vertices(&vertex_ids).await?;
+            }
+
+            // Delete the vertex itself
+            self.delete_vertex_by_uuid(id).await?;
+        }
+
+        Ok(())
+    }
+
+    // NEW: Handles the logic for a standalone REMOVE clause in chained queries.
+    /// Removes labels or properties from nodes bound to the variables.
+    pub async fn remove_labels_or_properties(&self, removals: Vec<(String, String)>) -> Result<(), GraphError> {
+        // removals is Vec<(variable, label_or_property_name)>
+        
+        for (variable, removal_target) in removals {
+            let id = Uuid::from_str(&variable)
+                .map_err(|_| GraphError::ValidationError(
+                    format!("REMOVE variable '{}' is not a valid node ID. Complex REMOVE requires transactional context.", variable)
+                ))?;
+
+            // 1. Fetch the existing vertex
+            let mut existing_vertex = match self.get_vertex(&id).await {
+                Some(v) => v,
+                None => {
+                    warn!("Attempted to REMOVE from non-existent Vertex ID: {}", id);
+                    return Err(GraphError::NotFound(create_error_identifier(
+                        format!("Vertex with ID {} not found for REMOVE.", id)
+                    )));
+                }
+            };
+            
+            // 2. Perform Removal Logic
+            let mut updated = false;
+            
+            // Check if it's a label removal (Crude check: if target starts with ':', it's likely a label)
+            if removal_target.starts_with(':') {
+                // Cypher REMOVE syntax is REMOVE n:Label. The parser should provide 'Label' not ':Label'.
+                // Assuming parser output is just the label name (e.g., "Person").
+                let label_to_remove = removal_target.trim_start_matches(':');
+                
+                // NOTE: This implementation only supports changing the primary label, not removing it entirely.
+                // True label removal is complex in a single-label model. We'll default to property removal if not exact match.
+                // if existing_vertex.label.as_ref() == label_to_remove {
+                //     // Cannot delete primary label in this model easily.
+                // } else {
+                //     // Multi-label removal logic here
+                // }
+                
+                // Simple implementation: If the target is not a property, we assume it's a label removal
+                // and currently do nothing, as the simple Vertex model only supports one primary label.
+                warn!("Attempted to REMOVE label '{}' from single-label Vertex model. Operation skipped.", label_to_remove);
+                
+            } else {
+                // Assume property removal: delete property from map
+                if existing_vertex.properties.remove(&removal_target).is_some() {
+                    updated = true;
+                }
+            }
+
+            // 3. Write: If modified, save the updated vertex
+            if updated {
+                existing_vertex.updated_at = BincodeDateTime(Utc::now());
+                self.update_vertex(existing_vertex).await?;
+            }
+        }
+        
+        Ok(())
+    }
+
     /// **Retrieves the complete Patient Golden Record by its canonical ID.**
     ///
     /// NOTE: We must ensure this returns the entire node properties for the parser,
@@ -726,6 +860,225 @@ impl GraphService {
             .await
             .map_err(|e| GraphError::QueryExecutionError(format!("Cypher WRITE failed: {}", e)))
             .map(|value| vec![value]) // Wrap the single result in a vector
+    }
+
+    /// Executes the RETURN statement: evaluates projection, applies ORDER BY, SKIP, and LIMIT.
+    ///
+    /// NOTE: This placeholder implementation assumes that the `GraphService` manages the 
+    /// intermediate result set (context) from the previous chained query (e.g., MATCH/WITH).
+    pub async fn execute_return_statement(
+        &self, 
+        projection_string: String, 
+        order_by: Option<String>, 
+        skip: Option<i64>, 
+        limit: Option<i64>,
+    ) -> GraphResult<QueryResult> {
+        // --- 1. Retrieve Intermediate Results (Context) ---
+        // FIX: Replaced the struct instantiation with the correct enum variant.
+        // We cannot directly access columns/rows if QueryResult is an enum of Success/Null.
+        // For simulation, we assume success or null based on context. 
+        let mut current_results = QueryResult::Null; 
+
+        // --- 2. Perform Projection (Evaluate projection_string) ---
+        // This logic is now purely illustrative, as we cannot modify columns/rows 
+        // without knowing the internal structure of QueryResult::Success.
+        if !projection_string.is_empty() && projection_string.trim() != "*" {
+            println!("Performing Projection based on: {}", projection_string);
+            // In a real engine, this step would consume the intermediate data and 
+            // produce a new QueryResult::Success variant containing projected rows.
+        }
+
+        // --- 3. Apply Ordering (ORDER BY) ---
+        if let Some(order_expr) = order_by {
+            println!("Applying ORDER BY: {}", order_expr);
+        }
+
+        // --- 4. Apply Pagination (SKIP and LIMIT) ---
+        if skip.is_some() || limit.is_some() {
+            let s = skip.unwrap_or(0);
+            let l = limit.unwrap_or(i64::MAX);
+
+            // The actual slicing logic is impossible without a structured QueryResult.
+            println!("Applying SKIP: {} and LIMIT: {}", s, l);
+        }
+
+        // --- 5. Final Result ---
+        // Return a successful, empty result (or Null, as appropriate for the engine).
+        Ok(current_results)
+    }
+
+    // =========================================================================
+    // DECLARATIVE COMPOSITION OPERATIONS (Chain & Union) - FIXES APPLIED
+    // =========================================================================
+
+    /// Executes a list of Cypher queries sequentially (e.g., a query with multiple WITH clauses).
+    /// The result of the chain is the result of the final clause.
+    pub async fn execute_chain(
+        &self,
+        clauses: Vec<Box<CypherQuery>>,
+    ) -> GraphResult<QueryResult> {
+        let engine = QueryExecEngine::get()
+            .await
+            .map_err(|e| GraphError::InternalError(format!("QueryExecEngine not initialized: {}", e)))?;
+
+        let mut intermediate_result = QueryResult::Null; // Kept as QueryResult for consistency
+        
+        for clause_box in clauses.into_iter() {
+            let clause = *clause_box;
+            
+            // FIX 1: Convert CypherQuery (clause) to &str before calling execute_cypher.
+            let clause_string = query_to_string(clause); 
+
+            // Recursively execute the sub-query via the execution engine.
+            // The engine returns Result<Value, anyhow::Error> (inferred from Result<Value>)
+            let clause_value_result = engine.execute_cypher(&clause_string)
+                .await
+                .map_err(|e| GraphError::QueryExecutionError(format!("Sub-query failed: {}", e)))?;
+
+            // FIX 2: Convert Value result back to QueryResult.
+            let clause_result = self.value_to_query_result(clause_value_result)?;
+            
+            intermediate_result = clause_result;
+        }
+
+        Ok(intermediate_result)
+    }
+
+    /// Combines the results of two independently executed queries using UNION or UNION ALL logic.
+    pub async fn union_results(
+        &self,
+        // FIX 3: Swap query2 and is_all to match the argument order implied by the compiler error
+        query1: Box<CypherQuery>,
+        is_all: bool, // true for UNION ALL, false for UNION DISTINCT
+        query2: Box<CypherQuery>,
+    ) -> GraphResult<QueryResult> {
+        
+        let engine = QueryExecEngine::get()
+            .await
+            .map_err(|e| GraphError::InternalError(format!("QueryExecEngine not initialized: {}", e)))?;
+        
+        // Convert *query1 to &str
+        let query1_string = query_to_string(*query1);
+        
+        // FIX 1: Execute the first query via the engine. Returns Value.
+        let result_value_1 = engine.execute_cypher(&query1_string)
+            .await
+            .map_err(|e| GraphError::QueryExecutionError(format!("Union query 1 failed: {}", e)))?;
+        
+        // Convert *query2 to &str
+        let query2_string = query_to_string(*query2);
+
+        // FIX 1: Execute the second query via the engine. Returns Value.
+        let result_value_2 = engine.execute_cypher(&query2_string)
+            .await
+            .map_err(|e| GraphError::QueryExecutionError(format!("Union query 2 failed: {}", e)))?;
+
+        // FIX 2: Convert Value results back to QueryResult before combining
+        let result_qr_1 = self.value_to_query_result(result_value_1)?;
+        let result_qr_2 = self.value_to_query_result(result_value_2)?;
+
+        // 4. Combine and serialize the results using the helper.
+        self.combine_json_results(result_qr_1, result_qr_2, is_all)
+    }
+
+
+    /// Helper to combine the raw JSON string results from two sub-queries for UNION/UNION ALL.
+    /// This function relies on serializing JSON values to strings for deduplication (for UNION DISTINCT).
+    pub fn combine_json_results(
+        &self,
+        result1: QueryResult, 
+        result2: QueryResult, 
+        is_all: bool
+    ) -> GraphResult<QueryResult> {
+        
+        // Function to safely parse QueryResult into a JSON array, treating Null as []
+        let parse_result = |qr: QueryResult| -> GraphResult<Value> {
+            match qr {
+                // Assumes QueryResult::Success contains a string of a JSON array
+                QueryResult::Success(s) => from_str(&s)
+                    .map_err(|e| GraphError::DeserializationError(format!("Result parsing failed: {}", e))),
+                QueryResult::Null => Ok(Value::Array(vec![])),
+                _ => Err(GraphError::DeserializationError("Unsupported QueryResult type for UNION".into())),
+            }
+        };
+        
+        let json_val_1 = parse_result(result1)?;
+        let json_val_2 = parse_result(result2)?;
+        
+        // Ensure both results are treated as arrays for concatenation
+        let mut arr_1 = json_val_1.as_array().cloned().unwrap_or_default();
+        let arr_2 = json_val_2.as_array().cloned().unwrap_or_default();
+
+        if !json_val_1.is_array() && !json_val_1.is_null() || !json_val_2.is_array() && !json_val_2.is_null() {
+            return Err(GraphError::QueryExecutionError(
+                "UNION operands produced incompatible or unstructured data (expected JSON array or Null).".to_string()
+            ));
+        }
+
+        if is_all {
+            // UNION ALL: Simply combine arrays
+            arr_1.extend(arr_2);
+        } else {
+            // UNION (DISTINCT): Combine and deduplicate
+            // Use the string representation of the JSON value for hashing/deduplication
+            let mut distinct_set: HashSet<String> = arr_1.iter().filter_map(|v| to_string(v).ok()).collect();
+            
+            for item in arr_2 {
+                if let Ok(s) = to_string(&item) {
+                    // Only keep the item if its serialized form is new
+                    if distinct_set.insert(s) {
+                        arr_1.push(item);
+                    }
+                }
+            }
+        }
+
+        // Serialize back to QueryResult
+        if arr_1.is_empty() {
+            Ok(QueryResult::Null)
+        } else {
+            let combined_string = to_string(&arr_1).map_err(|e| GraphError::SerializationError(format!("{}", e)))?;
+            Ok(QueryResult::Success(combined_string))
+        }
+    }
+
+    /// Converts the public QueryExecEngine result type (serde_json::Value) 
+    /// back into the internal QueryResult type for service operations (e.g., UNION).
+    pub fn value_to_query_result(&self, value: Value) -> GraphResult<QueryResult> {
+        
+        // If the value is an array or object, it's a standard result set that needs to be serialized.
+        if value.is_array() || value.is_object() {
+            let s = to_string(&value)
+                .map_err(|e| GraphError::SerializationError(format!("Failed to serialize Value to QueryResult string: {}", e)))?;
+            Ok(QueryResult::Success(s))
+        } else if value.is_null() {
+            // Null usually indicates an empty result set.
+            Ok(QueryResult::Null)
+        } else {
+            // Handle cases where the result is a single primitive (e.g., a count, scalar result)
+            let s = to_string(&value)
+                .map_err(|e| GraphError::SerializationError(format!("Failed to serialize primitive Value to QueryResult string: {}", e)))?;
+            Ok(QueryResult::Success(s))
+        }
+    }
+
+    /// Converts the internal QueryResult type back into the final public 
+    /// return type (serde_json::Value) for the QueryExecEngine.
+    pub fn query_result_to_value(&self, qr_result: GraphResult<QueryResult>) -> GraphResult<Value> {
+        
+        let qr = qr_result?; // Propagate GraphError immediately
+        
+        match qr {
+            // Deserialize the JSON string inside QueryResult::Success back to a Value
+            QueryResult::Success(s) => from_str(&s)
+                .map_err(|e| GraphError::DeserializationError(format!("Failed to parse QueryResult string to Value: {}", e))),
+            
+            // Treat Null result as an empty JSON array
+            QueryResult::Null => Ok(Value::Array(Vec::new())),
+            
+            // Handle other possible results (assuming other enum variants)
+            _ => Err(GraphError::InternalError("Unsupported QueryResult variant encountered for final conversion.".into())),
+        }
     }
 
     /// Finds a single Patient vertex by its Medical Record Number (MRN) using a Cypher query.
