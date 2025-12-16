@@ -3749,22 +3749,22 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                 // 0. Initial Logging and Setup
                 println!("===> MATCH patterns: {}", match_patterns.len());
                 for (i, pat) in match_patterns.iter().enumerate() {
-                    println!("===>     Match pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
+                    println!("===>     Match pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
                 }
                 
                 println!("===> CREATE patterns: {}", create_patterns.len());
                 for (i, pat) in create_patterns.iter().enumerate() {
-                    println!("===>     Create pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
+                    println!("===>     Create pattern {}: {} nodes, {} rels", i, pat.1.len(), pat.2.len());
                     for (j, node) in pat.1.iter().enumerate() {
-                        println!("===>       Node {}: var={:?}, label={:?}", j, node.0, node.1);
+                        println!("===>       Node {}: var={:?}, label={:?}", j, node.0, node.1);
                     }
                     for (j, rel) in pat.2.iter().enumerate() {
-                        println!("===>       Rel {}: var={:?}, label={:?}", j, rel.0, rel.1);
+                        println!("===>       Rel {}: var={:?}, label={:?}", j, rel.0, rel.1);
                     }
                 }
                 
                 info!("===> EXECUTING MatchCreate: {} match patterns, {} create patterns", 
-                             match_patterns.len(), create_patterns.len());
+                            match_patterns.len(), create_patterns.len());
                 
                 let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
                 let mut created_vertices = Vec::new();
@@ -3772,70 +3772,74 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
 
                 // 1. Resolve (MATCH) nodes
                 println!("===> BEFORE resolve_match_patterns call");
-                // FIX: Use &*graph_service to pass a &GraphService reference, not the Arc<GraphService> itself.
                 var_to_id.extend(
+                    // Use &*graph_service to pass a &GraphService reference
                     resolve_match_patterns(&*graph_service, match_patterns).await? 
                 );
                 
                 // DIAGNOSTIC LOGGING
                 println!("===> AFTER resolve_match_patterns: var_to_id has {} entries", var_to_id.len());
                 for (var, id) in &var_to_id {
-                    println!("===>     Bound: {} -> {}", var, id.0);
+                    println!("===>       Bound: {} -> {}", var, id.0);
                 }
                 println!("===> ABOUT TO PROCESS {} CREATE PATTERNS", create_patterns.len());
 
                 // 2. Process CREATE patterns
                 for (pat_idx, pat) in create_patterns.iter().enumerate() {
                     println!("===> PROCESSING CREATE PATTERN {}: {} nodes, {} rels", 
-                                     pat_idx, pat.1.len(), pat.2.len());
+                                        pat_idx, pat.1.len(), pat.2.len());
                     
                     // a. Create/Resolve Nodes in the CREATE pattern
                     for (node_idx, (var_opt, label_opt, properties)) in pat.1.iter().enumerate() {
-                        println!("===>     CREATE pattern node {}: var={:?}, label={:?}", 
-                                         node_idx, var_opt, label_opt);
+                        println!("===>       CREATE pattern node {}: var={:?}, label={:?}", 
+                                            node_idx, var_opt, label_opt);
                         
-                        if let Some(v) = var_opt.as_ref() {
-                            // If the variable is not bound (from MATCH), it's a NEW node to be created.
-                            if !var_to_id.contains_key(v) {
-                                println!("===>       Variable '{}' not bound, creating new vertex", v);
-                                
-                                let props: GraphResult<HashMap<String, PropertyValue>> = properties
-                                    .iter()
-                                    .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
-                                    .collect();
-                                
-                                let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
-                                let new_id = SerializableUuid(Uuid::new_v4());
-                                
-                                let vertex = Vertex {
-                                    id: new_id,
-                                    label: Identifier::new(final_label)?,
-                                    properties: props?,
-                                    created_at: Utc::now().into(),  
-                                    updated_at: Utc::now().into(),  
-                                };
-                                
-                                // DELEGATION FIX: Use graph_service.create_vertex for unified handling
-                                // This method must now encapsulate storage persistence and in-memory updates.
-                                // FIX: Since graph_service is Arc, we must dereference or call .as_ref()
-                                graph_service.create_vertex(vertex.clone()).await?;
+                        // Determine the variable name (either user-supplied or temporary for anonymous nodes)
+                        let v_final = match var_opt.as_ref() {
+                            // Case 1: Node has a variable (e.g., 'g')
+                            Some(v) => v.clone(),
+                            // Case 2: Node is anonymous (e.g., (:GoldenRecord)). Generate a unique temporary key.
+                            None => format!("__anon_pat{}_n{}", pat_idx, node_idx), // <--- FIX 3: Anonymous variable
+                        };
+                        
+                        // Check if this variable is already bound (from MATCH or previous CREATE)
+                        let is_bound = var_to_id.contains_key(&v_final);
 
-                                var_to_id.insert(v.clone(), new_id);
-                                created_vertices.push(vertex);
-                                
-                                println!("===>       Created new vertex with id {}", new_id.0);
-                            } else {
-                                println!("===>       Variable '{}' already bound to {}", v, var_to_id[v].0);
-                            }
-                        } else {
-                            if !properties.is_empty() {
-                                warn!("CREATE pattern contains a node with properties but no variable/label: {:?}", properties);
-                            }
+                        if !is_bound {
+                            println!("===>       Variable '{}' not bound, creating new vertex", v_final);
+                            
+                            let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                                .iter()
+                                .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
+                                .collect();
+                            
+                            let final_label = label_opt.as_ref().cloned().unwrap_or_else(|| "Node".to_string());
+                            let new_id = SerializableUuid(Uuid::new_v4());
+                            
+                            let vertex = Vertex {
+                                id: new_id,
+                                label: Identifier::new(final_label)?,
+                                properties: props?,
+                                created_at: Utc::now().into(),  
+                                updated_at: Utc::now().into(),  
+                            };
+                            
+                            // DELEGATION FIX: Use graph_service.create_vertex for unified handling
+                            graph_service.create_vertex(vertex.clone()).await?;
+
+                            // Bind the final variable (user-supplied or temporary anonymous) to the new ID
+                            var_to_id.insert(v_final.clone(), new_id); // <--- FIX 3: Insert anonymous ID
+                            created_vertices.push(vertex);
+                            
+                            println!("===>       Created new vertex with id {} bound to {}", new_id.0, v_final);
+                        } else if var_opt.is_some() {
+                            // Only log if it was an explicit user variable that was already matched
+                            println!("===>       Variable '{}' already bound to {}", v_final, var_to_id[&v_final].0);
                         }
                     }
 
                     // b. Create Edges in the CREATE pattern (sequential relationships)
-                    println!("===>     Checking edge creation: {} nodes, {} relationships", pat.1.len(), pat.2.len());
+                    println!("===>       Checking edge creation: {} nodes, {} relationships", pat.1.len(), pat.2.len());
                     
                     if pat.1.len().saturating_sub(1) != pat.2.len() {
                         return Err(GraphError::ValidationError(format!(
@@ -3844,44 +3848,42 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         )));
                     }
 
-                    println!("===>     About to create {} edges", pat.2.len());
+                    println!("===>       About to create {} edges", pat.2.len());
                     
                     for (i, rel_tuple) in pat.2.iter().enumerate() {
-                        println!("===>     Processing edge {}", i);
+                        println!("===>       Processing edge {}", i);
                         
-                        // Get node variables from the sequence
-                        let from_var_opt = pat.1.get(i).and_then(|node_pattern| node_pattern.0.as_ref());
-                        let to_var_opt = pat.1.get(i + 1).and_then(|node_pattern| node_pattern.0.as_ref());
-
-                        println!("===>       from_var_opt: {:?}, to_var_opt: {:?}", from_var_opt, to_var_opt);
-
-                        let from_var = from_var_opt.ok_or_else(|| {
-                            GraphError::ValidationError(format!(
-                                "Node at index {} in CREATE pattern has no variable for edge creation", i
-                            ))
+                        // Get node patterns
+                        let from_node_pattern = pat.1.get(i).ok_or_else(|| {
+                            GraphError::ValidationError(format!("Missing start node for relationship at index {}", i))
                         })?;
-                        let to_var = to_var_opt.ok_or_else(|| {
-                            GraphError::ValidationError(format!(
-                                "Node at index {} in CREATE pattern has no variable for edge creation", i + 1
-                            ))
+                        let to_node_pattern = pat.1.get(i + 1).ok_or_else(|| {
+                            GraphError::ValidationError(format!("Missing end node for relationship at index {}", i))
                         })?;
 
-                        println!("===>       from_var: '{}', to_var: '{}'", from_var, to_var);
+                        // Resolve the start and end variable names (using explicit variable or temporary name)
+                        let from_var = from_node_pattern.0.as_ref()
+                            .map(|s| s.clone())
+                            .unwrap_or_else(|| format!("__anon_pat{}_n{}", pat_idx, i)); // <--- FIX 3: Re-resolve temporary key
 
-                        // Resolve IDs from the bound map (matched or newly created)
-                        let from_id = *var_to_id.get(from_var).ok_or_else(|| {
-                            println!("===>       ERROR: Unbound source variable '{}'", from_var);
-                            println!("===>       Available variables: {:?}", var_to_id.keys().collect::<Vec<_>>());
+                        let to_var = to_node_pattern.0.as_ref()
+                            .map(|s| s.clone())
+                            .unwrap_or_else(|| format!("__anon_pat{}_n{}", pat_idx, i + 1)); // <--- FIX 3: Re-resolve temporary key
+
+                        println!("===>       from_var: '{}', to_var: '{}'", from_var, to_var);
+
+                        // Resolve IDs from the bound map (now guaranteed to be there for anonymous nodes too)
+                        let from_id = *var_to_id.get(&from_var).ok_or_else(|| {
+                            println!("===>       ERROR: Unbound source variable '{}'", from_var);
                             GraphError::ValidationError(format!("Unbound source var for edge: {}", from_var))
                         })?;
                         
-                        let to_id = *var_to_id.get(to_var).ok_or_else(|| {
-                            println!("===>       ERROR: Unbound target variable '{}'", to_var);
-                            println!("===>       Available variables: {:?}", var_to_id.keys().collect::<Vec<_>>());
+                        let to_id = *var_to_id.get(&to_var).ok_or_else(|| {
+                            println!("===>       ERROR: Unbound target variable '{}'", to_var);
                             GraphError::ValidationError(format!("Unbound target var for edge: {}", to_var))
                         })?;
 
-                        println!("===>       Resolved IDs: from={}, to={}", from_id.0, to_id.0);
+                        println!("===>       Resolved IDs: from={}, to={}", from_id.0, to_id.0);
 
                         // rel_tuple is (_rel_var, label, len_range, properties, direction)
                         let (_rel_var, label_opt, _len_range, properties, direction_opt) = rel_tuple;
@@ -3889,12 +3891,12 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         // Handle direction: Some(false) is inbound.
                         let (outbound_id, inbound_id) = match direction_opt {
                             Some(false) => (to_id, from_id), // (B)<-[R]-(A) where A is from, B is to
-                            _ => (from_id, to_id),           // (A)-[R]->(B)
+                            _ => (from_id, to_id),          // (A)-[R]->(B)
                         };
 
                         let edge_type_str = label_opt.as_ref().cloned().unwrap_or("RELATED".to_string());
                         
-                        println!("===>       Creating edge: {} -[:{}]-> {}", outbound_id.0, edge_type_str, inbound_id.0);
+                        println!("===>       Creating edge: {} -[:{}]-> {}", outbound_id.0, edge_type_str, inbound_id.0);
                         
                         let props: GraphResult<BTreeMap<String, PropertyValue>> = properties.iter()
                             .map(|(k, v)| to_property_value(v.clone()).map(|pv| (k.clone(), pv)))
@@ -3909,20 +3911,19 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             properties: props?,
                         };
                         
-                        println!("===>       Calling graph_service.create_edge()");
+                        println!("===>       Calling graph_service.create_edge()");
                         
                         // DELEGATION FIX: Use graph_service.create_edge for unified handling
-                        // FIX: Since graph_service is Arc, we must dereference or call .as_ref()
                         graph_service.create_edge(edge.clone()).await?;
                         
-                        println!("===>       Edge created successfully with id {}", edge.id.0);
+                        println!("===>       Edge created successfully with id {}", edge.id.0);
                         
                         created_edges.push(edge);
                     }
                 }
 
                 println!("===> MatchCreate COMPLETE: {} vertices, {} edges created", 
-                              created_vertices.len(), created_edges.len());
+                            created_vertices.len(), created_edges.len());
 
                 Ok(json!({
                     "status": "success",
