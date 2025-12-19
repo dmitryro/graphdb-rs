@@ -1470,7 +1470,7 @@ impl StorageEngine for SledClient {
         Ok(())
     }
     
-    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
         let port = match &self.mode {
             Some(SledClientMode::ZMQ(port)) => *port,
             _ => DEFAULT_STORAGE_PORT,
@@ -1544,6 +1544,17 @@ impl StorageEngine for SledClient {
                                     v.properties.insert(k, prop_value);
                                 }
                             }
+                        }
+                    }
+                }
+                // --- MISSING MATCH ARM ADDED ---
+                GraphOp::SetVertexProperty(id, key_id, property_value) => {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            let key_string = key_id.to_string();
+                            
+                            // property_value is the deserialized PropertyValue, so insert it directly.
+                            v.properties.insert(key_string, property_value);
                         }
                     }
                 }

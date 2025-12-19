@@ -244,7 +244,7 @@ impl StorageEngine for TikvStorage {
         info!("TikvStorage::replay_into - starting replay");
 
         let start_key = b"wal_".to_vec();
-        let end_key   = b"wal`".to_vec();             // upper bound (exclusive)
+        let end_key   = b"wal`".to_vec();           // upper bound (exclusive)
 
         // TiKV range scan
         let mut txn = self.client.begin_optimistic().await
@@ -296,6 +296,17 @@ impl StorageEngine for TikvStorage {
                             for (k, json_val) in updates {
                                 v.properties.insert(k, json_to_prop(json_val)?);
                             }
+                        }
+                    }
+                }
+                // --- MISSING MATCH ARM ADDED ---
+                GraphOp::SetVertexProperty(id, key_id, property_value) => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            let key_string = key_id.to_string();
+                            
+                            // property_value is the deserialized PropertyValue, so insert it directly.
+                            v.properties.insert(key_string, property_value);
                         }
                     }
                 }
