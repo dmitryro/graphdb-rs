@@ -1354,33 +1354,23 @@ pub async fn run_single_command(
             Ok(())
         }
         Commands::Mpi(mpi_command) => {
-            // 1. Get storage engine singleton
+            // 1. Initialize storage and populate engine-specific singletons (SLED_DB/ROCKSDB_DB).
+            // This calls initialize_storage_for_query, ensuring the "FINAL FIX" block runs.
             let storage: Arc<dyn GraphStorageEngine> = get_storage_engine_singleton()
                 .await
-                .context("Cannot execute MPI command: Storage engine singleton is not initialized.")?;
+                .context("Cannot execute MPI command: Storage engine initialization failed.")?;
 
-            // --- CRITICAL FIX: Ensure MpiIdentityResolutionService is initialized globally ---
-            // This call is responsible for: Storage -> GraphService -> MPI Service initialization.
-            // It is called once and is guaranteed to be idempotent via OnceCell logic.
+            // 2. Ensure MpiIdentityResolutionService is initialized globally using the raw storage handle.
             initialize_mpi_services(storage.clone())
                 .await
                 .context("Fatal Error: Failed to initialize core MPI services.")?;
 
             info!("Executing MPI subcommand: {:?}", mpi_command);
 
-            // Execute the MPI command
+            // 3. Execute the MPI command
             match mpi_command {
-                // --- Index Operation (UPDATED) ---
                 MPICommand::Index { 
-                    name, 
-                    first_name, 
-                    last_name, 
-                    dob, 
-                    mrn, 
-                    address, 
-                    phone,
-                    system, // NEW
-                    gender, // NEW
+                    name, first_name, last_name, dob, mrn, address, phone, system, gender,
                 } => {
                     handlers_mpi::handle_mpi_index(
                         storage.clone(),
@@ -1388,38 +1378,26 @@ pub async fn run_single_command(
                         first_name,
                         last_name,
                         dob,
-                        mrn, // Mandatory String
+                        mrn,
                         address,
                         phone,
-                        Some(system), // NEW
-                        gender, // NEW
+                        Some(system),
+                        gender,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI index failed: {}", e))?;
                 }
 
-                // --- Match Operation (UPDATED) ---
-                // --- Match Operation (UPDATED) ---
                 MPICommand::Match { 
-                    name, 
-                    dob, 
-                    address, 
-                    phone, 
-                    name_algo,
-                    target_mrn,     // String -> needs Some()
-                    candidate_mrn,  // String -> needs Some()
-                    score,          // f64 -> needs Some()
-                    action,         // String -> needs Some()
+                    name, dob, address, phone, name_algo, target_mrn, candidate_mrn, score, action,
                 } => {
                     handlers_mpi::handle_mpi_match(
                         storage.clone(),
-                        name,            // Already Option<String>
-                        dob,             // Already Option<String>
-                        address,         // Already Option<String>
-                        phone,           // Already Option<String>
-                        name_algo,       // Already NameMatchAlgorithm
-                        
-                        // FIX: Wrap the mandatory fields (String/f64) in Some()
+                        name,
+                        dob,
+                        address,
+                        phone,
+                        name_algo,
                         Some(target_mrn),     
                         Some(candidate_mrn),  
                         Some(score),          
@@ -1429,59 +1407,41 @@ pub async fn run_single_command(
                     .map_err(|e| anyhow::anyhow!("MPI match failed: {}", e))?;
                 }
 
-                // --- Merge Operation (UPDATED) ---
                 MPICommand::Merge { 
-                    master_mrn,     // NEW
-                    duplicate_mrn,  // NEW
-                    user_id,        // NEW - Requires Option<String>
-                    reason,         // NEW - Requires Option<String>
-                    resolution_policy
+                    master_mrn, duplicate_mrn, user_id, reason, resolution_policy
                 } => {
                     handlers_mpi::handle_mpi_merge(
                         storage.clone(),
                         master_mrn,
                         duplicate_mrn,
-                        Some(user_id), // FIX: Wrap String in Option<String>
-                        Some(reason),  // FIX: Wrap String in Option<String>
+                        Some(user_id),
+                        Some(reason),
                         resolution_policy
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI merge failed: {}", e))?;
                 }
 
-                // --- Resolve Patient ID Operation (UPDATED) ---
                 MPICommand::Resolve { 
-                    id, 
-                    external_id, 
-                    id_type,
-                    source_mrn, // Argument 5
-                    system,     // Argument 6
+                    id, external_id, id_type, source_mrn, system,
                 } => {
-                    // NOTE: The previous logic consolidated the IDs, but the static
-                    // handler `handle_mpi_resolve` expects all fields separately.
-                    
-                    // We call the static handler with all destructured fields directly:
                     handlers_mpi::handle_mpi_resolve(
-                        storage.clone(),      // Argument 1
-                        id,                   // Argument 2: Option<String>
-                        external_id,          // Argument 3: Option<String>
-                        id_type,              // Argument 4: Option<String>
-                        source_mrn,           // Argument 5: Option<String>
-                        system,               // Argument 6: Option<String>
+                        storage.clone(),
+                        id,
+                        external_id,
+                        id_type,
+                        source_mrn,
+                        system,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI resolve failed: {}", e))?;
                 }
                 
-                // --- NEW COMMAND: Fetch Identity ---
                 MPICommand::FetchIdentity { 
-                    id, 
-                    external_id, 
-                    id_type,
-                    source_mrn,
+                    id, external_id, id_type, source_mrn,
                 } => {
                     handlers_mpi::handle_mpi_fetch_identity(
-                        storage.clone(), // FIX: Missing storage argument
+                        storage.clone(),
                         id,
                         external_id,
                         id_type,
@@ -1491,10 +1451,9 @@ pub async fn run_single_command(
                     .map_err(|e| anyhow::anyhow!("MPI fetch-identity failed: {}", e))?;
                 }
 
-                // --- Search Patient Demographics Operation (UNCHANGED) ---
                 MPICommand::Search { name, first_name, last_name, dob, address, phone } => {
                     handlers_mpi::handle_mpi_search(
-                        storage.clone(), // FIX: Missing storage argument
+                        storage.clone(),
                         name,
                         first_name,
                         last_name,
@@ -1506,7 +1465,6 @@ pub async fn run_single_command(
                     .map_err(|e| anyhow::anyhow!("MPI search failed: {}", e))?;
                 }
 
-                // --- Link Operation (UNCHANGED) ---
                 MPICommand::Link { master_id, external_id, id_type } => {
                     handlers_mpi::handle_mpi_link(
                         storage.clone(),
@@ -1518,7 +1476,6 @@ pub async fn run_single_command(
                     .map_err(|e| anyhow!("MPI link failed: {}", e))?;
                 }
 
-                // --- Audit Operation (UNCHANGED) ---
                 MPICommand::Audit { mpi_id, timeframe } => {
                     handlers_mpi::handle_mpi_audit(
                         storage.clone(),
@@ -1529,46 +1486,30 @@ pub async fn run_single_command(
                     .map_err(|e| anyhow::anyhow!("MPI audit failed: {}", e))?;
                 }
 
-                // --- Split Operation (FIXED for new arguments) ---
                 MPICommand::Split { 
-                    merged_id, 
-                    new_patient_data_json, 
-                    reason,
-                    // FIX 1: Add the newly required field from the CLI command
-                    split_patient_id_str, 
+                    merged_id, new_patient_data_json, reason, split_patient_id_str, 
                 } => {
-                    // 1. Deserialize the JSON string provided by the CLI argument into the Patient struct.
-                    let new_patient_data: Patient = serde_json::from_str(&new_patient_data_json) // Assuming serde_json::from_str is used/imported
-                        .map_err(|e| anyhow::anyhow!("Failed to parse Patient data JSON for Split command: {}", e))?;
+                    let new_patient_data: Patient = serde_json::from_str(&new_patient_data_json)
+                        .map_err(|e| anyhow::anyhow!("Failed to parse Patient data JSON: {}", e))?;
 
-                    // 2. Call the handler with the correctly typed arguments.
                     handlers_mpi::handle_mpi_split(
                         storage.clone(),
                         merged_id,
-                        new_patient_data, // Now correctly a Patient struct
-                        // NOTE: Assuming the 'reason' field in the handler is Option<String>.
-                        // We will assume 'reason' is destructured as a String and needs wrapping.
-                        // If 'reason' is Option<String> in the destructuring, pass 'reason' directly.
-                        // I will assume the original code's intent where 'reason' is a String:
-                        Some(reason), 
-                        
-                        // FIX 2: Pass the new required argument (String)
+                        new_patient_data,
+                        Some(reason),
                         split_patient_id_str,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI split/unmerge failed: {}", e))?;
                 }
 
-                // --- Golden Record Retrieval (FIXED) ---
                 MPICommand::GetGoldenRecord { patient_id } => {
-                    // FIX: Convert the incoming String (patient_id) into the expected PatientId type.
-                    // Assuming PatientId::new() takes a String and returns a Result.
                     let structured_id = PatientId::new(patient_id)
                         .map_err(|e| anyhow::anyhow!("Invalid patient_id format: {}", e))?;
                     
                     handlers_mpi::handle_get_golden_record(
                         storage.clone(),
-                        structured_id // Pass the correctly typed PatientId
+                        structured_id
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI Golden Record retrieval failed: {}", e))?;
@@ -1579,19 +1520,21 @@ pub async fn run_single_command(
             Ok(())
         }
         Commands::Patient(action) => {
-            // 1. MUST Initialize storage explicitly before proceeding.
-            // This mirrors the MPI command's robust initialization check.
-            let _storage: Arc<dyn GraphStorageEngine> = get_storage_engine_singleton()
+            // 1. Use the high-level Query Engine singleton. 
+            // This internally calls initialize_storage_for_query AND 
+            // sets up the Database instance + Sled/Rocks singletons.
+            let query_engine: Arc<QueryExecEngine> = get_query_engine_singleton()
                 .await
-                .context("Cannot execute Patient command: Storage engine singleton is not initialized.")?;
+                .context("Cannot execute Patient command: Query engine initialization failed.")?;
             
             info!("Executing Patient subcommand in non-interactive mode: {:?}", action);
             
-            // 2. Call the existing non-interactive handler function.
-            // This function (handle_patient_command) will now run against an initialized storage.
+            // 2. Pass the engine or the database to your handler.
+            // If handle_patient_command relies on the singleton, it will now find 
+            // SLED_DB or ROCKSDB_DB ready because get_query_engine_singleton 
+            // just finished running the "FINAL FIX" block in initialize_storage_for_query.
             let output = handle_patient_command(action).await;
             
-            // 3. Print the formatted output string from the handler.
             println!("{}", output);
             
             info!("Patient command finished.");

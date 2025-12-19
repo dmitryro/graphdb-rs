@@ -459,26 +459,32 @@ impl MPIHandlers {
         master_mrn: String,
         duplicate_mrn: String,
         resolution_policy: String,
-        user_id: Option<String>, // Retaining for full signature adherence
-        reason: Option<String>, // Retaining for full signature adherence
+        user_id: Option<String>, 
+        reason: Option<String>, 
     ) -> Result<(), GraphError> {
         println!("=== MPI Record Merge ===");
         println!("Consolidating duplicate patient records...\n");
         
+        // --- 1. Sanitize Inputs at the Entry Point ---
+        // Ensuring no stray newlines or quotes from CLI input interfere with query generation
+        let source_mpi_id = duplicate_mrn.trim().to_string();
+        let target_mpi_id = master_mrn.trim().to_string();
+        let policy = resolution_policy.trim().to_string();
         
-        let source_mpi_id = duplicate_mrn;
-        let target_mpi_id = master_mrn;
+        // Sanitize optional context strings
+        let clean_user_id = user_id.map(|s| s.trim().to_string());
+        let clean_reason = reason.map(|s| s.trim().to_string());
         
-        self.validate_resolution_policy(&resolution_policy)?;
+        self.validate_resolution_policy(&policy)?;
 
         println!("Source Record (will be merged): {}", source_mpi_id);
         println!("Target Record (survivor): {}", target_mpi_id);
-        println!("Conflict Resolution Policy: {}", resolution_policy);
+        println!("Conflict Resolution Policy: {}", policy);
 
-        if user_id.is_some() || reason.is_some() {
+        if clean_user_id.is_some() || clean_reason.is_some() {
             println!("\n[Merge Context]");
-            println!(" User ID: {}", user_id.as_deref().unwrap_or("N/A"));
-            println!(" Reason: {}", reason.as_deref().unwrap_or("N/A"));
+            println!(" User ID: {}", clean_user_id.as_deref().unwrap_or("N/A"));
+            println!(" Reason:  {}", clean_reason.as_deref().unwrap_or("N/A"));
         }
 
         println!("\n⚠ WARNING: This operation will:");
@@ -488,34 +494,45 @@ impl MPIHandlers {
         println!(" 4. Create permanent audit trail");
         println!();
         
+        // --- 2. Call Service Layer ---
+        // The service layer now handles the atomized, comment-free Cypher execution
         let result = self
             .mpi_service
             .manual_merge_records(
                 source_mpi_id.clone(),
                 target_mpi_id.clone(),
-                resolution_policy.clone(),
-                user_id, // Passed to service
-                reason, // Passed to service
+                policy.clone(),
+                clean_user_id,
+                clean_reason,
             )
             .await;
 
+        // --- 3. Result Handling ---
         match result {
             Ok(_golden_record) => {
                 println!("✓ Merge completed successfully");
                 println!(" Source ID {} → Target ID {}", source_mpi_id, target_mpi_id);
-                println!(" Policy Applied: {}", resolution_policy);
-                println!(" Golden Record Created: Yes");
+                println!(" Policy Applied: {}", policy);
+                println!(" Golden Record Created/Linked: Yes");
                 println!("\nAll future queries for source ID will return target record.");
                 println!("Merge can be audited but cannot be automatically reversed.");
             }
             Err(e) => {
+                // Check if the error is a validation error (node not found) vs a syntax error
                 eprintln!("✗ Merge failed: {}", e);
-                eprintln!("\nPossible causes:");
-                eprintln!(" - One or both patient IDs do not exist");
-                eprintln!(" - Records are already merged");
-                eprintln!(" - Source and target are the same record");
-                eprintln!(" - Business rules prevent this merge");
-                return Err(GraphError::InternalError(e.to_string()));
+                
+                eprintln!("\nTroubleshooting:");
+                if e.contains("No existing node found") {
+                    eprintln!(" - Ensure MRNs/IDs are correct and exist in the database.");
+                } else if e.contains("subset of Cypher") {
+                    eprintln!(" - Query engine rejected syntax. Check for illegal characters in IDs/Reasons.");
+                } else {
+                    eprintln!(" - Records might already be merged.");
+                    eprintln!(" - Source and target might be the same record.");
+                    eprintln!(" - Check storage logs for lock contention or WAL errors.");
+                }
+                
+                return Err(GraphError::InternalError(e));
             }
         }
         Ok(())
