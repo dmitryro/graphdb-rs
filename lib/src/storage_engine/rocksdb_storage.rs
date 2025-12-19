@@ -2241,8 +2241,20 @@ impl StorageEngine for RocksDBStorage {
                         if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
                             if let Some(v) = graph.vertices.get_mut(&uuid) {
                                 for (k, json_val) in updates {
+                                    // Assuming json_to_prop is available in this scope or handles the conversion
                                     v.properties.insert(k, json_to_prop(json_val)?);
                                 }
+                            }
+                        }
+                    }
+                    // --- MISSING MATCH ARM ADDED ---
+                    GraphOp::SetVertexProperty(id, key_id, property_value) => {
+                        if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                            if let Some(v) = graph.vertices.get_mut(&uuid) {
+                                let key_string = key_id.to_string();
+                                
+                                // property_value is the deserialized PropertyValue, so insert it directly.
+                                v.properties.insert(key_string, property_value);
                             }
                         }
                     }

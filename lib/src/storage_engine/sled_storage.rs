@@ -1280,7 +1280,7 @@ impl StorageEngine for SledStorage {
         Ok(())
     }
 
-    async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
+async fn replay_into(&self, graph: &mut Graph) -> Result<(), GraphError> {
         info!("SledStorage::replay_into - starting replay");
         let db = SLED_DB.get()
             .ok_or_else(|| GraphError::StorageError("Sled database not initialized".into()))?;
@@ -1324,6 +1324,19 @@ impl StorageEngine for SledStorage {
                             for (k, json_val) in updates {
                                 v.properties.insert(k, json_to_prop(json_val)?);
                             }
+                        }
+                    }
+                }
+                GraphOp::SetVertexProperty(id, key_id, property_value) => {
+                    // Convert Identifier to Uuid via string parsing
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            // Convert the key Identifier to a String property name
+                            let key_string = key_id.to_string();
+                            
+                            // The property_value is ALREADY a PropertyValue, so we use it directly.
+                            // FIX: Removed the incorrect call to json_to_prop(property_value)
+                            v.properties.insert(key_string, property_value);
                         }
                     }
                 }

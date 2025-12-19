@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Result, Context};
+use std::{cmp::Ordering, fmt, str::FromStr};
+use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use log::{error, info, warn};
 use models::errors::GraphError;
@@ -28,6 +30,7 @@ use crate::storage_engine::postgres_storage::PostgresStorage;
 use crate::storage_engine::mysql_storage::MySQLStorage;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
+#[derive(Clone, Debug)]
 pub struct Database {
     pub storage: Arc<dyn GraphStorageEngine + Send + Sync>,
     pub config: StorageConfig,

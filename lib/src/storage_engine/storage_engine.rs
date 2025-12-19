@@ -152,6 +152,7 @@ pub enum GraphOp {
     DeleteVertex(Identifier),
     DeleteEdge(Identifier),
     UpdateVertex(Identifier, HashMap<String, Value>),
+    SetVertexProperty(Identifier, Identifier, PropertyValue),
 }
 
 #[derive(Debug, Default)]
@@ -514,6 +515,7 @@ impl StorageEngine for SurrealdbGraphStorage {
         }
 
         // fetch all WAL rows already sorted by id (time)
+        // NOTE: Assuming StoredValue has a `value` field that holds the serialized GraphOp
         let mut rows: Vec<StoredValue> = self.db
             .query("SELECT value FROM wal ORDER BY id")
             .await
@@ -546,6 +548,17 @@ impl StorageEngine for SurrealdbGraphStorage {
                             for (k, json_val) in updates {
                                 v.properties.insert(k, json_to_prop(json_val)?);
                             }
+                        }
+                    }
+                }
+                // --- MISSING MATCH ARM ADDED ---
+                GraphOp::SetVertexProperty(id, key_id, property_value) => {
+                    if let Ok(uuid) = Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            let key_string = key_id.to_string();
+                            
+                            // property_value is the deserialized PropertyValue, so insert it directly.
+                            v.properties.insert(key_string, property_value);
                         }
                     }
                 }

@@ -1380,10 +1380,25 @@ impl StorageEngine for RocksDBClient {
                         if let Some(v) = graph.vertices.get_mut(&uuid) {
                             for (k, val) in updates {
                                 // Convert JsonValue to PropertyValue
+                                // NOTE: The val here is a serde_json::Value which needs conversion.
+                                // Assuming a helper like `json_to_prop` or similar logic exists,
+                                // but for simplicity and context, we'll try to convert from serde_json::Value to PropertyValue.
                                 if let Ok(prop_value) = serde_json::from_value(val) {
                                     v.properties.insert(k, prop_value);
                                 }
                             }
+                        }
+                    }
+                }
+                // --- MISSING MATCH ARM ADDED ---
+                GraphOp::SetVertexProperty(id, key_id, property_value) => {
+                    // Convert Identifier to Uuid
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id.to_string()) {
+                        if let Some(v) = graph.vertices.get_mut(&uuid) {
+                            let key_string = key_id.to_string();
+                            
+                            // Since property_value is already the deserialized PropertyValue, insert it.
+                            v.properties.insert(key_string, property_value);
                         }
                     }
                 }
