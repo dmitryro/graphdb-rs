@@ -421,7 +421,10 @@ pub enum BinaryOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnaryOp {
-    Not, Neg,
+    Not, 
+    Neg,
+    IsNotNull, 
+    IsNull,   
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -465,22 +468,22 @@ impl From<&Value> for CypherValue {
 }
 
 impl CypherValue {
-    pub fn from_json(value: serde_json::Value) -> Self {
-        match value {
-            serde_json::Value::Null => CypherValue::Null,
-            serde_json::Value::Bool(b) => CypherValue::Bool(b),
-            serde_json::Value::Number(n) => {
+pub fn from_json(val: Value) -> Self {
+        match val {
+            Value::Null => CypherValue::Null,
+            Value::Bool(b) => CypherValue::Bool(b),
+            Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     CypherValue::Integer(i)
                 } else {
                     CypherValue::Float(n.as_f64().unwrap_or(0.0))
                 }
             }
-            serde_json::Value::String(s) => CypherValue::String(s),
-            serde_json::Value::Array(arr) => {
+            Value::String(s) => CypherValue::String(s),
+            Value::Array(arr) => {
                 CypherValue::List(arr.into_iter().map(Self::from_json).collect())
             }
-            serde_json::Value::Object(obj) => {
+            Value::Object(obj) => {
                 let mut map = HashMap::new();
                 for (k, v) in obj {
                     map.insert(k, Self::from_json(v));
@@ -713,15 +716,18 @@ pub enum Mutation {
 
 impl WhereClause {
     pub fn evaluate(&self, ctx: &EvaluationContext) -> GraphResult<bool> {
-        // NOTE: The implementation of Expression::evaluate() is assumed to exist elsewhere, 
-        // as it is called here.
+        // 1. Evaluate the inner expression tree
         let result = self.condition.evaluate(ctx)?;
+
+        // 2. Convert CypherValue to bool (Cypher truthiness)
         match result {
             CypherValue::Bool(b) => Ok(b),
-            CypherValue::Null => Ok(false),
-            _ => Err(GraphError::EvaluationError(
-                "WHERE clause must evaluate to a boolean value".into(),
-            )),
+            CypherValue::Null => Ok(false), // WHERE NULL is false
+            _ => {
+                // Technically, Cypher treats non-booleans in WHERE as false/null,
+                // but logging this can help with debugging query logic.
+                Ok(false)
+            }
         }
     }
 }
@@ -766,38 +772,73 @@ impl Expression {
                 let l = left.evaluate(ctx)?;
                 let r = right.evaluate(ctx)?;
                 op.apply(&l, &r)
-            }
-            Expression::Unary { op, expr } => op.apply(&expr.evaluate(ctx)?),
-            
+            },
+            Expression::Unary { op, expr } => {
+                let val = expr.evaluate(ctx)?;
+                match op {
+                    UnaryOp::Not => {
+                        if let CypherValue::Bool(b) = val { 
+                            Ok(CypherValue::Bool(!b)) 
+                        } else { 
+                            Err(GraphError::EvaluationError("NOT requires boolean".into())) 
+                        }
+                    },
+                    UnaryOp::Neg => {
+                        match val {
+                            CypherValue::Integer(i) => Ok(CypherValue::Integer(-i)),
+                            CypherValue::Float(f) => Ok(CypherValue::Float(-f)),
+                            _ => Err(GraphError::EvaluationError("Negative requires numeric".into())),
+                        }
+                    },
+                    // --- FIXED: Handling the new variants ---
+                    UnaryOp::IsNotNull => {
+                        Ok(CypherValue::Bool(!matches!(val, CypherValue::Null)))
+                    },
+                    UnaryOp::IsNull => {
+                        Ok(CypherValue::Bool(matches!(val, CypherValue::Null)))
+                    },
+                }
+            },  
             Expression::FunctionCall { name, args } => {
                 match name.to_uppercase().as_str() {
                     "ID" => {
-                        if args.len() != 1 {
-                            return Err(GraphError::EvaluationError("ID() function expects exactly 1 argument".to_string()));
+                        if let Some(Expression::Variable(var_name)) = args.get(0) {
+                            if let Some(CypherValue::Vertex(v)) = ctx.variables.get(var_name) {
+                                // Return the ID as a String so it can be compared or checked
+                                Ok(CypherValue::String(v.id.to_string()))
+                            } else {
+                                Ok(CypherValue::Null)
+                            }
+                        } else {
+                            Err(GraphError::EvaluationError("ID() requires a variable".into()))
                         }
-                        let val = args[0].evaluate(ctx)?;
-                        match val {
-                            CypherValue::Vertex(v) => Ok(CypherValue::String(v.id.to_string())),
-                            CypherValue::Edge(e) => Ok(CypherValue::String(e.id.to_string())),
-                            _ => Err(GraphError::EvaluationError("ID() argument must be a Vertex or Edge".to_string())),
-                        }
-                    }
-                    _ => Err(GraphError::EvaluationError(format!("Unknown function: {name}"))),
+                    },
+                    _ => Err(GraphError::EvaluationError(format!("Unknown function: {}", name)))
                 }
             }
-
             // --- FIXED: PropertyComparison using correct CypherValue variants ---
             Expression::PropertyComparison { variable, property, operator, value } => {
                 let target = ctx.variables.get(variable)
                     .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{variable}' not found")))?;
                 
                 let left_val = match target {
-                    CypherValue::Vertex(v) => v.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null),
-                    CypherValue::Edge(e) => e.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null),
+                    CypherValue::Vertex(v) => v.properties.get(property)
+                        .map(property_value_to_cypher) // Directly pass reference &PropertyValue
+                        .unwrap_or(CypherValue::Null),
+                    CypherValue::Edge(e) => e.properties.get(property)
+                        .map(property_value_to_cypher) // Directly pass reference &PropertyValue
+                        .unwrap_or(CypherValue::Null),
                     _ => return Err(GraphError::EvaluationError(format!("Variable '{variable}' is not a Vertex or Edge"))),
                 };
 
-                // Use from_json to convert the stored Value into a CypherValue
+                // Handle null check operators
+                let op_upper = operator.to_uppercase();
+                if op_upper == "IS NOT NULL" {
+                    return Ok(CypherValue::Bool(!matches!(left_val, CypherValue::Null)));
+                } else if op_upper == "IS NULL" {
+                    return Ok(CypherValue::Bool(matches!(left_val, CypherValue::Null)));
+                }
+
                 let right_val = CypherValue::from_json(value.clone());
                 evaluate_comparison(&left_val, operator, &right_val)
             }
@@ -819,6 +860,14 @@ impl Expression {
                     }
                     _ => return Err(GraphError::EvaluationError(format!("Unknown function: {function}"))),
                 };
+
+                // Handle null check operators for functions (e.g., WHERE ID(p) IS NOT NULL)
+                let op_upper = operator.to_uppercase();
+                if op_upper == "IS NOT NULL" {
+                    return Ok(CypherValue::Bool(!matches!(left_val, CypherValue::Null)));
+                } else if op_upper == "IS NULL" {
+                    return Ok(CypherValue::Bool(matches!(left_val, CypherValue::Null)));
+                }
 
                 // FORCE the right side to a raw String by stripping JSON quotes
                 let right_val = if value.is_string() {
@@ -865,6 +914,13 @@ impl UnaryOp {
                 CypherValue::Integer(i) => Ok(CypherValue::Integer(-i)),
                 CypherValue::Float(f) => Ok(CypherValue::Float(-f)),
                 _ => Err(GraphError::EvaluationError("Cannot negate non-numeric value".into())),
+            },
+            // --- FIXED: Handling the new variants ---
+            UnaryOp::IsNotNull => {
+                Ok(CypherValue::Bool(!matches!(val, CypherValue::Null)))
+            },
+            UnaryOp::IsNull => {
+                Ok(CypherValue::Bool(matches!(val, CypherValue::Null)))
             },
         }
     }
