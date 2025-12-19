@@ -1,0 +1,266 @@
+// New: Required to parse key=value assignments for SET and MERGE clauses: `n.name = 'Joe'`
+fn parse_set_assignment_tuple(input: &str) -> IResult<&str, (String, String, Value)> {
+    map(
+        tuple((
+            parse_identifier, // variable (e.g., n)
+            preceded(char('.'), parse_identifier), // property (e.g., .name)
+            preceded(tuple((multispace0, tag("="), multispace0)), parse_property_value), // value
+        )),
+        |(var, prop, val)| (var, prop, val),
+    )(input)
+}
+
+// New: Required to parse the ON CREATE SET / ON MATCH SET sub-clauses in MERGE
+fn parse_on_set_clause(on_type: &str) -> impl Fn(&str) -> IResult<&str, Vec<(String, String, Value)>> {
+    move |input| {
+        map(
+            preceded(
+                pair(tag_no_case(on_type), terminated(tag_no_case("SET"), multispace1)),
+                separated_list1(preceded(multispace0, char(',')), parse_set_assignment_tuple),
+            ),
+            |assignments| assignments,
+        )(input)
+    }
+}
+
+// REPLACEMENT for existing fn parse_identifier
+fn parse_identifier(input: &str) -> IResult<&str, String> {
+    map(
+        take_while1(|c: char| c.is_alphanumeric() || c == '_'), 
+        |s: &str| s.to_string()
+    )(input)
+}
+
+// REPLACEMENT for existing fn parse_property_value
+fn parse_property_value(input: &str) -> IResult<&str, Value> {
+    let string_parser = map(
+        delimited(char('"'), take_until("\""), char('"')),
+        |s: &str| Value::String(s.to_string()),
+    );
+    let number_parser = map(double, |f| Value::Number(serde_json::Number::from_f64(f).unwrap()));
+    preceded(multispace0, alt((string_parser, number_parser)))(input)
+}
+
+// REPLACEMENT for existing fn parse_property_map (Used by parse_node and parse_relationship)
+fn parse_property_map(input: &str) -> IResult<&str, HashMap<String, Value>> {
+    map(
+        delimited(
+            preceded(multispace0, char('{')),
+            separated_list0(
+                preceded(multispace0, char(',')),
+                pair(
+                    preceded(multispace0, parse_identifier),
+                    preceded(tuple((multispace0, char(':'), multispace0)), parse_property_value),
+                ),
+            ),
+            preceded(multispace0, char('}')),
+        ),
+        |list| list.into_iter().collect(),
+    )(input)
+}
+
+// REPLACEMENT for existing fn parse_variable_length (Fixes digit1 E0425 errors)
+fn parse_variable_length(input: &str) -> IResult<&str, Option<(Option<u32>, Option<u32>)>> {
+    map(
+        opt(preceded(
+            char('*'),
+            alt((
+                // *m..n or *..n or *m..
+                map(separated_pair(opt(digit1), tag(".."), opt(digit1)), |(m, n)| {
+                    (m.and_then(|s| s.parse().ok()).or(Some(0)), n.and_then(|s| s.parse().ok()))
+                }),
+                // *n (e.g., *2)
+                map(digit1, |n: &str| (Some(n.parse().unwrap_or(0)), Some(n.parse().unwrap_or(0)))),
+                // * (means *0.. for path)
+                value((Some(0), None), multispace0),
+            )),
+        )),
+        // `res` is Option<Result of alt>. This maps it to the expected return type.
+        |res| res.map(|(m, n)| (m.or(Some(0)), n)), 
+    )(input)
+}
+
+// REPLACEMENT for existing fn parse_node
+fn parse_node(input: &str) -> IResult<&str, NodePattern> {
+    map(
+        delimited(
+            preceded(multispace0, char('(')),
+            tuple((
+                opt(terminated(parse_identifier, multispace0)), 
+                opt(preceded(char(':'), parse_identifier)), 
+                opt(parse_property_map), 
+            )),
+            char(')'),
+        ),
+        |(var, label, props)| (var, label, props.unwrap_or_default()),
+    )(input)
+}
+
+// REPLACEMENT for existing fn parse_relationship
+fn parse_relationship(input: &str) -> IResult<&str, RelPattern> {
+    let (input, (left_marker, content_opt, right_marker)) = tuple((
+        preceded(multispace0, alt((tag("<"), tag("-")))), 
+        opt(delimited(
+            preceded(multispace0, char('[')),
+            tuple((
+                opt(terminated(parse_identifier, preceded(multispace0, char(':')))),
+                opt(parse_identifier),
+                parse_variable_length,
+                opt(parse_property_map),
+            )),
+            preceded(multispace0, char(']')),
+        )),
+        preceded(multispace0, alt((tag(">"), tag("-")))), 
+    ))(input)?;
+
+    let direction = match (left_marker, right_marker) {
+        ("<", "-") => Some(false), 
+        ("-", ">") => Some(true),  
+        _ => None,                 
+    };
+    
+    let (var, r_type, length, props) = match content_opt {
+        Some((v, r, l, p)) => (v, r, l, p.unwrap_or_default()),
+        None => (None, None, None, HashMap::new()),
+    };
+
+    let rel_pattern: RelPattern = (var, r_type, length, props, direction);
+    
+    Ok((input, rel_pattern))
+}
+
+// REPLACEMENT for existing pub fn parse_pattern
+pub fn parse_pattern(input: &str) -> IResult<&str, Pattern> {
+    let (input, path_var) = opt(terminated(
+        parse_identifier, 
+        tuple((multispace0, char('='), multispace0))
+    ))(input)?;
+
+    let (input, first_node) = parse_node(input)?;
+    let (input, _) = multispace0(input)?; 
+    
+    let mut nodes = vec![first_node];
+    let mut rels = Vec::new();
+    let mut remaining = input;
+    
+    loop {
+        match parse_relationship(remaining) {
+            Ok((rest, rel)) => {
+                rels.push(rel);
+                
+                let (rest, _) = multispace0(rest)?;
+                
+                match parse_node(rest) {
+                    Ok((rest, node)) => {
+                        nodes.push(node);
+                        let (rest, _) = multispace0(rest)?;
+                        remaining = rest;
+                    }
+                    Err(_) => break, 
+                }
+            }
+            Err(_) => break, 
+        }
+    }
+    
+    Ok((remaining, (path_var, nodes, rels)))
+}
+
+// REPLACEMENT for existing pub fn parse_match_clause
+pub fn parse_match_clause(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        preceded(
+            terminated(tag_no_case("MATCH"), multispace1),
+            separated_list1(preceded(multispace0, char(',')), parse_pattern),
+        ),
+        |patterns| CypherQuery::MatchPattern { patterns },
+    )(input)
+}
+
+// REPLACEMENT for existing pub fn parse_create_clause
+pub fn parse_create_clause(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        preceded(
+            terminated(tag_no_case("CREATE"), multispace1),
+            separated_list1(preceded(multispace0, char(',')), parse_pattern),
+        ),
+        |patterns| CypherQuery::CreateStatement { patterns, return_items: vec![] }, 
+    )(input)
+}
+
+// REPLACEMENT for existing pub fn parse_return_clause
+pub fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        preceded(
+            terminated(tag_no_case("RETURN"), multispace1),
+            separated_list1(preceded(multispace0, char(',')), parse_identifier), 
+        ),
+        |_| CypherQuery::Chain(vec![/* Return placeholder */]), 
+    )(input)
+}
+
+// REPLACEMENT for existing pub fn parse_with_clause
+pub fn parse_with_clause(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        preceded(
+            terminated(tag_no_case("WITH"), multispace1),
+            separated_list1(preceded(multispace0, char(',')), parse_identifier),
+        ),
+        |_| CypherQuery::Chain(vec![/* WITH placeholder */]),
+    )(input)
+}
+
+// REPLACEMENT for existing pub fn parse_set_clause
+pub fn parse_set_clause(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        preceded(
+            terminated(tag_no_case("SET"), multispace1),
+            separated_list1(preceded(multispace0, char(',')), parse_set_assignment_tuple),
+        ),
+        |_| CypherQuery::SetKeyValue { key: "TEMP".to_string(), value: "TEMP".to_string() },
+    )(input)
+}
+
+// REPLACEMENT for existing pub fn parse_delete_clause (Fixes E0308)
+pub fn parse_delete_clause(input: &str) -> IResult<&str, CypherQuery> {
+    let detach_parser = opt(terminated(tag_no_case("DETACH"), multispace1));
+    map(
+        preceded(
+            pair(detach_parser, terminated(tag_no_case("DELETE"), multispace1)),
+            separated_list1(preceded(multispace0, char(',')), parse_identifier),
+        ),
+        |variables| CypherQuery::DetachDeleteNodes { 
+            node_variable: variables.first().cloned().unwrap_or_default(), 
+            label: None 
+        },
+    )(input)
+}
+
+// REPLACEMENT for existing pub fn parse_merge
+pub fn parse_merge(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        tuple((
+            preceded(
+                terminated(tag_no_case("MERGE"), multispace1),
+                separated_list1(preceded(multispace0, char(',')), parse_pattern),
+            ),
+            opt(preceded(multispace1, parse_on_set_clause("ON CREATE"))),
+            opt(preceded(multispace1, parse_on_set_clause("ON MATCH"))),
+        )),
+        |(patterns, on_create, on_match)| CypherQuery::Merge {
+            patterns,
+            on_create_set: on_create.unwrap_or_default(),
+            on_match_set: on_match.unwrap_or_default(),
+        },
+    )(input)
+}
+
+
+
+
+
+
+
+
+
+

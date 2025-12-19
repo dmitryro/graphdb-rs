@@ -139,6 +139,7 @@ impl Ord for HashablePropertyMap {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Encode, Decode)]
 #[serde(untagged)]
 pub enum PropertyValue {
+    Null, // Added to fix E0599
     Boolean(bool),
     Integer(i64),
     I32(i32),
@@ -146,11 +147,9 @@ pub enum PropertyValue {
     String(String),
     Uuid(crate::identifiers::SerializableUuid),
     Byte(u8),
-    
-    // --- UPDATED VARIANTS USING WRAPPERS ---
-    // These variants now hold types that correctly implement Hash, PartialOrd, and Ord.
     Map(HashablePropertyMap),
-    Vertex(UnhashableVertex), 
+    Vertex(UnhashableVertex),
+    List(Vec<PropertyValue>), // Replaces 'Array' concept
 }
 
 impl PropertyValue {
@@ -160,38 +159,61 @@ impl PropertyValue {
             _ => None,
         }
     }
+
     pub fn as_i32(&self) -> Option<&i32> {
         match self {
             PropertyValue::I32(v) => Some(v),
             _ => None,
         }
     }
+
     pub fn as_i64(&self) -> Option<&i64> {
         match self {
             PropertyValue::Integer(v) => Some(v),
             _ => None,
         }
     }
+
+    /// Helper to access the internal list if the variant is a List
+    pub fn as_list(&self) -> Option<&Vec<PropertyValue>> {
+        match self {
+            PropertyValue::List(l) => Some(l),
+            _ => None,
+        }
+    }
+
     pub fn to_serde_value(&self) -> serde_json::Value {
         use serde_json::Value;
         match self {
+            PropertyValue::Null => Value::Null,
+            
             PropertyValue::Boolean(b) => Value::Bool(*b),
             PropertyValue::Integer(i) => Value::Number((*i).into()),
             PropertyValue::I32(i) => Value::Number((*i).into()),
-            PropertyValue::Float(f) => Value::from(f.0),
+            
+            // Fix: Since f.0 is a primitive f64, use it directly.
+            PropertyValue::Float(f) => Value::from(f.0), 
+            
             PropertyValue::String(s) => Value::String(s.clone()),
             PropertyValue::Byte(b) => Value::Number((*b as i64).into()),
             PropertyValue::Uuid(u) => Value::String(u.0.to_string()),
+            
+            PropertyValue::List(items) => {
+                let vec = items.iter()
+                    .map(|item| item.to_serde_value())
+                    .collect::<Vec<Value>>();
+                Value::Array(vec)
+            },
+
             PropertyValue::Map(m) => {
                 let map = m.0.iter()
-                    // FIX: Assuming k is &Identifier, which implements Display/ToString
-                    // or dereferences to &str, allowing direct .to_string().
-                    .map(|(k, v)| (k.to_string(), v.to_serde_value())) 
+                    .map(|(k, v)| (k.to_string(), v.to_serde_value()))
                     .collect::<serde_json::Map<String, Value>>();
                 Value::Object(map)
             },
+            
             PropertyValue::Vertex(v) => {
-                serde_json::to_value(&v.0).unwrap_or(Value::Null) 
+                serde_json::to_value(&v.0).unwrap_or(Value::Null)
             },
         }
     }
