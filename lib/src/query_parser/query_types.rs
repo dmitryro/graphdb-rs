@@ -15,17 +15,44 @@ use std::result::Result;
 // This definition allows you to specify both T and E when using StdResult.
 pub type StdResult<T, E> = Result<T, E>;
 /// (variable_name_opt, label_opt, properties_map)
-pub type NodePattern = (Option<String>, Option<String>, HashMap<String, Value>);
+// Changed from Option<String> to Vec<String>
+pub type NodePattern = (Option<String>, Vec<String>, HashMap<String, Value>);
 
 /// (variable_name_opt, label_opt, length_range_opt, properties_map, direction_opt)
 /// direction_opt: true for ->, false for <-, None for --
 pub type RelPattern = (
-    Option<String>,
-    Option<String>,
-    Option<(Option<u32>, Option<u32>)>,
-    HashMap<String, Value>,
-    Option<bool>,
+    Option<String>,                    // Variable name
+    Option<String>,                    // Relationship Type (e.g., 'WORKS_AT')
+    Option<(Option<u32>, Option<u32>)>, // Variable length: [*1..5]
+    HashMap<String, Value>,            // Properties
+    Option<bool>,                      // Direction (Left/Right/None)
 );
+
+// Type alias for the parser's raw output (before conversion)
+pub type ParsedPatternsReturnType = Vec<(
+    Option<String>,
+    Vec<(Option<String>, Option<String>, HashMap<String, Value>)>,
+    Vec<RelPattern>
+)>;
+
+// Type alias for the execution format (after conversion)
+pub type ExecutionPatternsReturnType = Vec<(
+    Option<String>,
+    Vec<(Option<String>, Vec<String>, HashMap<String, Value>)>,
+    Vec<RelPattern>
+)>;
+
+
+/// 1. Define the Literal enum if it's not imported from elsewhere
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    String(String),
+    Number(f64),
+    Float(SerializableFloat),
+    Boolean(bool),
+    Integer(i64),
+    Null,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CypherExpression {
@@ -275,15 +302,15 @@ pub enum CypherQuery {
         where_clause: Option<WhereClause>, // Added
     },
     MatchSet {
-        match_patterns: Vec<Pattern>,
-        where_clause: Option<WhereClause>, // Added
-        set_clauses: Vec<(String, String, Value)>,
+        match_patterns: Vec<Pattern>, // Adjust type name to match your codebase
+        where_clause: Option<WhereClause>,
+        set_clauses: Vec<(String, String, Expression)>, // Change Value to Expression
     },
     MatchCreateSet {
         match_patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, // Added
         create_patterns: Vec<Pattern>,
-        set_clauses: Vec<(String, String, Value)>,
+        set_clauses: Vec<(String, String, Expression)>,
     },
     MatchCreate {
         match_patterns: Vec<Pattern>,
@@ -340,8 +367,8 @@ pub enum CypherQuery {
     Merge {
         patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, // Added (Supported by Cypher in MERGE)
-        on_create_set: Vec<(String, String, Value)>,
-        on_match_set: Vec<(String, String, Value)>,
+        on_create_set: Vec<(String, String, Expression)>, 
+        on_match_set: Vec<(String, String, Expression)>,
     },
     ReturnStatement {
         projection_string: String,
@@ -351,7 +378,7 @@ pub enum CypherQuery {
     },
     // NEW: Standalone SET clause for chaining
     SetStatement { 
-        assignments: Vec<(String, String, Value)>, 
+        assignments: Vec<(String, String, Expression)>, 
     },
     
     // NEW: Standalone DELETE/DETACH DELETE clause
@@ -469,7 +496,7 @@ impl From<&Value> for CypherValue {
 }
 
 impl CypherValue {
-pub fn from_json(val: Value) -> Self {
+    pub fn from_json(val: Value) -> Self {
         match val {
             Value::Null => CypherValue::Null,
             Value::Bool(b) => CypherValue::Bool(b),
@@ -490,6 +517,38 @@ pub fn from_json(val: Value) -> Self {
                     map.insert(k, Self::from_json(v));
                 }
                 CypherValue::Map(map)
+            }
+        }
+    }
+
+    /// Converts CypherValue to a "flat" JSON value, stripping Enum tags.
+    /// This prevents the "Nested objects not supported" error in the storage layer.
+    pub fn to_json(&self) -> Value {
+        match self {
+            CypherValue::Null => Value::Null,
+            CypherValue::Bool(b) => Value::Bool(*b),
+            CypherValue::Integer(i) => Value::Number((*i).into()),
+            CypherValue::Float(f) => serde_json::Number::from_f64(*f)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
+            CypherValue::String(s) => Value::String(s.clone()),
+            // Handle the Uuid variant by converting it to a string
+            CypherValue::Uuid(u) => Value::String(u.0.to_string()),
+            CypherValue::List(list) => {
+                Value::Array(list.iter().map(|v| v.to_json()).collect())
+            }
+            CypherValue::Map(map) => {
+                let mut obj = serde_json::Map::new();
+                for (k, v) in map {
+                    obj.insert(k.clone(), v.to_json());
+                }
+                Value::Object(obj)
+            }
+            CypherValue::Vertex(v) => {
+                serde_json::to_value(v).unwrap_or(Value::Null)
+            }
+            CypherValue::Edge(e) => {
+                serde_json::to_value(e).unwrap_or(Value::Null)
             }
         }
     }
@@ -636,6 +695,8 @@ pub struct ExecutionResult {
     pub updated_edges: HashSet<Uuid>,
     pub deleted_edges: HashSet<Uuid>,
     pub updated_kv_keys: HashSet<String>,
+    // ADDED: Track number of properties modified (e.g., u.count + 1)
+    pub properties_set_count: usize,
 }
 
 impl ExecutionResult {
@@ -671,6 +732,11 @@ impl ExecutionResult {
         self.updated_kv_keys.insert(key);
     }
 
+    // ADDED: Helper to increment property count
+    pub fn inc_properties_set(&mut self) {
+        self.properties_set_count += 1;
+    }
+
     pub fn has_mutations(&self) -> bool {
         !(self.created_nodes.is_empty()
             && self.updated_nodes.is_empty()
@@ -678,7 +744,8 @@ impl ExecutionResult {
             && self.created_edges.is_empty()
             && self.updated_edges.is_empty()
             && self.deleted_edges.is_empty()
-            && self.updated_kv_keys.is_empty())
+            && self.updated_kv_keys.is_empty()
+            && self.properties_set_count == 0) // Updated to include prop count
     }
 
     pub fn created_count(&self) -> usize {
@@ -697,6 +764,8 @@ impl ExecutionResult {
         self.updated_edges.extend(other.updated_edges);
         self.deleted_edges.extend(other.deleted_edges);
         self.updated_kv_keys.extend(other.updated_kv_keys);
+        // ADDED: Accumulate property counts
+        self.properties_set_count += other.properties_set_count;
     }
 }
 
