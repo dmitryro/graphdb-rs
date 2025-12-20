@@ -465,11 +465,12 @@ impl FhirService {
     pub async fn patient_to_fhir(&self, patient: &models::medical::Patient) -> FhirPatient {
         // 1. Name
         let name = HumanNameBuilder::default()
-            .family(patient.last_name.clone())
-            .given(vec![Some(patient.first_name.clone())])
+            // FIX: last_name is Option<String>, unwrap it to String for the builder
+            .family(patient.last_name.clone().unwrap_or_default())
+            // FIX: first_name is Option<String>, unwrap it for the inner Some()
+            .given(vec![Some(patient.first_name.clone().unwrap_or_default())])
             .build()
             .expect("Failed to build HumanName");
-
         // 2. Identifiers
         let mut identifiers = Vec::new();
         if let Some(mrn) = &patient.mrn {
@@ -512,12 +513,12 @@ impl FhirService {
 
         // 5. Build Patient
         let mut builder = PatientBuilder::default()
-            .id(patient.id.to_string())
+            // FIX: Convert Option<i32> to Option<String>, then handle the None case
+            .id(patient.id.map(|id| id.to_string()).unwrap_or_default())
             .identifier(identifiers)
             .active(true)
             .name(vec![Some(name)])
             .gender(gender); // Now correctly passing the AdministrativeGender enum
-
         // birth_date is optional: only call setter when Some
         if let Some(date) = birth_date {
             builder = builder.birth_date(date);

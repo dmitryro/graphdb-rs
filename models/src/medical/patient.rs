@@ -13,15 +13,15 @@ use crate::properties::{ PropertyValue, UnhashableVertex }; // <--- ADD THIS IMP
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Patient {
     // Primary identifiers
-    pub id: i32,
+    pub id: Option<i32>,
     pub user_id: Option<i32>,
     pub mrn: Option<String>,  // Medical Record Number
     pub ssn: Option<String>,  // Social Security Number (encrypted in production)
 
     // Demographics
-    pub first_name: String,
+    pub first_name: Option<String>,
     pub middle_name: Option<String>,
-    pub last_name: String,
+    pub last_name: Option<String>,
     pub suffix: Option<String>,  // Jr, Sr, III, etc.
     pub preferred_name: Option<String>,
     pub date_of_birth: DateTime<Utc>,
@@ -110,7 +110,10 @@ impl ToVertex for Patient {
         let mut v = Vertex::new(Identifier::new("Patient".to_string()).unwrap());
 
         // Primary identifiers
-        v.add_property("id", &self.id.to_string());
+        // ID Property
+        if let Some(id_val) = self.id {
+            v.add_property("id", &id_val.to_string());
+        }
         if let Some(ref val) = self.user_id {
             v.add_property("user_id", &val.to_string());
         }
@@ -120,13 +123,20 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.ssn {
             v.add_property("ssn", val);
         }
-
         // Demographics
-        v.add_property("first_name", &self.first_name);
+        // Only add the property to the graph vertex if the field is Some
+        if let Some(ref val) = self.first_name {
+            v.add_property("first_name", val);
+        }
+        
         if let Some(ref val) = self.middle_name {
             v.add_property("middle_name", val);
         }
-        v.add_property("last_name", &self.last_name);
+        
+        if let Some(ref val) = self.last_name {
+            v.add_property("last_name", val);
+        }
+
         if let Some(ref val) = self.suffix {
             v.add_property("suffix", val);
         }
@@ -550,17 +560,19 @@ impl Patient {
             // Primary identifiers
             // FIX: Handle PropertyValue being an Integer or a String for ID
             id: {
-                let prop = normalized.properties.get("id")?;
+                // 1. Get the property from the vertex
+                let prop = normalized.properties.get("id");
                 
+                // 2. Extract the string representation (handle string or integer types)
                 let id_str = match prop {
-                    PropertyValue::String(s) => s.clone(),
-                    // Assuming PropertyValue::Integer holds an i64 (common for GraphDBs)
-                    PropertyValue::Integer(i) => i.to_string(), 
-                    _ => return None, // Fail if not a string or integer
+                    Some(PropertyValue::String(s)) => Some(s.clone()),
+                    Some(PropertyValue::Integer(i)) => Some(i.to_string()),
+                    _ => None, // If property is missing or wrong type, we get None
                 };
             
-                // Parse the resulting string into the final Patient's ID type (e.g., i32/i64)
-                id_str.parse().ok()?
+                // 3. Parse the string into i32 and wrap in Some, 
+                // or return None if parsing fails/property was missing.
+                id_str.and_then(|s| s.parse::<i32>().ok())
             },
             
             user_id: normalized.properties.get("user_id")
@@ -573,12 +585,18 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Demographics (Now guaranteed to exist by normalize_patient_vertex)
-            first_name: normalized.properties.get("first_name")?.as_str()?.to_string(),
+            // Demographics (Safe mapping to Option<String>)
+            first_name: normalized.properties.get("first_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+
             middle_name: normalized.properties.get("middle_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            last_name: normalized.properties.get("last_name")?.as_str()?.to_string(),
+
+            last_name: normalized.properties.get("last_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             suffix: normalized.properties.get("suffix")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),

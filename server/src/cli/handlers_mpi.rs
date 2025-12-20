@@ -385,7 +385,12 @@ impl MPIHandlers {
 
         println!("Indexing Patient:");
         println!(" MRN: {}", new_patient.mrn.as_deref().unwrap_or("N/A"));
-        println!(" Name: {} {}", new_patient.first_name, new_patient.last_name);
+        
+        // FIX: first_name and last_name are Option<String>, must handle Display trait mismatch
+        let display_first = new_patient.first_name.as_deref().unwrap_or("N/A");
+        let display_last = new_patient.last_name.as_deref().unwrap_or("N/A");
+        println!(" Name: {} {}", display_first, display_last);
+        
         println!(" DOB: {}", new_patient.date_of_birth.format("%Y-%m-%d"));
         println!();
 
@@ -395,7 +400,13 @@ impl MPIHandlers {
         match result {
             Ok(indexed_record) => {
                 println!("✓ Indexing successful");
-                println!(" Assigned Patient ID: {}", indexed_record.id);
+                
+                // FIX: indexed_record.id is Option<i32>, handle Display mismatch
+                let display_id = indexed_record.id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+                println!(" Assigned Patient ID: {}", display_id);
+                
                 println!(" Linked Vertex ID: {}", indexed_record.user_id.map(|id| id.to_string()).unwrap_or_else(|| "N/A".to_string()));
                 println!("\nRecord indexed and matched/linked to the Golden Record.");
             }
@@ -577,7 +588,13 @@ impl MPIHandlers {
         match result {
             Ok(record) => {
                 println!("✓ Link successful");
-                println!(" MPI Record ID: {}", record.id);
+                
+                // FIX: record.id is now Option<i32>, so we handle the Display mismatch 
+                // by using unwrap_or_default or mapping to string.
+                let display_id = record.id.to_string();
+                
+                println!(" MPI Record ID: {}", display_id);
+                
                 println!(" External ID: {} → Master ID: {}", external_id, master_mpi_id);
                 println!(" Identifier Type: {}", id_type);
                 println!("\nCross-reference established. Patient can now be found using this identifier.");
@@ -656,9 +673,16 @@ impl MPIHandlers {
                 phone.clone()
             )?;
 
+
             println!("Search Criteria:");
-            println!(" Name: {} {}", patient.first_name, patient.last_name);
             
+            // FIX: Use as_deref() to get Option<&str> and unwrap_or to provide a printable fallback
+            let first = patient.first_name.as_deref().unwrap_or("N/A");
+            let last = patient.last_name.as_deref().unwrap_or("N/A");
+            
+            println!(" Name: {} {}", first, last);
+
+
             if patient.date_of_birth.naive_utc().date().year() > 1900 {
                 println!(" DOB: {}", patient.date_of_birth.format("%Y-%m-%d"));
             } else {
@@ -837,9 +861,16 @@ impl MPIHandlers {
         
         // Output Patient Data (Golden Record)
         println!("\n### GOLDEN RECORD DATA ###");
-        println!("Patient Name: {} {}", patient_record.first_name, patient_record.last_name);
-        println!("Date of Birth: {}", patient_record.date_of_birth.format("%Y-%m-%d").to_string());
-        
+
+        // FIX: Extract first_name and last_name safely from Option<String>
+        let first = patient_record.first_name.as_deref().unwrap_or("N/A");
+        let last = patient_record.last_name.as_deref().unwrap_or("N/A");
+
+        println!("Patient Name: {} {}", first, last);
+
+        // FIX: If date_of_birth is also an Option, handle it before calling .format()
+        println!("Date of Birth: {}", patient_record.date_of_birth.format("%Y-%m-%d"));
+
         // Use debug print for Address
         let address_str = patient_record.address.as_ref()
             .map(|a| format!("{:?}", a))
@@ -875,7 +906,10 @@ impl MPIHandlers {
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_fetch_identity(
         &self,
-        id: Option<String>, external_id: Option<String>, id_type: Option<String>, source_mrn: Option<String>,
+        id: Option<String>, 
+        external_id: Option<String>, 
+        id_type: Option<String>, 
+        source_mrn: Option<String>,
         // Add the new system parameter to the handler, which was required in the previous fixes.
         system: Option<String>,
     ) -> Result<(), GraphError> {
@@ -886,13 +920,14 @@ impl MPIHandlers {
             .or(external_id.as_ref())
             .or(source_mrn.as_ref())
             .cloned()
-            .context("At least one ID field (--id, --external-id, or --source-mrn) is required for fetch operation.")?;
+            .context("At least one ID field (--id, --external-id, or --source-mrn) is required for fetch operation.")
+            .map_err(|e| GraphError::InternalError(e.to_string()))?;
         
         // NOTE: The previous code was incorrectly trying to assign the result of consolidate_id (which returns ()) 
         // to final_id. The call is logically separate.
         
         // Conditional consolidation: If we have enough mandatory fields to link an ID, perform the consolidation.
-        if let (Some(ext_id), Some(src_mrn_val), Some(sys), Some(id_t)) = 
+        if let (Some(ext_id), Some(_src_mrn_val), Some(sys), Some(id_t)) = 
             (external_id.clone(), source_mrn.clone(), system.clone(), id_type.clone()) 
         {
             // The consolidate_id signature requires (String, String, String, String):
@@ -902,41 +937,59 @@ impl MPIHandlers {
             // 4. system (the source system)
             
             // FIX 2: Call consolidate_id correctly with unwrapped values and .await
+            // Note: _src_mrn_val is prefixed with underscore to resolve unused variable warning 
+            // if it is not explicitly required by the consolidate_id signature.
             self.consolidate_id(
                 final_id.clone(),     // 1. raw_patient_id_str (Patient ID to link to)
                 ext_id,               // 2. external_id
-                id_t,                 // 3. id_type (Assuming id_type is used as the id_type argument)
+                id_t,                 // 3. id_type
                 sys,                  // 4. system
             ).await?;
         }
         
         info!("Fetching identity record for ID: {} (Type: {:?})", final_id, id_type);
 
-        let final_id_type: Option<IdType> = id_type.map(IdType::from);
-        let resolved_id_type = final_id_type.clone().unwrap_or_else(|| IdType::Other("UNKNOWN_ID_TYPE".to_string()));
-
-        // FIX 3: Initialize the ExternalId struct with the required `system` field.
-        let external_id_struct: ExternalId = ExternalId { 
-            id_type: resolved_id_type, 
-            id_value: final_id.clone(),
-            system: system, // Passed as Option<String>
+        // Branching Scenario Logic:
+        // We check if we have an explicit External ID + Type combo. 
+        // If not, we fall back to the generic fetch_identity which branches by format.
+        let mpi_result = if let (Some(ext_val), Some(t_val)) = (external_id, id_type.clone()) {
+            info!("[MPI] Routing to explicit external ID lookup: {} ({})", ext_val, t_val);
+            self.mpi_service.fetch_identity_by_external_id(ext_val, t_val).await
+        } else {
+            info!("[MPI] Routing to standard identifier resolution: {}", final_id);
+            // FIX 3: Added .clone() here to prevent moving final_id, 
+            // so it remains available for the println! at the end of the method.
+            self.mpi_service.fetch_identity(final_id.clone()).await
         };
-        
-        // No fix needed here, .await is already on the resolve_and_fetch_patient call below.
-        let (_, patient_record) = self.mpi_service
-            .resolve_and_fetch_patient(external_id_struct, final_id_type)
-            .await
-            .context("Failed to fetch patient record for provided ID.")
-            .map_err(|e| GraphError::InternalError(e.to_string()))?;
+
+        // Handle error and unwrap the MasterPatientIndex
+        let patient_record = mpi_result.map_err(|e| {
+            error!("[MPI ERROR] Identity resolution failed: {}", e);
+            GraphError::InternalError(format!("MPI fetch identity operation failed: {}", e))
+        })?;
         
         println!("---------------------------------------------------");
         println!("✅ FETCH IDENTITY SUCCESS");
+        // final_id is still available because we cloned it in the match arm above.
         println!("Retrieved Golden Record using ID: {}", final_id);
         println!("\n### GOLDEN RECORD DATA ###");
-        println!("Canonical ID: {}", patient_record.id);
-        println!("Full Name: {} {}", patient_record.first_name, patient_record.last_name);
-        println!("Date of Birth: {}", patient_record.date_of_birth.format("%Y-%m-%d"));
-        println!("Phone (Home): {}", patient_record.phone_home.as_deref().unwrap_or("N/A"));
+        
+        // patient_id is now Option, provide fallback for Display
+        println!("Canonical ID: {}", patient_record.patient_id.unwrap_or(-1));
+        
+        println!("Full Name: {} {}", 
+            patient_record.first_name.as_deref().unwrap_or(""), 
+            patient_record.last_name.as_deref().unwrap_or("")
+        );
+        
+        if let Some(dob) = patient_record.date_of_birth {
+            println!("Date of Birth: {}", dob.format("%Y-%m-%d"));
+        } else {
+            println!("Date of Birth: N/A");
+        }
+        
+        println!("Phone: {}", patient_record.contact_number.as_deref().unwrap_or("N/A"));
+        println!("SSN: {}", patient_record.social_security_number.as_deref().unwrap_or("N/A"));
         println!("---------------------------------------------------");
 
         Ok(())
@@ -989,15 +1042,25 @@ impl MPIHandlers {
             for (index, patient) in search_results.iter().enumerate() {
                 println!("\n===================================================");
                 println!("[Result {} / {}]", index + 1, search_results.len());
-                let patient_id_str = patient.id.to_string();
+                
+                // FIX: patient.id is Option<i32>. We map it to a String or default to "0".
+                let patient_id_str = patient.id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                
                 println!("Canonical Patient ID: {}", patient_id_str);
                 println!("===================================================");
                 
                 // Output Patient Data (Golden Record)
                 println!("\n### GOLDEN RECORD DATA ###");
-                println!("Full Name: {} {}", patient.first_name, patient.last_name);
-                println!("Date of Birth: {}", patient.date_of_birth.format("%Y-%m-%d").to_string());
                 
+                // FIX: first_name and last_name are Option<String>. 
+                // We use as_deref().unwrap_or("N/A") to satisfy the Display requirement.
+                let first = patient.first_name.as_deref().unwrap_or("N/A");
+                let last = patient.last_name.as_deref().unwrap_or("N/A");
+                
+                println!("Full Name: {} {}", first, last);
+                println!("Date of Birth: {}", patient.date_of_birth.format("%Y-%m-%d").to_string());
                 // Use debug print for Address
                 let address_str = patient.address.as_ref()
                     .map(|a| format!("{:?}", a))
@@ -1130,15 +1193,15 @@ impl MPIHandlers {
         // Return minimal Patient for matching
         Ok(Patient {
             // Primary identifiers
-            id: rand::random(),
+            id: Some(rand::random()),
             user_id: None,
             mrn: None,
             ssn: None,
 
             // Demographics - critical for matching
-            first_name,
+            first_name: Some(first_name),
             middle_name,
-            last_name,
+            last_name: Some(last_name),
             suffix: None,
             preferred_name: None,
             date_of_birth,
@@ -1220,8 +1283,11 @@ impl MPIHandlers {
             (Some(f), Some(l), _) => (f, l),
 
             // Case 2: Names exist in the database record, use them (MRN-only call)
-            // Use existing patient data's names
-            (_, _, Some(p)) => (p.first_name.clone(), p.last_name.clone()),
+            // FIX: Unwrap Option<String> to String to match Case 1 and 3 types.
+            (_, _, Some(p)) => (
+                p.first_name.clone().unwrap_or_else(|| "Unknown".to_string()),
+                p.last_name.clone().unwrap_or_else(|| "Unknown".to_string())
+            ),
 
             // Case 3: Names are missing and NO existing record found, try to parse from full 'name' field
             (None, None, None) => {
@@ -1244,7 +1310,6 @@ impl MPIHandlers {
                  ));
             }
         };
-
         // --- LOGIC FOR DATA MERGING ---
         
         // Start with existing patient data or a default patient struct
@@ -1274,8 +1339,8 @@ impl MPIHandlers {
         
         // Apply resolved/new values
         patient_to_index.mrn = Some(mrn);
-        patient_to_index.first_name = final_first_name;
-        patient_to_index.last_name = final_last_name;
+        patient_to_index.first_name = Some(final_first_name);
+        patient_to_index.last_name = Some(final_last_name);
         patient_to_index.date_of_birth = date_of_birth;
         patient_to_index.address = address_tuple;
         patient_to_index.address_id = patient_to_index.address.as_ref().map(|a| a.id);
@@ -1296,7 +1361,7 @@ impl MPIHandlers {
         
         // Only assign new IDs and created_at if it's genuinely a new record
         if patient_to_index.created_at.timestamp() == 0 { // Check if it's the default created_at value
-            patient_to_index.id = rand::random();
+            patient_to_index.id = Some(rand::random());
             patient_to_index.created_at = now;
         }
         
@@ -1410,7 +1475,7 @@ impl MPIHandlers {
         let target_mpi_id = merged_id;
         
         println!("Merged Record to Split: {}", target_mpi_id);
-        println!("New Patient Data ID: {}", new_patient_data.id);
+        println!("New Patient Data ID: {:?}", Some(new_patient_data.id));
         println!("Reason for Split: {}", reason);
         // Display the new required ID
         println!("Internal ID being split out: {}", split_patient_id); 
@@ -1469,11 +1534,19 @@ impl MPIHandlers {
         match result {
             Ok(golden_patient) => {
                 println!("✓ Golden Record successfully retrieved.");
-                println!(" Full Name: {} {}", golden_patient.first_name, golden_patient.last_name);
+                
+                // FIX: first_name and last_name are Option<String>. 
+                // We use as_deref().unwrap_or("N/A") to satisfy the Display requirement.
+                let first = golden_patient.first_name.as_deref().unwrap_or("N/A");
+                let last = golden_patient.last_name.as_deref().unwrap_or("N/A");
+                
+                println!(" Full Name: {} {}", first, last);
                 println!(" Date of Birth: {}", golden_patient.date_of_birth.format("%Y-%m-%d"));
                 println!(" MRN: {}", golden_patient.mrn.as_deref().unwrap_or("N/A"));
                 
                 // Further logic to print address, phone, etc., would go here.
+                // Note: address and phone likely also need .as_deref().unwrap_or("N/A") 
+                // if they are also Option types.
                 
                 Ok(())
             }

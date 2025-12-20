@@ -1,23 +1,22 @@
 // medical_knowledge/src/patient/patient_service.rs
 //! Patient Service — Global singleton for patient management
 //! Handles patient creation, viewing, searching, timeline, problems, meds, care gaps, allergies, referrals, drug alerts
-
-use std::collections::{ HashMap };
-// Assuming GraphService is accessible via lib
-use lib::graph_engine::graph_service::{GraphService}; 
-use lib::config::{ sanitize_cypher_string, format_optional_string };
-use models::medical::{Patient, Problem, Prescription, Allergy, Referral};
-use models::{Vertex};
-use crate::{FromVertex}; // Assuming FromVertex is a trait in the current crate
-use models::identifiers::{Identifier, VertexId};
-use models::errors::{GraphError, GraphResult};
-use lib::commands::{PatientCommand, JourneyFormat, AlertFormat, AlertSeverity};
 use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock}; // tokio::sync used
 use uuid::Uuid;
 use chrono::{DateTime, Utc, NaiveDate, NaiveDateTime};
 use serde_json::{self, Value, json}; // Added serde_json for property manipulation
 use anyhow::{anyhow, Result}; // Added for better error handling in get()
+use log::{info, error, warn, debug};
+use std::collections::{ HashMap };
+use models::medical::{Patient, Problem, Prescription, Allergy, Referral};
+use models::{Vertex};
+use models::identifiers::{Identifier, VertexId};
+use models::errors::{GraphError, GraphResult};
+use lib::commands::{PatientCommand, JourneyFormat, AlertFormat, AlertSeverity};
+use lib::graph_engine::graph_service::{GraphService}; 
+use lib::config::{ sanitize_cypher_string, format_optional_string };
+use crate::{FromVertex}; // Assuming FromVertex is a trait in the current crate
 
 // Global singleton
 pub static PATIENT_SERVICE: OnceCell<Arc<PatientService>> = OnceCell::const_new();
@@ -120,8 +119,15 @@ impl PatientService {
     // Renamed to clarify role: only manages in-memory cache, not persistence
     async fn add_patient_to_cache(&self, patient: Patient) {
         let mut patients = self.patients.write().await;
-        // Assuming Uuid::from_u128 conversion is correct for patient.id (i32)
-        patients.insert(Uuid::from_u128(patient.id as u128), patient); 
+        
+        // FIX: Check if the optional ID exists before casting and inserting
+        if let Some(id_val) = patient.id {
+            // Assuming Uuid::from_u128 conversion is correct for patient.id (i32)
+            patients.insert(Uuid::from_u128(id_val as u128), patient);
+        } else {
+            // Log a warning if we attempt to cache a patient without a canonical ID
+            warn!("[MPI] Skipping cache insertion: Patient has no canonical ID.");
+        }
     }
 
     // =========================================================================
@@ -134,14 +140,16 @@ impl PatientService {
         // NOTE: Converting Uuid::as_u128() to i32 risks truncation/overflow, 
         // but we keep this logic as it was provided, only ensuring the Uuid is 
         // generated and the patient struct is updated.
-        new_patient.id = patient_uuid.as_u128() as i32;
+        // FIX: Wrapped in Some() to match Option<i32>
+        new_patient.id = Some(patient_uuid.as_u128() as i32);
         new_patient.created_at = Utc::now();
         new_patient.updated_at = Utc::now();
         
         // 1. Sanitize REQUIRED string fields
-        // first_name and last_name are not Option<String>, so they can be sanitized directly.
-        let first_name = sanitize_cypher_string(&new_patient.first_name);
-        let last_name = sanitize_cypher_string(&new_patient.last_name);
+        // FIX: first_name and last_name are now Option<String>. 
+        // We use as_deref().unwrap_or("") to pass a &str to the sanitizer.
+        let first_name = sanitize_cypher_string(new_patient.first_name.as_deref().unwrap_or(""));
+        let last_name = sanitize_cypher_string(new_patient.last_name.as_deref().unwrap_or(""));
         
         // 2. Format OPTIONAL string fields (FIX applied here)
         // FIX: gender is now Option<String> and must be handled like ssn and mrn.
@@ -155,12 +163,15 @@ impl PatientService {
         let updated_at = new_patient.updated_at.to_rfc3339();
         
         // Build Cypher query with properly formatted values
-        // Note: The new_patient.id is an i32 and does not need quoting.
+        // Note: The new_patient.id is an Option<i32>. 
+        // FIX: We map it to a string or "null" to satisfy the format! macro's Display requirement.
+        let id_val = new_patient.id.map(|i| i.to_string()).unwrap_or_else(|| "null".to_string());
+
         // Optional strings (gender, ssn, mrn) are now quoted inside format_optional_string 
         // (or output as 'null'), so they don't need additional quotes in the query string.
         let query = format!(
             "CREATE (p:Patient {{id: {}, first_name: \"{}\", last_name: \"{}\", gender: {}, ssn: {}, mrn: {}, date_of_birth: \"{}\", created_at: \"{}\", updated_at: \"{}\"}});",
-            new_patient.id,
+            id_val,
             first_name,
             last_name,
             gender, // Already formatted as "value" or null

@@ -750,6 +750,84 @@ impl GraphService {
         Ok(())
     }
 
+    /// Finds a patient vertex by internal numeric ID property using a Cypher query.
+    /// This returns the raw Vertex structure, not the Patient model.
+    /// 
+    /// Note: This is different from get_patient_by_id which returns a Patient model
+    /// and queries for GoldenRecord labels.
+    pub async fn get_patient_vertex_by_internal_id(&self, patient_id: i32) -> Result<Option<Vertex>, GraphError> {
+        // Construct the Cypher query (no label filtering, just id property match)
+        // Note: Using the Integer format directly in the query string as our Sled engine
+        // treats numeric values without quotes as integers.
+        let query = format!("MATCH (p:Patient {{id: {}}}) RETURN p", patient_id);
+        
+        info!("[GraphService] Executing internal ID vertex lookup: {}", query);
+
+        // Execute the read query
+        let results_vec = self.execute_cypher_read(&query, json!({})).await?;
+        
+        // --- Robust Parsing of Nested Cypher Result ---
+
+        // 1. Extract the top-level response object
+        let cypher_json_value = results_vec.into_iter().next()
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher execution returned an empty top-level array.".into()
+            ))?;
+        
+        // 2. Access the 'results' array
+        let results_array = cypher_json_value.as_object()
+            .and_then(|obj| obj.get("results"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher response missing top-level 'results' array.".into()
+            ))?;
+        
+        // 3. Access the first result block
+        let first_result_block = results_array.get(0)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher 'results' array was empty.".into()
+            ))?;
+        
+        // 4. Extract the 'vertices' array
+        let vertices = first_result_block.as_object()
+            .and_then(|obj| obj.get("vertices"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher result block missing 'vertices' array.".into()
+            ))?;
+        
+        // 5. Handle empty match gracefully
+        if vertices.is_empty() {
+            info!("[GraphService] No vertex found with internal ID: {}", patient_id);
+            return Ok(None);
+        }
+        
+        // 6. Alert on multiple matches (internal IDs should be unique)
+        if vertices.len() > 1 {
+            warn!("Patient internal ID {} lookup returned {} vertices. Returning the first one.", patient_id, vertices.len());
+        }
+        
+        // 7. Extract the vertex JSON node
+        let vertex_json_value = vertices.get(0)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Vertices array was unexpectedly empty.".into()
+            ))?;
+        
+        // 8. Deserialize into the Rust Vertex model
+        match serde_json::from_value::<Vertex>(vertex_json_value.clone()) {
+            Ok(vertex) => {
+                info!("[GraphService] Successfully retrieved vertex {} for internal ID {}", vertex.id.0, patient_id);
+                Ok(Some(vertex))
+            },
+            Err(e) => {
+                error!("Failed to deserialize JSON to Vertex for ID {}: {}", patient_id, e);
+                Err(GraphError::DeserializationError(
+                    format!("Failed to parse vertex JSON: {}", e)
+                ))
+            }
+        }
+    }
+    
     /// **Retrieves the complete Patient Golden Record by its canonical ID.**
     ///
     /// NOTE: We must ensure this returns the entire node properties for the parser,
@@ -1763,6 +1841,7 @@ impl GraphService {
         }
     }
 
+
     /// Finds a single Patient vertex by its Medical Record Number (MRN) using a Cypher query.
     pub async fn get_patient_by_mrn(&self, mrn: &str) -> Result<Option<Vertex>, GraphError> {
         
@@ -2368,7 +2447,71 @@ impl GraphService {
             .filter_map(|id| graph.vertices.get(&id).cloned())
             .collect()
     }
-    
+  
+    /// This utilizes the robust result-parsing tactic from get_patient_by_mrn to 
+    /// navigate the nested Cypher engine response.
+    pub async fn get_patient_by_external_id(
+        &self, 
+        id_value: &str, 
+        id_property_name: &str
+    ) -> Result<Option<Patient>> {
+        
+        // 1. Sanitize the property name and value to prevent Cypher injection
+        let safe_value = id_value.replace('\'', "\\'");
+        let safe_prop_name = id_property_name.chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>();
+        
+        // 2. Construct the query targeting the GoldenRecord label
+        // We return 'p' as the node, which contains all properties for deserialization
+        let query = format!(
+            "MATCH (p:Patient:GoldenRecord {{ {}: '{}' }}) RETURN p",
+            safe_prop_name, safe_value
+        );
+
+        // 3. Execute and get the top-level array
+        let results_vec = self.execute_cypher_read(&query, json!({})).await
+            .context("GraphService failed to execute external ID patient retrieval")?;
+            
+        let cypher_json_value = results_vec.into_iter().next()
+            .ok_or_else(|| anyhow!("Cypher execution returned an empty top-level array."))?;
+
+        // 4. Navigate the results -> vertices JSON path
+        let results_array = cypher_json_value.as_object()
+            .and_then(|obj| obj.get("results"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Cypher response missing 'results' array."))?;
+
+        let first_result_block = results_array.get(0)
+            .ok_or_else(|| anyhow!("Cypher 'results' array was empty."))?;
+
+        let vertices = first_result_block.as_object()
+            .and_then(|obj| obj.get("vertices"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Cypher result block missing 'vertices' array."))?;
+
+        // 5. Handle empty matches
+        if vertices.is_empty() {
+            return Ok(None);
+        }
+
+        // 6. Extract the vertex JSON node
+        let vertex_json_value = vertices.get(0)
+            .ok_or_else(|| anyhow!("Vertices array was unexpectedly empty."))?;
+
+        // 7. Deserialize into Patient struct
+        // Since get_patient_by_mrn returns Option<Vertex>, we use the parser 
+        // specialized for the Patient model here.
+        match parse_patient_from_cypher_result(vertex_json_value.clone()) {
+            Ok(patient) => Ok(Some(patient)),
+            Err(e) => {
+                error!("Failed to hydrate Patient from external ID lookup: {}", e);
+                // Return None or Err depending on if you want to skip malformed records
+                Err(anyhow!("Failed to parse patient JSON: {}", e))
+            }
+        }
+    }
+
     // In graph_service.rs or a storage trait:
     pub async fn get_vertex_by_internal_id(&self, internal_id: i32) -> GraphResult<Vertex> {
         

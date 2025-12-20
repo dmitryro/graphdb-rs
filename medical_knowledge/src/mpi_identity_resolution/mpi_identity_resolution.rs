@@ -10,7 +10,7 @@ use std::str::FromStr; // FIX for E0599 (no function from_str)
 use lib::graph_engine::graph_service::{GraphService, initialize_graph_service}; 
 use models::medical::*;
 use models::{Graph, Identifier, Edge, Vertex, ToVertex};
-use models::medical::{Patient, MasterPatientIndex, GoldenRecord };
+use models::medical::{Patient, MasterPatientIndex, GoldenRecord, Address};
 use models::identifiers::SerializableUuid;
 use models::properties::{ PropertyValue, SerializableFloat, PropertyMap };
 use models::timestamp::BincodeDateTime;
@@ -39,6 +39,15 @@ pub struct PatientCandidate {
     pub match_score: f64,
     pub blocking_keys: Vec<String>, // Keys that led to this match
 }
+
+#[derive(Debug, Clone, PartialEq)]
+enum IdentifierType {
+    MRN,           // Medical Record Number (e.g., "M12345", "MRN78901")
+    InternalID,    // Numeric internal ID (e.g., "12345", "-557141486")
+    UUID,          // UUID format (e.g., "b73948a7-960d-455d-8165-85b1210242be")
+    ExternalID,    // External ID requiring type (handled separately)
+}
+
 
 #[derive(Clone)]
 pub struct MpiIdentityResolutionService {
@@ -361,25 +370,36 @@ impl MpiIdentityResolutionService {
         // --- 1. Split Name into First and Last ---
         let mut parts: Vec<&str> = full_name.split_whitespace().collect();
         
-        let last_name = parts.pop().unwrap_or("").to_string(); 
-        let first_name = parts.join(" ").to_string(); 
+        // Handle empty input or single names gracefully
+        let last_name = if parts.len() > 1 {
+            parts.pop().map(|s| s.to_string())
+        } else {
+            None
+        };
         
-        // If the DOB string is empty, use the sentinel date (1900-01-01) used by the CLI.
+        let first_name = if !parts.is_empty() {
+            Some(parts.join(" "))
+        } else if last_name.is_none() && !full_name.is_empty() {
+            // Fallback for single-word names
+            Some(full_name.to_string())
+        } else {
+            None
+        };
+        
+        // --- 2. Parse Date of Birth ---
         let naive_date = match NaiveDate::parse_from_str(dob_str, "%Y-%m-%d") {
             Ok(d) => d,
             Err(_) if dob_str.is_empty() => NaiveDate::from_ymd_opt(1900, 1, 1).unwrap(),
             Err(e) => return Err(format!("Failed to parse DOB '{}': {}", dob_str, e)),
         };
         
-        // FIX: Ensure the NaiveDateTime is correctly unwrapped or constructed.
+        // Correct conversion to DateTime<Utc>
         let date_of_birth: DateTime<Utc> = Utc.from_utc_datetime(
-            &naive_date.and_hms_opt(0, 0, 0).unwrap_or_else(|| {
-                // Returns NaiveDateTime, which is the expected type.
-                naive_date.and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
-            })
+            &naive_date.and_hms_opt(0, 0, 0).expect("Invalid time construction")
         );
         
         // --- 3. Create Temporary Patient for Key Generation ---
+        // FIX: Wrap strings in Some() to match Option<String> in model
         let temp_patient = Patient {
             first_name,
             last_name,
@@ -398,28 +418,37 @@ impl MpiIdentityResolutionService {
     /// Generates a set of robust blocking keys from the patient's data.
     /// These keys are used to quickly filter potential match candidates.
     fn generate_blocking_keys(patient: &Patient) -> Vec<String> {
-        // Use a clean, uppercase version of names, taking the first few characters.
-        let first_name_part = patient.first_name.to_uppercase().chars().take(1).collect::<String>();
-        let last_name_part = patient.last_name.to_uppercase().chars().take(4).collect::<String>();
-        
-        // This line is now valid because Datelike is imported:
-        let dob_year = patient.date_of_birth.year().to_string(); 
-        
         let mut keys = Vec::new();
+        
+        // Extract Year from DOB (Assuming date_of_birth is still a mandatory NaiveDate or similar)
+        let dob_year = patient.date_of_birth.year().to_string();
 
-        // Key 1: Last Name Prefix (4 chars) + First Initial + DOB Year (e.g., JOHS_A_1980)
-        if !first_name_part.is_empty() && !last_name_part.is_empty() {
-             keys.push(format!("{}_{}_{}", last_name_part, first_name_part, dob_year));
+        // 1. Process Names safely using .as_ref() and .map()
+        let first_initial = patient.first_name.as_ref()
+            .map(|s| s.to_uppercase().chars().take(1).collect::<String>());
+            
+        let last_name_prefix = patient.last_name.as_ref()
+            .map(|s| s.to_uppercase().chars().take(4).collect::<String>());
+
+        // Key 1: Last Name Prefix (4 chars) + First Initial + DOB Year (e.g., SMIT_A_1980)
+        // We only generate this if BOTH name components exist.
+        if let (Some(f_init), Some(l_pre)) = (first_initial, last_name_prefix) {
+            if !f_init.is_empty() && !l_pre.is_empty() {
+                keys.push(format!("{}_{}_{}", l_pre, f_init, dob_year));
+            }
         }
 
-        // Key 2: Full Last Name + DOB Year (e.g., JOHNSON_1980)
-        let full_last_name_clean = patient.last_name.to_uppercase().replace(" ", "");
-        if !full_last_name_clean.is_empty() {
-             keys.push(format!("{}_{}", full_last_name_clean, dob_year));
+        // Key 2: Full Last Name + DOB Year (e.g., SMITH_1980)
+        if let Some(ref last_name) = patient.last_name {
+            let full_last_name_clean = last_name.to_uppercase().replace(" ", "");
+            if !full_last_name_clean.is_empty() {
+                keys.push(format!("{}_{}", full_last_name_clean, dob_year));
+            }
         }
 
+        // Fallback if no specific keys could be generated
         if keys.is_empty() {
-            keys.push("NO_BLOCKING_KEY".to_string());
+            keys.push(format!("BY_YEAR_{}", dob_year));
         }
 
         keys
@@ -497,9 +526,13 @@ impl MpiIdentityResolutionService {
             .await
             .context("Failed to execute demographic search in the Graph Service layer (Cypher query execution failed).")?;
 
+        // NOTE: The error E0599 is triggered when you try to convert patient.id (Option<i32>) to a String.
+        // If you are using these search_results to build FHIR resources or logging, 
+        // handle the ID conversion like this:
+        // let id_str = patient.id.map(|id| id.to_string()).unwrap_or_else(|| "unknown".to_string());
+
         Ok(search_results)
     }
-
     // =========================================================================
     // INDEXING & REAL-TIME
     // =========================================================================
@@ -514,20 +547,24 @@ impl MpiIdentityResolutionService {
             mrn_idx.insert(mrn.clone(), vertex_id);
         }
 
-        let norm_name = format!("{} {}", patient.last_name.to_lowercase(), patient.first_name.to_lowercase());
+        // FIX: Handle Option<String> for names by providing a default empty string
+        let last_norm = patient.last_name.as_deref().unwrap_or("").to_lowercase();
+        let first_norm = patient.first_name.as_deref().unwrap_or("").to_lowercase();
+        let norm_name = format!("{} {}", last_norm, first_norm);
+        
         let dob = patient.date_of_birth.format("%Y-%m-%d").to_string();
         name_dob_idx.entry((norm_name, dob))
             .or_default()
             .push(vertex_id);
         
         // NEW FIX: Blocking Index population with println! logging
-        // Calls the correct static helper `Self::generate_blocking_keys`
         let keys = Self::generate_blocking_keys(patient);
         
         let mut blocking_idx = self.blocking_index.write().await;
         
+        // FIX: Use {:?} for Option<i32> display
         println!(
-            "[MPI Debug] Indexing Patient ID {} (Vertex ID {}). BLOCKING KEYS: {:?}", 
+            "[MPI Debug] Indexing Patient ID {:?} (Vertex ID {}). BLOCKING KEYS: {:?}", 
             patient.id, 
             vertex_id, 
             keys
@@ -571,32 +608,32 @@ impl MpiIdentityResolutionService {
     /// 3. Runs probabilistic matching against existing candidates.
     /// 4. Performs auto-merge/update if a high-confidence match is found.
     /// Handles the entire process of indexing a new patient record from a public interface.
-
     pub async fn index_new_patient(&self, mut patient_data: Patient) -> Result<Patient, String> {
         let gs = &self.graph_service;
 
-        let mut new_patient_vertex_id;
+        let new_patient_vertex_id: Uuid;
         let mut is_new_creation = false;
 
         // 1. Check for existing patient via MRN (Optimization)
-        // [Existing logic for patient existence check by MRN]
         if let Some(mrn) = patient_data.mrn.as_ref() {
             match gs.get_patient_by_mrn(mrn).await {
                 Ok(Some(existing_vertex)) => {
                     // Patient exists by MRN, perform update/re-indexing
                     new_patient_vertex_id = existing_vertex.id.0;
+                    
+                    // FIX: Maintain Option<i32> type throughout the chain
                     patient_data.id = existing_vertex.properties.get("id")
-                             .and_then(|p| match p {
-                                 PropertyValue::Integer(val) => Some(*val as i32),
-                                 _ => None,
-                             }).unwrap_or(patient_data.id);
-                    // Use info! (assuming it's defined via log/tracing)
+                        .and_then(|p| match p {
+                            PropertyValue::Integer(val) => Some(*val as i32),
+                            _ => None,
+                        })
+                        .or(patient_data.id); // Use .or() to merge Options
+
                     println!("[MPI Debug] Patient with MRN {} found (Vertex ID {}). Re-indexing triggered.", mrn, new_patient_vertex_id);
                 }
                 Ok(None) => {
                     // Patient is new by MRN, proceed with creation.
                     is_new_creation = true;
-                    // Need to manually assign an ID for the new vertex before adding it for logging consistency
                     let patient_vertex = {
                         let mut v = patient_data.to_vertex();
                         v.id = SerializableUuid(Uuid::new_v4()); // Assign new UUID
@@ -615,25 +652,24 @@ impl MpiIdentityResolutionService {
         }
 
         // 2. Run the indexing and probabilistic matching
-        println!("[MPI Debug] Patient {} indexed. Starting probabilistic matching.", patient_data.id);
+        // FIX: Use {:?} for Option<i32> in println!
+        println!("[MPI Debug] Patient {:?} indexed. Starting probabilistic matching.", patient_data.id);
         self.index_patient(&patient_data, new_patient_vertex_id).await;
 
         let candidates = self.find_candidates(&patient_data).await;
         
         let mut match_performed = false;
 
-        if let Some(best) = candidates.into_iter().max_by(|a, b| b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal)) {
-            println!("[MPI Debug] Best candidate found for patient {} with score: {}", patient_data.id, best.match_score);
-            match_performed = true;
+        if let Some(best) = candidates.into_iter().max_by(|a, b| a.match_score.partial_cmp(&b.match_score).unwrap_or(std::cmp::Ordering::Equal)) {
+            println!("[MPI Debug] Best candidate found for patient {:?} with score: {}", patient_data.id, best.match_score);
             
             // 3. Auto-merge/Update if score is high enough
             if best.match_score > 0.95 {
-                
+                match_performed = true;
                 let target_vertex_id: Uuid = best.patient_vertex_id;
                 
                 // If we just created a new vertex, but found a high-confidence match 
                 if is_new_creation && target_vertex_id != new_patient_vertex_id {
-                    // Update properties of the existing, matching Golden Record candidate
                     let mut update_props = HashMap::new();
                     if let Some(new_mrn) = patient_data.mrn.as_ref() {
                          update_props.insert(String::from("mrn"), PropertyValue::String(new_mrn.clone()));
@@ -648,26 +684,22 @@ impl MpiIdentityResolutionService {
                 
                 // Perform the actual merge (linking the new/duplicate record to the golden record)
                 self.auto_merge(new_patient_vertex_id, patient_data.clone(), best).await;
-                println!("[MPI Debug] Auto-merge successful for Patient {}", patient_data.id);
+                println!("[MPI Debug] Auto-merge successful for Patient {:?}", patient_data.id);
                 
             } else {
                  println!("[MPI Debug] Score {} is below auto-merge threshold (0.95). No auto-merge performed.", best.match_score);
             }
         }
         
-        // 4. CRITICAL FIX: If the patient was NEWLY CREATED and NO high-confidence match was found,
-        // this patient *becomes* the new Golden Record.
+        // 4. If newly created and NO high-confidence match found, create a new Golden Record.
         if is_new_creation && !match_performed {
-            // This is a brand new patient with no matches -> create its Golden Record.
             self.create_golden_record_and_link(&patient_data, new_patient_vertex_id)
                 .await
                 .map_err(|e| format!("CRITICAL: Failed to establish Golden Record link for new patient: {}", e))?;
         }
 
-        // Return the final patient record
         Ok(patient_data)
     }
-
 
     /// Factory method for the global singleton, accepting the pre-initialized GraphService.
     /// FIX: Now uses Cypher query and correctly handles nested result structure parsing.
@@ -811,10 +843,6 @@ impl MpiIdentityResolutionService {
         let mut candidates_to_score = Vec::new();
         let mut processed_gr_uuids = HashSet::new();
         
-        // NOTE: In a real system, this loop would fetch each Patient vertex, 
-        // score it against `patient`, and then find its associated Golden Record.
-        // 
-
         for patient_uuid in candidate_patient_uuids.iter() {
             // Find the canonical Golden Record ID for this matched patient
             if let Some(gr_uuid) = self.get_golden_record_for_patient_vertex_id(*patient_uuid).await {
@@ -832,11 +860,13 @@ impl MpiIdentityResolutionService {
                     rand::random::<f64>() * 0.8
                 };
                 
-                // IMPORTANT: patient_vertex_id now holds the Golden Record's UUID
+                // Fix E0308: Handle Option<i32> for the candidate fields
                 candidates_to_score.push(PatientCandidate {
                     patient_vertex_id: gr_uuid, 
-                    patient_id: patient.id, // Candidate's ID (should be GR's ID, mocked here)
-                    master_record_id: Some(patient.id), // GR ID
+                    // Use a sentinel value (0) if the ID is missing
+                    patient_id: patient.id.unwrap_or(0), 
+                    // master_record_id is Option<i32>, so we can pass patient.id directly
+                    master_record_id: patient.id, 
                     match_score: score, 
                     blocking_keys: blocking_keys.clone(),
                 });
@@ -1158,56 +1188,187 @@ impl MpiIdentityResolutionService {
         Ok(changes)
     }
 
-    // =========================================================================
-    // NEW PUBLIC METHODS FOR IDENTITY MANAGEMENT, SEARCH, AND RESOLVE
-    // =========================================================================
-
-    /// NEW: Fetches the Golden Record (Canonical Identity) for a given Patient ID.
+    /// Fetches the Golden Record (Canonical Identity) for a given Patient identifier.
+    /// 
+    /// Handles three input types automatically:
+    /// 1. MRN (Medical Record Number) - alphanumeric strings like "M12345"
+    /// 2. Internal numeric ID - integers like 12345 or -557141486
+    /// 3. UUID - full UUID format
     pub async fn fetch_identity(&self, patient_id_str: String) -> Result<MasterPatientIndex, String> {
-        let patient_id_numeric = extract_numeric_patient_id(&patient_id_str)
-            .map_err(|e| format!("Invalid Patient ID format: {}", e))?;
-
         let gs = &self.graph_service;
-
-        // Query to find the Patient and its linked Golden Record
-        let query = format!(
-            r#"
-            MATCH (p:Patient {{id: {}}})-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord)
-            RETURN g
-            "#,
-            patient_id_numeric
-        );
-
-        let result = gs.execute_cypher_read(&query, Value::Null).await
-            .map_err(|e| format!("Failed to fetch identity for patient {}: {}", patient_id_numeric, e))?;
-
-        // Assuming a helper function can extract a GoldenRecord vertex and convert to MasterPatientIndex
-        let mpi = result.into_iter()
-            .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
-            .flatten()
-            .flat_map(|res_item| res_item.get("g").cloned()) // Get the 'g' (GoldenRecord) Value
-            .next()
-            .ok_or_else(|| format!("No Golden Record found for patient {}.", patient_id_numeric))
-            .and_then(|gr_value| {
-                // This is a placeholder for deserialization logic
-                // In a real application, you'd convert the graph result (Value) to your MasterPatientIndex struct
-                Ok(MasterPatientIndex { 
-                    id: rand::random(),
-                    patient_id: Some(patient_id_numeric),
-                    first_name: gr_value.get("first_name").and_then(Value::as_str).map(|s| s.to_string()),
-                    last_name: gr_value.get("last_name").and_then(Value::as_str).map(|s| s.to_string()),
-                    date_of_birth: None, gender: None, address: None, contact_number: None,
-                    email: None, social_security_number: None, match_score: None, match_date: None,
-                    created_at: Utc::now(), updated_at: Utc::now(),
-                })
-            })?;
-
+        let clean_id = patient_id_str.trim_matches(|c| c == '\'' || c == '"');
+        
+        info!("[MPI] fetch_identity called with identifier: '{}'", clean_id);
+        
+        // =====================================================================
+        // STEP 1: Identify the type of identifier
+        // =====================================================================
+        let id_type = Self::identify_id_type(clean_id);
+        info!("[MPI] Identified ID type: {:?}", id_type);
+        
+        // =====================================================================
+        // STEP 2: Find the starting patient vertex using appropriate method
+        // =====================================================================
+        let start_node = match id_type {
+            IdentifierType::MRN => {
+                info!("[MPI] Looking up by MRN: '{}'", clean_id);
+                match gs.get_patient_by_mrn(clean_id).await {
+                    Ok(Some(v)) => {
+                        info!("[MPI] ✓ Found patient by MRN (Vertex UUID: {})", v.id.0);
+                        v
+                    },
+                    Ok(None) => {
+                        return Err(format!("No patient found with MRN: '{}'", clean_id));
+                    },
+                    Err(e) => {
+                        error!("[MPI] Error querying by MRN: {}", e);
+                        return Err(format!("Failed to query patient by MRN: {}", e));
+                    }
+                }
+            },
+            
+            IdentifierType::InternalID => {
+                let numeric_id = clean_id.parse::<i32>()
+                    .map_err(|e| format!("Failed to parse internal ID: {}", e))?;
+                
+                info!("[MPI] Looking up by internal ID: {}", numeric_id);
+                match gs.get_patient_vertex_by_internal_id(numeric_id).await {
+                    Ok(Some(v)) => {
+                        info!("[MPI] ✓ Found patient by internal ID (Vertex UUID: {})", v.id.0);
+                        v
+                    },
+                    Ok(None) => {
+                        return Err(format!("No patient found with internal ID: {}", numeric_id));
+                    },
+                    Err(e) => {
+                        error!("[MPI] Error querying by internal ID: {}", e);
+                        return Err(format!("Failed to query patient by internal ID: {}", e));
+                    }
+                }
+            },
+            
+            IdentifierType::UUID => {
+                let uuid = Uuid::parse_str(clean_id)
+                    .map_err(|e| format!("Failed to parse UUID: {}", e))?;
+                
+                info!("[MPI] Looking up by UUID: {}", uuid);
+                match gs.storage.get_vertex(&uuid).await {
+                    Ok(Some(v)) => {
+                        info!("[MPI] ✓ Found patient by UUID");
+                        v
+                    },
+                    Ok(None) => {
+                        return Err(format!("No patient found with UUID: {}", uuid));
+                    },
+                    Err(e) => {
+                        error!("[MPI] Storage error: {}", e);
+                        return Err(format!("Failed to retrieve patient by UUID: {}", e));
+                    }
+                }
+            },
+            
+            IdentifierType::ExternalID => {
+                return Err("External ID requires both value and type. Use fetch_identity_by_external_id instead.".to_string());
+            }
+        };
+        
+        // =====================================================================
+        // STEP 3: Resolve merge chain to find the canonical (survivor) record
+        // =====================================================================
+        let mut canonical_node = start_node.clone();
+        let mut merge_hops = 0;
+        const MAX_MERGE_HOPS: u32 = 10;
+        
+        while let Some(PropertyValue::String(target_uuid_str)) = canonical_node.properties.get("merged_into_uuid") {
+            if merge_hops >= MAX_MERGE_HOPS {
+                error!("[MPI] Detected circular merge chain at vertex {}", canonical_node.id.0);
+                return Err("Merge chain too deep or circular - possible data corruption".to_string());
+            }
+            
+            info!("[MPI] Patient {} is MERGED into {} (hop {})", 
+                  canonical_node.id.0, target_uuid_str, merge_hops + 1);
+            
+            let target_uuid = Uuid::parse_str(target_uuid_str)
+                .map_err(|e| format!("Invalid UUID in merged_into_uuid: {}", e))?;
+            
+            canonical_node = gs.storage.get_vertex(&target_uuid).await
+                .map_err(|e| format!("Storage error fetching merge target: {}", e))?
+                .ok_or_else(|| format!("Merge target vertex {} not found", target_uuid_str))?;
+            
+            merge_hops += 1;
+        }
+        
+        info!("[MPI] ✓ Resolved to canonical patient vertex: {} (after {} merge hops)", 
+              canonical_node.id.0, merge_hops);
+        
+        // =====================================================================
+        // STEP 4: Extract patient data from the canonical vertex
+        // =====================================================================
+        let props = &canonical_node.properties;
+        
+        let patient_id = props.get("id")
+            .and_then(|v| match v {
+                PropertyValue::Integer(i) => Some(*i as i32),
+                PropertyValue::I32(i) => Some(*i),
+                PropertyValue::String(s) => s.parse::<i32>().ok(),
+                _ => None
+            })
+            .ok_or_else(|| "Canonical patient vertex missing 'id' property".to_string())?;
+        
+        let get_string = |key: &str| -> Option<String> {
+            props.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+        
+        let get_datetime = |key: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+            props.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        };
+        
+        let date_of_birth = get_datetime("date_of_birth")
+            .or_else(|| {
+                get_string("date_of_birth")
+                    .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+                    .map(|d| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                        d.and_hms_opt(0, 0, 0).unwrap(),
+                        chrono::Utc
+                    ))
+            });
+        
+        let address = Self::extract_address_from_vertex(&canonical_node);
+        
+        // =====================================================================
+        // STEP 5: Construct and return MasterPatientIndex
+        // =====================================================================
+        let mpi = MasterPatientIndex {
+            id: rand::random::<i32>(),
+            patient_id: Some(patient_id),
+            first_name: get_string("first_name"),
+            last_name: get_string("last_name"),
+            date_of_birth,
+            gender: get_string("gender"),
+            address,
+            contact_number: get_string("contact_number")
+                .or_else(|| get_string("phone_mobile"))
+                .or_else(|| get_string("phone_home")),
+            email: get_string("email"),
+            social_security_number: get_string("ssn"),
+            match_score: None,
+            match_date: None,
+            created_at: get_datetime("created_at").unwrap_or_else(|| chrono::Utc::now()),
+            updated_at: get_datetime("updated_at").unwrap_or_else(|| chrono::Utc::now()),
+        };
+        
+        info!("[MPI] ✓ Successfully resolved identity for patient ID: {}", patient_id);
+        
         Ok(mpi)
     }
 
     /// NEW: Search for potential patient matches.
     pub async fn search(&self, patient: Patient) -> Result<Vec<MasterPatientIndex>, String> {
-        info!("Searching for candidates for patient: {}", patient.id);
+        // FIX: Use {:?} for Option<i32> or handle it with unwrap_or
+        info!("Searching for candidates for patient: {:?}", patient.id);
         
         // 1. Find candidates using blocking keys and calculate scores
         let candidates = self.find_candidates(&patient).await;
@@ -1219,6 +1380,7 @@ impl MpiIdentityResolutionService {
         for candidate in candidates.into_iter().filter(|c| c.match_score >= 0.70) { // Apply confidence threshold
             
             // Get the candidate's Patient vertex
+            // candidate.patient_id is i32 (from your previous find_candidates fix)
             let candidate_patient_vertex = gs.get_patient_vertex_by_id(candidate.patient_id)
                 .await
                 .ok_or_else(|| format!("Candidate Patient ID {} not found.", candidate.patient_id))?;
@@ -1236,7 +1398,7 @@ impl MpiIdentityResolutionService {
                 );
 
                 if let Ok(gr_result) = gs.execute_cypher_read(&gr_query, Value::Null).await {
-                    // Placeholder logic to convert the GR to MasterPatientIndex
+                    // Extract the Golden Record data from the Cypher response
                     if let Some(gr_value) = gr_result.into_iter()
                         .flat_map(|val| val.get("results").and_then(Value::as_array).map(|arr| arr.to_vec()))
                         .flatten()
@@ -1245,14 +1407,21 @@ impl MpiIdentityResolutionService {
                     {
                         let mpi = MasterPatientIndex {
                             id: rand::random(),
+                            // candidate.patient_id is i32, wrap in Some to match Option<i32>
                             patient_id: Some(candidate.patient_id),
                             first_name: gr_value.get("first_name").and_then(Value::as_str).map(|s| s.to_string()),
                             last_name: gr_value.get("last_name").and_then(Value::as_str).map(|s| s.to_string()),
-                            // FIX E0308: Cast f64 (candidate.match_score) to f32
+                            // Cast f64 (candidate.match_score) to f32
                             match_score: Some(candidate.match_score as f32), 
                             match_date: Some(Utc::now()),
-                            date_of_birth: None, gender: None, address: None, contact_number: None,
-                            email: None, social_security_number: None, created_at: Utc::now(), updated_at: Utc::now(),
+                            date_of_birth: None, 
+                            gender: None, 
+                            address: None, 
+                            contact_number: None,
+                            email: None, 
+                            social_security_number: None, 
+                            created_at: Utc::now(), 
+                            updated_at: Utc::now(),
                         };
                         results.push(mpi);
                     }
@@ -1296,7 +1465,6 @@ impl MpiIdentityResolutionService {
     // =========================================================================
     // MATCHING LOGIC (No major functional change, but included for completeness)
     // =========================================================================
-
     async fn find_candidates(&self, patient: &Patient) -> Vec<PatientCandidate> {
         let mut candidates = HashSet::new();
         // 🎯 Using injected dependency
@@ -1304,7 +1472,7 @@ impl MpiIdentityResolutionService {
         
         let graph = gs.read().await;
 
-        // Blocking on MRN
+        // 1. Blocking on MRN
         if let Some(mrn) = patient.mrn.as_ref() {
             let mrn_idx = self.mrn_index.read().await;
             if let Some(id) = mrn_idx.get(mrn) {
@@ -1312,15 +1480,20 @@ impl MpiIdentityResolutionService {
             }
         }
         
-        // Blocking on Name + DOB
-        let norm_name = format!("{} {}", patient.last_name.to_lowercase(), patient.first_name.to_lowercase());
+        // 2. Blocking on Name + DOB
+        // Safely handle Option<String> by providing an empty default for normalization
+        let last_norm = patient.last_name.as_deref().unwrap_or("").to_lowercase();
+        let first_norm = patient.first_name.as_deref().unwrap_or("").to_lowercase();
+        let norm_name = format!("{} {}", last_norm, first_norm);
+        
         let dob = patient.date_of_birth.format("%Y-%m-%d").to_string();
+        
         let name_dob_idx = self.name_dob_index.read().await;
         if let Some(ids) = name_dob_idx.get(&(norm_name, dob)) {
             candidates.extend(ids);
         }
 
-        // Blocking on SSN (via MPI record, not Patient record)
+        // 3. Blocking on SSN (via MPI record, not Patient record)
         if let Some(ssn) = patient.ssn.as_ref() {
             let ssn_idx = self.ssn_index.read().await;
             if let Some(_mpi_vertex_id) = ssn_idx.get(ssn) {
@@ -1329,17 +1502,22 @@ impl MpiIdentityResolutionService {
         }
 
         let mut scored = Vec::new();
+        // Get the vertex ID of the current patient to avoid self-matching
+        let current_vertex_id = patient.to_vertex().id.0;
+
         for &candidate_id in &candidates {
-            if candidate_id == patient.to_vertex().id.0 {
+            if candidate_id == current_vertex_id {
                 continue;
             }
             
             if let Some(vertex) = graph.get_vertex(&candidate_id) {
                 if let Some(existing) = Patient::from_vertex(vertex) {
                     let score = self.calculate_match_score(patient, &existing);
+                    
                     scored.push(PatientCandidate {
                         patient_vertex_id: candidate_id,
-                        patient_id: existing.id,
+                        // Fix: handle Option<i32> by unwrapping or using a sentinel (0)
+                        patient_id: existing.id.unwrap_or(0),
                         master_record_id: None,
                         match_score: score,
                         blocking_keys: vec![], 
@@ -1363,37 +1541,58 @@ impl MpiIdentityResolutionService {
         const WEIGHT_CONTACT: f64 = 0.05; // Email + Phone
 
         // 1. MRN Match (High Weight: 0.35)
-        if a.mrn == b.mrn && a.mrn.is_some() { score += WEIGHT_MRN; }
+        if a.mrn == b.mrn && a.mrn.is_some() { 
+            score += WEIGHT_MRN; 
+        }
         
         // 2. Name Similarity (Medium Weight: 0.30)
-        let name_a = format!("{} {}", a.first_name, a.last_name).to_lowercase();
-        let name_b = format!("{} {}", b.first_name, b.last_name).to_lowercase();
+        // Use as_deref() to get &str and unwrap_or to handle None as empty string
+        let first_a = a.first_name.as_deref().unwrap_or("");
+        let last_a = a.last_name.as_deref().unwrap_or("");
+        let first_b = b.first_name.as_deref().unwrap_or("");
+        let last_b = b.last_name.as_deref().unwrap_or("");
+
+        let name_a = format!("{} {}", first_a, last_a).to_lowercase();
+        let name_b = format!("{} {}", first_b, last_b).to_lowercase();
         
-        // Jaro-Winkler (Good for typographical errors at start of string)
-        let jaro_winkler_sim = strsim::jaro_winkler(&name_a, &name_b);
+        // Only calculate similarity if the names aren't both empty
+        if !name_a.trim().is_empty() && !name_b.trim().is_empty() {
+            // Jaro-Winkler (Good for typographical errors at start of string)
+            let jaro_winkler_sim = strsim::jaro_winkler(&name_a, &name_b);
 
-        // Levenshtein Similarity (Good for general edit distance)
-        let levenshtein_dist = strsim::levenshtein(&name_a, &name_b) as f64;
-        let max_len = (name_a.len().max(name_b.len())) as f64;
-        // Normalize Levenshtein distance to a similarity score (1.0 = perfect match)
-        let levenshtein_sim = if max_len == 0.0 { 1.0 } else { 1.0 - (levenshtein_dist / max_len) };
+            // Levenshtein Similarity (Good for general edit distance)
+            let levenshtein_dist = strsim::levenshtein(&name_a, &name_b) as f64;
+            let max_len = (name_a.len().max(name_b.len())) as f64;
+            
+            let levenshtein_sim = if max_len == 0.0 { 1.0 } else { 1.0 - (levenshtein_dist / max_len) };
 
-        // Average the two similarity scores and apply the weight
-        let avg_name_sim = (jaro_winkler_sim + levenshtein_sim) / 2.0;
-        score += avg_name_sim * WEIGHT_NAME; 
+            // Average the two similarity scores and apply the weight
+            let avg_name_sim = (jaro_winkler_sim + levenshtein_sim) / 2.0;
+            score += avg_name_sim * WEIGHT_NAME; 
+        }
         
         // 3. DOB Match (High Weight: 0.20)
-        if a.date_of_birth == b.date_of_birth { score += WEIGHT_DOB; }
+        // Ensure they match AND it's not the default sentinel date (1900-01-01)
+        let sentinel_date = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+            
+        if a.date_of_birth == b.date_of_birth && a.date_of_birth.naive_utc() != sentinel_date { 
+            score += WEIGHT_DOB; 
+        }
         
         // 4. SSN Match (Medium Weight: 0.10)
-        if a.ssn.as_ref() == b.ssn.as_ref() && a.ssn.is_some() { score += WEIGHT_SSN; }
+        if a.ssn == b.ssn && a.ssn.is_some() { 
+            score += WEIGHT_SSN; 
+        }
 
         // 5. Contact Info Match (Low Weight: 0.05 total)
         let mut contact_score = 0.0;
-        if a.email.as_ref() == b.email.as_ref() && a.email.is_some() { contact_score += 0.5; }
-        if a.phone_mobile.as_ref() == b.phone_mobile.as_ref() && a.phone_mobile.is_some() { contact_score += 0.5; }
+        if a.email == b.email && a.email.is_some() { contact_score += 0.5; }
+        if a.phone_mobile == b.phone_mobile && a.phone_mobile.is_some() { contact_score += 0.5; }
         
-        score += contact_score * WEIGHT_CONTACT; // Max 0.05 contribution
+        score += contact_score * WEIGHT_CONTACT;
 
         score.clamp(0.0, 1.0)
     }
@@ -1418,12 +1617,33 @@ impl MpiIdentityResolutionService {
             Identifier::new("GoldenRecord".to_string()).map_err(|e| e.to_string())?
         );
         
-        gr_vertex.properties.insert("canonical_id".to_string(), PropertyValue::String(gr_uuid.to_string()));
-        gr_vertex.properties.insert("first_name".to_string(), PropertyValue::String(patient.first_name.clone()));
-        gr_vertex.properties.insert("last_name".to_string(), PropertyValue::String(patient.last_name.clone()));
-        gr_vertex.properties.insert("created_at".to_string(), PropertyValue::String(chrono::Utc::now().to_rfc3339()));
+        // Use the generated UUID as the canonical business ID
+        gr_vertex.properties.insert(
+            "canonical_id".to_string(), 
+            PropertyValue::String(gr_uuid.to_string())
+        );
 
-        let gr_vertex_id = gr_vertex.id.0; // The Uuid of the new GoldenRecord
+        // Safe insertion of Optional demographics
+        if let Some(ref first) = patient.first_name {
+            gr_vertex.properties.insert(
+                "first_name".to_string(), 
+                PropertyValue::String(first.clone())
+            );
+        }
+
+        if let Some(ref last) = patient.last_name {
+            gr_vertex.properties.insert(
+                "last_name".to_string(), 
+                PropertyValue::String(last.clone())
+            );
+        }
+
+        gr_vertex.properties.insert(
+            "created_at".to_string(), 
+            PropertyValue::String(chrono::Utc::now().to_rfc3339())
+        );
+
+        let gr_vertex_id = gr_vertex.id.0; // The Uuid of the new GoldenRecord vertex
 
         gs.add_vertex(gr_vertex).await
             .map_err(|e| format!("Failed to add Golden Record vertex: {}", e))?;
@@ -1528,19 +1748,30 @@ impl MpiIdentityResolutionService {
         // Find the Golden Record associated with the candidate patient
         let candidate_patient_vertex = match gs.get_patient_vertex_by_id(candidate.patient_id).await {
             Some(v) => v,
-            None => { error!("Candidate patient vertex not found for ID: {}", candidate.patient_id); return; }
+            None => { 
+                error!("Candidate patient vertex not found for ID: {}", candidate.patient_id); 
+                return; 
+            }
         };
 
         let target_golden_record_uuid_result = self.ensure_golden_record_and_link(&candidate_patient_vertex).await;
 
         let target_golden_record_canonical_id = match target_golden_record_uuid_result {
             Ok(id) => id,
-            Err(e) => { error!("Failed to ensure Golden Record for candidate {}: {}", candidate.patient_id, e); return; }
+            Err(e) => { 
+                error!("Failed to ensure Golden Record for candidate {}: {}", candidate.patient_id, e); 
+                return; 
+            }
         };
+
+        // Prepare ID for display
+        let patient_display_id = new_patient.id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "NONE".to_string());
         
         info!(
             "Performing auto-merge: Linking Patient {} (Source) to Golden Record Identity {}", 
-            new_patient.id, 
+            patient_display_id, 
             target_golden_record_canonical_id
         );
 
@@ -1579,20 +1810,27 @@ impl MpiIdentityResolutionService {
             return;
         }
 
-        // 3. Mark the source node's status to indicate it is now merged/retired (Optional, but good practice)
+        // 3. Mark the source node's status to indicate it is now merged/retired.
+        // We use the internal UUID here to be safe, as new_patient.id might be None.
         let set_status_query = format!(
-            "MATCH (source:Patient {{id: {}}}) 
-            SET source.patient_status = \"MERGED\", source.updated_at = timestamp() 
-            RETURN source",
-            new_patient.id
+            r#"
+            MATCH (source:Patient)
+            WHERE ID(source) = "{}"
+            SET source.patient_status = "MERGED", source.updated_at = timestamp() 
+            RETURN source
+            "#,
+            new_patient_vertex_id
         );
 
         if let Err(e) = gs.execute_cypher_write(&set_status_query, Value::Null).await {
             error!("Failed to set source patient status to MERGED: {}", e);
         }
 
-        info!("Auto-merge complete: New patient {} successfully linked to Golden Record {}", 
-            new_patient.id, target_golden_record_canonical_id);
+        info!(
+            "Auto-merge complete: New patient {} successfully linked to Golden Record {}", 
+            patient_display_id, 
+            target_golden_record_canonical_id
+        );
     }
 
     // Helper: Fetches the Golden Record vertex ID linked to a given Patient vertex ID.
@@ -1928,26 +2166,50 @@ impl MpiIdentityResolutionService {
                 .map_err(|e| format!("Failed to create HAS_GOLDEN_RECORD link: {}", e))?;
                 
             // Query 5: Record the MatchScore (uses the actual GR vertex UUID)
-            self.create_match_score_link(
-                gr_vertex_uuid,
-                candidate_patient.id, // Use the Patient's ID from the Candidate lookup
-                score,
-                "explicit_probabilistic_link".to_string(),
-            ).await?;
+            // We only record the link if the patient has a valid canonical ID
+            if let Some(patient_id_val) = candidate_patient.id {
+                self.create_match_score_link(
+                    gr_vertex_uuid.clone(), // Ensure gr_vertex_uuid is available for the call
+                    patient_id_val, 
+                    score,
+                    "explicit_probabilistic_link".to_string(),
+                ).await?;
+            } else {
+                warn!(
+                    "[MPI] Skipping MatchScore link: Candidate patient has no canonical ID (Vertex: {})", 
+                    gr_vertex_uuid
+                );
+            }
 
             info!("✅ Successfully linked Candidate MRN {} to Golden Record {}.", candidate_mrn, master_gr_app_id);
             
         } else if action.to_lowercase().as_str() == "ignore" || action.to_lowercase().as_str() == "false_positive" {
-            info!("Recording match score of {} between {} and {} with action '{}'. No graph link created.", score, target_mrn, candidate_mrn, action);
-            
-            // Record the MatchScore for auditing without creating a link
-            self.create_match_score_link(
-                gr_vertex_uuid,
-                target_patient.id, 
-                score,
-                format!("explicit_{}", action),
-            ).await?;
+            // FIX: Removed .as_deref().unwrap_or("NONE") because target_mrn/candidate_mrn are String, not Option
+            let target_mrn_display = &target_mrn;
+            let candidate_mrn_display = &candidate_mrn;
 
+            info!(
+                "Recording match score of {} between {} and {} with action '{}'. Processing graph link...", 
+                score, 
+                target_mrn_display, 
+                candidate_mrn_display, 
+                action
+            );
+            
+            // Record the MatchScore for auditing only if the patient has a valid ID
+            if let Some(patient_id_val) = target_patient.id {
+                self.create_match_score_link(
+                    gr_vertex_uuid,
+                    patient_id_val, 
+                    score,
+                    format!("explicit_{}", action),
+                ).await?;
+            } else {
+                warn!(
+                    "[MPI] Cannot create match score link: Target patient (MRN: {}) is missing a canonical ID.",
+                    target_mrn_display
+                );
+            }
             info!("Successfully recorded explicit match score, action was to ignore/do not link.");
         } else {
             return Err(format!("Unsupported match action: {}. Must be 'link', 'merge', or 'ignore'.", action));
@@ -1955,7 +2217,7 @@ impl MpiIdentityResolutionService {
 
         Ok(())
     }
-    
+
     // =========================================================================
     // SOFT-LINKING & CONFLICT MANAGEMENT
     // =========================================================================
@@ -2143,12 +2405,111 @@ impl MpiIdentityResolutionService {
                 if let Some(mrn) = patient.mrn.take() {
                     patient.mrn = Some(format!("GOLDEN_{}", mrn));
                 } else {
-                    patient.mrn = Some(format!("GOLDEN_ID_{}", patient.id));
+                    // FIX: Handle the Option<i32> for the ID field
+                    let id_display = patient.id
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "UNKNOWN".to_string());
+                        
+                    patient.mrn = Some(format!("GOLDEN_ID_{}", id_display));
                 }
                 
                 Ok(patient)
             },
             None => Err(format!("Failed to convert Golden Record data to Patient model for {}.", patient_id_str)),
         }
+    }
+
+    /// Fetches identity by external ID (requires both value and type)
+    pub async fn fetch_identity_by_external_id(
+        &self, 
+        external_id: String, 
+        id_type: String
+    ) -> Result<MasterPatientIndex, String> {
+        let gs = &self.graph_service;
+        
+        info!("[MPI] fetch_identity_by_external_id called with external_id='{}', type='{}'", 
+              external_id, id_type);
+        
+        // 1. Find patient by external ID (Returns Option<Patient>)
+        let p_struct = match gs.get_patient_by_external_id(&external_id, &id_type).await {
+            Ok(Some(p)) => {
+                // Use unwrap_or to show a placeholder if the ID is None
+                let display_id = p.id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "NONE".to_string());
+
+                info!("[MPI] ✓ Found patient by external ID (Patient ID: {})", display_id);
+                p
+            },
+            Ok(None) => {
+                return Err(format!("No patient found with external ID '{}' of type '{}'", 
+                                   external_id, id_type));
+            },
+            Err(e) => {
+                error!("[MPI] Error querying by external ID: {}", e);
+                return Err(format!("Failed to query patient by external ID: {}", e));
+            }
+        };
+        
+        // 2. Continue with merge resolution.
+        // Since fetch_identity starts by looking up the patient, we pass the 
+        // ID we just found. 
+        // Note: Ensure your fetch_identity logic handles stringified i32s as well as MRNs.
+        if let Some(id_val) = p_struct.id {
+            self.fetch_identity(id_val.to_string()).await
+        } else {
+            // Handle the case where the patient exists but has no canonical ID
+            Err("Cannot fetch identity: Patient record exists but is missing a canonical ID".into())
+        }
+    }
+
+    /// Identifies the type of identifier based on format
+    fn identify_id_type(id_str: &str) -> IdentifierType {
+        // Remove quotes and whitespace
+        let clean = id_str.trim_matches(|c| c == '\'' || c == '"').trim();
+        
+        // Check if it's a UUID (8-4-4-4-12 hex format)
+        if Uuid::parse_str(clean).is_ok() {
+            return IdentifierType::UUID;
+        }
+        
+        // Check if it's a pure numeric ID (positive or negative integer)
+        if clean.parse::<i32>().is_ok() {
+            return IdentifierType::InternalID;
+        }
+        
+        // Everything else is treated as MRN (alphanumeric identifiers)
+        // Examples: "M12345", "MRN78901", "ABC-123", etc.
+        IdentifierType::MRN
+    }
+    
+    /// Helper method to extract Address from vertex properties
+    fn extract_address_from_vertex(vertex: &Vertex) -> Option<Address> {
+        let props = &vertex.properties;
+        
+        let get_prop = |key: &str| -> Option<String> {
+            props.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+        
+        let address_line1 = get_prop("address_line1")?;
+        let city = get_prop("city")?;
+        let postal_code = get_prop("postal_code")?;
+        let country = get_prop("country")?;
+        
+        let state_province_str = get_prop("state_province")
+            .or_else(|| get_prop("state"))
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let state_province = Identifier::new(state_province_str).ok()?;
+        
+        let address_line2 = get_prop("address_line2");
+        
+        Some(Address::new(
+            address_line1,
+            address_line2,
+            city,
+            state_province,
+            postal_code,
+            country,
+        ))
     }
 }
