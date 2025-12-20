@@ -3001,7 +3001,27 @@ fn parse_literal_value(input: &str) -> IResult<&str, serde_json::Value> {
 pub fn parse_where(input: &str) -> IResult<&str, WhereClause> {
     let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
-    let (input, condition) = parse_where_expression(input)?;
+    
+    // Use separated_list1 to parse one or more expressions separated by AND
+    let (input, mut expressions) = separated_list1(
+        tuple((multispace1, tag_no_case("AND"), multispace1)),
+        parse_where_expression
+    ).parse(input)?;
+
+    // Fold the list of expressions into a nested Expression::And tree
+    let condition = if expressions.len() == 1 {
+        expressions.remove(0)
+    } else {
+        let mut iter = expressions.into_iter();
+        let mut root = iter.next().unwrap();
+        for next_expr in iter {
+            root = Expression::And {
+                left: Box::new(root),
+                right: Box::new(next_expr),
+            };
+        }
+        root
+    };
     
     Ok((input, WhereClause { condition }))
 }
@@ -3083,14 +3103,32 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     }))
 }
 
-/// The WHERE clause parser itself
+/// The WHERE clause parser itself - updated for legacy compatibility with AND support
 fn parse_where_clause_content(input: &str) -> IResult<&str, String> {
     let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // Serialize the expression as a debug string for legacy compatibility
-    let (input, expr) = parse_where_expression(input)?;
-    Ok((input, format!("{:?}", expr)))
+    // Parse the full chain of expressions
+    let (input, mut expressions) = separated_list1(
+        tuple((multispace1, tag_no_case("AND"), multispace1)),
+        parse_where_expression
+    ).parse(input)?;
+
+    let final_expr = if expressions.len() == 1 {
+        expressions.remove(0)
+    } else {
+        let mut iter = expressions.into_iter();
+        let mut root = iter.next().unwrap();
+        for next_expr in iter {
+            root = Expression::And {
+                left: Box::new(root),
+                right: Box::new(next_expr),
+            };
+        }
+        root
+    };
+
+    Ok((input, format!("{:?}", final_expr)))
 }
 
 fn take_until_keyword(input: &str) -> IResult<&str, &str> {

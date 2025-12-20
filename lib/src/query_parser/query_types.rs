@@ -412,6 +412,7 @@ pub enum Expression {
         operator: String,
         value: Value,
     },
+    And { left: Box<Expression>, right: Box<Expression> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -881,6 +882,24 @@ impl Expression {
 
                 // Now it's String == String, which cannot fail if the characters match
                 evaluate_comparison(&left_val, operator, &right_val)
+            }
+            Expression::And { left, right } => {
+                let l_val = left.evaluate(ctx)?;
+                let r_val = right.evaluate(ctx)?;
+
+                match (l_val, r_val) {
+                    (CypherValue::Bool(l), CypherValue::Bool(r)) => {
+                        Ok(CypherValue::Bool(l && r))
+                    },
+                    (CypherValue::Null, _) | (_, CypherValue::Null) => {
+                        // In Cypher logic: null AND true is null, null AND false is false.
+                        // For a simple WHERE filter, Null is usually treated as false.
+                        Ok(CypherValue::Null)
+                    },
+                    _ => Err(GraphError::EvaluationError(
+                        "Logical AND requires boolean operands".into()
+                    )),
+                }
             }
         }
     }

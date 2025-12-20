@@ -2431,9 +2431,10 @@ impl MpiIdentityResolutionService {
               external_id, id_type);
         
         // 1. Find patient by external ID (Returns Option<Patient>)
+        // This call utilizes the updated parse_where which now correctly handles 
+        // the multiple conditions (external_id AND id_type) via Expression::And logic.
         let p_struct = match gs.get_patient_by_external_id(&external_id, &id_type).await {
             Ok(Some(p)) => {
-                // Use unwrap_or to show a placeholder if the ID is None
                 let display_id = p.id
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "NONE".to_string());
@@ -2442,24 +2443,37 @@ impl MpiIdentityResolutionService {
                 p
             },
             Ok(None) => {
-                return Err(format!("No patient found with external ID '{}' of type '{}'", 
-                                   external_id, id_type));
+                // GRACEFUL REPORTING:
+                // Now that the parser supports AND, an Ok(None) specifically means 
+                // the query was valid but the intersection of external_id and id_type 
+                // yielded no results in the database.
+                warn!("[MPI] No patient found matching both ID Type '{}' and External ID '{}'", 
+                      id_type, external_id);
+                return Err(format!(
+                    "Lookup successful, but no patient record exists with {}='{}'", 
+                    id_type, external_id
+                ));
             },
             Err(e) => {
-                error!("[MPI] Error querying by external ID: {}", e);
+                // Parser or Execution errors:
+                // This covers issues like evaluation errors in Expression::And 
+                // or property access failures.
+                error!("[MPI] Database error during external ID query: {}", e);
                 return Err(format!("Failed to query patient by external ID: {}", e));
             }
         };
         
-        // 2. Continue with merge resolution.
-        // Since fetch_identity starts by looking up the patient, we pass the 
-        // ID we just found. 
-        // Note: Ensure your fetch_identity logic handles stringified i32s as well as MRNs.
+        // 2. Continue with merge resolution using the internal ID
+        // The patient record exists; we now move to fetch the full canonical MasterPatientIndex.
         if let Some(id_val) = p_struct.id {
+            info!("[MPI] Resolving Master Patient Index for internal ID: {}", id_val);
             self.fetch_identity(id_val.to_string()).await
         } else {
-            // Handle the case where the patient exists but has no canonical ID
-            Err("Cannot fetch identity: Patient record exists but is missing a canonical ID".into())
+            // This case handles records that may have been created without 
+            // the required internal database ID (canonical ID).
+            error!("[MPI] Patient record found for {}='{}', but contains no internal numeric ID", 
+                   id_type, external_id);
+            Err("Cannot fetch identity: Found patient record is missing a canonical ID".into())
         }
     }
 
