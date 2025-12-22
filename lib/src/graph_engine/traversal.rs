@@ -35,6 +35,8 @@ pub trait TraverseExt {
     fn a_star(&self, start: Uuid, goal: Uuid) -> Option<(i64, Vec<Uuid>)>;
     fn reachable(&self, start: Uuid) -> HashSet<Uuid>;
     fn shortest_path(&self, start: Uuid, goal: Uuid) -> Option<Vec<Uuid>>;
+    fn get_transactional_history(&self, golden_id: Uuid) -> Vec<(Vertex, Edge, Vertex)>;
+    fn get_lineage_tree(&self, start_id: Uuid) -> Vec<(Vertex, Edge, Vertex)>;
     /// Finds all vertices and edges participating in paths that match the variable-length pattern.
     /// Returns (matched_vertex_ids, matched_edge_ids).
     fn match_variable_length_path(
@@ -202,7 +204,7 @@ impl TraverseExt for Graph {
         }
         None
     }
-    
+
     fn match_variable_length_path(
         &self, 
         start_id: Uuid, 
@@ -319,5 +321,62 @@ impl TraverseExt for Graph {
         }
 
         (all_matched_path_vertices, all_matched_path_edges)
+    }
+
+    /// Industry Standard: Identity Provenance Crawl
+    /// Recursively finds all source records and the merge events that created the current state.
+    fn get_lineage_tree(&self, start_id: Uuid) -> Vec<(Vertex, Edge, Vertex)> {
+        let mut results = Vec::new();
+        let mut visited = HashSet::new();
+        let mut stack = vec![start_id];
+
+        while let Some(current_id) = stack.pop() {
+            if !visited.insert(current_id) { continue; }
+
+            // Trace backwards via MERGED_FROM or REPRESENTS relationships
+            for edge in self.incoming_edges(&current_id) {
+                if edge.label == "MERGED_FROM" || edge.label == "LINKED_TO" {
+                    if let Some(source_v) = self.get_vertex(&edge.outbound_id.0) {
+                        if let Some(target_v) = self.get_vertex(&current_id) {
+                            results.push((source_v.clone(), edge.clone(), target_v.clone()));
+                            stack.push(edge.outbound_id.0);
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// Extracts the "Chain of Evolution" for a Golden Record.
+    /// Traverses the [:PARTICIPATED_IN] and [:RESULTED_IN] edges to rebuild the timeline.
+    fn get_transactional_history(&self, golden_id: Uuid) -> Vec<(Vertex, Edge, Vertex)> {
+        let mut history = Vec::new();
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from([golden_id]);
+
+        while let Some(current_id) = queue.pop_front() {
+            if !visited.insert(current_id) { continue; }
+
+            // Trace back from the Golden Record/Patient to the IdentityEvents that modified them
+            for edge in self.incoming_edges(&current_id) {
+                if edge.label == "RESULTED_IN" {
+                    let event_id = edge.outbound_id.0;
+                    if let Some(event_v) = self.get_vertex(&event_id) {
+                        // Find the source patient who participated in this event
+                        for entry_edge in self.incoming_edges(&event_id) {
+                            if entry_edge.label == "PARTICIPATED_IN" {
+                                if let Some(source_v) = self.get_vertex(&entry_edge.outbound_id.0) {
+                                    history.push((source_v.clone(), edge.clone(), event_v.clone()));
+                                    queue.push_back(source_v.id.0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        history.sort_by(|a, b| b.2.created_at.cmp(&a.2.created_at)); // Chronological
+        history
     }
 }

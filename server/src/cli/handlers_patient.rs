@@ -387,7 +387,7 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 // adjusted elsewhere to handle these remaining Nones, or the graph layer is tolerant of them).
                 // However, since the error was on ssn/mrn, we must treat them as mandatory strings 
                 // (even if empty) for the Cypher query builder.
-                user_id: None, middle_name: None, suffix: None,
+                vertex_id: None, user_id: None, middle_name: None, suffix: None,
                 preferred_name: None,
                 date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, phone_home: None,
@@ -570,7 +570,7 @@ pub async fn handle_patient_command_interactive(
                 updated_at: Utc::now(),
                 patient_status: Some("ACTIVE".to_string()), 
 
-                user_id: None, middle_name: None, suffix: None,
+                vertex_id: None, user_id: None, middle_name: None, suffix: None,
                 preferred_name: None,
                 date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, phone_home: None,

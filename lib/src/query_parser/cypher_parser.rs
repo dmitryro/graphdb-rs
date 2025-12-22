@@ -149,31 +149,55 @@ fn parse_literal(input: &str) -> IResult<&str, Literal> {
 fn is_at_keyword_boundary(input: &str) -> bool {
     let trimmed = input.trim_start();
     let upper = trimmed.to_uppercase();
-    
-    // Check most specific/longer keywords first
-    upper.starts_with("WHERE") ||
-    upper.starts_with("RETURN") ||
-    upper.starts_with("CREATE") ||
-    upper.starts_with("ORDER BY") ||
-    upper.starts_with("ORDER") ||
-    upper.starts_with("SKIP") ||
-    upper.starts_with("LIMIT") ||
-    upper.starts_with("SET") ||
-    upper.starts_with("DETACH DELETE") || // Check long version first
-    upper.starts_with("DELETE") ||
-    upper.starts_with("DETACH") ||
-    upper.starts_with("REMOVE") ||
-    upper.starts_with("MERGE") ||
-    upper.starts_with("WITH") ||
-    upper.starts_with("AND") ||           // Added AND
-    upper.starts_with("ON CREATE") ||
-    upper.starts_with("ON MATCH") ||
-    upper.starts_with("UNION ALL") ||
-    upper.starts_with("UNION") ||
-    upper.starts_with("FOREACH") ||
-    upper.starts_with("UNWIND") ||
-    upper.starts_with("CALL")
+
+    // Existing checks
+    if upper.starts_with("WHERE")
+        || upper.starts_with("RETURN")
+        || upper.starts_with("CREATE")
+        || upper.starts_with("ORDER BY")
+        || upper.starts_with("ORDER")
+        || upper.starts_with("SKIP")
+        || upper.starts_with("LIMIT")
+        || upper.starts_with("SET")
+        || upper.starts_with("DETACH DELETE")
+        || upper.starts_with("DELETE")
+        || upper.starts_with("DETACH")
+        || upper.starts_with("REMOVE")
+        || upper.starts_with("MERGE")
+        || upper.starts_with("WITH")
+        || upper.starts_with("AND")
+        || upper.starts_with("ON CREATE")
+        || upper.starts_with("ON MATCH")
+        || upper.starts_with("UNION ALL")
+        || upper.starts_with("UNION")
+        || upper.starts_with("FOREACH")
+        || upper.starts_with("UNWIND")
+        || upper.starts_with("CALL")
+    {
+        return true;
+    }
+
+    // NEW: stop if we see a closing ) followed by a keyword
+    if trimmed.starts_with(')') {
+        let after_paren = trimmed[1..].trim_start().to_uppercase();
+        if after_paren.starts_with("CREATE")
+            || after_paren.starts_with("RETURN")
+            || after_paren.starts_with("SET")
+            || after_paren.starts_with("WHERE")
+            || after_paren.starts_with("DELETE")
+            || after_paren.starts_with("DETACH")
+            || after_paren.starts_with("WITH")
+            || after_paren.starts_with("MERGE")
+        {
+            return true;
+        }
+    }
+
+    false
 }
+
+// FIXED: Use parse_property_value instead of parse_literal
+// This ensures consistent handling of numbers, UUIDs, and all value types
 fn parse_property_map(input: &str) -> IResult<&str, Vec<(String, Literal)>> {
     delimited(
         char('{'),
@@ -182,16 +206,30 @@ fn parse_property_map(input: &str) -> IResult<&str, Vec<(String, Literal)>> {
             separated_list0(
                 delimited(multispace0, char(','), multispace0),
                 separated_pair(
-                    // Ensure the key &str is converted to String to match your return type
                     map(parse_identifier, |s: &str| s.to_string()), 
                     delimited(multispace0, char(':'), multispace0),
-                    parse_literal
+                    map(parse_property_value, |v| match v {
+                        Value::String(s) => Literal::String(s),
+                        Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                Literal::Integer(i)
+                            } else if let Some(f) = n.as_f64() {
+                                // FIX: Wrap the f64 in SerializableFloat
+                                Literal::Float(SerializableFloat(f))
+                            } else {
+                                Literal::String(n.to_string())
+                            }
+                        },
+                        Value::Bool(b) => Literal::Boolean(b),
+                        Value::Null => Literal::Null,
+                        _ => Literal::String(format!("{:?}", v)),
+                    })
                 )
             ),
             multispace0
         ),
         char('}')
-    ).parse(input) // <--- Use .parse(input) instead of (input)
+    ).parse(input)
 }
 
 // ============================================================================
@@ -384,7 +422,8 @@ fn parse_match_create_relationship(input: &str) -> IResult<&str, CypherQuery> {
 fn parse_single_pattern(input: &str) -> IResult<&str, Pattern> {
     use nom::Parser;
     
-    println!("===> parse_single_pattern START, input: '{}'", input.chars().take(40).collect::<String>());
+    println!("===> parse_single_pattern START, input: '{}'", input.chars().take(1000).collect::<String>());
+    println!("===> parse_single_pattern START, input length: {}", input.len());
     
     let mut all_nodes: Vec<NodePattern> = Vec::new();
     let mut all_relationships: Vec<RelPattern> = Vec::new();
@@ -476,10 +515,29 @@ fn parse_create_statement(input: &str) -> IResult<&str, CypherQuery> {
 
 fn parse_string_literal(input: &str) -> IResult<&str, &str> {
     alt((
-        delimited(char('\''), take_while1(|c: char| c != '\'' && c != '\\'), char('\'')),
-        delimited(char('"'), take_while1(|c: char| c != '"' && c != '\\'), char('"')),
-        map(tag("''"), |_| ""),
-        map(tag("\"\""), |_| ""),
+        // Single quotes
+        delimited(
+            char('\''),
+            // recognize() captures the entire span including escapes
+            recognize(many0(alt((
+                tag("\\'"),
+                tag("\\\\"),
+                tag("\\n"),
+                recognize(none_of("'\\"))
+            )))),
+            char('\'')
+        ),
+        // Double quotes
+        delimited(
+            char('"'),
+            recognize(many0(alt((
+                tag("\\\""),
+                tag("\\\\"),
+                tag("\\n"),
+                recognize(none_of("\"\\"))
+            )))),
+            char('"')
+        ),
     )).parse(input)
 }
 
@@ -504,31 +562,40 @@ fn parse_optional_match(input: &str) -> IResult<&str, ()> {
     Ok((input, ()))
 }
 
+/// Updated to ensure timestamp() and UUIDs are handled correctly in properties
+// lib/src/query_parser/cypher_parser.rs
+
 fn parse_property_value(input: &str) -> IResult<&str, Value> {
     alt((
-        // String literals (quoted)
+        // 1. Quoted String literals - ALWAYS use these for UUIDs in Cypher strings
         map(parse_string_literal, |s: &str| Value::String(s.to_string())),
        
-        // Numbers
+        // 2. Signed Numbers - Catch the -1369861507 Patient IDs
         parse_signed_number_value,
        
-        // Booleans
+        // 3. Booleans and Null
         map(tag_no_case("true"), |_| Value::Bool(true)),
         map(tag_no_case("false"), |_| Value::Bool(false)),
-       
-        // Null
         map(tag_no_case("null"), |_| Value::Null),
        
-        // Unquoted strings/identifiers (for UUIDs, etc.)
-        map(take_while1(|c: char| c.is_alphanumeric() || c == '-' || c == '_'), |s: &str| Value::String(s.to_string())),
-       
-        // Functions (e.g., timestamp())
+        // 4. IMPROVED: Unquoted UUIDs/Identifiers
+        // We allow starting digits, but only if it's NOT a pure number
         map(
-            tuple((
-                parse_identifier,
-                char('('),
-                char(')'),
-            )),
+            verify(
+                take_while1(|c: char| c.is_alphanumeric() || c == '-' || c == '_'),
+                |s: &str| {
+                    // Reject if it's a pure signed integer (let parser #2 handle those)
+                    // But allow if it contains non-digit chars (like hex a-f or hyphens)
+                    let is_pure_number = s.parse::<i64>().is_ok();
+                    !is_pure_number
+                }
+            ), 
+            |s: &str| Value::String(s.to_string())
+        ),
+       
+        // 5. Functions
+        map(
+            tuple((parse_identifier, char('('), char(')'))),
             |(func, _, _)| {
                 if func.to_lowercase() == "timestamp" {
                     Value::String(Utc::now().to_rfc3339())
@@ -544,8 +611,9 @@ fn parse_property(input: &str) -> IResult<&str, (String, Value)> {
     let (input, (key, _, value)) = tuple((
         parse_identifier,
         preceded(multispace0, char(':')),
-        preceded(multispace0, parse_property_value),
+        preceded(multispace0, parse_property_value), // Must handle Parameter variant
     )).parse(input)?;
+    
     Ok((input, (key.to_string(), value)))
 }
 
@@ -554,8 +622,8 @@ fn parse_properties(input: &str) -> IResult<&str, HashMap<String, Value>> {
         delimited(
             preceded(multispace0, char('{')),
             opt(separated_list1(
-                preceded(multispace0, char(',')),
-                preceded(multispace0, parse_property)
+                preceded(multispace0, char(',')), // This is the separator
+                preceded(multispace0, parse_property) // This is the item
             )),
             preceded(multispace0, char('}')),
         ),
@@ -567,20 +635,15 @@ fn parse_node(input: &str) -> IResult<&str, NodePattern> {
     type E<'a> = nom::error::Error<&'a str>;
 
     let (input, _) = multispace0::<&str, E>.parse(input)?;
-    
-    // 1. MUST start with opening parenthesis
     let (input, _) = char::<&str, E>('(').parse(input)?;
     let (input, _) = multispace0::<&str, E>.parse(input)?;
     
-    // 2. Optional variable name
     let (input, var_opt) = opt(
         take_while1::<_, &str, E>(|c: char| c.is_alphanumeric() || c == '_')
     ).parse(input)?;
     
     let (input, _) = multispace0::<&str, E>.parse(input)?;
     
-    // 3. MULTIPLE labels: :User:Admin:Employee
-    // Changed to return the full Vec<String>
     let (input, labels) = many0(
         preceded(
             char::<&str, E>(':'),
@@ -593,10 +656,11 @@ fn parse_node(input: &str) -> IResult<&str, NodePattern> {
     
     let (input, _) = multispace0::<&str, E>.parse(input)?;
     
-    // 4. Optional properties in {...}
+    // Improved Property Map Parsing
     let (input, props) = if input.trim_start().starts_with('{') {
+        let (next_input, _) = multispace0::<&str, E>.parse(input)?;
         delimited(
-            preceded(multispace0::<&str, E>, char('{')),
+            char('{'),
             map(
                 opt(separated_list1(
                     preceded(multispace0::<&str, E>, char(',')),
@@ -605,19 +669,20 @@ fn parse_node(input: &str) -> IResult<&str, NodePattern> {
                 |props_list| props_list.unwrap_or_default().into_iter().collect::<HashMap<String, Value>>()
             ),
             preceded(multispace0::<&str, E>, char('}'))
-        ).parse(input)?
+        ).parse(next_input)?
     } else {
         (input, HashMap::new())
     };
     
     let (input, _) = multispace0::<&str, E>.parse(input)?;
-    
-    // 5. MUST end with closing parenthesis
     let (input, _) = char::<&str, E>(')').parse(input)?;
-    
+
+    // CRITICAL: Lookahead for WHERE/RETURN to ensure remainder is clean
+    let (input, _) = multispace0::<&str, E>.parse(input)?;
+
     Ok((input, (
         var_opt.map(|s| s.to_string()),
-        labels, // Now passing the full Vec
+        labels,
         props
     )))
 }
@@ -2629,32 +2694,30 @@ fn parse_pattern_with_stop_guard(input: &str) -> IResult<&str, Pattern> {
     parse_pattern_restricted(input)
 }
 
-/// Parses a Cypher literal value.
-// FIX E0618: Must be a function that returns an IResult by calling the parser immediately.
 /// Parse a value (string, number, boolean, null)
+/// FIX: Re-ordered to prioritize Strings and handle UUID hyphens
 fn parse_value(input: &str) -> IResult<&str, Value> {
     alt((
-        // String with double quotes
+        // 1. Quoted Strings - Always String
         map(
-            delimited(char('"'), take_while(|c| c != '"'), char('"')),
+            alt((
+                delimited(char('"'), take_while(|c| c != '"'), char('"')),
+                delimited(char('\''), take_while(|c| c != '\''), char('\'')),
+            )),
             |s: &str| Value::String(s.to_string())
         ),
-        // String with single quotes
-        map(
-            delimited(char('\''), take_while(|c| c != '\''), char('\'')),
-            |s: &str| Value::String(s.to_string())
-        ),
-        // Boolean
+        
+        // 2. Booleans & Null
         map(tag_no_case("true"), |_| Value::Bool(true)),
         map(tag_no_case("false"), |_| Value::Bool(false)),
-        // Null
         map(tag_no_case("null"), |_| Value::Null),
-        // Number
+
+        // 3. Numbers - Prioritize if it starts with a digit or minus followed by digit
         map(
             recognize(tuple((
                 opt(char('-')),
-                take_while1(|c: char| c.is_numeric()),
-                opt(tuple((char('.'), take_while1(|c: char| c.is_numeric()))))
+                digit1,
+                opt(tuple((char('.'), digit1)))
             ))),
             |s: &str| {
                 if s.contains('.') {
@@ -2663,6 +2726,12 @@ fn parse_value(input: &str) -> IResult<&str, Value> {
                     Value::Number(serde_json::Number::from(s.parse::<i64>().unwrap()))
                 }
             }
+        ),
+
+        // 4. UUIDs / Unquoted Strings (The fallback)
+        map(
+            take_while1(|c: char| c.is_alphanumeric() || c == '-' || c == '_'), 
+            |s: &str| Value::String(s.to_string())
         ),
     )).parse(input)
 }
@@ -2761,7 +2830,10 @@ fn parse_set_clause(input: &str) -> IResult<&str, (String, HashMap<String, Value
     let (input, _) = preceded(multispace0, char('.')).parse(input)?;
     let (input, prop) = parse_identifier.parse(input)?;
     let (input, _) = delimited(multispace0, char('='), multispace0).parse(input)?;
-    let (input, val) = parse_value.parse(input)?;
+    
+    // FIX: Use parse_property_value instead of parse_value to support 
+    // the same logic used in node properties (UUIDs, timestamps, etc.)
+    let (input, val) = parse_property_value.parse(input)?;
     
     let mut map = HashMap::new();
     map.insert(prop.to_string(), val);
@@ -3169,35 +3241,35 @@ fn parse_relationship_full(input: &str) -> IResult<&str, RelPattern> {
 
 // Parse patterns within a single MATCH clause, stopping at keyword boundaries
 fn parse_match_clause_patterns(input: &str) -> IResult<&str, ParsedPatternsReturnType> {
+    // Increased take() for debugging to see if the UUID is actually there before parsing
     println!(
-        "===> parse_match_clause_patterns START, input: '{}'",
-        input.chars().take(50).collect::<String>()
+        "===> parse_match_clause_patterns START, input length: {}, preview: '{}'",
+        input.len(),
+        input.chars().take(100).collect::<String>()
     );
     
     let separator = tuple((multispace0, char(','), multispace0));
     
-    // 1. Parse using the restricted pattern parser
-    // This likely returns Vec<(Option<String>, Vec<String>, HashMap<String, Value>)>
+    // Use alt to handle both full pattern parsing and a potential failure check
     let (remainder, patterns) = separated_list1(
         separator,
-        |i| parse_pattern_restricted(i)
+        parse_pattern_restricted
     ).parse(input)?;
 
-    // 2. Transform the result to match ParsedPatternsReturnType (Vec<String> -> Option<String>)
-    // This is required because ParsedPatternsReturnType expects Option<String> for node labels.
     let transformed: ParsedPatternsReturnType = patterns.into_iter().map(|(path_var, nodes, edges)| {
         let transformed_nodes = nodes.into_iter().map(|(node_var, labels_vec, props)| {
-            // Take the first label if it exists to convert Vec back to Option
             let label_opt = labels_vec.into_iter().next();
             (node_var, label_opt, props)
         }).collect();
         (path_var, transformed_nodes, edges)
     }).collect();
 
+    // CRITICAL: If remainder starts with a character that isn't a Cypher keyword (RETURN, WITH, etc.)
+    // or a comma, it means parse_pattern_restricted quit early (likely on a long string).
     println!(
-        "===> parse_match_clause_patterns END – parsed {} patterns, remainder: '{}'",
-        transformed.len(),
-        remainder.chars().take(50).collect::<String>()
+        "===> parse_match_clause_patterns END – remainder length: {}, remainder: '{}'",
+        remainder.len(),
+        remainder.chars().take(100).collect::<String>()
     );
     
     Ok((remainder, transformed))
@@ -3435,6 +3507,13 @@ fn parse_terminal_expression(input: &str) -> IResult<&str, CypherExpression> {
         // 5. Simple Variable: n
         map(parse_identifier, |s| CypherExpression::Variable(s.to_string())),
     )).parse(input)
+}
+
+// Support for $mrn, $id, etc.
+fn parse_parameter(input: &str) -> IResult<&str, String> {
+    let (input, _) = char('$')(input)?;
+    let (input, name) = parse_identifier(input)?;
+    Ok((input, format!("${}", name)))
 }
 
 fn parse_parenthesized_expression(input: &str) -> IResult<&str, CypherExpression> {
@@ -4288,76 +4367,95 @@ pub fn parse_with_clause(input: &str) -> IResult<&str, CypherQuery> {
 /// Resolves a node variable's ID by checking the storage engine for a matching 
 /// vertex based on its label and properties.
 async fn resolve_var(
-    // *** DEPENDENCY CHANGE: Use GraphService instead of Arc<dyn GraphStorageEngine> ***
     graph_service: &GraphService, 
     var: &str,
     label: &Option<String>,
     properties: &HashMap<String, Value>,
+    where_clause: &Option<WhereClause>, // Added parameter to access filters
 ) -> GraphResult<SerializableUuid> {
-    println!("===>       resolve_var: Looking for var='{}', label={:?}, {} properties", 
-             var, label, properties.len());
+    println!("===>        resolve_var: Looking for var='{}', label={:?}", var, label);
     
     let mut query_props: HashMap<String, PropertyValue> = HashMap::new();
+    
+    // 1. Process inline properties from the MATCH pattern (e.g., {id: '123'})
     for (k, v) in properties.iter() {
-        println!("===>       Property: {} = {:?}", k, v);
-        // Assuming to_property_value is correct for type conversion
         query_props.insert(k.clone(), to_property_value(v.clone())?);
     }
+
+    // 2. Use the helper to extract extra filters from the WHERE clause (e.g., WHERE n.id = '123')
+    let extra_filters = extract_filters_for_var(where_clause, var);
+    for (k, v) in extra_filters {
+        println!("===>        Merging WHERE filter for resolution: {} = {:?}", k, v);
+        query_props.insert(k, v);
+    }
     
-    // *** DELEGATION FIX: Call get_all_vertices() through graph_service ***
-    println!("========================== USING DIRECT DB ACCESS TO GET ALL VERTICES ========================");
+    println!("===>        Searching through vertices with merged constraints: {:?}", query_props);
     let all_vertices = graph_service.get_all_vertices().await?;
-    println!("===>       resolve_var: Searching through {} vertices", all_vertices.len());
     
     let matched_vertex = all_vertices.into_iter().find(|v| {
-        // 1. Check Label Match
+        // Match Label
         let matches_label = label.as_ref().map_or(true, |query_label| {
-            let result = v.label.as_ref() == query_label.as_str();
-            println!("===>       Checking vertex {}: label '{}' vs '{:?}' = {}", 
-                      v.id.0, v.label.as_ref(), query_label, result);
-            result
+            v.label.as_ref() == query_label.as_str()
         });
         
-        if !matches_label {
-            return false; // Early exit if label does not match
-        }
+        if !matches_label { return false; }
 
-        // 2. Check Property Matches
-        let matches_props = query_props.iter().all(|(k, expected_val)| {
-            let actual_val_opt = v.properties.get(k);
-            let result = actual_val_opt.map_or(false, |actual_val| {
-                actual_val == expected_val
-            });
-            
-            if !result {
-                println!("===>       Vertex {}: Property '{}' mismatch (actual: {:?}, expected: {:?})", 
-                         v.id.0, k, actual_val_opt, expected_val);
-            }
-            result
-        });
-        
-        let is_match = matches_label && matches_props; 
-        
-        if is_match {
-            println!("===>       MATCH FOUND: Vertex {}", v.id.0);
-        }
-        
-        is_match
+        // Match merged Properties (Inline + WHERE)
+        query_props.iter().all(|(k, expected_val)| {
+            v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+        })
     });
     
     match matched_vertex {
         Some(v) => {
-            println!("===>       resolve_var: SUCCESS - Returning {}", v.id.0);
+            println!("===>        resolve_var: SUCCESS - Returning {}", v.id.0);
             Ok(v.id)
         },
         None => {
-            println!("===>       resolve_var: ERROR - No match found");
             Err(GraphError::ValidationError(format!(
-                "No existing node found for variable '{}' with label '{:?}' and constraints: {:?}",
-                var, label, properties
+                "No node found for variable '{}' matching constraints: {:?}",
+                var, query_props
             )))
         }
     }
+}
+
+fn extract_filters_for_var(
+    where_clause: &Option<WhereClause>,
+    var_name: &str,
+) -> HashMap<String, PropertyValue> {
+    let mut filters = HashMap::new();
+
+    if let Some(WhereClause { condition }) = where_clause {
+        let mut queue = vec![condition];
+        
+        while let Some(expr) = queue.pop() {
+            match expr {
+                // Traverse AND trees to find all equalities
+                Expression::And { left, right } => {
+                    queue.push(left);
+                    queue.push(right);
+                }
+                // Match n.id = 'value' using Eq and Property variants
+                Expression::Binary {
+                    left,
+                    op: BinaryOp::Eq, // Matches BinaryOp::Eq in query_types.rs
+                    right,
+                } => {
+                    if let Expression::Property(PropertyAccess::Vertex(var, prop)) = left.as_ref() {
+                        if var == var_name {
+                            if let Expression::Literal(cypher_val) = right.as_ref() {
+                                // Uses PropertyValue::from(CypherValue) implementation
+                                filters.insert(prop.clone(), PropertyValue::from(cypher_val.clone()));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    filters
 }
 
 // A higher-level function to resolve all node patterns in a MATCH clause.
@@ -4373,9 +4471,11 @@ async fn resolve_var(
 async fn resolve_match_patterns(
     graph_service: &GraphService, 
     match_patterns: Vec<Pattern>,
+    where_clause: &Option<WhereClause>, // Added to support WHERE-based resolution
 ) -> GraphResult<HashMap<String, SerializableUuid>> {
     let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
     
+    // Audit-compliant logging for transaction tracing
     println!("===> resolve_match_patterns: Received {} patterns", match_patterns.len());
     
     for (pattern_idx, pat) in match_patterns.iter().enumerate() {
@@ -4384,54 +4484,39 @@ async fn resolve_match_patterns(
             pattern_idx, pat.0, pat.1.len(), pat.2.len()
         );
 
-        // Maintain check for unimplemented relationship logic
+        // Maintain engine stability
         if !pat.2.is_empty() {
             return Err(GraphError::NotImplemented(format!(
-                "Full graph pattern matching with relationships (Pattern {}) is not yet implemented in resolve_match_patterns.", 
+                "Full graph pattern matching with relationships (Pattern {}) is not yet implemented.", 
                 pattern_idx
             )));
         }
 
-        // Resolve independent node patterns
         for (node_idx, (var_opt, labels_vec, properties)) in pat.1.iter().enumerate() {
-            println!(
-                "===>    Node {}: var={:?}, labels={:?}, {} properties", 
-                node_idx, var_opt, labels_vec, properties.len()
-            );
-            
             if let Some(v_ref) = var_opt.as_ref() {
                 let var_name = v_ref.to_string();
                 
-                // Resolve variable if not already bound
                 if !var_to_id.contains_key(&var_name) {
-                    println!("===>    Calling resolve_var for '{}'", var_name);
+                    println!("===>    Calling resolve_var for '{}' with WHERE context", var_name);
                     
-                    // SHIM: resolve_var expects &Option<String>, but we have &Vec<String>.
-                    // We take the first label if any exist.
                     let first_label_opt = labels_vec.first().cloned();
                     
-                    // Pass graph_service dependency down
+                    // CRITICAL FIX: We pass the where_clause here. 
+                    // This allows resolve_var to extract constraints like `s.id = '...'` 
+                    // to ensure we hit the specific Patient/GoldenRecord required for the audit.
                     let id = resolve_var(
                         graph_service, 
                         v_ref, 
                         &first_label_opt, 
-                        properties
+                        properties,
+                        where_clause 
                     ).await?;
                     
                     println!("===>    SUCCESS: '{}' resolved to {}", var_name, id.0);
                     var_to_id.insert(var_name, id);
-                } else {
-                    println!("===>    SKIPPED: '{}' already bound", var_name);
                 }
-            } else {
-                println!("===>    SKIPPED: Node has no variable");
             }
         }
-    }
-    
-    println!("===> resolve_match_patterns: Final map has {} entries", var_to_id.len());
-    for (var, id) in &var_to_id {
-        println!("===>    {} -> {}", var, id.0);
     }
     
     Ok(var_to_id)
@@ -4614,15 +4699,19 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                 info!("===> EXECUTING MatchCreate: {} match patterns, {} create patterns", 
                             match_patterns.len(), create_patterns.len());
                 
+                // Track IDs for relationship creation
                 let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
                 let mut created_vertices = Vec::new();
                 let mut created_edges = Vec::new();
 
-                let matched_bindings = resolve_match_patterns(&*graph_service, match_patterns).await?;
+                // FIX: Pass the where_clause as the 3rd argument to resolve_match_patterns
+                // This enables the resolution logic to use WHERE filters (like IDs) to find the correct nodes.
+                let matched_bindings = resolve_match_patterns(&*graph_service, match_patterns, &where_clause).await?;
                 
                 let mut should_proceed = true;
                 if let Some(wc) = where_clause {
                     let ctx = EvaluationContext::from_uuid_bindings(&matched_bindings);
+                    // Evaluate the condition to see if the CREATE should actually execute
                     if !wc.evaluate(&ctx).unwrap_or(false) {
                         should_proceed = false;
                     }
@@ -4632,6 +4721,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     var_to_id.extend(matched_bindings);
 
                     for (pat_idx, pat) in create_patterns.iter().enumerate() {
+                        // 1. Resolve and Create Nodes in the Pattern
                         for (node_idx, (var_opt, labels_vec, properties)) in pat.1.iter().enumerate() {
                             let v_final = match var_opt.as_ref() {
                                 Some(v) => v.clone(),
@@ -4644,7 +4734,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                     .map(|(k, val)| to_property_value(val.clone()).map(|pv| (k.clone(), pv)))
                                     .collect();
                                 
-                                // FIX: Extract the first label or default to "Node"
+                                // Extract the first label or default to "Node"
                                 let final_label = labels_vec.first().cloned().unwrap_or_else(|| "Node".to_string());
                                 let new_id = SerializableUuid(Uuid::new_v4());
                                 
@@ -4662,6 +4752,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             }
                         }
 
+                        // 2. Create Relationships in the Pattern
                         for (i, rel_tuple) in pat.2.iter().enumerate() {
                             let from_node_pattern = &pat.1[i];
                             let to_node_pattern = &pat.1[i+1];
@@ -4762,7 +4853,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                 let mut created_vertices: Vec<Vertex> = Vec::new();
                 let mut updated_vertices: Vec<Vertex> = Vec::new();
 
-                let matched_bindings = resolve_match_patterns(&graph_service, match_patterns).await?;
+                // FIX: Pass the where_clause as the 3rd argument to resolve_match_patterns.
+                // This allows the resolution logic to use WHERE filters to accurately identify 
+                // the GoldenRecord or Event before applying SET updates.
+                let matched_bindings = resolve_match_patterns(&graph_service, match_patterns, &where_clause).await?;
                 
                 let mut should_proceed = true;
                 if let Some(wc) = where_clause {
@@ -4780,7 +4874,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         for (var_opt, labels_vec, properties) in &pat.1 {
                             if let Some(v) = var_opt.as_ref() {
                                 if !var_to_id.contains_key(v) {
-                                    // Correctly handle the Result during collection
                                     let props: HashMap<String, PropertyValue> = properties
                                         .iter()
                                         .map(|(k, val)| {
@@ -4806,11 +4899,9 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         }
                     }
                     
-                    // 2. SET Logic - FIXED: Handled Option from get_vertex
+                    // 2. SET Logic - Updates properties on matched or created nodes
                     for (var, prop, expr) in set_clauses {
                         if let Some(id_wrapper) = var_to_id.get(&var) {
-                            // Since get_vertex returns Option<Vertex>, we use ok_or_else directly 
-                            // on the awaited result to convert it to a Result for the ? operator.
                             let mut vertex = graph_service.get_vertex(&id_wrapper.0).await.ok_or_else(|| {
                                 GraphError::NotFound(unsafe { Identifier::new_unchecked(var.clone()) })
                             })?;
@@ -4818,7 +4909,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             let ctx = EvaluationContext::from_vertex(&vertex);
                             let evaluated_val = evaluate_expression(&expr, &ctx)?;
 
-                            // CONVERT to JSON Value for storage
                             let json_val = serde_json::to_value(&evaluated_val)
                                 .map_err(|e| GraphError::ValidationError(format!("Conversion failed: {}", e)))?;
                             
@@ -5756,7 +5846,7 @@ fn type_name_of_val(v: &Value) -> &str {
     }
 }
 /// Helper to convert Cypher `Value` → `PropertyValue`
-fn to_property_value(v: Value) -> GraphResult<PropertyValue> {
+pub fn to_property_value(v: Value) -> GraphResult<PropertyValue> {
     // Check for special function calls first
     if let Value::Object(ref m) = v {
         if let Some(func) = m.get("__CYPHER_FUNC__") {

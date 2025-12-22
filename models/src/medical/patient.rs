@@ -103,19 +103,27 @@ pub struct Patient {
     pub created_by: Option<i32>,
     pub updated_by: Option<i32>,
     pub last_visit_date: Option<DateTime<Utc>>,
+
+    // Graph vertex ID
+    pub vertex_id: Option<Uuid>,
 }
 
 impl ToVertex for Patient {
     fn to_vertex(&self) -> Vertex {
+        // Initialize with "Patient" label
         let mut v = Vertex::new(Identifier::new("Patient".to_string()).unwrap());
 
-        // Primary identifiers
-        // ID Property
+        // --- PRIMARY IDENTIFIERS ---
+        // These are the core keys for the MPI and Golden Record
         if let Some(id_val) = self.id {
             v.add_property("id", &id_val.to_string());
         }
         if let Some(ref val) = self.user_id {
             v.add_property("user_id", &val.to_string());
+        }
+        // Vertex ID is crucial for the graph of changes/events
+        if let Some(ref val) = self.vertex_id {
+            v.add_property("vertex_id", &val.to_string());
         }
         if let Some(ref val) = self.mrn {
             v.add_property("mrn", val);
@@ -123,36 +131,33 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.ssn {
             v.add_property("ssn", val);
         }
-        // Demographics
-        // Only add the property to the graph vertex if the field is Some
+
+        // --- DEMOGRAPHICS ---
         if let Some(ref val) = self.first_name {
             v.add_property("first_name", val);
         }
-        
         if let Some(ref val) = self.middle_name {
             v.add_property("middle_name", val);
         }
-        
         if let Some(ref val) = self.last_name {
             v.add_property("last_name", val);
         }
-
         if let Some(ref val) = self.suffix {
             v.add_property("suffix", val);
         }
         if let Some(ref val) = self.preferred_name {
             v.add_property("preferred_name", val);
         }
+
         v.add_property("date_of_birth", &self.date_of_birth.to_rfc3339());
+
         if let Some(ref val) = self.date_of_death {
             v.add_property("date_of_death", &val.to_rfc3339());
         }
         
-        // FIX: The gender field is now Option<String> and must be unwrapped
         if let Some(ref val) = self.gender { 
             v.add_property("gender", val);
         }
-        
         if let Some(ref val) = self.sex_assigned_at_birth {
             v.add_property("sex_assigned_at_birth", val);
         }
@@ -163,13 +168,13 @@ impl ToVertex for Patient {
             v.add_property("pronouns", val);
         }
 
-        // Contact Information
+        // --- CONTACT INFORMATION ---
         if let Some(ref addr_id) = self.address_id {
             v.add_property("address_id", &addr_id.to_string());
         }
         if let Some(ref addr) = self.address {
-            // serde_json is already in your dep graph via the workspace
-            v.add_property("address", &serde_json::to_string(addr).expect("Address serialise"));
+            // Serialization ensures complex address structs are stored as JSON strings in the property
+            v.add_property("address", &serde_json::to_string(addr).expect("Address serialization failed"));
         }
         if let Some(ref val) = self.phone_home {
             v.add_property("phone_home", val);
@@ -190,13 +195,10 @@ impl ToVertex for Patient {
             v.add_property("preferred_language", val);
         }
         if let Some(interpreter_needed) = self.interpreter_needed {
-            // 1. Unwrap the inner `bool` value.
-            // 2. Convert the `bool` to a String (e.g., "true" or "false").
-            // 3. Add the property to the vertex.
             v.add_property("interpreter_needed", &interpreter_needed.to_string()); 
         }
 
-        // Emergency Contact
+        // --- EMERGENCY CONTACT ---
         if let Some(ref val) = self.emergency_contact_name {
             v.add_property("emergency_contact_name", val);
         }
@@ -207,7 +209,7 @@ impl ToVertex for Patient {
             v.add_property("emergency_contact_phone", val);
         }
 
-        // Demographic Details
+        // --- DEMOGRAPHIC DETAILS ---
         if let Some(ref val) = self.marital_status {
             v.add_property("marital_status", val);
         }
@@ -221,7 +223,7 @@ impl ToVertex for Patient {
             v.add_property("religion", val);
         }
 
-        // Insurance & Financial
+        // --- INSURANCE & FINANCIAL ---
         if let Some(ref val) = self.primary_insurance {
             v.add_property("primary_insurance", val);
         }
@@ -241,7 +243,7 @@ impl ToVertex for Patient {
             v.add_property("guarantor_relationship", val);
         }
 
-        // Clinical Information
+        // --- CLINICAL INFORMATION ---
         if let Some(ref val) = self.primary_care_provider_id {
             v.add_property("primary_care_provider_id", &val.to_string());
         }
@@ -251,14 +253,11 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.organ_donor {
             v.add_property("organ_donor", &val.to_string());
         }
-        // --- Corrected Block (models/src/medical/patient.rs) ---
 
-        // Directive Status
-        // FIX: Use if let Some(...) for advance_directive_on_file
+        // --- DIRECTIVE STATUS ---
         if let Some(val) = self.advance_directive_on_file {
             v.add_property("advance_directive_on_file", &val.to_string());
         }
-
         if let Some(ref val) = self.dni_status {
             v.add_property("dni_status", val);
         }
@@ -269,22 +268,16 @@ impl ToVertex for Patient {
             v.add_property("code_status", val);
         }
 
-        // Administrative
-        // FIX: The patient_status field is now an Option<String>, so it must be unpacked.
+        // --- ADMINISTRATIVE ---
         if let Some(ref val) = self.patient_status {
-            // We pass a reference to the String content as &str via .as_str()
             v.add_property("patient_status", val.as_str()); 
         }
-
-        // FIX: Use if let Some(...) for vip_flag
         if let Some(val) = self.vip_flag {
             v.add_property("vip_flag", &val.to_string());
         } 
-        // FIX: Use if let Some(...) for confidential_flag
         if let Some(val) = self.confidential_flag {
             v.add_property("confidential_flag", &val.to_string());
         }
-
         if let Some(ref val) = self.research_consent {
             v.add_property("research_consent", &val.to_string());
         }
@@ -292,7 +285,7 @@ impl ToVertex for Patient {
             v.add_property("marketing_consent", &val.to_string());
         }
 
-        // Social Determinants of Health
+        // --- SOCIAL DETERMINANTS OF HEALTH ---
         if let Some(ref val) = self.employment_status {
             v.add_property("employment_status", val);
         }
@@ -305,12 +298,9 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.financial_strain {
             v.add_property("financial_strain", val);
         }
-
-        // FIX: Use if let Some(...) for food_insecurity
         if let Some(val) = self.food_insecurity {
             v.add_property("food_insecurity", &val.to_string());
         }
-        // FIX: Use if let Some(...) for transportation_needs
         if let Some(val) = self.transportation_needs {
             v.add_property("transportation_needs", &val.to_string());
         }
@@ -324,7 +314,7 @@ impl ToVertex for Patient {
             v.add_property("disability_status", val);
         }
 
-        // Clinical Alerts
+        // --- CLINICAL ALERTS ---
         if let Some(ref val) = self.alert_flags {
             v.add_property("alert_flags", val);
         }
@@ -332,7 +322,8 @@ impl ToVertex for Patient {
             v.add_property("special_needs", val);
         }
 
-        // Audit Trail
+        // --- AUDIT TRAIL ---
+        // Ensuring UTC timestamps are stored in ISO format for temporal queries
         v.add_property("created_at", &self.created_at.to_rfc3339());
         v.add_property("updated_at", &self.updated_at.to_rfc3339());
         if let Some(ref val) = self.created_by {
@@ -349,28 +340,19 @@ impl ToVertex for Patient {
     }
 }
 
-// Add this helper function before Patient::from_vertex
-
-/// Normalizes vertex properties by converting legacy aliases to canonical field names
-// Add this helper function before Patient::from_vertex
-
-/// Normalizes vertex properties by converting legacy aliases to canonical field names
-// NOTE: This code assumes the following types and modules are in scope (e.g., via use statements):
-// Vertex, PropertyValue, Patient, Address, Uuid, chrono::Utc, chrono::NaiveDate, chrono::Datelike, chrono::Timelike
-
-/// Normalizes vertex properties by converting legacy aliases to canonical field names
-// Add this helper function before Patient::from_vertex
-
-/// Normalizes vertex properties by converting legacy aliases to canonical field names
-// NOTE: This code assumes the following types and modules are in scope (e.g., via use statements):
-// Vertex, PropertyValue, Patient, Address, Uuid, chrono::Utc, chrono::NaiveDate, chrono::Datelike, chrono::Timelike
-
 /// Normalizes vertex properties by converting legacy aliases to canonical field names
 /// and ensuring required fields have non-null string representations.
 fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
     let mut normalized = vertex.clone();
     
-    // --- 1. Handle legacy "dob" field and ensure "date_of_birth" is present ---
+    // --- 1. NEW: Handle vertex_id mapping ---
+    // Extract the physical graph vertex ID and ensure it's in the properties for the struct mapper
+    normalized.properties.insert(
+        "vertex_id".to_string(),
+        PropertyValue::String(vertex.id.0.to_string())
+    );
+    
+    // --- 2. Handle legacy "dob" field and ensure "date_of_birth" is present ---
     let dob_key = "date_of_birth".to_string();
     if !normalized.properties.contains_key(&dob_key) {
         // Attempt to convert "dob"
@@ -411,7 +393,7 @@ fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
         }
     }
     
-    // --- 2. Handle legacy "name" field ---
+    // --- 3. Handle legacy "name" field ---
     // This logic attempts to split 'name' into 'first_name' and 'last_name' if they are missing
     let mut names_set = normalized.properties.contains_key("first_name") && normalized.properties.contains_key("last_name");
     
@@ -463,7 +445,7 @@ fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
         normalized.properties.insert("last_name".to_string(), PropertyValue::String("".to_string()));
     }
     
-    // --- 3. Ensure other required/default fields are present (preserved existing logic) ---
+    // --- 4. Ensure other required/default fields are present ---
 
     // Ensure required fields have defaults if missing
     if !normalized.properties.contains_key("patient_status") {
@@ -487,8 +469,6 @@ fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
             PropertyValue::String("false".to_string())
         );
     }
-    
-    // ... (other boolean and audit field defaults are preserved) ...
     
     if !normalized.properties.contains_key("advance_directive_on_file") {
         normalized.properties.insert(
@@ -551,27 +531,22 @@ impl Patient {
         }
         
         // Normalize the vertex properties first
-        // NOTE: This helper function is assumed to be defined elsewhere and correctly
-        // converts properties (e.g., handling missing required fields and property types).
         let normalized = normalize_patient_vertex(vertex);
         
-        // Now use the original from_vertex logic with the normalized vertex
         Some(Patient {
+            // NEW: Graph vertex ID for tracing and relating events
+            vertex_id: normalized.properties.get("vertex_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok()),
+
             // Primary identifiers
-            // FIX: Handle PropertyValue being an Integer or a String for ID
             id: {
-                // 1. Get the property from the vertex
                 let prop = normalized.properties.get("id");
-                
-                // 2. Extract the string representation (handle string or integer types)
                 let id_str = match prop {
                     Some(PropertyValue::String(s)) => Some(s.clone()),
                     Some(PropertyValue::Integer(i)) => Some(i.to_string()),
-                    _ => None, // If property is missing or wrong type, we get None
+                    _ => None,
                 };
-            
-                // 3. Parse the string into i32 and wrap in Some, 
-                // or return None if parsing fails/property was missing.
                 id_str.and_then(|s| s.parse::<i32>().ok())
             },
             
@@ -585,15 +560,13 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Demographics (Safe mapping to Option<String>)
+            // Demographics
             first_name: normalized.properties.get("first_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-
             middle_name: normalized.properties.get("middle_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-
             last_name: normalized.properties.get("last_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -603,16 +576,16 @@ impl Patient {
             preferred_name: normalized.properties.get("preferred_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            // date_of_birth is now guaranteed to be present and in RFC3339 format
+
             date_of_birth: chrono::DateTime::parse_from_rfc3339(
                 normalized.properties.get("date_of_birth")?.as_str()?
             ).ok()?.with_timezone(&chrono::Utc),
+            
             date_of_death: normalized.properties.get("date_of_death")
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
             
-            // FIX: gender is now Option<String>
             gender: normalized.properties.get("gender")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -655,7 +628,7 @@ impl Patient {
                 
             interpreter_needed: normalized.properties.get("interpreter_needed")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
+                .and_then(|s| s.parse().ok()),
 
             // Emergency Contact
             emergency_contact_name: normalized.properties.get("emergency_contact_name")
@@ -716,7 +689,7 @@ impl Patient {
             // Directive Status
             advance_directive_on_file: normalized.properties.get("advance_directive_on_file")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
+                .and_then(|s| s.parse().ok()),
             dni_status: normalized.properties.get("dni_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -731,16 +704,13 @@ impl Patient {
             patient_status: normalized.properties.get("patient_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                // FIX: Instead of unwrap_or_else (which returns String), use or_else 
-                // to provide a default value wrapped in Some, resulting in Option<String>.
-                // Since .map(|s| s.to_string()) returns Option<String>, we call or_else on it.
                 .or_else(|| Some("ACTIVE".to_string())),
             vip_flag: normalized.properties.get("vip_flag")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
+                .and_then(|s| s.parse().ok()),
             confidential_flag: normalized.properties.get("confidential_flag")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
+                .and_then(|s| s.parse().ok()),
             research_consent: normalized.properties.get("research_consent")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
@@ -763,10 +733,10 @@ impl Patient {
                 .map(|s| s.to_string()),
             food_insecurity: normalized.properties.get("food_insecurity")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
+                .and_then(|s| s.parse().ok()),
             transportation_needs: normalized.properties.get("transportation_needs")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()), // FIX: Removed .unwrap_or(false)
+                .and_then(|s| s.parse().ok()),
             social_isolation: normalized.properties.get("social_isolation")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -776,6 +746,7 @@ impl Patient {
             disability_status: normalized.properties.get("disability_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            
             // Clinical Alerts
             alert_flags: normalized.properties.get("alert_flags")
                 .and_then(|v| v.as_str())
@@ -804,39 +775,28 @@ impl Patient {
         })
     }
 
-    /// Attempts to convert a raw graph database return Value (e.g., from Cypher result)
-    /// representing a Vertex into a Patient struct.
     pub fn from_vertex_value(value: &PropertyValue) -> Option<Self> {
-        
         // 1. Check if the PropertyValue contains the canonical Vertex structure.
         if let PropertyValue::Vertex(unhashable_vertex) = value {
-            
-            // Extract the inner Vertex reference from the wrapper's field
             let vertex = &unhashable_vertex.0;
-
             return Patient::from_vertex(vertex); 
         }
 
-        // 2. Fallback check for PropertyValue::Map (raw properties returned by graph engine)
+        // 2. Fallback check for PropertyValue::Map
         if let PropertyValue::Map(hashable_map) = value {
-            
-            // Extract the inner PropertyMap (HashMap<Identifier, PropertyValue>)
             let property_map = &hashable_map.0; 
 
-            // --- FIX E0308: Convert HashMap<Identifier, PropertyValue> to HashMap<String, PropertyValue> ---
             let properties: HashMap<String, PropertyValue> = property_map
                 .iter()
-                .map(|(id, value)| (id.to_string(), value.clone())) // Assuming Identifier has a .to_string() method
+                .map(|(id, value)| (id.to_string(), value.clone()))
                 .collect();
-            // --------------------------------------------------------------------------------------------------
 
-            // Construct a minimal Vertex struct using the converted properties map
             let label = Identifier::new("Patient".to_string()).ok()?; 
 
             let vertex = Vertex {
                 id: Default::default(),
                 label,
-                properties, // Use the correctly typed HashMap
+                properties,
                 created_at: Utc::now().into(),
                 updated_at: Utc::now().into(),
             };
@@ -844,17 +804,12 @@ impl Patient {
             return Patient::from_vertex(&vertex); 
         }
         
-        // If the value is neither the wrapped Vertex nor a Map of properties
         None
     }
-    // NOTE: You must ensure that the `PropertyValue` type has a variant like 
-    // `PropertyValue::Vertex(Vertex)` or create a conversion helper to turn the
-    // raw data in `gr_vertex_value` into your application's `Vertex` struct.
-    // For the sake of fixing the compilation error, the above code provides the function signature.
 }
 
 // --- Placeholder for IdType (necessary for the parsing logic above to compile) ---
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IdType {
     Mrn,
     Ssn,
@@ -943,6 +898,18 @@ impl PatientId {
     /// Attempts to parse the inner String as a Uuid. (Alias for to_uuid, as requested).
     pub fn as_uuid(&self) -> Result<Uuid, uuid::Error> {
         self.0.parse::<Uuid>()
+    }
+
+    /// NEW: Consumes the PatientId and returns a Uuid.
+    /// This resolves the E0599 error in mpi_identity_resolution.rs.
+    pub fn into_uuid(self) -> Uuid {
+        self.0.parse::<Uuid>().unwrap_or_else(|_| {
+            // 2025-12-20: If we can't parse the UUID, we log a warning.
+            // In a production MPI, you might want to resolve this via a lookup 
+            // table instead of using a nil UUID fallback.
+            eprintln!("[MPI Internal] Warning: Could not parse PatientId '{}' as UUID. Falling back to nil.", self.0);
+            Uuid::nil()
+        })
     }
 }
 

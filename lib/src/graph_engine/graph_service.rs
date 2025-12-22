@@ -882,68 +882,62 @@ impl GraphService {
         &self,
         criteria: HashMap<String, String>,
     ) -> Result<Vec<Patient>> {
-        if criteria.is_empty() {
-            return Ok(Vec::new()); // No criteria, no search.
-        }
+        let mut match_clauses = Vec::new();
+        let mut fuzzy_scores = Vec::new();
 
-        // --- 1. Query Construction (Reintroducing GoldenRecord and logic) ---
-        let mut where_clauses = Vec::new();
-        
-        // 
-        
+        // 1. Separate "Fuzzy" items (Names) from "Strict" items (Flags)
         for (key, value) in criteria.iter() {
-            // Sanitize input to prevent Cypher injection attacks
-            let sanitized_value = sanitize_cypher_string(value);
+            let sanitized = sanitize_cypher_string(value);
             
-            // Construct a WHERE clause for each field.
-            let clause = match key.as_str() {
-                // Fuzzy/Substring search for common fields
-                "name" | "first_name" | "last_name" | "address" | "phone" => {
-                    // Using CONTAINS for simple substring search on string fields
-                    format!("p.{key} CONTAINS '{sanitized_value}'")
+            match key.as_str() {
+                "first_name" | "last_name" | "name" => {
+                    // Calculate Levenshtein distance: lower is better. 
+                    // We add 1 to the score to avoid division by zero and normalize.
+                    fuzzy_scores.push(format!("levenshtein(p.{key}, '{sanitized}')"));
                 }
-                // Exact match fields
-                "dob" | "gender" | "patient_status" => {
-                    format!("p.{key} = '{sanitized_value}'")
+                "date_of_birth" | "dob" => {
+                    // DOB acts as a hard filter to narrow the search space
+                    match_clauses.push(format!("p.{key} STARTS WITH '{sanitized}'"));
                 }
-                _ => {
-                    // Ignore unrecognized keys
-                    continue;
+                "gender" | "phone" => {
+                    match_clauses.push(format!("p.{key} = '{sanitized}'"));
                 }
-            };
-            where_clauses.push(clause);
+                _ => continue,
+            }
         }
 
-        // Combine clauses with AND
-        let where_clause_str = where_clauses.join(" AND ");
+        // 2. Build the Query
+        // We filter by hard flags first (where_clause), then calculate fuzzy score
+        let where_section = if match_clauses.is_empty() {
+            "p:Patient".to_string()
+        } else {
+            format!("p:Patient WHERE {}", match_clauses.join(" AND "))
+        };
 
-        // Ensure the Cypher query only returns Golden Records.
+        // If no names provided, score is constant; otherwise, average the distances
+        let score_calc = if fuzzy_scores.is_empty() {
+            "0".to_string()
+        } else {
+            format!("({}) / {}", fuzzy_scores.join(" + "), fuzzy_scores.len())
+        };
+
         let cypher_query = format!(
-            "MATCH (p:Patient:GoldenRecord) WHERE {where_clause_str} RETURN p" // Return the node 'p'
+            "MATCH ({}) 
+             WITH p, {} AS dist 
+             WHERE dist < 3 
+             RETURN p ORDER BY dist ASC LIMIT 10",
+            where_section, score_calc
         );
 
-        // --- 2. Query Execution ---
-        println!("===> Executing demographic search query: {}", cypher_query);
+        println!("===> Executing Fuzzy Search: {}", cypher_query);
 
-        // Execute the read query using the existing execution method.
-        let raw_results_vec_of_value = self.execute_cypher_read(&cypher_query, Value::Null).await
-            .map_err(|e| anyhow::anyhow!("Graph search query failed: {}", e))?;
+        let raw_results = self.execute_cypher_read(&cypher_query, Value::Null).await?;
         
-        // Extract the actual result set (which is the first/only element of the returned vector)
-        let raw_result_set = raw_results_vec_of_value.into_iter().next()
-            .context("QueryExecEngine returned empty result vector.")?;
-
-        // --- 3. Result Parsing ---
-        // The raw_result_set (Value) should contain an array of patient nodes/maps.
-        let results_array = raw_result_set.as_array()
-            .context("Expected Cypher result to be an array for patient parsing.")?;
-
+        // 3. Parse and Return
         let mut patients = Vec::new();
-        for result_item in results_array {
-            // result_item is the 'p' node map returned by the Cypher query
-            match parse_patient_from_cypher_result(result_item.clone()) {
-                Ok(patient) => patients.push(patient),
-                Err(e) => log::warn!("Failed to parse patient from Cypher result: {}", e),
+        for row in raw_results {
+            if let Ok(patient) = parse_patient_from_cypher_result(row) {
+                patients.push(patient);
             }
         }
 
@@ -964,6 +958,279 @@ impl GraphService {
                 .join(", ");
             Some(s)
         }
+    }
+
+    /// PERSISTENCE: Records an MPI Transaction into the 'Graph of Changes'.
+    /// FIX: Splits path into two MERGE statements to bypass parser/visibility limits.
+    pub async fn log_mpi_transaction(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        action: &str,
+        reason: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let event_id = Uuid::new_v4().to_string();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+
+        // QUERY 1: Assert Source and Event in a single path
+        let q1 = format!(
+            "MERGE (s:Patient {{id: '{source_id}'}})-[:PARTICIPATED_IN]->(e:IdentityEvent {{
+                id: '{event_id}', 
+                action: '{action}', 
+                reason: '{reason}', 
+                user_id: '{user_id}', 
+                timestamp: '{timestamp}'
+            }})"
+        );
+        self.execute_cypher_write(&q1, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Structural log Step 1 failed: {}", e))?;
+
+        // QUERY 2: Assert Link from Event to Golden Record
+        let q2 = format!(
+            "MERGE (e:IdentityEvent {{id: '{event_id}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
+        );
+        self.execute_cypher_write(&q2, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Structural log Step 2 failed: {}", e))?;
+
+        Ok(())
+    }
+
+    /// PERSISTENCE: Records detailed metadata into the 'Graph of Events'.
+    /// FIX: Returns Result<(), anyhow::Error> and uses path-merging.
+    pub async fn persist_mpi_change_event(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        event_type: &str,
+        metadata: serde_json::Value,
+    ) -> Result<Uuid> {
+        let event_uuid = Uuid::new_v4();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let metadata_str = metadata.to_string();
+
+        // STEP 1: Link Source -> Event (Path MERGE)
+        // We interpolate the UUID as a string into the Cypher template
+        let q1 = format!(
+            "MERGE (p:Patient {{id: '{source_id}'}})-[:PARTICIPATED_IN]->(e:IdentityEvent {{
+                id: '{event_uuid}', 
+                event_type: '{event_type}', 
+                metadata: '{metadata_str}', 
+                timestamp: '{timestamp}'
+            }})"
+        );
+        self.execute_cypher_write(&q1, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Metadata log failed at source: {}", e))?;
+
+        // STEP 2: Link Event -> Target (Path MERGE)
+        let q2 = format!(
+            "MERGE (e:IdentityEvent {{id: '{event_uuid}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
+        );
+        self.execute_cypher_write(&q2, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Metadata log failed at target: {}", e))?;
+
+        Ok(event_uuid)
+    }
+
+    /// 2025-12-20 Compliance: Retrieves all historical events for a specific identity.
+    /// Traverses edges from the target vertex to find all related IdentityEvent nodes.
+    pub async fn get_transactional_history(&self, patient_uuid: Uuid) -> Result<Vec<Vertex>, GraphError> {
+        // We use a Cypher query to find all events where this patient participated or was a result.
+        // Sorting by timestamp ensures the 'steps' in the LineageReport are chronological.
+        let query = format!(
+            "MATCH (p {{id: '{}'}})-[:PARTICIPATED_IN|RESULTED_IN]-(event:IdentityEvent) 
+             RETURN event 
+             ORDER BY event.timestamp ASC",
+            patient_uuid
+        );
+
+        // Execute the read query
+        let results = self.execute_cypher_read(&query, Value::Null).await?;
+
+        // Map the Cypher result rows back into Vertex objects
+        let mut history = Vec::new();
+        for row in results {
+            // Assuming your GraphEngine provides a way to convert a Cypher row/Value back to a Vertex
+            if let Ok(vertex) = self.map_value_to_vertex(row) {
+                history.push(vertex);
+            }
+        }
+
+        Ok(history)
+    }
+
+    /// Helper to convert raw database values into the Vertex model
+    fn map_value_to_vertex(&self, value: Value) -> Result<Vertex, GraphError> {
+        // This logic depends on your specific database driver's Value type.
+        // Usually, you deserialize the properties map into the Vertex struct.
+        serde_json::from_value(json!(value))
+            .map_err(|e| GraphError::DeserializationError(e.to_string()))
+    }
+
+    /// PERSISTENCE: Scans a record for Red Flags (Identity Conflicts).
+    /// This is called during indexing and merging.
+    pub async fn detect_and_persist_red_flags(&self, patient_id: Uuid) -> Result<Vec<String>> {
+        let mut flags = Vec::new();
+        
+        // FIX: .await returns Option<Vertex>.
+        // 1. Use .ok_or_else to convert Option -> Result<Vertex, anyhow::Error>
+        // 2. Then use '?' to unwrap the Result.
+        let vertex = self.get_vertex(&patient_id)
+            .await
+            .ok_or_else(|| anyhow!("Patient record {} not found in graph", patient_id))?;
+
+        // Red Flag 1: SSN Reuse
+        if let Some(ssn) = vertex.properties.get("ssn") {
+            let ssn_val = ssn.as_str().unwrap_or("");
+            
+            if !ssn_val.is_empty() {
+                let query = format!(
+                    "MATCH (other:Patient) WHERE other.ssn = '{}' AND other.id <> '{}' RETURN other", 
+                    ssn_val, patient_id
+                );
+                
+                // execute_cypher_read likely returns a Result; we map its error to anyhow
+                let results = self.execute_cypher_read(&query, Value::Null).await
+                    .map_err(|e| anyhow!("Conflict query failed: {}", e))?;
+                    
+                if !results.is_empty() {
+                    flags.push(format!("CONFLICT: SSN shared with {} other records", results.len()));
+                }
+            }
+        }
+
+        if !flags.is_empty() {
+            let mut updates = HashMap::new();
+            updates.insert("red_flags".to_string(), to_property_value(json!(flags))?);
+            updates.insert("has_conflict".to_string(), to_property_value(json!(true))?);
+            updates.insert("stewardship_status".to_string(), to_property_value(json!("REQUIRES_REVIEW"))?);
+            
+            // update_vertex_properties returns a Result; map it to anyhow
+            self.update_vertex_properties(patient_id, updates).await
+                .map_err(|e| anyhow!("Failed to persist red flags to vertex {}: {}", patient_id, e))?;
+            
+            // 2025-12-20: Log to Graph of Events for full traceability
+            let _ = self.persist_mpi_change_event(
+                patient_id, 
+                Uuid::nil(), 
+                "CONFLICT_DETECTED", 
+                json!({
+                    "detected_flags": flags,
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+            ).await;
+        }
+
+        Ok(flags)
+    }
+
+    /// PERSISTENCE: Retrieves the "Stewardship Dashboard" data.
+    pub async fn fetch_stewardship_report(&self, limit: usize) -> Result<Vec<Value>> {
+        let query = format!(
+            "MATCH (g:GoldenRecord)
+             OPTIONAL MATCH (g)<-[:MERGED_INTO*]-(p:Patient)
+             RETURN g.canonical_mrn as id,
+                    count(p) as link_density,
+                    g.red_flags as active_flags,
+                    g.updated_at as last_event
+             ORDER BY link_density DESC LIMIT {}",
+            limit
+        );
+        // FIX: Map GraphError to anyhow::Error using .map_err
+        self.execute_cypher_read(&query, Value::Null).await
+            .map_err(|e| anyhow!("Failed to fetch stewardship report: {}", e))
+    }
+
+
+    /// PERSISTENCE: Conflict Detection (Red Flagging)
+    /// Scans for shared identifiers across different logical identities.
+     pub async fn run_conflict_detection(&self, patient_id: Uuid) -> Result<Vec<String>> {
+        let mut flags = Vec::new();
+        
+        // FIX: Convert Option to Result using .ok_or_else() so we can use the '?' operator.
+        // This provides a clear error message if the patient is missing from the graph.
+        let p = self.get_vertex(&patient_id)
+            .await
+            .ok_or_else(|| anyhow!("Conflict detection failed: Patient {} not found", patient_id))?;
+
+        // 1. Check for SSN Collision (Industry Standard Red Flag)
+        if let Some(ssn) = p.properties.get("ssn") {
+            let ssn_str = ssn.as_str().unwrap_or("");
+            if !ssn_str.is_empty() {
+                let query = format!(
+                    "MATCH (other:Patient) WHERE other.ssn = '{}' AND other.id <> '{}' RETURN other.id", 
+                    ssn_str, patient_id
+                );
+                
+                // Map GraphError to anyhow::Error
+                let collisions = self.execute_cypher_read(&query, Value::Null)
+                    .await
+                    .map_err(|e| anyhow!("SSN collision query failed: {}", e))?;
+                    
+                if !collisions.is_empty() {
+                    flags.push(format!("COLLISION: SSN shared with {} other records", collisions.len()));
+                }
+            }
+        }
+
+        // 2. Check for Name/DOB divergence (Levenshtein check)
+        // [Placeholder for your primary demographics comparison logic]
+
+        if !flags.is_empty() {
+            // Persist the red flags to the patient record
+            self.update_vertex_properties(patient_id, HashMap::from([
+                ("red_flags".to_string(), to_property_value(json!(flags))?),
+                ("stewardship_status".to_string(), to_property_value(json!("REQUIRES_REVIEW"))?),
+            ])).await.map_err(|e| anyhow!("Failed to persist conflict flags: {}", e))?;
+
+            // =========================================================================
+            // 2025-12-20: Log the Conflict Detection to the Graph of Events
+            // =========================================================================
+            let _ = self.persist_mpi_change_event(
+                patient_id,
+                Uuid::nil(),
+                "CONFLICT_DETECTED",
+                json!({
+                    "detected_flags": flags,
+                    "status": "REQUIRES_REVIEW",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+            ).await;
+        }
+        
+        Ok(flags)
+    }
+
+    /// PERSISTENCE: Conflict Resolution (The stewardship override)
+    /// Allows a human to dismiss a flag with a reason code.
+    pub async fn resolve_identity_conflict(
+        &self, 
+        patient_id: Uuid, 
+        resolution_note: &str, 
+        steward_id: &str
+    ) -> Result<()> {
+        let updates = HashMap::from([
+            ("red_flags".to_string(), to_property_value(json!([]))?), // Clear flags
+            ("stewardship_status".to_string(), to_property_value(json!("RESOLVED"))?),
+            ("last_reviewed_by".to_string(), to_property_value(json!(steward_id))?),
+            ("resolution_note".to_string(), to_property_value(json!(resolution_note))?),
+        ]);
+
+        self.update_vertex_properties(patient_id, updates).await?;
+        
+        // Log this resolution as its own event in the graph
+        self.persist_mpi_change_event(
+            patient_id, 
+            patient_id, 
+            "CONFLICT_RESOLUTION", 
+            json!({"note": resolution_note, "steward": steward_id})
+        ).await?;
+
+        Ok(())
     }
 
     /// Executes the pipeline transformation defined by a Cypher `WITH` clause.
@@ -2128,261 +2395,120 @@ impl GraphService {
     pub async fn execute_merge_query(
         &self,
         patterns: Vec<(Option<String>, Vec<NodePattern>, Vec<RelPattern>)>,
-        where_clause: Option<WhereClause>,
+        _where_clause: Option<WhereClause>,
         on_create_set: Vec<(String, String, Expression)>,
         on_match_set: Vec<(String, String, Expression)>,
     ) -> GraphResult<ExecutionResult> {
+        if patterns.is_empty() { return Ok(ExecutionResult::new()); }
+
+        let mut execution_result = ExecutionResult::new();
+        let mut bindings: HashMap<String, Uuid> = HashMap::new();
+
+        // 1. Process Path Nodes
+        let (_, node_patterns, rel_patterns) = &patterns[0];
         
-        // --- Validation ---
-        if patterns.is_empty() {
-            return Ok(ExecutionResult::new());
-        }
+        for node_pat in node_patterns {
+            let (var_name_opt, labels, props) = node_pat;
+            
+            // Extract the 'id' to use for physical lookup and primary key
+            let provided_id = if let Some(id_val) = props.get("id") {
+                id_val.as_str().and_then(|s| Uuid::parse_str(s).ok())
+            } else {
+                None
+            };
 
-        // Use the *first* pattern for matching/creating.
-        let (path_var_opt, node_patterns, rel_patterns) = &patterns[0];
+            // Attempt to find existing node physically
+            let existing_vertex = if let Some(ref uuid) = provided_id {
+                self.storage.get_vertex(uuid).await?
+            } else {
+                None
+            };
 
-        if node_patterns.is_empty() {
-             return Err(GraphError::ValidationError("MERGE pattern must contain at least one node.".into()));
-        }
-
-        // --- CRITICAL PATH HANDLING: ---
-        if node_patterns.len() > 1 || !rel_patterns.is_empty() {
-            info!("Complex MERGE pattern ({}) detected, processing first node only for single-node MERGE fallback.", node_patterns.len());
-        }
-        
-        let node_pattern: &NodePattern = &node_patterns[0];
-        
-        // Handle node_pattern.1 as Vec<String>
-        let labels = &node_pattern.1;
-        if labels.is_empty() {
-            return Err(GraphError::ValidationError("MERGE requires at least one node label.".into()));
-        }
-        let primary_label = labels[0].clone();
-        let node_properties = &node_pattern.2;
-
-        if node_properties.is_empty() {
-            return Err(GraphError::QueryError(
-                "MERGE requires properties to match or create identity (e.g., {id: '123'})".into()
-            ));
-        }
-
-        // --- 1. Try to MATCH the node by UUID ---
-        let match_id_value = node_properties.get("id");
-        let matched_uuid = match match_id_value.and_then(|v| v.as_i64()) {
-            Some(_id) => None, // Logic preserved: treat as None for specific test case fallback
-            None => None,
-        };
-
-        let match_result = if let Some(uuid) = matched_uuid {
-            self.storage.get_vertex(&uuid).await
-        } else {
-            Ok(None)
-        };
-
-        // --- 2. UTILIZE WHERE CLAUSE ---
-        let validated_match = match match_result {
-            Ok(Some(vertex)) => {
-                if let Some(wc) = &where_clause {
+            let node_id = match existing_vertex {
+                Some(mut vertex) => {
+                    let current_id = vertex.id.0; // Copy the ID before vertex is moved
+                    
+                    // --- ON MATCH ---
                     let ctx = EvaluationContext::from_vertex(&vertex);
-                    
-                    match wc.condition.evaluate(&ctx) {
-                        Ok(val) => {
-                            if matches!(val, CypherValue::Bool(true)) {
-                                Ok(Some(vertex))
-                            } else {
-                                info!("MERGE: Match failed WHERE clause for vertex {:?}. Switching to ON CREATE.", vertex.id);
-                                Ok(None)
-                            }
-                        },
-                        Err(e) => Err(e),
+                    let mut changed = false;
+                    for (var, key, expr) in &on_match_set {
+                        if var_name_opt.as_ref() == Some(var) {
+                            let val = evaluate_expression(expr, &ctx)?;
+                            vertex.properties.insert(key.clone(), to_property_value(val.to_json())?);
+                            changed = true;
+                        }
                     }
-                } else {
-                    Ok(Some(vertex))
-                }
-            },
-            other => other,
-        };
-        
-        // --- 3. Implement MERGE Branching Logic ---
-        match validated_match {
-            Ok(Some(vertex)) => {
-                // --- ON MATCH PATH ---
-                let mut execution_result = ExecutionResult::new();
-                let mut match_mutations = Vec::new();
-                
-                // Create context from the matched vertex to evaluate expressions like u.count + 1
-                let ctx = EvaluationContext::from_vertex(&vertex);
-
-                for (var, prop_key, expr) in &on_match_set {
-                    // If the variable matches the node being merged
-                    if node_pattern.0.as_ref() == Some(var) {
-                        // DYNAMIC EVALUATION: Compute the new value based on existing state
-                        let cypher_val = evaluate_expression(expr, &ctx)?;
-                        
-                        // FIX: Use .to_json() to strip enum tags and avoid "Nested objects" error
-                        let json_val = cypher_val.to_json();
-                        let property_value = to_property_value(json_val)?;
-                        
-                        let vertex_identifier = Identifier::from_uuid(vertex.id.0) 
-                            .map_err(|e| GraphError::InternalError(format!("Invalid Identifier: {}", e)))?;
-                                        
-                        match_mutations.push(GraphOp::SetVertexProperty(
-                            vertex_identifier,
-                            Identifier::from(prop_key.as_str()),
-                            property_value
-                        ));
-                        execution_result.properties_set_count += 1;
+                    
+                    if changed {
+                        vertex.updated_at = chrono::Utc::now().into();
+                        // Physical persistence consumes 'vertex'
+                        self.storage.update_vertex(vertex).await?;
                     }
-                }
-
-                for op in match_mutations {
-                    self.storage.append(op).await?;
-                }
                     
-                execution_result.add_updated_node(vertex.id.0);
-                Ok(execution_result)
-            },
-            Ok(None) => {
-                // --- ON CREATE PATH (Not Found or WHERE Failed) ---
-                
-                // Handle complex path creation logic
-                if node_patterns.len() > 1 || !rel_patterns.is_empty() {
-                    info!("===> MERGE: Path NOT MATCHED. Falling back to path CREATE.");
-
-                    let mut execution_result = ExecutionResult::new();
-                    let mut mutations = Vec::new();
-                    let mut initial_bindings = HashMap::new(); 
-                    
-                    let get_uuid = |bindings: &HashMap<String, serde_json::Value>, var: &str| -> GraphResult<Uuid> {
-                        let binding_value = bindings.get(var)
-                            .ok_or_else(|| GraphError::ValidationError(format!("Variable '{}' not found.", var)))?;
-                        let id_str = binding_value.as_str().ok_or_else(|| 
-                            GraphError::InternalError(format!("Variable '{}' not a string UUID.", var)))?;
-                        uuid::Uuid::parse_str(id_str)
-                            .map_err(|e| GraphError::InternalError(format!("Invalid UUID: {}", e)))
+                    execution_result.add_updated_node(current_id);
+                    current_id
+                },
+                None => {
+                    // --- ON CREATE ---
+                    let new_uuid = provided_id.unwrap_or_else(Uuid::new_v4);
+                    let now: BincodeDateTime = chrono::Utc::now().into();
+                    let mut new_v = Vertex {
+                        id: SerializableUuid(new_uuid),
+                        label: Identifier::new(labels[0].clone()).map_err(|e| GraphError::InternalError(e.to_string()))?,
+                        properties: HashMap::new(),
+                        created_at: now,
+                        updated_at: now,
                     };
-                    
-                    let (_, node_patterns_to_create, rel_patterns_to_create) = &patterns[0];
-                    let node_var_names: Vec<Option<String>> = node_patterns_to_create.iter()
-                        .map(|(var, _, _)| var.clone())
-                        .collect();
 
-                    // 1. Nodes in Path
-                    for node_pat in node_patterns_to_create {
-                        let (var_name_opt, node_labels, properties) = node_pat;
-                        let var_name = var_name_opt.clone().unwrap_or_default();
-                        
-                        if !var_name.is_empty() && initial_bindings.contains_key(&var_name) {
-                            continue;
-                        }
-                        
-                        let node_uuid = Uuid::new_v4();
-                        let p_label = node_labels[0].clone();
-                        let now: BincodeDateTime = Utc::now().into();
+                    for (k, v) in props {
+                        new_v.properties.insert(k.clone(), to_property_value(v.clone())?);
+                    }
 
-                        let mut new_v = Vertex {
-                            id: SerializableUuid(node_uuid),
-                            label: Identifier::new(p_label).map_err(|e| GraphError::InternalError(e.to_string()))?,
-                            properties: HashMap::new(),
-                            created_at: now,
-                            updated_at: now,
-                        };
-                        
-                        // Merge Pattern properties with ON CREATE properties
-                        for (key, val) in properties {
-                            new_v.properties.insert(key.clone(), to_property_value(val.clone())?);
-                        }
-                        
-                        // Initial context for creation
-                        let create_ctx = EvaluationContext::from_vertex(&new_v);
-
-                        for (set_var, prop_key, expr) in &on_create_set {
-                            if var_name_opt.as_ref() == Some(set_var) {
-                                let val = evaluate_expression(expr, &create_ctx)?;
-                                
-                                // FIX: Use .to_json() to strip enum tags
-                                let json_val = val.to_json();
-                                new_v.properties.insert(prop_key.clone(), to_property_value(json_val)?);
-                                execution_result.properties_set_count += 1;
-                            }
-                        }
-
-                        mutations.push(GraphOp::InsertVertex(new_v));
-                        execution_result.add_created_node(node_uuid);
-                        if let Some(v_name) = var_name_opt {
-                            initial_bindings.insert(v_name.clone(), serde_json::json!(node_uuid.to_string()));
+                    let ctx = EvaluationContext::from_vertex(&new_v);
+                    for (var, key, expr) in &on_create_set {
+                        if var_name_opt.as_ref() == Some(var) {
+                            let val = evaluate_expression(expr, &ctx)?;
+                            new_v.properties.insert(key.clone(), to_property_value(val.to_json())?);
                         }
                     }
 
-                    // 2. Edges in Path
-                    for (idx, rel_pat) in rel_patterns_to_create.iter().enumerate() {
-                        let (v_name_opt, r_type_opt, _, props, _) = rel_pat;
-                        let s_var = node_var_names[idx].as_ref().ok_or_else(|| GraphError::ValidationError("Source var missing".into()))?;
-                        let t_var = node_var_names[idx+1].as_ref().ok_or_else(|| GraphError::ValidationError("Target var missing".into()))?;
-                        
-                        let s_id = get_uuid(&initial_bindings, s_var)?;
-                        let t_id = get_uuid(&initial_bindings, t_var)?;
-                        let r_type = r_type_opt.clone().ok_or_else(|| GraphError::ValidationError("Rel type missing".into()))?;
-                        
-                        let e_uuid = Uuid::new_v4();
-                        let mut new_e = Edge {
-                            id: SerializableUuid(e_uuid),
-                            outbound_id: SerializableUuid(s_id),
-                            edge_type: Identifier::new(r_type.clone()).map_err(|e| GraphError::InternalError(e.to_string()))?,
-                            inbound_id: SerializableUuid(t_id),
-                            label: r_type,
-                            properties: BTreeMap::new(),
-                        };
-                        
-                        for (key, val) in props {
-                            new_e.properties.insert(key.clone(), to_property_value(val.clone())?);
-                        }
-                        
-                        mutations.push(GraphOp::InsertEdge(new_e));
-                        execution_result.add_created_edge(e_uuid);
-                    }
-                    
-                    for op in mutations { self.storage.append(op).await?; }
-                    return Ok(execution_result);
-                } 
-                
-                // --- Simple Node CREATE (Fallback for single-node patterns) ---
-                let new_uuid = Uuid::new_v4();
-                let now: BincodeDateTime = Utc::now().into();
-                let mut new_vertex = Vertex {
-                    id: SerializableUuid(new_uuid),
-                    label: Identifier::new(primary_label).map_err(|e| GraphError::InternalError(e.to_string()))?,
-                    properties: HashMap::new(),
-                    created_at: now,
-                    updated_at: now,
-                };
-                
-                // 1. Apply identity properties from MERGE pattern
-                for (key, val) in node_properties {
-                    new_vertex.properties.insert(key.clone(), to_property_value(val.clone())?);
+                    self.storage.create_vertex(new_v).await?;
+                    execution_result.add_created_node(new_uuid);
+                    new_uuid
                 }
+            };
 
-                // 2. Apply ON CREATE expressions
-                let create_ctx = EvaluationContext::from_vertex(&new_vertex);
-                let mut execution_result = ExecutionResult::new();
-                
-                for (var, prop_key, expr) in &on_create_set {
-                    if node_pattern.0.as_ref() == Some(var) {
-                        let val = evaluate_expression(expr, &create_ctx)?;
-                        
-                        // FIX: Use .to_json() to strip enum tags
-                        let json_val = val.to_json();
-                        new_vertex.properties.insert(prop_key.clone(), to_property_value(json_val)?);
-                        execution_result.properties_set_count += 1;
-                    }
-                }
-                
-                self.storage.append(GraphOp::InsertVertex(new_vertex)).await?;
-                execution_result.add_created_node(new_uuid);
-                Ok(execution_result)
-            },
-            Err(e) => Err(e),
+            if let Some(var) = var_name_opt {
+                bindings.insert(var.clone(), node_id);
+            }
         }
+
+        // 2. Process Path Relationships
+        for (idx, rel_pat) in rel_patterns.iter().enumerate() {
+            let (_, r_type_opt, _, props, _) = rel_pat;
+            let (s_var_opt, _, _) = &node_patterns[idx];
+            let (t_var_opt, _, _) = &node_patterns[idx+1];
+            
+            let s_id = bindings.get(s_var_opt.as_ref().unwrap()).ok_or_else(|| GraphError::InternalError("Source ID unbound".into()))?;
+            let t_id = bindings.get(t_var_opt.as_ref().unwrap()).ok_or_else(|| GraphError::InternalError("Target ID unbound".into()))?;
+            let r_type = r_type_opt.clone().unwrap_or_else(|| "RELATED".to_string());
+
+            let new_e = Edge {
+                id: SerializableUuid(Uuid::new_v4()),
+                outbound_id: SerializableUuid(*s_id),
+                inbound_id: SerializableUuid(*t_id),
+                edge_type: Identifier::new(r_type.clone()).map_err(|e| GraphError::InternalError(e.to_string()))?,
+                label: r_type,
+                properties: props.iter()
+                    .map(|(k,v)| (k.clone(), to_property_value(v.clone()).unwrap()))
+                    .collect(),
+            };
+
+            self.storage.create_edge(new_e.clone()).await?;
+            execution_result.add_created_edge(new_e.id.0);
+        }
+
+        Ok(execution_result)
     }
 
     // =========================================================================

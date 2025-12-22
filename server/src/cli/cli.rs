@@ -1514,6 +1514,75 @@ pub async fn run_single_command(
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI Golden Record retrieval failed: {}", e))?;
                 }
+                // --- Traceability: Graph of Changes (Lineage) ---
+                // Fulfills 2025-12-20 requirement for relating transactions to Golden Records.
+                // --- NEW: Lineage / Evolution Ontology Operation ---
+                MPICommand::Lineage { 
+                    id, 
+                    id_type, 
+                    from, 
+                    to, 
+                    head, 
+                    tail, 
+                    depth, 
+                    include_flags 
+                } => {
+                    // 2025-12-20: Convert bool toggle to Option<String> for the handler
+                    let flags_str = if include_flags { Some("true".to_string()) } else { None };
+
+                    handlers_mpi::handle_mpi_lineage(
+                        storage.clone(),
+                        id,
+                        id_type,
+                        from,
+                        to,
+                        head,
+                        tail,
+                        Some(depth), // FIX: Wrap u32 in Some()
+                        flags_str,   // FIX: Pass Option<String> instead of bool
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI lineage retrieval failed: {}", e))?;
+                }
+
+                // --- Point-in-Time Reconstruction (Snapshot) ---
+                MPICommand::Snapshot { 
+                    id, 
+                    format, 
+                    as_of 
+                } => {
+                    // FIX: Snapshot requires a concrete String ID. 
+                    // We unwrap the Option here to meet the handler's requirement.
+                    let target_id = id.ok_or_else(|| anyhow::anyhow!("Snapshot requires an ID (--id)"))?;
+
+                    handlers_mpi::handle_mpi_snapshot(
+                        storage.clone(),
+                        target_id,         // Pass as String
+                        Some(format),      // FIX: Wrap String in Some() for Option<String>
+                        as_of,             // Already Option<String>
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI snapshot failed: {}", e))?;
+                }
+
+                // --- Observability & Slicing (Status) ---
+                // Supports head/tail slicing and global index health monitoring.
+                MPICommand::Status { 
+                    only_conflicts, 
+                    limit, 
+                    slice, 
+                    system 
+                } => {
+                    handlers_mpi::handle_mpi_status(
+                        storage.clone(),
+                        only_conflicts,
+                        limit,
+                        Some(slice),
+                        system,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI status retrieval failed: {}", e))?;
+                }
             }
 
             info!("MPI command successfully executed");
