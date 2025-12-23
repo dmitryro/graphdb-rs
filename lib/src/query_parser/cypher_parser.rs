@@ -2136,17 +2136,11 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     // --- 4. PARSE OPTIONAL WITH CLAUSE ---
     let (input_after_with, with_clause_raw) = opt(preceded(
         multispace0,
-        parse_with
+        parse_with_full, // Returns ParsedWithClause
     )).parse(input_current)?;
 
-    captured_with = with_clause_raw.map(|w| ParsedWithClause {
-        items: Vec::new(),
-        distinct: false,
-        where_clause: Some(WhereClause { condition: w.condition }),
-        order_by: Vec::new(),
-        skip: None,
-        limit: None,
-    });
+    // FIX: with_clause_raw is already ParsedWithClause — no conversion needed
+    captured_with = with_clause_raw;
     input_current = input_after_with;
 
     // --- 5. PARSE ON CLAUSES (MERGE only) ---
@@ -3780,14 +3774,82 @@ fn parse_and_expression(input: &str) -> IResult<&str, CypherExpression> {
 
 pub fn parse_with(input: &str) -> IResult<&str, WithClause> {
     println!("===> parse_with START");
+    
     // 1. Consume "WITH" keyword
     let (input, _) = tag_no_case("WITH").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
-
-    // 2. Parse logical expression (supports AND/OR)
-    let (input, condition) = parse_logical_expression(input)?;
-
+    
+    // 2. Parse projection items (e.g., "p, p.age AS dist")
+    // For now, skip/consume them since we're just tracking the WHERE condition
+    let (input, _) = take_while1(|c: char| {
+        let upper = c.to_ascii_uppercase();
+        !(upper == 'W' && input.trim_start().to_uppercase().starts_with("WHERE"))
+    }).parse(input)?;
+    
+    let (input, _) = multispace0.parse(input)?;
+    
+    // 3. Parse optional WHERE clause after WITH projections
+    let (input, condition_opt) = opt(preceded(
+        tuple((tag_no_case("WHERE"), multispace1)),
+        parse_logical_expression
+    )).parse(input)?;
+    
+    // 4. If no WHERE, create a trivial true condition
+    let condition = condition_opt.unwrap_or_else(|| {
+        Expression::Literal(CypherValue::Bool(true))
+    });
+    
     Ok((input, WithClause { condition }))
+}
+
+pub fn parse_with_full(input: &str) -> IResult<&str, ParsedWithClause> {
+    println!("===> parse_with_full START");
+    
+    // 1. Consume "WITH" keyword
+    let (input, _) = tag_no_case("WITH").parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    
+    // 2. Parse DISTINCT (optional)
+    let (input, distinct) = opt(terminated(tag_no_case("DISTINCT"), multispace1)).parse(input)?;
+    let is_distinct = distinct.is_some();
+    
+    // 3. Parse projection items (comma-separated list)
+    // For now, just consume until we hit WHERE/ORDER/SKIP/LIMIT/RETURN
+    let (input, _projection_str) = take_while1(|c: char| {
+        let trimmed = input.trim_start();
+        let upper = trimmed.to_uppercase();
+        !upper.starts_with("WHERE") 
+            && !upper.starts_with("ORDER")
+            && !upper.starts_with("SKIP")
+            && !upper.starts_with("LIMIT")
+            && !upper.starts_with("RETURN")
+    }).parse(input)?;
+    
+    let (input, _) = multispace0.parse(input)?;
+    
+    // 4. Parse optional WHERE
+    let (input, where_clause) = opt(preceded(
+        tuple((tag_no_case("WHERE"), multispace1)),
+        map(parse_logical_expression, |condition| WhereClause { condition })
+    )).parse(input)?;
+    
+    // 5. Parse optional ORDER BY (skip for now)
+    let (input, _) = multispace0.parse(input)?;
+    
+    // 6. Parse optional SKIP
+    let (input, _) = multispace0.parse(input)?;
+    
+    // 7. Parse optional LIMIT
+    let (input, _) = multispace0.parse(input)?;
+    
+    Ok((input, ParsedWithClause {
+        items: Vec::new(), // TODO: actually parse projection items
+        distinct: is_distinct,
+        where_clause,
+        order_by: Vec::new(),
+        skip: None,
+        limit: None,
+    }))
 }
 
 /// Level 3: Comparisons (=, <>, etc.)
