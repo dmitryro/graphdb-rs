@@ -54,6 +54,13 @@ pub enum Literal {
     Null,
 }
 
+#[derive(Debug, Clone)]
+pub enum LogicalExpr {
+    Condition(String, BinaryOp, PropertyValue),
+    And(Box<LogicalExpr>, Box<LogicalExpr>),
+    Or(Box<LogicalExpr>, Box<LogicalExpr>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CypherExpression {
     Literal(Value),
@@ -253,16 +260,6 @@ pub enum CypherValue {
     List(Vec<CypherValue>),
 }
 
-// In query_types.rs (or relevant file)
-pub struct ParsedWithClause {
-    pub items: Vec<QueryReturnItem>,
-    pub distinct: bool,
-    pub where_clause: Option<Value>,
-    pub order_by: Vec<OrderByItem>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
-}
-
 // =================================================================
 // CYPHER QUERY ENUM (WITH CRITICAL UPDATES FOR CHAINING)
 // =================================================================
@@ -287,6 +284,7 @@ pub enum CypherQuery {
     MatchRemove {
         match_patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, // Added
+        with_clause: Option<ParsedWithClause>,
         remove_clauses: Vec<(String, String)>,
     },
     CreateComplexPattern {
@@ -300,21 +298,25 @@ pub enum CypherQuery {
     MatchPattern {
         patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, // Added
+        with_clause: Option<ParsedWithClause>,
     },
     MatchSet {
         match_patterns: Vec<Pattern>, // Adjust type name to match your codebase
+        with_clause: Option<ParsedWithClause>,
         where_clause: Option<WhereClause>,
         set_clauses: Vec<(String, String, Expression)>, // Change Value to Expression
     },
     MatchCreateSet {
         match_patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, // Added
+        with_clause: Option<ParsedWithClause>,
         create_patterns: Vec<Pattern>,
         set_clauses: Vec<(String, String, Expression)>,
     },
     MatchCreate {
         match_patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, // Added
+        with_clause: Option<ParsedWithClause>,
         create_patterns: Vec<Pattern>,
     },
     CreateEdgeBetweenExisting {
@@ -359,6 +361,7 @@ pub enum CypherQuery {
         edge_variable: String,
         pattern: MatchPattern,
         where_clause: Option<WhereClause>,
+        with_clause: Option<ParsedWithClause>,
     },
     DetachDeleteNodes {
         node_variable: String,
@@ -367,12 +370,13 @@ pub enum CypherQuery {
     Merge {
         patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, // Added (Supported by Cypher in MERGE)
+        with_clause: Option<ParsedWithClause>,
         on_create_set: Vec<(String, String, Expression)>, 
         on_match_set: Vec<(String, String, Expression)>,
     },
     ReturnStatement {
         projection_string: String,
-        order_by: Option<String>, // Placeholder for ORDER BY expressions
+        order_by: Vec<OrderByItem>, // Placeholder for ORDER BY expressions
         skip: Option<i64>,        // Parsed value for SKIP
         limit: Option<i64>,       // Parsed value for LIMIT
     },
@@ -386,7 +390,6 @@ pub enum CypherQuery {
         variables: Vec<String>, // List of variable names to delete
         detach: bool,
     },
-    
     // NEW: Standalone REMOVE clause
     RemoveStatement { 
         removals: Vec<(String, String)>, // e.g., ("n", "label") or ("n", "property")
@@ -396,6 +399,22 @@ pub enum CypherQuery {
     Union(Box<CypherQuery>, bool, Box<CypherQuery>),
 }
 
+// Ensure the inner WithClause also has them if it's a separate struct
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub condition: Expression,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedWithClause {
+    pub items: Vec<QueryReturnItem>,
+    pub distinct: bool,
+    /// Uses WhereClause to maintain the Expression tree for MPI logical filtering
+    pub where_clause: Option<WhereClause>, 
+    pub order_by: Vec<OrderByItem>,
+    pub skip: Option<i64>,
+    pub limit: Option<i64>,
+}
 
 // =================================================================
 // EXPRESSION AND EVALUATION LOGIC
@@ -440,11 +459,13 @@ pub enum Expression {
         value: Value,
     },
     And { left: Box<Expression>, right: Box<Expression> },
+// --- ADD THIS ---
+    Or { left: Box<Expression>, right: Box<Expression> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinaryOp {
-    Eq, Neq, Lt, Lte, Gt, Gte, And, Or, Xor, Plus, Minus, Mul, Div, Mod, In, Contains, StartsWith, EndsWith, Regex,
+    Eq, Neq, Lt, Lte, Gt, Gte, And, Or, Xor, Plus, Minus, Mul, Div, Mod, Contains, StartsWith, EndsWith, Regex, In, NotIn, 
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -552,6 +573,13 @@ impl CypherValue {
             }
         }
     }
+
+    pub fn as_bool(&self) -> bool {
+        match self {
+            CypherValue::Bool(b) => *b,
+            _ => false,
+        }
+    }
 }
 
 impl From<PropertyValue> for CypherValue {
@@ -592,6 +620,19 @@ impl From<PropertyValue> for CypherValue {
 }
 
 impl EvaluationContext {
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let mut variables = std::collections::HashMap::new();
+        if let Some(obj) = value.as_object() {
+            for (k, v) in obj {
+                variables.insert(k.clone(), CypherValue::from_json(v.clone()));
+            }
+        }
+        Self {
+            variables,
+            parameters: std::collections::HashMap::new(),
+        }
+    }
+
     pub fn from_match(graph_match: &GraphMatch) -> Self {
         let mut variables = HashMap::new();
         for (var_name, vertex) in &graph_match.vertices {
@@ -623,16 +664,21 @@ impl EvaluationContext {
     }
 
     /// Creates a context from a single Vertex for WHERE clause filtering.
-    pub fn from_vertex(vertex: &Vertex) -> Self {
+    /// FIX: Added `var_name` parameter to support variable-based lookups (e.g., `n.name`)
+    pub fn from_vertex(var_name: &str, vertex: &Vertex) -> Self {
         let mut variables = HashMap::new();
-        let mut properties_map = HashMap::new();
+        
+        // 1. Register the vertex under the variable name provided in the MATCH clause (e.g., "n")
+        // This allows the expression evaluator to resolve `n.name`.
+        variables.insert(var_name.to_string(), CypherValue::Vertex(vertex.clone()));
 
+        // 2. Maintain a properties map for generic or internal property access
+        let mut properties_map = HashMap::new();
         for (key, val) in &vertex.properties {
             properties_map.insert(key.clone(), CypherValue::from(val.clone()));
         }
 
-        // Standard Cypher: allow access via the variable name if available, 
-        // or just the properties map.
+        // Standard Cypher: allow access via the generic "properties" name 
         variables.insert("properties".to_string(), CypherValue::Map(properties_map));
         
         Self { 
@@ -860,22 +906,20 @@ impl Expression {
                             _ => Err(GraphError::EvaluationError("Negative requires numeric".into())),
                         }
                     },
-                    // --- FIXED: Handling the new variants ---
-                    UnaryOp::IsNotNull => {
-                        Ok(CypherValue::Bool(!matches!(val, CypherValue::Null)))
-                    },
-                    UnaryOp::IsNull => {
-                        Ok(CypherValue::Bool(matches!(val, CypherValue::Null)))
-                    },
+                    UnaryOp::IsNotNull => Ok(CypherValue::Bool(!matches!(val, CypherValue::Null))),
+                    UnaryOp::IsNull => Ok(CypherValue::Bool(matches!(val, CypherValue::Null))),
                 }
             },  
             Expression::FunctionCall { name, args } => {
                 match name.to_uppercase().as_str() {
                     "ID" => {
                         if let Some(Expression::Variable(var_name)) = args.get(0) {
-                            if let Some(CypherValue::Vertex(v)) = ctx.variables.get(var_name) {
-                                // Return the ID as a String so it can be compared or checked
-                                Ok(CypherValue::String(v.id.to_string()))
+                            if let Some(val) = ctx.variables.get(var_name) {
+                                match val {
+                                    CypherValue::Vertex(v) => Ok(CypherValue::String(v.id.to_string())),
+                                    CypherValue::Edge(e) => Ok(CypherValue::String(e.id.to_string())),
+                                    _ => Ok(CypherValue::Null),
+                                }
                             } else {
                                 Ok(CypherValue::Null)
                             }
@@ -886,22 +930,20 @@ impl Expression {
                     _ => Err(GraphError::EvaluationError(format!("Unknown function: {}", name)))
                 }
             }
-            // --- FIXED: PropertyComparison using correct CypherValue variants ---
             Expression::PropertyComparison { variable, property, operator, value } => {
                 let target = ctx.variables.get(variable)
                     .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{variable}' not found")))?;
                 
                 let left_val = match target {
                     CypherValue::Vertex(v) => v.properties.get(property)
-                        .map(property_value_to_cypher) // Directly pass reference &PropertyValue
+                        .map(property_value_to_cypher)
                         .unwrap_or(CypherValue::Null),
                     CypherValue::Edge(e) => e.properties.get(property)
-                        .map(property_value_to_cypher) // Directly pass reference &PropertyValue
+                        .map(property_value_to_cypher)
                         .unwrap_or(CypherValue::Null),
                     _ => return Err(GraphError::EvaluationError(format!("Variable '{variable}' is not a Vertex or Edge"))),
                 };
 
-                // Handle null check operators
                 let op_upper = operator.to_uppercase();
                 if op_upper == "IS NOT NULL" {
                     return Ok(CypherValue::Bool(!matches!(left_val, CypherValue::Null)));
@@ -912,15 +954,12 @@ impl Expression {
                 let right_val = CypherValue::from_json(value.clone());
                 evaluate_comparison(&left_val, operator, &right_val)
             }
-
-            // --- FIXED: FunctionComparison using correct CypherValue variants ---
             Expression::FunctionComparison { function, argument, operator, value } => {
                 let left_val = match function.to_uppercase().as_str() {
                     "ID" => {
                         let target = ctx.variables.get(argument)
                             .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{argument}' not found")))?;
                         
-                        // FORCE the left side to a raw String immediately
                         match target {
                             CypherValue::Vertex(v) => CypherValue::String(v.id.to_string()),
                             CypherValue::Edge(e) => CypherValue::String(e.id.to_string()),
@@ -931,7 +970,6 @@ impl Expression {
                     _ => return Err(GraphError::EvaluationError(format!("Unknown function: {function}"))),
                 };
 
-                // Handle null check operators for functions (e.g., WHERE ID(p) IS NOT NULL)
                 let op_upper = operator.to_uppercase();
                 if op_upper == "IS NOT NULL" {
                     return Ok(CypherValue::Bool(!matches!(left_val, CypherValue::Null)));
@@ -939,17 +977,12 @@ impl Expression {
                     return Ok(CypherValue::Bool(matches!(left_val, CypherValue::Null)));
                 }
 
-                // FORCE the right side to a raw String by stripping JSON quotes
                 let right_val = if value.is_string() {
-                    // .as_str() removes the literal quotes from the JSON value
                     CypherValue::String(value.as_str().unwrap_or("").to_string())
                 } else {
-                    // Fallback: strip quotes manually if it's a raw string representation
-                    let s = value.to_string().trim_matches('"').to_string();
-                    CypherValue::String(s)
+                    CypherValue::String(value.to_string().trim_matches('"').to_string())
                 };
 
-                // Now it's String == String, which cannot fail if the characters match
                 evaluate_comparison(&left_val, operator, &right_val)
             }
             Expression::And { left, right } => {
@@ -957,17 +990,22 @@ impl Expression {
                 let r_val = right.evaluate(ctx)?;
 
                 match (l_val, r_val) {
-                    (CypherValue::Bool(l), CypherValue::Bool(r)) => {
-                        Ok(CypherValue::Bool(l && r))
-                    },
-                    (CypherValue::Null, _) | (_, CypherValue::Null) => {
-                        // In Cypher logic: null AND true is null, null AND false is false.
-                        // For a simple WHERE filter, Null is usually treated as false.
-                        Ok(CypherValue::Null)
-                    },
-                    _ => Err(GraphError::EvaluationError(
-                        "Logical AND requires boolean operands".into()
-                    )),
+                    (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l && r)),
+                    (CypherValue::Bool(false), _) | (_, CypherValue::Bool(false)) => Ok(CypherValue::Bool(false)),
+                    (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+                    _ => Err(GraphError::EvaluationError("Logical AND requires boolean operands".into())),
+                }
+            }
+            // FIXED: Added missing Or variant for exhaustive matching
+            Expression::Or { left, right } => {
+                let l_val = left.evaluate(ctx)?;
+                let r_val = right.evaluate(ctx)?;
+
+                match (l_val, r_val) {
+                    (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l || r)),
+                    (CypherValue::Bool(true), _) | (_, CypherValue::Bool(true)) => Ok(CypherValue::Bool(true)),
+                    (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+                    _ => Err(GraphError::EvaluationError("Logical OR requires boolean operands".into())),
                 }
             }
         }
@@ -985,11 +1023,57 @@ impl BinaryOp {
             BinaryOp::Gte => compare(left, right, |a, b| a >= b),
             BinaryOp::And => Ok(CypherValue::Bool(to_bool(left)? && to_bool(right)?)),
             BinaryOp::Or => Ok(CypherValue::Bool(to_bool(left)? || to_bool(right)?)),
+            BinaryOp::Xor => Ok(CypherValue::Bool(to_bool(left)? ^ to_bool(right)?)),
             BinaryOp::Plus => add(left, right),
             BinaryOp::Minus => subtract(left, right),
             BinaryOp::Mul => multiply(left, right),
             BinaryOp::Div => divide(left, right),
-            _ => Err(GraphError::EvaluationError(format!("Operator {self:?} not supported"))),
+            BinaryOp::Mod => {
+                if let (CypherValue::Integer(l), CypherValue::Integer(r)) = (left, right) {
+                    Ok(CypherValue::Integer(l % r))
+                } else {
+                    Err(GraphError::EvaluationError("Modulo requires integers".into()))
+                }
+            },
+            BinaryOp::In => {
+                if let CypherValue::List(list) = right {
+                    Ok(CypherValue::Bool(list.contains(left)))
+                } else {
+                    Err(GraphError::EvaluationError("Right side of IN must be a list".into()))
+                }
+            }
+            BinaryOp::NotIn => {
+                if let CypherValue::List(list) = right {
+                    Ok(CypherValue::Bool(!list.contains(left)))
+                } else {
+                    Err(GraphError::EvaluationError("Right side of NOT IN must be a list".into()))
+                }
+            }
+            BinaryOp::Contains => {
+                if let (CypherValue::String(l), CypherValue::String(r)) = (left, right) {
+                    Ok(CypherValue::Bool(l.contains(r)))
+                } else {
+                    Err(GraphError::EvaluationError("CONTAINS requires strings".into()))
+                }
+            }
+            BinaryOp::StartsWith => {
+                if let (CypherValue::String(l), CypherValue::String(r)) = (left, right) {
+                    Ok(CypherValue::Bool(l.starts_with(r)))
+                } else {
+                    Err(GraphError::EvaluationError("STARTS WITH requires strings".into()))
+                }
+            }
+            BinaryOp::EndsWith => {
+                if let (CypherValue::String(l), CypherValue::String(r)) = (left, right) {
+                    Ok(CypherValue::Bool(l.ends_with(r)))
+                } else {
+                    Err(GraphError::EvaluationError("ENDS WITH requires strings".into()))
+                }
+            }
+            BinaryOp::Regex => {
+                // Placeholder for regex implementation (requires 'regex' crate)
+                Err(GraphError::NotImplemented("Regex matching not yet implemented".into()))
+            }
         }
     }
 }
@@ -1184,44 +1268,57 @@ fn divide(a: &CypherValue, b: &CypherValue) -> GraphResult<CypherValue> {
 impl From<CypherExpression> for Expression {
     fn from(ce: CypherExpression) -> Self {
         match ce {
+            // Converts raw JSON literals to internal CypherValues (Strings, Numbers, etc.)
             CypherExpression::Literal(val) => 
                 Expression::Literal(CypherValue::from_json(val)),
             
+            // Maps variable names (e.g., 'n', 'p') for context lookup
             CypherExpression::Variable(s) => 
                 Expression::Variable(s),
             
+            // Maps property lookups (e.g., n.name) to Vertex/Edge property access
             CypherExpression::PropertyLookup { var, prop } => {
-                // Mapping to PropertyAccess::Vertex variant
                 Expression::Property(PropertyAccess::Vertex(var, prop))
             },
+
+            // Handles function calls like COUNT(), ID(), etc.
             CypherExpression::FunctionCall { name, args } => {
-                // Map this to your internal Expression or Value type
-                // Example assuming you have an Expression::FunctionCall:
                 Expression::FunctionCall {
                     name,
-                    args: args.into_iter().map(|a| a.into()).collect(),
+                    args: args.into_iter().map(Expression::from).collect(),
                 }
             },
+
+            // Handles Boolean and Mathematical operators
             CypherExpression::BinaryOp { left, op, right } => {
-                let binary_op = match op.to_uppercase().as_str() {
-                    "=" => BinaryOp::Eq,
-                    "!=" | "<>" => BinaryOp::Neq,
-                    ">" => BinaryOp::Gt,
-                    "<" => BinaryOp::Lt,
-                    ">=" => BinaryOp::Gte,
-                    "<=" => BinaryOp::Lte,
-                    "AND" => BinaryOp::And,
-                    "OR" => BinaryOp::Or,
-                    "+" => BinaryOp::Plus,
-                    "-" => BinaryOp::Minus,
-                    "*" => BinaryOp::Mul,
-                    "/" => BinaryOp::Div,
-                    _ => panic!("Unsupported operator: {}", op),
-                };
-                Expression::Binary {
-                    op: binary_op,
-                    left: Box::new(Expression::from(*left)),
-                    right: Box::new(Expression::from(*right)),
+                let op_upper = op.to_uppercase();
+                match op_upper.as_str() {
+                    "AND" => Expression::And {
+                        left: Box::new(Expression::from(*left)),
+                        right: Box::new(Expression::from(*right)),
+                    },
+                    // FIX: Explicitly handle the OR operator for MPI identity resolution
+                    "OR" => Expression::Or {
+                        left: Box::new(Expression::from(*left)),
+                        right: Box::new(Expression::from(*right)),
+                    },
+                    _ => {
+                        let binary_op = match op_upper.as_str() {
+                            "=" | "==" => BinaryOp::Eq,
+                            "!=" | "<>" => BinaryOp::Neq,
+                            ">" => BinaryOp::Gt,
+                            "<" => BinaryOp::Lt,
+                            ">=" => BinaryOp::Gte,
+                            "<=" => BinaryOp::Lte,
+                            // ... rest of operators
+                            _ => panic!("Unsupported operator for MPI resolution: {}", op),
+                        };
+                        Expression::Binary {
+                            op: binary_op,
+                            left: Box::new(Expression::from(*left)),
+                            right: Box::new(Expression::from(*right)),
+                        }
+                    }
                 }
             }
         }

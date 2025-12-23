@@ -525,6 +525,7 @@ impl MpiIdentityResolutionService {
         let mut criteria = HashMap::new();
         
         // Map criteria for both execution and logging
+        // Ensure keys match the vertex property names seen in the debug logs
         if let Some(n) = name { criteria.insert("name".to_string(), n); }
         if let Some(fnm) = first_name { criteria.insert("first_name".to_string(), fnm); }
         if let Some(lnm) = last_name { criteria.insert("last_name".to_string(), lnm); }
@@ -543,6 +544,7 @@ impl MpiIdentityResolutionService {
             .context("Demographic search execution failed.")?;
 
         // 2. LOGGING: Create a persistent 'SearchEvent' node (2025-12-20 Audit Trail)
+        // We use persist_mpi_change_event to satisfy the Graph of Events requirement
         let event_id = self.graph_service.persist_mpi_change_event(
             Uuid::nil(), 
             Uuid::nil(), 
@@ -556,8 +558,7 @@ impl MpiIdentityResolutionService {
         ).await?;
 
         // 3. TRACING: Link the search event to every patient returned
-        // Since Patient knows nothing about being a vertex, we resolve their UUIDs 
-        // using the MRN to fulfill the "Graph of Changes" requirement.
+        // This creates the "Graph of Changes" relationship between the Search and the Patient
         for patient in &results {
             if let Some(mrn) = &patient.mrn {
                 // Resolve the domain MRN to a Graph UUID
@@ -565,11 +566,19 @@ impl MpiIdentityResolutionService {
                     let edge_label = Identifier::new("REVEALED_RECORD".to_string())
                         .map_err(|e| anyhow!("Invalid Identifier: {}", e))?;
 
-                    // Correctly construct the Edge object for GraphService
-                    let edge = Edge::new(
-                        SerializableUuid(event_id),
-                        edge_label,
-                        SerializableUuid(v_uuid),
+                    // Correctly construct the Edge object
+                    // Note: Your logs show vertex_id is a String property, 
+                    // ensure resolve_id_to_uuid is checking that property.
+                    let mut edge = Edge::new(
+                        event_id,             // outbound_id (Search Event)
+                        edge_label,           // label
+                        v_uuid                // inbound_id (Patient)
+                    );
+
+                    // Add lineage metadata to the edge itself
+                    edge.properties.insert(
+                        "audit_timestamp".to_string(), 
+                        PropertyValue::String(Utc::now().to_rfc3339())
                     );
 
                     let _ = self.graph_service.create_edge(edge).await;
