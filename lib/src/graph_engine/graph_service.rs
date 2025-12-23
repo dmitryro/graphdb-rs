@@ -889,17 +889,14 @@ impl GraphService {
             let sanitized = sanitize_cypher_string(value);
             
             match key.as_str() {
-                // Map the input key to the correct Graph Schema key
                 "first_name" | "last_name" => {
                     fuzzy_scores.push(format!("levenshtein(p.{}, '{}')", key, sanitized));
                 }
                 "name" => {
-                    // If 'name' is provided, we fuzzy match against both parts
                     fuzzy_scores.push(format!("levenshtein(p.first_name, '{}')", sanitized));
                     fuzzy_scores.push(format!("levenshtein(p.last_name, '{}')", sanitized));
                 }
                 "date_of_birth" | "dob" => {
-                    // CRITICAL: Always use the canonical key 'date_of_birth' found in Sled
                     match_clauses.push(format!("p.date_of_birth STARTS WITH '{}'", sanitized));
                 }
                 "gender" => {
@@ -912,35 +909,43 @@ impl GraphService {
             }
         }
 
-        // 2. Build the Query
-        let where_section = if match_clauses.is_empty() {
-            "p:Patient".to_string()
+        // 2. Build the Query — CORRECT SYNTAX
+        let cypher_query = if match_clauses.is_empty() {
+            // No strict filters → just MATCH
+            format!(
+                "MATCH (p:Patient) \
+                 WITH p, {} AS dist \
+                 WHERE dist < 3 \
+                 RETURN p ORDER BY dist ASC LIMIT 10",
+                if fuzzy_scores.is_empty() {
+                    "0".to_string()
+                } else {
+                    format!("({}) / {}", fuzzy_scores.join(" + "), fuzzy_scores.len())
+                }
+            )
         } else {
-            format!("p:Patient WHERE {}", match_clauses.join(" AND "))
+            // With strict filters → separate MATCH and WHERE
+            format!(
+                "MATCH (p:Patient) \
+                 WHERE {} \
+                 WITH p, {} AS dist \
+                 WHERE dist < 3 \
+                 RETURN p ORDER BY dist ASC LIMIT 10",
+                match_clauses.join(" AND "),
+                if fuzzy_scores.is_empty() {
+                    "0".to_string()
+                } else {
+                    format!("({}) / {}", fuzzy_scores.join(" + "), fuzzy_scores.len())
+                }
+            )
         };
-
-        let score_calc = if fuzzy_scores.is_empty() {
-            "0".to_string()
-        } else {
-            format!("({}) / {}", fuzzy_scores.join(" + "), fuzzy_scores.len())
-        };
-
-        let cypher_query = format!(
-            "MATCH ({}) \
-             WITH p, {} AS dist \
-             WHERE dist < 3 \
-             RETURN p ORDER BY dist ASC LIMIT 10",
-            where_section, score_calc
-        );
 
         println!("===> Executing Fuzzy Search: {}", cypher_query);
 
-        // Use execute_cypher_read (ensure this is implemented in your graph_service)
         let raw_results = self
             .execute_cypher_read(&cypher_query, serde_json::Value::Null)
             .await?;
         
-        // 3. Parse and Return
         let mut patients = Vec::new();
         for row in raw_results {
             if let Ok(patient) = parse_patient_from_cypher_result(row) {
@@ -2512,7 +2517,7 @@ impl GraphService {
 
         Ok(execution_result)
     }
-    
+
     /// Helper to handle the "ON CREATE" logic shared by physical misses and logical mismatches
     async fn create_new_merge_vertex(
         &self,

@@ -458,8 +458,12 @@ pub enum Expression {
         operator: String,
         value: Value,
     },
+    StartsWith {
+        variable: String,
+        property: String,
+        prefix: String,
+    },
     And { left: Box<Expression>, right: Box<Expression> },
-// --- ADD THIS ---
     Or { left: Box<Expression>, right: Box<Expression> },
 }
 
@@ -954,6 +958,26 @@ impl Expression {
                 let right_val = CypherValue::from_json(value.clone());
                 evaluate_comparison(&left_val, operator, &right_val)
             }
+            Expression::StartsWith { variable, property, prefix } => {
+                let target = ctx.variables.get(variable)
+                    .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{variable}' not found")))?;
+                
+                let prop_val = match target {
+                    CypherValue::Vertex(v) => v.properties.get(property)
+                        .map(property_value_to_cypher)
+                        .unwrap_or(CypherValue::Null),
+                    CypherValue::Edge(e) => e.properties.get(property)
+                        .map(property_value_to_cypher)
+                        .unwrap_or(CypherValue::Null),
+                    _ => return Err(GraphError::EvaluationError(format!("Variable '{variable}' is not a Vertex or Edge"))),
+                };
+
+                match prop_val {
+                    CypherValue::String(s) => Ok(CypherValue::Bool(s.starts_with(prefix))),
+                    CypherValue::Null => Ok(CypherValue::Bool(false)),
+                    _ => Ok(CypherValue::Bool(false)), // Non-string properties don't match STARTS WITH
+                }
+            }
             Expression::FunctionComparison { function, argument, operator, value } => {
                 let left_val = match function.to_uppercase().as_str() {
                     "ID" => {
@@ -996,7 +1020,6 @@ impl Expression {
                     _ => Err(GraphError::EvaluationError("Logical AND requires boolean operands".into())),
                 }
             }
-            // FIXED: Added missing Or variant for exhaustive matching
             Expression::Or { left, right } => {
                 let l_val = left.evaluate(ctx)?;
                 let r_val = right.evaluate(ctx)?;
@@ -1268,20 +1291,16 @@ fn divide(a: &CypherValue, b: &CypherValue) -> GraphResult<CypherValue> {
 impl From<CypherExpression> for Expression {
     fn from(ce: CypherExpression) -> Self {
         match ce {
-            // Converts raw JSON literals to internal CypherValues (Strings, Numbers, etc.)
             CypherExpression::Literal(val) => 
                 Expression::Literal(CypherValue::from_json(val)),
             
-            // Maps variable names (e.g., 'n', 'p') for context lookup
             CypherExpression::Variable(s) => 
                 Expression::Variable(s),
             
-            // Maps property lookups (e.g., n.name) to Vertex/Edge property access
             CypherExpression::PropertyLookup { var, prop } => {
                 Expression::Property(PropertyAccess::Vertex(var, prop))
             },
 
-            // Handles function calls like COUNT(), ID(), etc.
             CypherExpression::FunctionCall { name, args } => {
                 Expression::FunctionCall {
                     name,
@@ -1289,7 +1308,6 @@ impl From<CypherExpression> for Expression {
                 }
             },
 
-            // Handles Boolean and Mathematical operators
             CypherExpression::BinaryOp { left, op, right } => {
                 let op_upper = op.to_uppercase();
                 match op_upper.as_str() {
@@ -1297,10 +1315,24 @@ impl From<CypherExpression> for Expression {
                         left: Box::new(Expression::from(*left)),
                         right: Box::new(Expression::from(*right)),
                     },
-                    // FIX: Explicitly handle the OR operator for MPI identity resolution
                     "OR" => Expression::Or {
                         left: Box::new(Expression::from(*left)),
                         right: Box::new(Expression::from(*right)),
+                    },
+                    "STARTS WITH" => {
+                        // Convert BinaryOp "STARTS WITH" into StartsWith expression
+                        // Assumes left is PropertyLookup { var, prop }, right is Literal(String)
+                        if let CypherExpression::PropertyLookup { var, prop } = *left {
+                            if let CypherExpression::Literal(serde_json::Value::String(prefix)) = *right {
+                                return Expression::StartsWith {
+                                    variable: var,
+                                    property: prop,
+                                    prefix,
+                                };
+                            }
+                        }
+                        // Fallback if structure doesn't match
+                        panic!("STARTS WITH requires left=property, right=string literal");
                     },
                     _ => {
                         let binary_op = match op_upper.as_str() {
@@ -1310,7 +1342,6 @@ impl From<CypherExpression> for Expression {
                             "<" => BinaryOp::Lt,
                             ">=" => BinaryOp::Gte,
                             "<=" => BinaryOp::Lte,
-                            // ... rest of operators
                             _ => panic!("Unsupported operator for MPI resolution: {}", op),
                         };
                         Expression::Binary {

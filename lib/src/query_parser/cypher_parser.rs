@@ -4112,6 +4112,9 @@ fn parse_function_call(input: &str) -> IResult<&str, (String, String)> {
 fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
     println!("===> parse_comparison_op START");
     alt((
+        tag_no_case("STARTS WITH"), 
+        tag_no_case("ENDS WITH"),
+        tag_no_case("CONTAINS"),
         tag_no_case("IS NOT NULL"),
         tag_no_case("IS NULL"),
         tag("="),
@@ -4126,13 +4129,11 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
 
 /// Parse a single WHERE condition/expression (property, function, or parenthesized)
 pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
-    // ✅ First, try parenthesized: ( ... )
     println!("===> parse_where_expression START");
     if let Ok((remaining, expr)) = parse_parenthesized_expression(input) {
         return Ok((remaining, expr));
     }
 
-    // Try function-based condition: ID(n) = "value" or ID(n) IS NOT NULL
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
@@ -4152,7 +4153,6 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }));
     }
     
-    // Try property-based condition: n.prop = "value" or n.prop IS NOT NULL
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     let (input, op) = parse_comparison_op(input)?;
@@ -4167,7 +4167,18 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     let (var, prop) = full_path.split_once('.')
         .map(|(v, p)| (v.to_string(), p.to_string()))
         .unwrap_or_else(|| (full_path.clone(), String::new()));
-    
+
+    // ✅ Handle STARTS WITH
+    if op.to_uppercase() == "STARTS WITH" {
+        if let Value::String(prefix) = val {
+            return Ok((input, Expression::StartsWith {
+                variable: var,
+                property: prop,
+                prefix,
+            }));
+        }
+    }
+
     Ok((input, Expression::PropertyComparison {
         variable: var,
         property: prop,
@@ -4987,28 +4998,23 @@ fn extract_filters_from_expression(
 ) {
     println!("===> extract_filters_from_expressio START");
     match expr {
-        // Handle AND: traverse both sides
         Expression::And { left, right } => {
             extract_filters_from_expression(left, var_name, filters);
             extract_filters_from_expression(right, var_name, filters);
         }
-        // Handle OR: also traverse both sides (MPI logic may use OR for identity resolution)
         Expression::Or { left, right } => {
             extract_filters_from_expression(left, var_name, filters);
             extract_filters_from_expression(right, var_name, filters);
         }
-        // Handle equality: n.prop = value
         Expression::Binary { op: BinaryOp::Eq, left, right } => {
             if let Expression::Property(PropertyAccess::Vertex(v, prop)) = left.as_ref() {
                 if v == var_name {
                     if let Expression::Literal(cypher_val) = right.as_ref() {
-                        // PropertyValue::from(CypherValue) is infallible → no Result
                         let prop_val = PropertyValue::from(cypher_val.clone());
                         filters.insert(prop.clone(), prop_val);
                     }
                 }
             }
-            // Also check reversed: value = n.prop
             if let Expression::Property(PropertyAccess::Vertex(v, prop)) = right.as_ref() {
                 if v == var_name {
                     if let Expression::Literal(cypher_val) = left.as_ref() {
@@ -5018,7 +5024,6 @@ fn extract_filters_from_expression(
                 }
             }
         }
-        // Handle function comparisons like ID(n) = "uuid"
         Expression::FunctionComparison {
             function,
             argument,
@@ -5026,13 +5031,11 @@ fn extract_filters_from_expression(
             value,
         } => {
             if function.to_uppercase() == "ID" && argument == var_name && operator == "=" {
-                // to_property_value returns GraphResult<PropertyValue>
                 if let Ok(prop_val) = to_property_value(value.clone()) {
                     filters.insert("id".to_string(), prop_val);
                 }
             }
         }
-        // Handle property comparisons (fallback from WHERE parser)
         Expression::PropertyComparison {
             variable,
             property,
@@ -5045,7 +5048,18 @@ fn extract_filters_from_expression(
                 }
             }
         }
-        // Ignore other expression types (Unary, arithmetic, etc.)
+        // ✅ Handle STARTS WITH
+        Expression::StartsWith {
+            variable,
+            property,
+            prefix,
+        } => {
+            if variable == var_name {
+                if let Ok(prop_val) = to_property_value(Value::String(prefix.clone())) {
+                    filters.insert(property.clone(), prop_val);
+                }
+            }
+        }
         _ => {}
     }
 }
