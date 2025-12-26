@@ -3237,6 +3237,40 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut current_subcommand_index = 0;
             let mut explicit_subcommand: Option<String> = None;
 
+            // Dashboard & Stewardship Variables
+            let mut only_conflicts = false; // Flag for dashboard filtering
+            let mut limit: Option<usize> = None;
+            let mut slice: Option<String> = None;
+            // system is already defined above
+
+            // Lineage & Trace Variables
+            let mut from: Option<String> = None;
+            let mut to: Option<String> = None;
+            let mut head: Option<usize> = None;
+            let mut tail: Option<usize> = None;
+            let mut depth: Option<u32> = None;
+            let mut include_flags = false;
+
+            // Snapshot Variables
+            let mut as_of: Option<String> = None;
+            let mut format: Option<String> = None;
+
+
+
+           // ADD THESE SPECIFICALLY to fix "cannot find value" errors
+            let mut from_date: Option<String> = None;
+            let mut to_date: Option<String> = None;
+            let mut head_limit: Option<usize> = None;
+            let mut tail_limit: Option<usize> = None;
+            let mut format_type: Option<String> = None;
+            
+            // Ensure 'limit' and others are also there
+            let mut limit: Option<usize> = None;
+            let mut depth: Option<u32> = None;
+            let mut include_flags = false;
+
+            // Transaction/Audit context
+            let mut requested_by: Option<String> = None; // For the "whoami" context
             if !remaining_args.is_empty() {
                 match remaining_args[0].to_lowercase().as_str() {
                     "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" | "index" | "resolve" | "search" | "fetch-identity" => { // NEW: fetch-identity
@@ -3250,6 +3284,87 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut i = current_subcommand_index;
             while i < remaining_args.len() {
                 match remaining_args[i].to_lowercase().as_str() {
+                    // Lineage / Status / Snaoshot flags
+                    "--from" => {
+                        if i + 1 < remaining_args.len() {
+                            from_date = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--to" => {
+                        if i + 1 < remaining_args.len() {
+                            to_date = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--head" => {
+                        if i + 1 < remaining_args.len() {
+                            head = remaining_args[i + 1].parse::<usize>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--tail" => {
+                        if i + 1 < remaining_args.len() {
+                            tail = remaining_args[i + 1].parse::<usize>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--as-of" => {
+                        if i + 1 < remaining_args.len() {
+                            as_of = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--format" => {
+                        if i + 1 < remaining_args.len() {
+                            format_type = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--slice" => {
+                        if i + 1 < remaining_args.len() {
+                            slice = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--depth" => {
+                        if i + 1 < remaining_args.len() {
+                            depth = remaining_args[i + 1].parse::<u32>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--include-flags" => {
+                        include_flags = true;
+                        i += 1;
+                    }
+                    "--only-conflicts" => {
+                        only_conflicts = true;
+                        i += 1;
+                    }
                     // General Demographic Flags
                     "--name" => {
                         if i + 1 < remaining_args.len() {
@@ -3558,6 +3673,33 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
 
             match explicit_subcommand.as_deref() {
+                Some("lineage") => {
+                    CommandType::Mpi(MPICommand::Lineage {
+                        id: id.unwrap_or_default(),
+                        id_type,
+                        from: from_date,
+                        to: to_date,
+                        head: head_limit,
+                        tail: tail_limit,
+                        depth: depth.unwrap_or(3),
+                        include_flags,
+                    })
+                },
+                Some("snapshot") => {
+                    CommandType::Mpi(MPICommand::Snapshot {
+                        id,
+                        format: format_type.unwrap_or_else(|| "json".into()),
+                        as_of,
+                    })
+                },
+                Some("status") => {
+                    CommandType::Mpi(MPICommand::Status {
+                        only_conflicts,
+                        limit: limit.or(head_limit).or(tail_limit),
+                        slice: slice.unwrap_or_else(|| "top".into()),
+                        system,
+                    })
+                }
                 Some("index") => {
                     if mrn.is_none() || system.is_none() {
                         eprintln!("Error: 'mpi index' requires --mrn and --system.");
@@ -9098,6 +9240,74 @@ pub async fn handle_interactive_command(
             let mpi_handlers_state = state.mpi_handlers.clone();
 
             match mpi_command {
+                // --- NEW: Lineage / Evolution Ontology Operation ---
+                // Directly supports the 2025-12-20 requirement for a "Graph of Changes"
+                MPICommand::Lineage { 
+                    id, 
+                    id_type, 
+                    from, 
+                    to, 
+                    head, 
+                    tail, 
+                    depth, 
+                    include_flags 
+                } => {
+                    // Convert bool to Option<String> to satisfy the function signature
+                    let flags_str = if include_flags { Some("true".to_string()) } else { None };
+
+                    handlers_mpi::handle_mpi_lineage_interactive(
+                        id,
+                        id_type,
+                        from,
+                        to,
+                        head,
+                        tail,
+                        Some(depth), // FIX: Wrap u32 in Some() to match Option<u32>
+                        flags_str, 
+                        mpi_handlers_state,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI lineage retrieval failed: {}", e))
+                }
+
+                // --- NEW: Snapshot / Point-in-Time Operation ---
+                // Allows fetching the state of a Golden Record as it existed at a specific time
+                MPICommand::Snapshot { 
+                    id, 
+                    format, 
+                    as_of 
+                } => {
+                    // FIX: Snapshot requires a concrete String ID, unwrap from Option
+                    let target_id = id.ok_or_else(|| anyhow::anyhow!("Snapshot command requires an ID (--id)"))?;
+
+                    handlers_mpi::handle_mpi_snapshot_interactive(
+                        target_id,         // Pass as String
+                        Some(format),      // FIX: Wrap format String in Some() for Option<String>
+                        as_of,             // Already Option<String>
+                        mpi_handlers_state,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI snapshot failed: {}", e))
+                }
+
+                // --- NEW: Status / Dashboard Operation ---
+                // Provides observability into conflicts and record history
+                MPICommand::Status { 
+                    only_conflicts, 
+                    limit, 
+                    slice, 
+                    system 
+                } => {
+                    handlers_mpi::handle_mpi_status_interactive(
+                        only_conflicts,
+                        limit,             // Already Option<usize>
+                        Some(slice),       // FIX: Wrap slice String in Some() for Option<String>
+                        system,            // Already Option<String>
+                        mpi_handlers_state,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI status retrieval failed: {}", e))
+                }
                 // --- Patient Indexing Operation (UPDATED) ---
                 MPICommand::Index { 
                     name, 

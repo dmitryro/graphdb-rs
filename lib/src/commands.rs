@@ -1515,6 +1515,55 @@ pub enum MPICommand {
         #[arg(long)]
         phone: Option<String>,
     },
+    /// Industry-Standard Lineage: Visualizes the evolution and survivorship of a Golden Record.
+    /// Shows how various IDs merged, linked, and contributed to the current state.
+    /// Industry-Standard Lineage: Visualizes the evolution and survivorship of a Golden Record.
+    Lineage {
+        /// Filter by Golden ID, MRN, or External ID.
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        id_type: Option<String>,
+        /// Time window filtering for the evolution chain.
+        #[arg(long)]
+        from: Option<String>, 
+        #[arg(long)]
+        to: Option<String>,
+        /// Slice the evolution history.
+        #[arg(long)]
+        head: Option<usize>,
+        #[arg(long)]
+        tail: Option<usize>,
+        #[arg(long, default_value_t = 3)]
+        depth: u32,
+        #[arg(long)]
+        include_flags: bool,
+    },
+
+    /// MPI Snapshot: Fetch a complete point-in-time state of a record or the entire index.
+    Snapshot {
+        #[arg(long)]
+        id: Option<String>,
+        /// Export as 'json' or 'fhir' (Industry standard for patient data exchange).
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Optional: specific timestamp to see what the record looked like then.
+        #[arg(long)]
+        as_of: Option<String>,
+    },
+
+    /// Comprehensive Dashboard/Status
+    Status {
+        #[arg(long)]
+        only_conflicts: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// "top" (newest) or "bottom" (oldest).
+        #[arg(long, default_value = "top")]
+        slice: String,
+        #[arg(long)]
+        system: Option<String>,
+    },
 }
 
 // =========================================================================

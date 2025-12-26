@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use log::{info, error, warn};
+use whoami;
 use std::sync::Arc;
 // Removed: tokio::sync::Mutex as TokioMutex (no longer used in local storage init)
 use lib::commands::{ MPICommand, NameMatchAlgorithm };
@@ -26,6 +27,7 @@ use models::medical::{MasterPatientIndex, Patient, Address, ExternalId, IdType, 
 use medical_knowledge::mpi_identity_resolution::{MpiIdentityResolutionService, PatientCandidate};
 use models::errors::GraphError;
 use models::identifiers::Identifier;
+use models::evolution::*;
 use crate::cli::{ get_storage_engine_singleton };
 
 // Placeholder types needed for function signatures
@@ -118,7 +120,7 @@ pub async fn initialize_mpi_services(
 ) -> Result<(), anyhow::Error> {
     // We modify this function to use `MPI_HANDLERS_SINGLETON.get_or_try_init` 
     // to handle the full initialization chain if not already done.
-    
+    let requested_by = whoami::username();  
     // We first check if MPIHandlers are already initialized.
     if MPI_HANDLERS_SINGLETON.get().is_some() {
         println!("MPIHandlers already initialized. Skipping dependency setup.");
@@ -136,7 +138,7 @@ pub async fn initialize_mpi_services(
         .context("GraphService failed to initialize or could not be retrieved.")?;
 
     // 3. Use the retrieved Arc<GraphService> instance to initialize the MPI service.
-    MpiIdentityResolutionService::global_init(graph_service_instance)
+    MpiIdentityResolutionService::global_init(graph_service_instance, &requested_by)
         .await
         .map_err(|e| anyhow!("Failed to initialize MpiIdentityResolutionService: {}", e))?;
         
@@ -158,7 +160,7 @@ impl MPIHandlers {
     /// Used in CLI context where global services are NOT pre-initialized.
     pub async fn new() -> Result<Arc<Self>, GraphError> {
         println!("Initializing Master Patient Index (MPI) service...");
-
+        let requested_by = whoami::username(); 
         // Check singleton first (Idempotency)
         if let Some(handlers) = MPI_HANDLERS_SINGLETON.get() {
             println!("MPIHandlers retrieved from singleton.");
@@ -175,7 +177,7 @@ impl MPIHandlers {
 
         // 3. Initialize MPI service globally (requires the GraphService instance)
         let graph_service = GraphService::get().await?;
-        MpiIdentityResolutionService::global_init(graph_service).await
+        MpiIdentityResolutionService::global_init(graph_service, &requested_by).await
             .map_err(|e| GraphError::InternalError(format!("Failed to initialize MPI service: {}", e)))?;
         println!("MpiIdentityResolutionService initialized globally.");
 
@@ -190,7 +192,7 @@ impl MPIHandlers {
     /// Initialize using externally provided storage (for tests/scripts)
     pub async fn new_with_storage(storage: Arc<dyn GraphStorageEngine>) -> Result<Arc<Self>, GraphError> {
         println!("Initializing MPI service with injected storage...");
-
+        let requested_by = whoami::username(); 
         // Check singleton first (Idempotency)
         if let Some(handlers) = MPI_HANDLERS_SINGLETON.get() {
             println!("MPIHandlers retrieved from singleton.");
@@ -205,7 +207,7 @@ impl MPIHandlers {
 
         // Initialize MPI service globally (requires the GraphService instance)
         let graph_service = GraphService::get().await?;
-        MpiIdentityResolutionService::global_init(graph_service).await
+        MpiIdentityResolutionService::global_init(graph_service, &requested_by).await
             .map_err(|e| GraphError::InternalError(format!("Failed to initialize MPI service: {}", e)))?;
         println!("MpiIdentityResolutionService initialized globally.");
 
@@ -244,7 +246,59 @@ impl MPIHandlers {
                     gender,   
                 ).await
             }
+            // --- NEW: Status / Stewardship Dashboard Routing ---
+            MPICommand::Status { 
+                only_conflicts, 
+                limit, 
+                slice, 
+                system 
+            } => {
+                self.handle_status(only_conflicts, limit, Some(slice), system).await
+            }
 
+            // --- NEW: Lineage / Traceability Routing ---
+            MPICommand::Lineage { 
+                id, 
+                id_type, 
+                from, 
+                to, 
+                head, 
+                tail, 
+                depth, 
+                include_flags 
+            } => {
+                // Convert include_flags (bool) to Option<String> for the audit metadata
+                let flags_str = if include_flags { Some("FULL_TRACE".to_string()) } else { None };
+
+                self.handle_lineage(
+                    id, 
+                    id_type, 
+                    from, 
+                    to, 
+                    head, 
+                    tail, 
+                    Some(depth), // Wrap u32 in Option
+                    flags_str
+                ).await
+            }
+
+            // --- NEW: Point-in-Time Snapshot Routing ---
+            MPICommand::Snapshot { 
+                id, 
+                format, 
+                as_of 
+            } => {
+                // Ensure ID is present for snapshot reconstruction
+                let target_id = id.ok_or_else(|| {
+                    GraphError::InvalidRequest("Snapshot requires a specific ID (--id)".to_string())
+                })?;
+
+                self.handle_snapshot(
+                    target_id, 
+                    Some(format), // Wrap mandatory format String in Option
+                    as_of
+                ).await
+            }
             // --- Match Command Routing (Passing ALL arguments) ---
             MPICommand::Match {
                 name, dob, address, phone, name_algo,
@@ -365,10 +419,11 @@ impl MPIHandlers {
         system: Option<String>, 
         gender: Option<String>, 
     ) -> Result<(), GraphError> {
+        let requested_by = whoami::username(); 
         println!("=== MPI Patient Indexing ===");
         println!("Inserting or updating patient record (MRN: {})...\n", mrn);
         
-
+      
         // 1. Build the Patient struct from input (merging with existing if found)
         let new_patient = self.create_patient_from_index_input(
             existing_patient_opt, 
@@ -382,21 +437,35 @@ impl MPIHandlers {
             system, 
             gender, 
         )?;
-
         println!("Indexing Patient:");
         println!(" MRN: {}", new_patient.mrn.as_deref().unwrap_or("N/A"));
-        println!(" Name: {} {}", new_patient.first_name, new_patient.last_name);
+        
+        // Display name
+        let display_first = new_patient.first_name.as_deref().unwrap_or("N/A");
+        let display_last = new_patient.last_name.as_deref().unwrap_or("N/A");
+        println!(" Name: {} {}", display_first, display_last);
+        
         println!(" DOB: {}", new_patient.date_of_birth.format("%Y-%m-%d"));
         println!();
-
+        
         // 2. Call the core service method
-        let result = self.mpi_service.index_new_patient(new_patient).await;
-
+        let result = self.mpi_service.index_new_patient(new_patient, &requested_by).await;
         match result {
             Ok(indexed_record) => {
                 println!("✓ Indexing successful");
-                println!(" Assigned Patient ID: {}", indexed_record.id);
-                println!(" Linked Vertex ID: {}", indexed_record.user_id.map(|id| id.to_string()).unwrap_or_else(|| "N/A".to_string()));
+                
+                // Display patient ID (database ID)
+                let display_id = indexed_record.id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+                println!(" Assigned Patient ID: {}", display_id);
+                
+                // Display vertex ID in human-readable format
+                let vertex_display = indexed_record.vertex_id
+                    .map(|uuid| format!("Patient-{}", uuid.to_string().split('-').next().unwrap_or("unknown")))
+                    .unwrap_or_else(|| "N/A".to_string());
+                println!(" Linked Vertex ID: {}", vertex_display);
+                
                 println!("\nRecord indexed and matched/linked to the Golden Record.");
             }
             Err(e) => {
@@ -414,6 +483,7 @@ impl MPIHandlers {
         phone: Option<String>,
         name_algo: NameMatchAlgorithm,
     ) -> Result<(), anyhow::Error> {
+        let requested_by = whoami::username(); 
         info!("Executing MPI match via global singleton retrieval.");
 
         // Retrieve the MPIHandlers instance from the global singleton, initializing it
@@ -462,6 +532,7 @@ impl MPIHandlers {
         user_id: Option<String>, 
         reason: Option<String>, 
     ) -> Result<(), GraphError> {
+        let requested_by = whoami::username(); 
         println!("=== MPI Record Merge ===");
         println!("Consolidating duplicate patient records...\n");
         
@@ -504,6 +575,7 @@ impl MPIHandlers {
                 policy.clone(),
                 clean_user_id,
                 clean_reason,
+                &requested_by,
             )
             .await;
 
@@ -545,6 +617,7 @@ impl MPIHandlers {
         external_id: String,
         id_type: String, // Router passes non-Option String
     ) -> Result<(), GraphError> {
+        let requested_by = whoami::username(); 
         println!("=== MPI Identity Linking ===");
         println!("Linking external identifier to master record...\n");
         
@@ -570,14 +643,21 @@ impl MPIHandlers {
                 external_id.clone(), 
                 // FIX: Use the original id_type String, or id_type_enum.to_string(), 
                 // depending on what the service expects. Since the service expects String:
-                id_type.clone() 
+                id_type.clone(),
+                &requested_by.clone(),
             )
             .await;
         
         match result {
             Ok(record) => {
                 println!("✓ Link successful");
-                println!(" MPI Record ID: {}", record.id);
+                
+                // FIX: record.id is now Option<i32>, so we handle the Display mismatch 
+                // by using unwrap_or_default or mapping to string.
+                let display_id = record.id.to_string();
+                
+                println!(" MPI Record ID: {}", display_id);
+                
                 println!(" External ID: {} → Master ID: {}", external_id, master_mpi_id);
                 println!(" Identifier Type: {}", id_type);
                 println!("\nCross-reference established. Patient can now be found using this identifier.");
@@ -608,6 +688,7 @@ impl MPIHandlers {
         score: Option<f64>,
         action: Option<String>,
     ) -> Result<(), GraphError> {
+        let requested_by = whoami::username(); 
         println!("=== MPI Patient Matching ===");
 
         // --- Explicit MRN/Score Matching Logic ---
@@ -656,9 +737,16 @@ impl MPIHandlers {
                 phone.clone()
             )?;
 
+
             println!("Search Criteria:");
-            println!(" Name: {} {}", patient.first_name, patient.last_name);
             
+            // FIX: Use as_deref() to get Option<&str> and unwrap_or to provide a printable fallback
+            let first = patient.first_name.as_deref().unwrap_or("N/A");
+            let last = patient.last_name.as_deref().unwrap_or("N/A");
+            
+            println!(" Name: {} {}", first, last);
+
+
             if patient.date_of_birth.naive_utc().date().year() > 1900 {
                 println!(" DOB: {}", patient.date_of_birth.format("%Y-%m-%d"));
             } else {
@@ -689,7 +777,7 @@ impl MPIHandlers {
             // --- 3. Execute Match with Keys ---
             let candidates = self
                 .mpi_service
-                .run_probabilistic_match(&patient, search_keys) 
+                .run_probabilistic_match(&patient, search_keys, &requested_by) 
                 .await
                 .map_err(|e| GraphError::InternalError(e.to_string()))?;
 
@@ -709,6 +797,7 @@ impl MPIHandlers {
         mpi_id: String,
         timeframe: Option<String>,
     ) -> Result<(), GraphError> {
+        let requested_by = whoami::username(); 
         println!("=== MPI Audit Trail ===");
         println!("Retrieving identity change history...\n");
 
@@ -724,7 +813,7 @@ impl MPIHandlers {
         
         let changes = self
             .mpi_service
-            .get_audit_trail(patient_mpi_id, timeframe)
+            .get_audit_trail(patient_mpi_id, timeframe, &requested_by)
             .await
             .map_err(|e| GraphError::InternalError(e.to_string()))?;
         
@@ -752,6 +841,191 @@ impl MPIHandlers {
         Ok(())
     }
 
+    /// Status - Comprehensive dashboard of Golden Records, MRNs, and stewardship flags.
+    pub async fn handle_status(
+        &self,
+        only_conflicts: bool,
+        limit: Option<usize>,
+        slice: Option<String>,
+        system: Option<String>,
+    ) -> Result<(), GraphError> {
+        // 2025-12-20: Fetching username for audit trail
+        let requested_by = whoami::username(); 
+         
+        println!("=== MPI GLOBAL STEWARDSHIP DASHBOARD ===");
+        
+        // 1. Fetch data with corrected argument order (requested_by last)
+        let raw_data = self.mpi_service
+            .get_comprehensive_status_data(only_conflicts, limit, slice, system, &requested_by)
+            .await
+            .map_err(|e| GraphError::InternalError(format!("MPI Service Error: {}", e)))?;
+
+        // 2. FIX E0609: Deserialize Value into typed MpiStewardshipDashboard
+        let dashboard: MpiStewardshipDashboard = serde_json::from_value(raw_data)
+            .map_err(|e| GraphError::InternalError(format!("Dashboard mapping failed: {}", e)))?;
+
+        println!("Summary: {} Golden Records | {} Total Identities | {} Active Conflicts", 
+            dashboard.golden_count, dashboard.total_patient_count, dashboard.conflict_count);
+        println!("{:=<100}", "");
+
+        // 3. Render Records
+        for record in dashboard.records {
+            let conflict_flag = if record.has_unresolved_conflict { "🚩 [CONFLICT]" } else { "✅ [STABLE]" };
+            
+            println!("GOLDEN RECORD: {} {} {}", 
+                record.first_name, record.last_name, conflict_flag);
+            println!("  ├─ Primary MRN: {}", record.primary_mrn.as_deref().unwrap_or("NONE"));
+            println!("  ├─ Status:      {}", record.status);
+            
+            if !record.source_links.is_empty() {
+                println!("  ├─ Related Identities (Source Systems):");
+                for link in record.source_links {
+                    println!("  │    • System: {:<12} | Ext ID: {:<15} | Internal Name: {}", 
+                        link.system_name, link.external_id, link.local_alias);
+                }
+            }
+
+            // The Graph of Events Loop: Evolution of the record
+            if !record.recent_events.is_empty() {
+                println!("  └─ Evolution (Recent Graph Events):");
+                for event in record.recent_events {
+                    let type_icon = match event.event_type.as_str() {
+                        "MERGE"  => "🔗",
+                        "SPLIT"  => "✂️",
+                        "UPDATE" => "📝",
+                        _        => "🔹",
+                    };
+                    println!("      {} [{}] {:<8} - {}", 
+                        type_icon, 
+                        event.timestamp.format("%Y-%m-%d %H:%M"), 
+                        event.event_type, 
+                        event.description
+                    );
+                }
+            }
+            println!("{:-<100}", "");
+        }
+        Ok(())
+    }
+
+    /// Lineage - Deep audit trace of transactions, merges, and structural changes.
+    pub async fn handle_lineage(
+        &self,
+        id: String,
+        id_type: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        head: Option<usize>,
+        tail: Option<usize>,
+        depth: Option<u32>,
+        include_flags: Option<String>,
+    ) -> Result<(), GraphError> {
+        let requested_by = "whoami";
+
+        println!("=== MPI IDENTITY LINEAGE & TRANSACTION TRACE ===");
+        
+        // 1. Fetch raw Value
+        let raw_report = self.mpi_service
+            .get_lineage_data(id, id_type, from, to, head, tail, depth, requested_by)
+            .await
+            .map_err(|e| GraphError::InternalError(format!("Trace failed: {}", e)))?;
+
+        // 2. FIX E0609: Deserialize into our typed Trace structure
+        let report: LineageReportTrace = serde_json::from_value(raw_report)
+            .map_err(|e| GraphError::InternalError(format!("Lineage data mapping failed: {}", e)))?;
+
+        println!("Canonical Identity: {} {}", report.first_name, report.last_name);
+        println!("Trace Depth: {:<5} | Active Red Flags: {}", depth.unwrap_or(1), report.red_flag_count);
+        println!("{:=<100}", "");
+
+        // Comprehensive History Loop
+        for (i, entry) in report.history_chain.iter().enumerate() {
+            println!("#{:02} [{}] TRANSACTION: {}", 
+                i + 1, 
+                entry.timestamp.format("%Y-%m-%d %H:%M:%S"), 
+                entry.action_type
+            );
+            println!("    Actor:  {:<15} | Source: {}", entry.user_id, entry.source_system);
+            
+            if let Some(reason) = &entry.change_reason {
+                println!("    Reason: {}", reason);
+            }
+
+            // Display logical diffs instead of raw JSON
+            if !entry.mutations.is_empty() {
+                println!("    Changes:");
+                for mutation in &entry.mutations {
+                    println!("      Δ {}: '{}' ➔ '{}'", mutation.field, mutation.old_val, mutation.new_val);
+                }
+            }
+
+            // Highlight Structural Evolution (Merges/Splits)
+            if entry.is_structural {
+                println!("    ⚠️  STRUCTURAL EVOLUTION: Identity '{}' was {} into this record.", 
+                    entry.involved_identity_alias, 
+                    if entry.action_type == "MERGE" { "absorbed" } else { "extracted" }
+                );
+            }
+            println!("{:-<60}", "");
+        }
+        
+        Ok(())
+    }
+
+    /// Snapshot - Point-in-time state reconstruction using the Graph of Changes.
+    pub async fn handle_snapshot(
+        &self,
+        id: String,
+        format: Option<String>,
+        as_of: Option<String>,
+    ) -> Result<(), GraphError> {
+        let requested_by = "whoami";
+        
+        // Parse the temporal boundary
+        let target_time = as_of.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
+        // 1. Fetch raw JSON Value from service
+        let raw_snapshot = self.mpi_service
+            .get_snapshot_data(id.clone(), target_time, requested_by)
+            .await
+            .map_err(|e| GraphError::InternalError(format!("Service call failed: {}", e)))?;
+
+        // 2. FIX E0609: Convert Value to strongly typed MpiSnapshot
+        let snapshot: MpiSnapshot = serde_json::from_value(raw_snapshot)
+            .map_err(|e| GraphError::InternalError(format!("Data mapping failed: {}", e)))?;
+
+        // 3. Output logic using the typed struct
+        println!("=== MPI TEMPORAL SNAPSHOT ===");
+        println!("State as of: {}", target_time.to_rfc3339());
+        println!("{:=<100}", "");
+
+        println!("IDENTITY PROFILE:");
+        println!("  Name:      {} {}", snapshot.first_name, snapshot.last_name);
+        println!("  DOB:       {}", snapshot.dob.format("%Y-%m-%d"));
+        println!("  Gender:    {}", snapshot.gender.as_deref().unwrap_or("Unknown"));
+        
+        println!("\nACTIVE CROSS-REFERENCES AT THIS TIME:");
+        if snapshot.cross_refs.is_empty() {
+            println!("  (No active cross-references found for this timestamp)");
+        } else {
+            for xref in snapshot.cross_refs {
+                println!("  • [{:<10}] MRN: {:<15} (Status: {})", 
+                    xref.system, 
+                    xref.mrn, 
+                    xref.status
+                );
+            }
+        }
+
+        println!("\nAUDIT METADATA:");
+        println!("  Graph Version: {}", snapshot.version_id);
+        println!("  Last Modified before Snapshot: {}", snapshot.last_modified.format("%Y-%m-%d %H:%M"));
+        
+        Ok(())
+    }
+
     // =========================================================================
     // CORRECTED NON-STATIC IDENTITY RESOLUTION HANDLERS (Resolve/Fetch/Search)
     // The previous static logic is fully integrated here as non-static methods.
@@ -769,7 +1043,7 @@ impl MPIHandlers {
         // FIX: Add the new system parameter
         system: Option<String>,
     ) -> Result<(), GraphError> {
-        
+        let requested_by = whoami::username(); 
         // FIX 1: Correctly derive final_id by using .as_ref() and .cloned() on the Option<String> inputs.
         // This avoids moving the original variables (id, external_id, source_mrn).
         // The original variable names are reused in the closures for clarity, but they refer to the borrowed content.
@@ -825,7 +1099,7 @@ impl MPIHandlers {
         
         // FIX 4: Add .await to the asynchronous call (already present in the previous fix)
         let (resolved_id, patient_record) = self.mpi_service
-            .resolve_and_fetch_patient(external_id_struct, final_id_type)
+            .resolve_and_fetch_patient(external_id_struct, final_id_type, &requested_by)
             .await
             .context("Failed to resolve ID and fetch patient record.")
             .map_err(|e| GraphError::InternalError(e.to_string()))?;
@@ -837,9 +1111,16 @@ impl MPIHandlers {
         
         // Output Patient Data (Golden Record)
         println!("\n### GOLDEN RECORD DATA ###");
-        println!("Patient Name: {} {}", patient_record.first_name, patient_record.last_name);
-        println!("Date of Birth: {}", patient_record.date_of_birth.format("%Y-%m-%d").to_string());
-        
+
+        // FIX: Extract first_name and last_name safely from Option<String>
+        let first = patient_record.first_name.as_deref().unwrap_or("N/A");
+        let last = patient_record.last_name.as_deref().unwrap_or("N/A");
+
+        println!("Patient Name: {} {}", first, last);
+
+        // FIX: If date_of_birth is also an Option, handle it before calling .format()
+        println!("Date of Birth: {}", patient_record.date_of_birth.format("%Y-%m-%d"));
+
         // Use debug print for Address
         let address_str = patient_record.address.as_ref()
             .map(|a| format!("{:?}", a))
@@ -875,24 +1156,28 @@ impl MPIHandlers {
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_fetch_identity(
         &self,
-        id: Option<String>, external_id: Option<String>, id_type: Option<String>, source_mrn: Option<String>,
+        id: Option<String>, 
+        external_id: Option<String>, 
+        id_type: Option<String>, 
+        source_mrn: Option<String>,
         // Add the new system parameter to the handler, which was required in the previous fixes.
         system: Option<String>,
     ) -> Result<(), GraphError> {
-        
+        let requested_by = whoami::username(); 
         // FIX 1: Correctly derive the ID to be used for fetching (final_id)
         // We use the first available ID for the fetch operation.
         let final_id = id.as_ref()
             .or(external_id.as_ref())
             .or(source_mrn.as_ref())
             .cloned()
-            .context("At least one ID field (--id, --external-id, or --source-mrn) is required for fetch operation.")?;
+            .context("At least one ID field (--id, --external-id, or --source-mrn) is required for fetch operation.")
+            .map_err(|e| GraphError::InternalError(e.to_string()))?;
         
         // NOTE: The previous code was incorrectly trying to assign the result of consolidate_id (which returns ()) 
         // to final_id. The call is logically separate.
         
         // Conditional consolidation: If we have enough mandatory fields to link an ID, perform the consolidation.
-        if let (Some(ext_id), Some(src_mrn_val), Some(sys), Some(id_t)) = 
+        if let (Some(ext_id), Some(_src_mrn_val), Some(sys), Some(id_t)) = 
             (external_id.clone(), source_mrn.clone(), system.clone(), id_type.clone()) 
         {
             // The consolidate_id signature requires (String, String, String, String):
@@ -902,41 +1187,59 @@ impl MPIHandlers {
             // 4. system (the source system)
             
             // FIX 2: Call consolidate_id correctly with unwrapped values and .await
+            // Note: _src_mrn_val is prefixed with underscore to resolve unused variable warning 
+            // if it is not explicitly required by the consolidate_id signature.
             self.consolidate_id(
                 final_id.clone(),     // 1. raw_patient_id_str (Patient ID to link to)
                 ext_id,               // 2. external_id
-                id_t,                 // 3. id_type (Assuming id_type is used as the id_type argument)
+                id_t,                 // 3. id_type
                 sys,                  // 4. system
             ).await?;
         }
         
         info!("Fetching identity record for ID: {} (Type: {:?})", final_id, id_type);
 
-        let final_id_type: Option<IdType> = id_type.map(IdType::from);
-        let resolved_id_type = final_id_type.clone().unwrap_or_else(|| IdType::Other("UNKNOWN_ID_TYPE".to_string()));
-
-        // FIX 3: Initialize the ExternalId struct with the required `system` field.
-        let external_id_struct: ExternalId = ExternalId { 
-            id_type: resolved_id_type, 
-            id_value: final_id.clone(),
-            system: system, // Passed as Option<String>
+        // Branching Scenario Logic:
+        // We check if we have an explicit External ID + Type combo. 
+        // If not, we fall back to the generic fetch_identity which branches by format.
+        let mpi_result = if let (Some(ext_val), Some(t_val)) = (external_id, id_type.clone()) {
+            info!("[MPI] Routing to explicit external ID lookup: {} ({})", ext_val, t_val);
+            self.mpi_service.fetch_identity_by_external_id(ext_val, t_val, &requested_by).await
+        } else {
+            info!("[MPI] Routing to standard identifier resolution: {}", final_id);
+            // FIX 3: Added .clone() here to prevent moving final_id, 
+            // so it remains available for the println! at the end of the method.
+            self.mpi_service.fetch_identity(final_id.clone(), &requested_by).await
         };
-        
-        // No fix needed here, .await is already on the resolve_and_fetch_patient call below.
-        let (_, patient_record) = self.mpi_service
-            .resolve_and_fetch_patient(external_id_struct, final_id_type)
-            .await
-            .context("Failed to fetch patient record for provided ID.")
-            .map_err(|e| GraphError::InternalError(e.to_string()))?;
+
+        // Handle error and unwrap the MasterPatientIndex
+        let patient_record = mpi_result.map_err(|e| {
+            error!("[MPI ERROR] Identity resolution failed: {}", e);
+            GraphError::InternalError(format!("MPI fetch identity operation failed: {}", e))
+        })?;
         
         println!("---------------------------------------------------");
         println!("✅ FETCH IDENTITY SUCCESS");
+        // final_id is still available because we cloned it in the match arm above.
         println!("Retrieved Golden Record using ID: {}", final_id);
         println!("\n### GOLDEN RECORD DATA ###");
-        println!("Canonical ID: {}", patient_record.id);
-        println!("Full Name: {} {}", patient_record.first_name, patient_record.last_name);
-        println!("Date of Birth: {}", patient_record.date_of_birth.format("%Y-%m-%d"));
-        println!("Phone (Home): {}", patient_record.phone_home.as_deref().unwrap_or("N/A"));
+        
+        // patient_id is now Option, provide fallback for Display
+        println!("Canonical ID: {}", patient_record.patient_id.unwrap_or(-1));
+        
+        println!("Full Name: {} {}", 
+            patient_record.first_name.as_deref().unwrap_or(""), 
+            patient_record.last_name.as_deref().unwrap_or("")
+        );
+        
+        if let Some(dob) = patient_record.date_of_birth {
+            println!("Date of Birth: {}", dob.format("%Y-%m-%d"));
+        } else {
+            println!("Date of Birth: N/A");
+        }
+        
+        println!("Phone: {}", patient_record.contact_number.as_deref().unwrap_or("N/A"));
+        println!("SSN: {}", patient_record.social_security_number.as_deref().unwrap_or("N/A"));
         println!("---------------------------------------------------");
 
         Ok(())
@@ -956,7 +1259,7 @@ impl MPIHandlers {
     ) -> Result<(), GraphError> {
         info!("Starting MPI search with demographics: Name={:?}, DOB={:?}", name, dob);
         
-        
+        let requested_by = whoami::username(); 
         // Safety check
         let has_fields = name.is_some() || first_name.is_some() || last_name.is_some() || dob.is_some() || address.is_some() || phone.is_some();
         if !has_fields {
@@ -972,6 +1275,7 @@ impl MPIHandlers {
                 dob.clone(),
                 address.clone(),
                 phone.clone(),
+                &requested_by.clone(),
             )
             .await
             .context("Failed to execute patient demographic search.")
@@ -989,15 +1293,25 @@ impl MPIHandlers {
             for (index, patient) in search_results.iter().enumerate() {
                 println!("\n===================================================");
                 println!("[Result {} / {}]", index + 1, search_results.len());
-                let patient_id_str = patient.id.to_string();
+                
+                // FIX: patient.id is Option<i32>. We map it to a String or default to "0".
+                let patient_id_str = patient.id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                
                 println!("Canonical Patient ID: {}", patient_id_str);
                 println!("===================================================");
                 
                 // Output Patient Data (Golden Record)
                 println!("\n### GOLDEN RECORD DATA ###");
-                println!("Full Name: {} {}", patient.first_name, patient.last_name);
-                println!("Date of Birth: {}", patient.date_of_birth.format("%Y-%m-%d").to_string());
                 
+                // FIX: first_name and last_name are Option<String>. 
+                // We use as_deref().unwrap_or("N/A") to satisfy the Display requirement.
+                let first = patient.first_name.as_deref().unwrap_or("N/A");
+                let last = patient.last_name.as_deref().unwrap_or("N/A");
+                
+                println!("Full Name: {} {}", first, last);
+                println!("Date of Birth: {}", patient.date_of_birth.format("%Y-%m-%d").to_string());
                 // Use debug print for Address
                 let address_str = patient.address.as_ref()
                     .map(|a| format!("{:?}", a))
@@ -1040,7 +1354,7 @@ impl MPIHandlers {
         id_type: String, // E.g., "MRN"
         system: String,  // E.g., "Epic", "Cerner"
     ) -> Result<(), GraphError> {
-        
+        let requested_by = whoami::username(); 
         // FIX: Convert the raw string ID into the PatientId struct (assuming a ::from method exists)
         let patient_id = PatientId::from(raw_patient_id_str.clone());
 
@@ -1057,6 +1371,7 @@ impl MPIHandlers {
             external_id.clone(),
             id_type,
             system,
+            &requested_by,
         ).await;
 
         match result {
@@ -1130,15 +1445,15 @@ impl MPIHandlers {
         // Return minimal Patient for matching
         Ok(Patient {
             // Primary identifiers
-            id: rand::random(),
+            id: Some(rand::random()),
             user_id: None,
             mrn: None,
             ssn: None,
 
             // Demographics - critical for matching
-            first_name,
+            first_name: Some(first_name),
             middle_name,
-            last_name,
+            last_name: Some(last_name),
             suffix: None,
             preferred_name: None,
             date_of_birth,
@@ -1199,7 +1514,7 @@ impl MPIHandlers {
     /// This method merges input data with an existing patient record if one was found.
     pub fn create_patient_from_index_input(
         &self,
-        existing_patient_opt: Option<Patient>, // NEW: Accepts the pre-retrieved patient
+        existing_patient_opt: Option<Patient>,
         name: Option<String>,
         first_name: Option<String>,
         last_name: Option<String>,
@@ -1207,9 +1522,7 @@ impl MPIHandlers {
         mrn: String,
         address_str: Option<String>,
         phone: Option<String>,
-        // FIX 1: Add the missing 'system' argument (Argument #9)
-        system: Option<String>, // Variable is declared here, but usage removed below to fix E0609.
-        // FIX 2: Add the missing 'gender' argument (Argument #10)
+        system: Option<String>,
         gender: Option<String>,
     ) -> Result<Patient, GraphError> {
         use chrono::{NaiveDate, Utc};
@@ -1220,14 +1533,14 @@ impl MPIHandlers {
             (Some(f), Some(l), _) => (f, l),
 
             // Case 2: Names exist in the database record, use them (MRN-only call)
-            // Use existing patient data's names
-            (_, _, Some(p)) => (p.first_name.clone(), p.last_name.clone()),
+            (_, _, Some(p)) => (
+                p.first_name.clone().unwrap_or_else(|| "Unknown".to_string()),
+                p.last_name.clone().unwrap_or_else(|| "Unknown".to_string())
+            ),
 
             // Case 3: Names are missing and NO existing record found, try to parse from full 'name' field
-            (None, None, None) => {
-                let full_name = name.ok_or_else(|| GraphError::InvalidRequest(
-                    "Must provide (first_name and last_name) or a full name string when creating a NEW record.".into()
-                ))?;
+            (None, None, None) if name.is_some() => {
+                let full_name = name.unwrap();
                 let parts: Vec<&str> = full_name.split_whitespace().collect();
                 if parts.is_empty() {
                     return Err(GraphError::InvalidRequest("Name cannot be empty".into()));
@@ -1237,11 +1550,17 @@ impl MPIHandlers {
                 (first, last)
             }
             
-            // Case 4: Handle partial inputs if no existing record is found.
+            // Case 4: No names provided and no existing record - use placeholder values
+            // This allows MRN-only indexing for new records
+            (None, None, None) => {
+                ("Unknown".to_string(), "Unknown".to_string())
+            }
+            
+            // Case 5: Partial input (only first or only last name) without existing record
             _ => {
-                 return Err(GraphError::InvalidRequest(
-                     "Must provide both first_name and last_name, or rely on an existing record for MRN.".into()
-                 ));
+                return Err(GraphError::InvalidRequest(
+                    "Must provide both first_name and last_name, or rely on an existing record for MRN.".into()
+                ));
             }
         };
 
@@ -1250,16 +1569,15 @@ impl MPIHandlers {
         // Start with existing patient data or a default patient struct
         let mut patient_to_index = existing_patient_opt.unwrap_or_else(Patient::default);
 
-        // 2. Parse Date of Birth (use new DOB if supplied, otherwise use existing, fallback to sentinel)
+        // Parse Date of Birth (use new DOB if supplied, otherwise use existing, fallback to sentinel)
         let date_of_birth = dob
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
             .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc())
-            .unwrap_or(patient_to_index.date_of_birth); // Use current/default DOB
+            .unwrap_or(patient_to_index.date_of_birth);
 
         
-        // 3. Create Address struct (or use existing address, merging data)
+        // Create Address struct (or use existing address, merging data)
         let address_tuple = address_str.map(|address_line1| {
-            // Creates a new Address struct using provided data and placeholders
             Address::new(
                 address_line1,
                 None,
@@ -1268,14 +1586,14 @@ impl MPIHandlers {
                 "00000".to_string(),
                 "US".to_string(),
             )
-        }).or_else(|| patient_to_index.address.clone()); // Use existing address if no new one provided
+        }).or_else(|| patient_to_index.address.clone());
 
         let now = Utc::now();
         
         // Apply resolved/new values
         patient_to_index.mrn = Some(mrn);
-        patient_to_index.first_name = final_first_name;
-        patient_to_index.last_name = final_last_name;
+        patient_to_index.first_name = Some(final_first_name);
+        patient_to_index.last_name = Some(final_last_name);
         patient_to_index.date_of_birth = date_of_birth;
         patient_to_index.address = address_tuple;
         patient_to_index.address_id = patient_to_index.address.as_ref().map(|a| a.id);
@@ -1283,20 +1601,17 @@ impl MPIHandlers {
         // Prioritize new phone, otherwise keep existing
         patient_to_index.phone_mobile = phone.or(patient_to_index.phone_mobile);
         
-        // FIX 3: Apply new/existing gender value
+        // Apply new/existing gender value
         patient_to_index.gender = gender.or(patient_to_index.gender);
         
-        // FIX 4: REMOVED. The field `source_system` does not exist in the Patient struct.
-        // patient_to_index.source_system = system.or(patient_to_index.source_system); 
-        // If you intended to use one of the existing fields for 'system', use that here.
-        // For now, the 'system' value is unused but required in the signature.
-        let _ = system; // Silence "unused variable" warning for `system`
+        // Silence unused variable warning for 'system'
+        let _ = system;
         
         patient_to_index.updated_at = now;
         
         // Only assign new IDs and created_at if it's genuinely a new record
-        if patient_to_index.created_at.timestamp() == 0 { // Check if it's the default created_at value
-            patient_to_index.id = rand::random();
+        if patient_to_index.created_at.timestamp() == 0 {
+            patient_to_index.id = Some(rand::random());
             patient_to_index.created_at = now;
         }
         
@@ -1403,6 +1718,7 @@ impl MPIHandlers {
         // FIX 1: Add the missing split_patient_id argument
         split_patient_id: i32,
     ) -> Result<(), GraphError> {
+        let requested_by = whoami::username(); 
         // ... (handle_split implementation remains the same) ...
         println!("=== MPI Identity Split (Unmerge) ===");
         println!("Reversing a previous merge operation...\n");
@@ -1410,7 +1726,7 @@ impl MPIHandlers {
         let target_mpi_id = merged_id;
         
         println!("Merged Record to Split: {}", target_mpi_id);
-        println!("New Patient Data ID: {}", new_patient_data.id);
+        println!("New Patient Data ID: {:?}", Some(new_patient_data.id));
         println!("Reason for Split: {}", reason);
         // Display the new required ID
         println!("Internal ID being split out: {}", split_patient_id); 
@@ -1431,6 +1747,7 @@ impl MPIHandlers {
                 reason,
                 // FIX 2: Pass the new required argument
                 split_patient_id, 
+                &requested_by,
             )
             .await;
 
@@ -1469,11 +1786,19 @@ impl MPIHandlers {
         match result {
             Ok(golden_patient) => {
                 println!("✓ Golden Record successfully retrieved.");
-                println!(" Full Name: {} {}", golden_patient.first_name, golden_patient.last_name);
+                
+                // FIX: first_name and last_name are Option<String>. 
+                // We use as_deref().unwrap_or("N/A") to satisfy the Display requirement.
+                let first = golden_patient.first_name.as_deref().unwrap_or("N/A");
+                let last = golden_patient.last_name.as_deref().unwrap_or("N/A");
+                
+                println!(" Full Name: {} {}", first, last);
                 println!(" Date of Birth: {}", golden_patient.date_of_birth.format("%Y-%m-%d"));
                 println!(" MRN: {}", golden_patient.mrn.as_deref().unwrap_or("N/A"));
                 
                 // Further logic to print address, phone, etc., would go here.
+                // Note: address and phone likely also need .as_deref().unwrap_or("N/A") 
+                // if they are also Option types.
                 
                 Ok(())
             }
@@ -1549,6 +1874,54 @@ impl MPIHandlers {
 // =========================================================================
 // INTERACTIVE MODE HANDLERS (Delegating to MPIHandlers INSTANCE methods)
 // =========================================================================
+
+pub async fn handle_mpi_lineage_interactive(
+    id: String,
+    id_type: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    depth: Option<u32>,
+    include_flags: Option<String>,
+    mpi_handlers_state: MpiHandlersStateRef,
+) -> Result<()> {
+    let handlers_lock = mpi_handlers_state.lock().await;
+    let handlers = handlers_lock.as_ref()
+        .context("MPIHandlers not initialized in state mutex.")?;
+
+    handlers.handle_lineage(id, id_type, from, to, head, tail, depth, include_flags).await
+        .map_err(|e| anyhow!("MPI lineage operation failed: {}", e))
+}
+
+pub async fn handle_mpi_snapshot_interactive(
+    id: String,
+    format: Option<String>,
+    as_of: Option<String>,
+    mpi_handlers_state: MpiHandlersStateRef,
+) -> Result<()> {
+    let handlers_lock = mpi_handlers_state.lock().await;
+    let handlers = handlers_lock.as_ref()
+        .context("MPIHandlers not initialized in state mutex.")?;
+
+    handlers.handle_snapshot(id, format, as_of).await
+        .map_err(|e| anyhow!("MPI snapshot operation failed: {}", e))
+}
+
+pub async fn handle_mpi_status_interactive(
+    only_conflicts: bool,
+    limit: Option<usize>,
+    slice: Option<String>,
+    system: Option<String>,
+    mpi_handlers_state: MpiHandlersStateRef,
+) -> Result<()> {
+    let handlers_lock = mpi_handlers_state.lock().await;
+    let handlers = handlers_lock.as_ref()
+        .context("MPIHandlers not initialized in state mutex.")?;
+
+    handlers.handle_status(only_conflicts, limit, slice, system).await
+        .map_err(|e| anyhow!("MPI status operation failed: {}", e))
+}
 
 /// Delegates the interactive MPI Index command to the internal handler (UPDATED).
 #[allow(clippy::too_many_arguments)]
@@ -1852,6 +2225,45 @@ pub async fn handle_get_golden_record_interactive(
 // =========================================================================
 // EXTERNAL CLI HANDLERS (Calling non-static methods via the instance)
 // =========================================================================
+
+pub async fn handle_mpi_lineage(
+    storage: Arc<dyn GraphStorageEngine>,
+    id: String,
+    id_type: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    depth: Option<u32>,
+    include_flags: Option<String>,
+) -> Result<()> {
+    let handlers = get_or_init_handlers_from_singleton(storage).await?;
+    handlers.handle_lineage(id, id_type, from, to, head, tail, depth, include_flags).await
+        .map_err(|e| anyhow!("Lineage operation failed: {}", e))
+}
+
+pub async fn handle_mpi_snapshot(
+    storage: Arc<dyn GraphStorageEngine>,
+    id: String,
+    format: Option<String>,
+    as_of: Option<String>,
+) -> Result<()> {
+    let handlers = get_or_init_handlers_from_singleton(storage).await?;
+    handlers.handle_snapshot(id, format, as_of).await
+        .map_err(|e| anyhow!("Snapshot operation failed: {}", e))
+}
+
+pub async fn handle_mpi_status(
+    storage: Arc<dyn GraphStorageEngine>,
+    only_conflicts: bool,
+    limit: Option<usize>,
+    slice: Option<String>,
+    system: Option<String>,
+) -> Result<()> {
+    let handlers = get_or_init_handlers_from_singleton(storage).await?;
+    handlers.handle_status(only_conflicts, limit, slice, system).await
+        .map_err(|e| anyhow!("Status operation failed: {}", e))
+}
 
 /// Handles the 'mpi index' command from the non-interactive CLI (UPDATED).
 #[allow(clippy::too_many_arguments)]
