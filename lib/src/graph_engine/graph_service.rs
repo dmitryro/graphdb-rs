@@ -20,6 +20,7 @@ use crate::graph_engine::medical::*;
 use crate::storage_engine::{ GraphStorageEngine, StorageEngine, GraphOp }; // Ensure this trait is in scope
 use crate::graph_engine::parse_patient::{ parse_patient_from_cypher_result };
 use crate::query_parser::query_types::*;
+use crate::query_parser::cypher_parser::{ evaluate_expression, parse_expression };
 use crate::config::{ QueryResult };
 
 /// Defines the event types for all graph mutations.
@@ -636,27 +637,40 @@ impl GraphService {
     // NEW: Handles the logic for a standalone SET clause in chained queries.
     /// Finds the variable in the current context (implied by the overall query plan)
     /// and updates its properties in storage and memory.
-    pub async fn apply_set_assignments(&self, assignments: Vec<(String, String, Value)>) -> Result<(), GraphError> {
-        // NOTE: This simple implementation requires that the 'assignment variable' (e.g., 'n' in n.prop=val)
-        // is actually an existing node ID in the first String of the tuple, or that a 
-        // preceding MATCH bound that variable to a known ID, which is tracked transactionally.
-        // Since we lack transactional context here, we treat the first string as a Uuid string 
-        // for a simple implementation. If it's a variable name, this must be handled by the 
-        // QueryExecEngine logic that calls this function.
-        
-        for (variable, prop_key, prop_value) in assignments {
+    pub async fn apply_set_assignments(
+        &self, 
+        assignments: Vec<(String, String, Expression)>
+    ) -> Result<(), GraphError> {
+        for (variable, prop_key, expression) in assignments {
+            // 1. Parse the variable as a UUID
             let id = Uuid::from_str(&variable)
                 .map_err(|_| GraphError::ValidationError(
-                    format!("SET variable '{}' is not a valid node ID. Complex SET requires transactional context.", variable)
+                    format!("SET variable '{}' is not a valid node ID.", variable)
                 ))?;
             
-            let prop_value = to_property_value(prop_value)
-                .map_err(|e| GraphError::ValidationError(format!("Invalid property value for SET: {}", e)))?;
+            // 2. Fetch the vertex
+            let vertex = self.get_vertex(&id).await.ok_or_else(|| {
+                GraphError::NotFound(unsafe { Identifier::new_unchecked(variable.clone()) })
+            })?;
+
+            // 3. Create evaluation context from the current vertex state
+            // FIX: Pass the variable name as the first argument as required by the definition 
+            // in query_types.rs (line 668).
+            let ctx = EvaluationContext::from_vertex(&variable, &vertex);
+
+            // 4. Evaluate the Expression into a CypherValue
+            // Note: Using the evaluate method directly on the expression.
+            let evaluated_val = expression.evaluate(&ctx)?;
+
+            // 5. Convert evaluated CypherValue to the storage PropertyValue
+            // Using the From implementation defined in query_types.rs.
+            let prop_value = PropertyValue::from(evaluated_val);
             
             let mut props_to_update = HashMap::new();
             props_to_update.insert(prop_key, prop_value);
 
-            // Use the existing partial update logic
+            // 6. Apply update and ensure it is logged to the graph of changes/events
+            // for tracing patient golden records.
             self.update_vertex_properties(id, props_to_update).await?;
         }
         
@@ -750,6 +764,84 @@ impl GraphService {
         Ok(())
     }
 
+    /// Finds a patient vertex by internal numeric ID property using a Cypher query.
+    /// This returns the raw Vertex structure, not the Patient model.
+    /// 
+    /// Note: This is different from get_patient_by_id which returns a Patient model
+    /// and queries for GoldenRecord labels.
+    pub async fn get_patient_vertex_by_internal_id(&self, patient_id: i32) -> Result<Option<Vertex>, GraphError> {
+        // Construct the Cypher query (no label filtering, just id property match)
+        // Note: Using the Integer format directly in the query string as our Sled engine
+        // treats numeric values without quotes as integers.
+        let query = format!("MATCH (p:Patient {{id: {}}}) RETURN p", patient_id);
+        
+        info!("[GraphService] Executing internal ID vertex lookup: {}", query);
+
+        // Execute the read query
+        let results_vec = self.execute_cypher_read(&query, json!({})).await?;
+        
+        // --- Robust Parsing of Nested Cypher Result ---
+
+        // 1. Extract the top-level response object
+        let cypher_json_value = results_vec.into_iter().next()
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher execution returned an empty top-level array.".into()
+            ))?;
+        
+        // 2. Access the 'results' array
+        let results_array = cypher_json_value.as_object()
+            .and_then(|obj| obj.get("results"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher response missing top-level 'results' array.".into()
+            ))?;
+        
+        // 3. Access the first result block
+        let first_result_block = results_array.get(0)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher 'results' array was empty.".into()
+            ))?;
+        
+        // 4. Extract the 'vertices' array
+        let vertices = first_result_block.as_object()
+            .and_then(|obj| obj.get("vertices"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Cypher result block missing 'vertices' array.".into()
+            ))?;
+        
+        // 5. Handle empty match gracefully
+        if vertices.is_empty() {
+            info!("[GraphService] No vertex found with internal ID: {}", patient_id);
+            return Ok(None);
+        }
+        
+        // 6. Alert on multiple matches (internal IDs should be unique)
+        if vertices.len() > 1 {
+            warn!("Patient internal ID {} lookup returned {} vertices. Returning the first one.", patient_id, vertices.len());
+        }
+        
+        // 7. Extract the vertex JSON node
+        let vertex_json_value = vertices.get(0)
+            .ok_or_else(|| GraphError::DeserializationError(
+                "Vertices array was unexpectedly empty.".into()
+            ))?;
+        
+        // 8. Deserialize into the Rust Vertex model
+        match serde_json::from_value::<Vertex>(vertex_json_value.clone()) {
+            Ok(vertex) => {
+                info!("[GraphService] Successfully retrieved vertex {} for internal ID {}", vertex.id.0, patient_id);
+                Ok(Some(vertex))
+            },
+            Err(e) => {
+                error!("Failed to deserialize JSON to Vertex for ID {}: {}", patient_id, e);
+                Err(GraphError::DeserializationError(
+                    format!("Failed to parse vertex JSON: {}", e)
+                ))
+            }
+        }
+    }
+    
     /// **Retrieves the complete Patient Golden Record by its canonical ID.**
     ///
     /// NOTE: We must ensure this returns the entire node properties for the parser,
@@ -789,71 +881,112 @@ impl GraphService {
         &self,
         criteria: HashMap<String, String>,
     ) -> Result<Vec<Patient>> {
-        if criteria.is_empty() {
-            return Ok(Vec::new()); // No criteria, no search.
-        }
-
-        // --- 1. Query Construction (Reintroducing GoldenRecord and logic) ---
-        let mut where_clauses = Vec::new();
-        
-        // 
+        let mut strict_clauses = Vec::new();
+        let mut with_exprs = Vec::new();
+        let mut where_fuzzy = String::new();
+        let mut order_by = String::new();
+        let mut has_fuzzy = false;
         
         for (key, value) in criteria.iter() {
-            // Sanitize input to prevent Cypher injection attacks
-            let sanitized_value = sanitize_cypher_string(value);
-            
-            // Construct a WHERE clause for each field.
-            let clause = match key.as_str() {
-                // Fuzzy/Substring search for common fields
-                "name" | "first_name" | "last_name" | "address" | "phone" => {
-                    // Using CONTAINS for simple substring search on string fields
-                    format!("p.{key} CONTAINS '{sanitized_value}'")
+            let sanitized = sanitize_cypher_string(value);
+            match key.as_str() {
+                "date_of_birth" | "dob" => {
+                    let date_part = sanitized.split('T').next().unwrap_or(&sanitized);
+                    strict_clauses.push(format!("p.date_of_birth STARTS WITH '{}'", date_part));
                 }
-                // Exact match fields
-                "dob" | "gender" | "patient_status" => {
-                    format!("p.{key} = '{sanitized_value}'")
+                "gender" => {
+                    strict_clauses.push(format!("p.gender = '{}'", sanitized));
                 }
-                _ => {
-                    // Ignore unrecognized keys
-                    continue;
+                "phone" => {
+                    strict_clauses.push(format!("p.phone = '{}'", sanitized));
                 }
-            };
-            where_clauses.push(clause);
-        }
-
-        // Combine clauses with AND
-        let where_clause_str = where_clauses.join(" AND ");
-
-        // Ensure the Cypher query only returns Golden Records.
-        let cypher_query = format!(
-            "MATCH (p:Patient:GoldenRecord) WHERE {where_clause_str} RETURN p" // Return the node 'p'
-        );
-
-        // --- 2. Query Execution ---
-        println!("===> Executing demographic search query: {}", cypher_query);
-
-        // Execute the read query using the existing execution method.
-        let raw_results_vec_of_value = self.execute_cypher_read(&cypher_query, Value::Null).await
-            .map_err(|e| anyhow::anyhow!("Graph search query failed: {}", e))?;
-        
-        // Extract the actual result set (which is the first/only element of the returned vector)
-        let raw_result_set = raw_results_vec_of_value.into_iter().next()
-            .context("QueryExecEngine returned empty result vector.")?;
-
-        // --- 3. Result Parsing ---
-        // The raw_result_set (Value) should contain an array of patient nodes/maps.
-        let results_array = raw_result_set.as_array()
-            .context("Expected Cypher result to be an array for patient parsing.")?;
-
-        let mut patients = Vec::new();
-        for result_item in results_array {
-            // result_item is the 'p' node map returned by the Cypher query
-            match parse_patient_from_cypher_result(result_item.clone()) {
-                Ok(patient) => patients.push(patient),
-                Err(e) => log::warn!("Failed to parse patient from Cypher result: {}", e),
+                "first_name" | "last_name" | "name" => {
+                    has_fuzzy = true;
+                    // Title case: First letter capital, rest lower
+                    let title_case = if sanitized.is_empty() {
+                        sanitized
+                    } else {
+                        let mut chars = sanitized.chars();
+                        let first = chars.next().unwrap().to_uppercase().to_string();
+                        let rest = chars.as_str().to_lowercase();
+                        first + &rest
+                    };
+                    
+                    if key == "first_name" {
+                        with_exprs.push(format!("levenshtein(p.first_name, '{}') AS dist", title_case));
+                    } else if key == "last_name" {
+                        with_exprs.push(format!("levenshtein(p.last_name, '{}') AS dist", title_case));
+                    } else if key == "name" {
+                        // For "name", assume it's full name — split or use as-is for both
+                        with_exprs.push(format!(
+                            "(levenshtein(p.first_name, '{}') + levenshtein(p.last_name, '{}')) / 2.0 AS dist",
+                            title_case, title_case
+                        ));
+                    }
+                    where_fuzzy = "dist < 3".to_string();
+                    order_by = "dist ASC".to_string();
+                }
+                _ => continue,
             }
         }
-
+        
+        let mut cypher_query = "MATCH (p:Patient)".to_string();
+        
+        if !strict_clauses.is_empty() {
+            cypher_query.push_str(" WHERE ");
+            cypher_query.push_str(&strict_clauses.join(" AND "));
+        }
+        
+        if has_fuzzy {
+            cypher_query.push_str(" WITH p");
+            if !with_exprs.is_empty() {
+                cypher_query.push_str(", ");
+                cypher_query.push_str(&with_exprs.join(", "));
+            }
+            if !where_fuzzy.is_empty() {
+                cypher_query.push_str(" WHERE ");
+                cypher_query.push_str(&where_fuzzy);
+            }
+            cypher_query.push_str(&format!(" RETURN p ORDER BY {} LIMIT 10", order_by));
+        } else {
+            cypher_query.push_str(" RETURN p LIMIT 10");
+        }
+        
+        println!("===> Executing Demographic Search: {}", cypher_query);
+        
+        let raw_results = self
+            .execute_cypher_read(&cypher_query, serde_json::Value::Null)
+            .await?;
+        
+        println!("===> Raw results count: {}", raw_results.len());
+        
+        let mut patients = Vec::new();
+        
+        // raw_results is already Vec<Value>, iterate directly
+        for result_item in raw_results {
+            println!("===> Processing result item: {}", serde_json::to_string_pretty(&result_item).unwrap_or_default());
+            
+            // Each result_item should have a "vertices" field
+            if let Some(vertices) = result_item.get("vertices").and_then(|v| v.as_array()) {
+                for vertex in vertices {
+                    println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
+                    
+                    match parse_patient_from_cypher_result(vertex.clone()) {
+                        Ok(patient) => {
+                            println!("===> Successfully parsed patient: {:?}", patient);
+                            patients.push(patient);
+                        }
+                        Err(e) => {
+                            println!("===> Failed to parse patient: {}", e);
+                            // Continue with next vertex instead of failing entire search
+                        }
+                    }
+                }
+            }
+        }
+        
+        println!("===> Total Patients Found: {}", patients.len());
+        
         Ok(patients)
     }
 
@@ -871,6 +1004,279 @@ impl GraphService {
                 .join(", ");
             Some(s)
         }
+    }
+
+    /// PERSISTENCE: Records an MPI Transaction into the 'Graph of Changes'.
+    /// FIX: Splits path into two MERGE statements to bypass parser/visibility limits.
+    pub async fn log_mpi_transaction(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        action: &str,
+        reason: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let event_id = Uuid::new_v4().to_string();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+
+        // QUERY 1: Assert Source and Event in a single path
+        let q1 = format!(
+            "MERGE (s:Patient {{id: '{source_id}'}})-[:PARTICIPATED_IN]->(e:IdentityEvent {{
+                id: '{event_id}', 
+                action: '{action}', 
+                reason: '{reason}', 
+                user_id: '{user_id}', 
+                timestamp: '{timestamp}'
+            }})"
+        );
+        self.execute_cypher_write(&q1, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Structural log Step 1 failed: {}", e))?;
+
+        // QUERY 2: Assert Link from Event to Golden Record
+        let q2 = format!(
+            "MERGE (e:IdentityEvent {{id: '{event_id}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
+        );
+        self.execute_cypher_write(&q2, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Structural log Step 2 failed: {}", e))?;
+
+        Ok(())
+    }
+
+    /// PERSISTENCE: Records detailed metadata into the 'Graph of Events'.
+    /// FIX: Returns Result<(), anyhow::Error> and uses path-merging.
+    pub async fn persist_mpi_change_event(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        event_type: &str,
+        metadata: serde_json::Value,
+    ) -> Result<Uuid> {
+        let event_uuid = Uuid::new_v4();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let metadata_str = metadata.to_string();
+
+        // STEP 1: Link Source -> Event (Path MERGE)
+        // We interpolate the UUID as a string into the Cypher template
+        let q1 = format!(
+            "MERGE (p:Patient {{id: '{source_id}'}})-[:PARTICIPATED_IN]->(e:IdentityEvent {{
+                id: '{event_uuid}', 
+                event_type: '{event_type}', 
+                metadata: '{metadata_str}', 
+                timestamp: '{timestamp}'
+            }})"
+        );
+        self.execute_cypher_write(&q1, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Metadata log failed at source: {}", e))?;
+
+        // STEP 2: Link Event -> Target (Path MERGE)
+        let q2 = format!(
+            "MERGE (e:IdentityEvent {{id: '{event_uuid}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
+        );
+        self.execute_cypher_write(&q2, serde_json::json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("Metadata log failed at target: {}", e))?;
+
+        Ok(event_uuid)
+    }
+
+    /// 2025-12-20 Compliance: Retrieves all historical events for a specific identity.
+    /// Traverses edges from the target vertex to find all related IdentityEvent nodes.
+    pub async fn get_transactional_history(&self, patient_uuid: Uuid) -> Result<Vec<Vertex>, GraphError> {
+        // We use a Cypher query to find all events where this patient participated or was a result.
+        // Sorting by timestamp ensures the 'steps' in the LineageReport are chronological.
+        let query = format!(
+            "MATCH (p {{id: '{}'}})-[:PARTICIPATED_IN|RESULTED_IN]-(event:IdentityEvent) 
+             RETURN event 
+             ORDER BY event.timestamp ASC",
+            patient_uuid
+        );
+
+        // Execute the read query
+        let results = self.execute_cypher_read(&query, Value::Null).await?;
+
+        // Map the Cypher result rows back into Vertex objects
+        let mut history = Vec::new();
+        for row in results {
+            // Assuming your GraphEngine provides a way to convert a Cypher row/Value back to a Vertex
+            if let Ok(vertex) = self.map_value_to_vertex(row) {
+                history.push(vertex);
+            }
+        }
+
+        Ok(history)
+    }
+
+    /// Helper to convert raw database values into the Vertex model
+    pub fn map_value_to_vertex(&self, value: Value) -> Result<Vertex, GraphError> {
+        // This logic depends on your specific database driver's Value type.
+        // Usually, you deserialize the properties map into the Vertex struct.
+        serde_json::from_value(json!(value))
+            .map_err(|e| GraphError::DeserializationError(e.to_string()))
+    }
+
+    /// PERSISTENCE: Scans a record for Red Flags (Identity Conflicts).
+    /// This is called during indexing and merging.
+    pub async fn detect_and_persist_red_flags(&self, patient_id: Uuid) -> Result<Vec<String>> {
+        let mut flags = Vec::new();
+        
+        // FIX: .await returns Option<Vertex>.
+        // 1. Use .ok_or_else to convert Option -> Result<Vertex, anyhow::Error>
+        // 2. Then use '?' to unwrap the Result.
+        let vertex = self.get_vertex(&patient_id)
+            .await
+            .ok_or_else(|| anyhow!("Patient record {} not found in graph", patient_id))?;
+
+        // Red Flag 1: SSN Reuse
+        if let Some(ssn) = vertex.properties.get("ssn") {
+            let ssn_val = ssn.as_str().unwrap_or("");
+            
+            if !ssn_val.is_empty() {
+                let query = format!(
+                    "MATCH (other:Patient) WHERE other.ssn = '{}' AND other.id <> '{}' RETURN other", 
+                    ssn_val, patient_id
+                );
+                
+                // execute_cypher_read likely returns a Result; we map its error to anyhow
+                let results = self.execute_cypher_read(&query, Value::Null).await
+                    .map_err(|e| anyhow!("Conflict query failed: {}", e))?;
+                    
+                if !results.is_empty() {
+                    flags.push(format!("CONFLICT: SSN shared with {} other records", results.len()));
+                }
+            }
+        }
+
+        if !flags.is_empty() {
+            let mut updates = HashMap::new();
+            updates.insert("red_flags".to_string(), to_property_value(json!(flags))?);
+            updates.insert("has_conflict".to_string(), to_property_value(json!(true))?);
+            updates.insert("stewardship_status".to_string(), to_property_value(json!("REQUIRES_REVIEW"))?);
+            
+            // update_vertex_properties returns a Result; map it to anyhow
+            self.update_vertex_properties(patient_id, updates).await
+                .map_err(|e| anyhow!("Failed to persist red flags to vertex {}: {}", patient_id, e))?;
+            
+            // 2025-12-20: Log to Graph of Events for full traceability
+            let _ = self.persist_mpi_change_event(
+                patient_id, 
+                Uuid::nil(), 
+                "CONFLICT_DETECTED", 
+                json!({
+                    "detected_flags": flags,
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+            ).await;
+        }
+
+        Ok(flags)
+    }
+
+    /// PERSISTENCE: Retrieves the "Stewardship Dashboard" data.
+    pub async fn fetch_stewardship_report(&self, limit: usize) -> Result<Vec<Value>> {
+        let query = format!(
+            "MATCH (g:GoldenRecord)
+             OPTIONAL MATCH (g)<-[:MERGED_INTO*]-(p:Patient)
+             RETURN g.canonical_mrn as id,
+                    count(p) as link_density,
+                    g.red_flags as active_flags,
+                    g.updated_at as last_event
+             ORDER BY link_density DESC LIMIT {}",
+            limit
+        );
+        // FIX: Map GraphError to anyhow::Error using .map_err
+        self.execute_cypher_read(&query, Value::Null).await
+            .map_err(|e| anyhow!("Failed to fetch stewardship report: {}", e))
+    }
+
+
+    /// PERSISTENCE: Conflict Detection (Red Flagging)
+    /// Scans for shared identifiers across different logical identities.
+     pub async fn run_conflict_detection(&self, patient_id: Uuid) -> Result<Vec<String>> {
+        let mut flags = Vec::new();
+        
+        // FIX: Convert Option to Result using .ok_or_else() so we can use the '?' operator.
+        // This provides a clear error message if the patient is missing from the graph.
+        let p = self.get_vertex(&patient_id)
+            .await
+            .ok_or_else(|| anyhow!("Conflict detection failed: Patient {} not found", patient_id))?;
+
+        // 1. Check for SSN Collision (Industry Standard Red Flag)
+        if let Some(ssn) = p.properties.get("ssn") {
+            let ssn_str = ssn.as_str().unwrap_or("");
+            if !ssn_str.is_empty() {
+                let query = format!(
+                    "MATCH (other:Patient) WHERE other.ssn = '{}' AND other.id <> '{}' RETURN other.id", 
+                    ssn_str, patient_id
+                );
+                
+                // Map GraphError to anyhow::Error
+                let collisions = self.execute_cypher_read(&query, Value::Null)
+                    .await
+                    .map_err(|e| anyhow!("SSN collision query failed: {}", e))?;
+                    
+                if !collisions.is_empty() {
+                    flags.push(format!("COLLISION: SSN shared with {} other records", collisions.len()));
+                }
+            }
+        }
+
+        // 2. Check for Name/DOB divergence (Levenshtein check)
+        // [Placeholder for your primary demographics comparison logic]
+
+        if !flags.is_empty() {
+            // Persist the red flags to the patient record
+            self.update_vertex_properties(patient_id, HashMap::from([
+                ("red_flags".to_string(), to_property_value(json!(flags))?),
+                ("stewardship_status".to_string(), to_property_value(json!("REQUIRES_REVIEW"))?),
+            ])).await.map_err(|e| anyhow!("Failed to persist conflict flags: {}", e))?;
+
+            // =========================================================================
+            // 2025-12-20: Log the Conflict Detection to the Graph of Events
+            // =========================================================================
+            let _ = self.persist_mpi_change_event(
+                patient_id,
+                Uuid::nil(),
+                "CONFLICT_DETECTED",
+                json!({
+                    "detected_flags": flags,
+                    "status": "REQUIRES_REVIEW",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+            ).await;
+        }
+        
+        Ok(flags)
+    }
+
+    /// PERSISTENCE: Conflict Resolution (The stewardship override)
+    /// Allows a human to dismiss a flag with a reason code.
+    pub async fn resolve_identity_conflict(
+        &self, 
+        patient_id: Uuid, 
+        resolution_note: &str, 
+        steward_id: &str
+    ) -> Result<()> {
+        let updates = HashMap::from([
+            ("red_flags".to_string(), to_property_value(json!([]))?), // Clear flags
+            ("stewardship_status".to_string(), to_property_value(json!("RESOLVED"))?),
+            ("last_reviewed_by".to_string(), to_property_value(json!(steward_id))?),
+            ("resolution_note".to_string(), to_property_value(json!(resolution_note))?),
+        ]);
+
+        self.update_vertex_properties(patient_id, updates).await?;
+        
+        // Log this resolution as its own event in the graph
+        self.persist_mpi_change_event(
+            patient_id, 
+            patient_id, 
+            "CONFLICT_RESOLUTION", 
+            json!({"note": resolution_note, "steward": steward_id})
+        ).await?;
+
+        Ok(())
     }
 
     /// Executes the pipeline transformation defined by a Cypher `WITH` clause.
@@ -893,53 +1299,31 @@ impl GraphService {
     /// This includes filtering, projection, distinct, ordering, skipping, and limiting the intermediate results.
     pub async fn execute_pipeline_transform(
         &self,
-        // FIX: Use a placeholder struct name (ParsedWithClause) that the user must define
-        // in their query_types module to hold the contents of the CypherQuery::WithStatement variant.
         clause: ParsedWithClause, 
-        input: Vec<Value>,
-    ) -> GraphResult<Vec<Value>> {
+        input: Vec<serde_json::Value>,
+    ) -> GraphResult<Vec<serde_json::Value>> {
         use std::collections::HashSet;
-        // NOTE: Assuming ParsedWithClause is imported via `use crate::query_parser::query_types::*;`
-
-        info!(
-            "Executing WITH: distinct={}, where={}, order_by={}, skip={:?}, limit={:?}",
-            clause.distinct, 
-            clause.where_clause.is_some(), 
-            clause.order_by.len(), 
-            clause.skip, 
-            clause.limit
-        );
-
         let mut results = input;
 
         // 1. Filtering (WHERE clause)
-        if let Some(ref where_expr) = clause.where_clause {
-            info!("Applying WHERE clause filtering...");
+        if let Some(ref where_clause_obj) = clause.where_clause {
             let mut filtered_results = Vec::new();
+            let condition_expr = &where_clause_obj.condition;
             
-            // NOTE: We rely on an inferred, essential helper to evaluate the Cypher predicate.
             for row in results.into_iter() {
-                // Assumed helper: fn evaluate_cypher_expression(&self, expression: &Value, row_context: &Value) -> GraphResult<bool>
-                match self.evaluate_cypher_expression(where_expr, &row) {
+                // Evaluates using the fixed helper above
+                match self.evaluate_cypher_expression(condition_expr, &row) {
                     Ok(true) => filtered_results.push(row),
-                    Ok(false) => continue, // Filtered out
-                    Err(e) => {
-                        error!("Failed to evaluate WHERE clause for a row: {:?}", e);
-                        return Err(GraphError::QueryExecutionError("Failed to evaluate WHERE clause".to_string()));
-                    }
+                    Ok(false) => continue, 
+                    Err(e) => return Err(e),
                 }
             }
             results = filtered_results;
         }
 
         // 2. Projection (ITEMS)
-        // This renames and selects the columns/variables for the next stage.
-        let mut projected_results = Vec::new();
         if !clause.items.is_empty() {
-            info!("Applying projection (ITEMS)...");
-            
-            // NOTE: We rely on an inferred, essential helper to handle Cypher projection/aliasing.
-            // Assumed helper: fn apply_cypher_projection(&self, items: &[QueryReturnItem], row: Value) -> GraphResult<Value>
+            let mut projected_results = Vec::new();
             for row in results.into_iter() {
                 let projected_row = self.apply_cypher_projection(&clause.items, row)?;
                 projected_results.push(projected_row);
@@ -947,44 +1331,25 @@ impl GraphService {
             results = projected_results;
         }
 
-
-        // 3. Distinct
+        // 3. Post-Processing (DISTINCT, ORDER BY, SKIP, LIMIT)
         if clause.distinct {
-            info!("Applying DISTINCT...");
-            // Use a HashSet of string representations to filter out duplicates.
-            // This is functional but can be slow for large sets/complex JSON.
             let mut seen = HashSet::new();
             results.retain(|row| seen.insert(row.to_string()));
         }
 
-        // 4. Sorting (ORDER BY)
         if !clause.order_by.is_empty() {
-            info!("Applying ORDER BY...");
-            
-            // NOTE: Sorting logic is complex because it requires dynamically checking types 
-            // and sort direction per item (e.g., ASC/DESC). We use an assumed helper for comparison.
-            // Assumed helper: fn compare_rows_for_sorting(&self, a: &Value, b: &Value, order_by_items: &[OrderByItem]) -> Ordering
-            let order_by_items = clause.order_by;
+            let order_by_items = clause.order_by.clone();
             results.sort_by(|a, b| self.compare_rows_for_sorting(a, b, &order_by_items));
         }
 
-        // 5. Paging (SKIP)
         if let Some(skip) = clause.skip {
-            if skip > 0 {
-                info!("Applying SKIP: {}", skip);
-                results = results.into_iter().skip(skip as usize).collect();
-            }
+            results = results.into_iter().skip(skip as usize).collect();
         }
 
-        // 6. Paging (LIMIT)
         if let Some(limit) = clause.limit {
-            if limit >= 0 { // limit = 0 is valid and returns an empty set
-                info!("Applying LIMIT: {}", limit);
-                results = results.into_iter().take(limit as usize).collect();
-            }
+            results = results.into_iter().take(limit as usize).collect();
         }
         
-        info!("WITH clause completed. Output rows: {}", results.len());
         Ok(results)
     }
 
@@ -996,12 +1361,20 @@ impl GraphService {
 
     /// **Inferred Helper 1:** Evaluates a Cypher predicate expression against a result row.
     /// This is required for the WHERE clause.
-    pub fn evaluate_cypher_expression(&self, expression: &Value, row: &Value) -> GraphResult<bool> {
-        // Placeholder implementation: A real implementation would parse and execute the expression tree.
-        // For now, assume it always passes if no expression is provided, or fails if invalid.
-        if expression.is_null() { return Ok(true); }
-        info!("Placeholder: Evaluating expression against row...");
-        Ok(true) 
+    pub fn evaluate_cypher_expression(
+        &self, 
+        expression: &Expression, 
+        row: &serde_json::Value
+    ) -> GraphResult<bool> {
+        // Bridges the JSON row to the AST EvaluationContext
+        let ctx = EvaluationContext::from_json(row);
+
+        match expression.evaluate(&ctx) {
+            Ok(value) => Ok(value.as_bool()), // Uses the helper defined below
+            Err(e) => Err(GraphError::QueryExecutionError(format!(
+                "Logical evaluation failed: {}", e
+            ))),
+        }
     }
 
     /// Helper to convert a parsed Vec<QueryReturnItem> into a raw projection string 
@@ -1058,41 +1431,48 @@ impl GraphService {
     /// **Inferred Helper 2:** Applies projection and aliasing to a row based on Cypher return items.
     /// This is required for the WITH/RETURN ITEMS clause.
     pub fn apply_cypher_projection(&self, items: &[QueryReturnItem], row: Value) -> GraphResult<Value> {
-        // Placeholder implementation: A real implementation would map the variables in the row.
         let mut new_row_map = Map::new();
-        let row_map = row.as_object().ok_or(GraphError::InternalError("Row not a JSON object".to_string()))?;
-        
+
+        // Build evaluation context from the current row (which contains bound variables like "p" → vertex)
+        let ctx = EvaluationContext::from_json(&row);
+
         for item in items {
-            // The key for the new map (alias, or expression if no alias)
             let target_key: String = item.alias.as_ref()
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    // If no alias, use the expression as the key
-                    item.expression.to_string()
-                });
-            
-            // The key used to look up the value in the existing row map.
-            // item.expression is already a String, so we just need a reference to it
-            let source_key: &str = &item.expression;
-            
-            // 1. Check if the source key exists in the current row.
-            if let Some(value) = row_map.get(source_key) {
-                new_row_map.insert(target_key, value.clone());
-            } else {
-                // 2. Handle missing source key (either an anonymous variable or a complex expression)
-                // If the source key (variable name) is not in the row map, it means the expression 
-                // needs to be evaluated (e.g., `n.name + n.surname`).
-                
-                // NOTE: A proper Cypher engine would evaluate the expression here.
-                
-                // For a sound placeholder: If not found, insert Null and log the need for evaluation.
-                new_row_map.insert(target_key, Value::Null);
-                // Example of where you'd call an evaluation engine:
-                // let evaluated_value = self.evaluate_complex_expression(&item.expression, row_map)?;
-                // new_row_map.insert(target_key, evaluated_value);
+                .unwrap_or_else(|| item.expression.clone());
+
+            // Parse the expression string (e.g., "levenshtein(p.first_name, 'Alice')")
+            match parse_expression(&item.expression) {
+                Ok((_, expr)) => {
+                    // Evaluate it against the current row context
+                    match expr.evaluate(&ctx) {
+                        Ok(cypher_value) => {
+                            // Convert back to JSON using your existing to_json()
+                            let json_value = cypher_value.to_json();
+                            new_row_map.insert(target_key, json_value);
+                        }
+                        Err(e) => {
+                            warn!("Projection evaluation failed for '{}': {}", item.expression, e);
+                            new_row_map.insert(target_key, Value::Null);
+                        }
+                    }
+                }
+                Err(parse_err) => {
+                    // Fallback: treat as simple variable lookup (for "p", "n", etc.)
+                    if let Some(row_obj) = row.as_object() {
+                        if let Some(value) = row_obj.get(&item.expression) {
+                            new_row_map.insert(target_key, value.clone());
+                        } else {
+                            warn!("Projection variable not found: {}", item.expression);
+                            new_row_map.insert(target_key, Value::Null);
+                        }
+                    } else {
+                        new_row_map.insert(target_key, Value::Null);
+                    }
+                }
             }
         }
-        
+
         Ok(Value::Object(new_row_map))
     }
 
@@ -1103,6 +1483,38 @@ impl GraphService {
         std::cmp::Ordering::Equal
     }
 
+
+    /// Executes a pipeline transformation (projection, filtering, etc.) based on a WITH clause.
+    /// This method is designed to be called by the parser to handle standalone 
+    /// or chained WITH statements.
+    pub async fn execute_with_projection(
+        &self,
+        items: Vec<QueryReturnItem>,
+        distinct: bool,
+        where_clause: Option<WhereClause>,
+        skip: Option<u64>,
+        limit: Option<u64>,
+    ) -> GraphResult<QueryResult> {
+        // MPI Requirement: All transactions must be logged into the graph of events.
+        // Even if this is a projection (read), we log the intent if it's an entry point.
+        info!("[GraphService] Executing MPI projection transaction.");
+
+        let input_rows = vec![Value::Object(serde_json::Map::new())];
+
+        // Fix Error [E0308]: Map Option<u64> to Option<i64> for ParsedWithClause
+        let clause = ParsedWithClause {
+            items,
+            distinct,
+            where_clause,
+            skip: skip.map(|s| s as i64),
+            limit: limit.map(|l| l as i64),
+            order_by: Vec::new(), 
+        };
+
+        let transformed_data = self.execute_pipeline_transform(clause, input_rows).await?;
+
+        self.value_to_query_result(Value::Array(transformed_data))
+    }
     // =========================================================================
     // STATEFUL EXECUTION FOR CHAINING
     // =========================================================================
@@ -1350,16 +1762,25 @@ impl GraphService {
         let engine = QueryExecEngine::get()
             .await
             .map_err(|e| GraphError::InternalError(format!("QueryExecEngine not initialized: {}", e)))?;
-
-        // FIX 1 (E0061): Remove the `params` argument from the call.
-        // FIX 2 (E0308): Use `.map(|value| vec![value])` to convert the single Value into a Vec<Value>.
+        
         println!("===> in execute_cypher_read - query was: {}", query);
-        engine.execute_cypher(query) 
+        
+        let result = engine.execute_cypher(query)
             .await
-            .map_err(|e| GraphError::QueryExecutionError(format!("Cypher READ failed: {}", e)))
-            .map(|value| vec![value]) // Wrap the single result in a vector
+            .map_err(|e| GraphError::QueryExecutionError(format!("Cypher READ failed: {}", e)))?;
+        
+        println!("===> execute_cypher returned: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        
+        // The result structure is: { "results": [ {...}, {...} ] }
+        // Extract the "results" array
+        if let Some(results_array) = result.get("results").and_then(|v| v.as_array()) {
+            Ok(results_array.clone())
+        } else {
+            // Fallback: if the structure is different, return the whole result wrapped
+            println!("===> Warning: Expected 'results' array, got different structure");
+            Ok(vec![result])
+        }
     }
-
     /// Executes a declarative write Cypher query against the graph (e.g., CREATE, MERGE).
     /// 
     /// NOTE: This is necessary for the PatientService::create_patient implementation.
@@ -1387,7 +1808,6 @@ impl GraphService {
     // pre-existing bindings (nodes matched in the path) for context.
     // lib/src/graph_engine/graph_service.rs
     // Implementation of the function used when a MERGE operation fails to find a match.
-
     pub async fn execute_create_patterns(
         &self,
         mut initial_bindings: HashMap<String, Value>, 
@@ -1403,14 +1823,26 @@ impl GraphService {
         // Helper to extract a bound UUID string from the HashMap<String, Value> bindings.
         let get_uuid = |bindings: &HashMap<String, Value>, var: &str| -> GraphResult<Uuid> {
             let binding_value = bindings.get(var)
-                .ok_or_else(|| GraphError::ValidationError(format!("Source/Target node variable '{}' not found in bindings: {:?}", var, bindings.keys().collect::<Vec<_>>())))?;
+                .ok_or_else(|| GraphError::ValidationError(format!(
+                    "Source/Target node variable '{}' not found in bindings: {:?}", 
+                    var, 
+                    bindings.keys().collect::<Vec<_>>()
+                )))?;
 
             // Expect the bound value to be the ID (Stringified UUID)
             let id_str = binding_value.as_str().ok_or_else(|| 
-                GraphError::InternalError(format!("Bound variable '{}' does not contain a string UUID. Found: {:?}", var, binding_value)))?;
+                GraphError::InternalError(format!(
+                    "Bound variable '{}' does not contain a string UUID. Found: {:?}", 
+                    var, 
+                    binding_value
+                )))?;
                 
             uuid::Uuid::parse_str(id_str)
-                .map_err(|e| GraphError::InternalError(format!("Invalid UUID string '{}' in bindings: {}", id_str, e)))
+                .map_err(|e| GraphError::InternalError(format!(
+                    "Invalid UUID string '{}' in bindings: {}", 
+                    id_str, 
+                    e
+                )))
         };
         
         for (_, node_patterns, rel_patterns) in create_patterns {
@@ -1422,7 +1854,7 @@ impl GraphService {
 
             // --- 1. Process Node Instructions (Vertices) ---
             for node_pattern in node_patterns {
-                let (var_name_opt, label_opt, properties) = node_pattern;
+                let (var_name_opt, labels, properties) = node_pattern;
                 
                 let var_name = var_name_opt.clone().unwrap_or_default();
                 
@@ -1432,16 +1864,27 @@ impl GraphService {
                 }
                 
                 let node_uuid = Uuid::new_v4();
-                let label = label_opt.clone()
-                    .ok_or_else(|| GraphError::ValidationError("Node label must be specified in MERGE/CREATE path.".into()))?;
+
+                // Since labels is now a Vec<String>, we check if it is empty.
+                if labels.is_empty() {
+                    return Err(GraphError::ValidationError(
+                        "Node label must be specified in MERGE/CREATE path.".into()
+                    ));
+                }
+                
+                // Extract the primary label for the Identifier.
+                let primary_label = labels[0].clone();
                 
                 let now: BincodeDateTime = Utc::now().into();
                 
                 // Construct the Vertex using the correct fields.
                 let mut new_vertex = Vertex {
                     id: SerializableUuid(node_uuid),
-                    label: Identifier::new(label.clone())
-                        .map_err(|e| GraphError::InternalError(format!("Invalid Identifier from node label: {}", e)))?,
+                    label: Identifier::new(primary_label)
+                        .map_err(|e| GraphError::InternalError(format!(
+                            "Invalid Identifier from node label: {}", 
+                            e
+                        )))?,
                     properties: HashMap::new(), // Vertex properties use HashMap
                     created_at: now,
                     updated_at: now,
@@ -1451,7 +1894,10 @@ impl GraphService {
                 for (key, val) in properties {
                     // Correctly convert the parser's internal value (val) to serde_json::Value
                     let property_value = to_property_value(val.clone().into()) 
-                        .map_err(|e| GraphError::QueryError(format!("Invalid property value in CREATE Vertex: {}", e)))?;
+                        .map_err(|e| GraphError::QueryError(format!(
+                            "Invalid property value in CREATE Vertex: {}", 
+                            e
+                        )))?;
                     
                     new_vertex.properties.insert(key.clone(), property_value);
                 }
@@ -1472,18 +1918,26 @@ impl GraphService {
                 // Find the source and target node variables from the previously saved list.
                 let source_var_name = node_var_names.get(idx)
                     .and_then(|v| v.as_ref())
-                    .ok_or_else(|| GraphError::ValidationError(format!("Source node at index {} must have a variable in a path pattern.", idx).into()))?;
+                    .ok_or_else(|| GraphError::ValidationError(format!(
+                        "Source node at index {} must have a variable in a path pattern.", 
+                        idx
+                    ).into()))?;
                 
                 let target_var_name = node_var_names.get(idx + 1)
                     .and_then(|v| v.as_ref())
-                    .ok_or_else(|| GraphError::ValidationError(format!("Target node at index {} must have a variable in a path pattern.", idx + 1).into()))?;
+                    .ok_or_else(|| GraphError::ValidationError(format!(
+                        "Target node at index {} must have a variable in a path pattern.", 
+                        idx + 1
+                    ).into()))?;
                 
                 // Retrieve the UUIDs for the source and target from the (updated) bindings.
                 let source_id = get_uuid(&initial_bindings, source_var_name)?.to_owned();
                 let target_id = get_uuid(&initial_bindings, target_var_name)?.to_owned();
                 
                 let rel_type = rel_type_opt.clone()
-                    .ok_or_else(|| GraphError::ValidationError("Relationship type must be specified in MERGE/CREATE path.".into()))?;
+                    .ok_or_else(|| GraphError::ValidationError(
+                        "Relationship type must be specified in MERGE/CREATE path.".into()
+                    ))?;
                 
                 let edge_uuid = Uuid::new_v4();
                 
@@ -1492,7 +1946,10 @@ impl GraphService {
                     id: SerializableUuid(edge_uuid),
                     outbound_id: SerializableUuid(source_id),
                     edge_type: Identifier::new(rel_type.clone())
-                        .map_err(|e| GraphError::InternalError(format!("Invalid Identifier from relationship type: {}", e)))?,
+                        .map_err(|e| GraphError::InternalError(format!(
+                            "Invalid Identifier from relationship type: {}", 
+                            e
+                        )))?,
                     inbound_id: SerializableUuid(target_id),
                     label: rel_type.clone(),
                     properties: BTreeMap::new(), // Edge properties use BTreeMap
@@ -1502,7 +1959,10 @@ impl GraphService {
                 for (key, val) in properties {
                     // Correctly convert the parser's internal value (val) to serde_json::Value
                     let property_value = to_property_value(val.clone().into())
-                        .map_err(|e| GraphError::QueryError(format!("Invalid property value in CREATE Edge: {}", e)))?;
+                        .map_err(|e| GraphError::QueryError(format!(
+                            "Invalid property value in CREATE Edge: {}", 
+                            e
+                        )))?;
                     
                     new_edge.properties.insert(key.clone(), property_value);
                 }
@@ -1763,6 +2223,7 @@ impl GraphService {
         }
     }
 
+
     /// Finds a single Patient vertex by its Medical Record Number (MRN) using a Cypher query.
     pub async fn get_patient_by_mrn(&self, mrn: &str) -> Result<Option<Vertex>, GraphError> {
         
@@ -1996,301 +2457,204 @@ impl GraphService {
         &self,
         patterns: Vec<(Option<String>, Vec<NodePattern>, Vec<RelPattern>)>,
         where_clause: Option<WhereClause>,
-        on_create_set: Vec<(String, String, Value)>,
-        on_match_set: Vec<(String, String, Value)>,
+        with_clause: Option<ParsedWithClause>,
+        on_create_set: Vec<(String, String, Expression)>,
+        on_match_set: Vec<(String, String, Expression)>,
     ) -> GraphResult<ExecutionResult> {
-        
-        // --- Validation (REMOVED HARD-CODED CONSTRAINT) ---
-        // NOTE: For now, we only implement the simple single-node MERGE for execution 
-        // delegation, but we MUST allow the parser to pass complex paths, as the 
-        // top-level Cypher engine will handle MATCH/CREATE if the path is not found.
+        if patterns.is_empty() { return Ok(ExecutionResult::new()); }
 
-        // If the parser passes a complex path (like (a)-[r]->(b)), we must return an error
-        // *or* delegate to the main MATCH/CREATE logic. Since this function is only 
-        // designed for single node MERGE, we re-introduce the error but only if the 
-        // parser logic *doesn't* handle complex MERGE correctly. 
-        
-        // Since the original query was:
-        // MERGE (p:Patient {id: -939767138})-[:HAS_GOLDEN_RECORD]->(g:GoldenRecord {canonical_id: "..."})
-        // and the high-level executor converts this to a MatchCreate arm when not found, 
-        // this low-level function should only be called for the single-node MERGE fallback.
-        
-        // HOWEVER, since the log shows: "MERGE only supports a single node pattern...", 
-        // the call to this function is still being made with the complex pattern.
-        
-        // --- TEMPORARY FIX: Allow path patterns to pass through this function (if it's called with them) ---
-        // The top-level query executor must handle complex MERGE by delegating to
-        // Match/MatchCreate. If this function is still receiving complex patterns, 
-        // the delegation flow is incorrect, but removing the guard allows the flow to proceed.
+        let mut execution_result = ExecutionResult::new();
+        let mut bindings: HashMap<String, Uuid> = HashMap::new();
 
-        // WARNING: This implementation is for single node MERGE only.
-        // If a complex pattern reaches here, it implies the top-level executor is flawed.
-        // We will now allow complex patterns to pass, but the logic below will only process 
-        // the first node, likely leading to incorrect results for paths.
+        // 1. Process Path Nodes
+        let (_, node_patterns, rel_patterns) = &patterns[0];
         
-        if patterns.is_empty() {
-            return Ok(ExecutionResult::new());
-        }
-
-        // Use the *first* pattern for matching/creating.
-        let (path_var_opt, node_patterns, rel_patterns) = &patterns[0];
-
-        if node_patterns.is_empty() {
-             return Err(GraphError::ValidationError("MERGE pattern must contain at least one node.".into()));
-        }
-
-        // --- CRITICAL PATH HANDLING: ---
-        // If the pattern is complex, we need the top-level executor to handle it.
-        // Since this function is the low-level implementation, if we see a path, 
-        // we must reject it or implement the complex MERGE logic (which is large).
-        
-        // For now, re-implementing the simple node MERGE logic below while retaining 
-        // the ability to pass complex patterns to the higher level. 
-        
-        // Let's ensure we only process the first node of the first pattern.
-        if node_patterns.len() > 1 || !rel_patterns.is_empty() {
-            // If the pattern is a path, it should be handled by the full MATCH/CREATE executor 
-            // after the initial "match path" attempt fails. 
-            // If it still reaches here, we assume it's an error in the dispatch flow.
+        for node_pat in node_patterns {
+            let (var_name_opt, labels, props) = node_pat;
+            let var_name = var_name_opt.clone().unwrap_or_else(|| "node".to_string());
             
-            // However, to fix the IMMEDIATE error, we must remove the explicit guard.
-            // The problem is that the logic below only handles *one* node.
+            // Extract the 'id' for physical lookup
+            let provided_id = if let Some(id_val) = props.get("id") {
+                id_val.as_str().and_then(|s| Uuid::parse_str(s).ok())
+            } else {
+                None
+            };
 
-            // For the sake of fixing the immediate bug, let's proceed with the first node.
-            // This is temporarily acceptable because the successful match of the complex
-            // pattern already occurred in the log, and this is the "not found" fallback.
-            // But the complex merge logic should not be in this function.
-            // Since the current state forces this, we proceed with node 0.
-            // NOTE: The user's query fails because the parser is too simplistic and the
-            // MERGE executor is too simplistic. Let's assume the top-level executor 
-            // is making the wrong call. We should let the top-level executor handle the path.
-            
-            // We will now fall back to the old single-node logic, but without the hard error.
-            // This is a *temporary* bridge to complete the test, but the true fix is in 
-            // the top-level query dispatcher.
-            
-            // If this function is *only* meant for single-node MERGE, the outer
-            // MATCH arm must correctly delegate complex MERGE to the MATCH-CREATE flow.
-            
-            // We revert to the single-node MERGE logic, processing the first node, and
-            // ignoring the rest of the path, assuming the complex MERGE path was already handled 
-            // by the top-level executor (which is where the path was *not found*).
-            
-            // This is the simplest way to allow the previous test to complete successfully
-            // without implementing the massive logic for complex MERGE here.
-            info!("Complex MERGE pattern ({}) detected, processing first node only for single-node MERGE fallback.", patterns[0].1.len());
-        }
-        
-        let node_pattern: &NodePattern = &node_patterns[0];
-        
-        let label = node_pattern.1.clone().unwrap_or_default();
-        let node_properties = &node_pattern.2;
+            // Attempt physical lookup
+            let existing_vertex_opt = if let Some(ref uuid) = provided_id {
+                self.storage.get_vertex(uuid).await?
+            } else {
+                None
+            };
 
-        if node_properties.is_empty() {
-            return Err(GraphError::QueryError(
-                "MERGE requires properties to match or create identity (e.g., {id: '123'})".into()
-            ));
-        }
-
-        // --- 1. Try to MATCH the node by UUID (simplification due to trait limitation) ---
-        let match_id_value = node_properties.get("id");
-        let matched_uuid = match match_id_value.and_then(|v| v.as_i64()).and_then(|id| {
-            // Look up by Identity properties would normally happen here. 
-            // Reverting to your current state which treats this as None for the Patients test case.
-            None 
-        }) {
-            Some(uuid) => Some(uuid),
-            None => None,
-        };
-
-        let match_result = if let Some(uuid) = matched_uuid {
-            self.storage.get_vertex(&uuid).await
-        } else {
-            Ok(None)
-        };
-
-        // --- 2. UTILIZE WHERE CLAUSE ---
-        let validated_match = match match_result {
-            Ok(Some(vertex)) => {
-                if let Some(wc) = &where_clause {
-                    let ctx = EvaluationContext::from_vertex(&vertex);
+            let node_id = match existing_vertex_opt {
+                Some(vertex) => {
+                    let current_id = vertex.id.0;
                     
-                    // wc.condition is &Expression. We call its evaluate method.
-                    match wc.condition.evaluate(&ctx) {
-                        Ok(val) => {
-                            // In Cypher, only a boolean true passes the filter.
-                            if matches!(val, CypherValue::Bool(true)) {
-                                Ok(Some(vertex))
-                            } else {
-                                info!("MERGE: Match failed WHERE clause for vertex {:?}. Switching to ON CREATE.", vertex.id);
-                                Ok(None)
-                            }
-                        },
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Ok(Some(vertex))
-                }
-            },
-            other => other,
-        };
-        
-        // --- 3. Implement MERGE Branching Logic ---
-        match validated_match {
-            Ok(Some(vertex)) => {
-                // --- ON MATCH PATH ---
-                let mut match_mutations = Vec::new();
-                for (_var, prop_key, val) in &on_match_set {
-                    let property_value = to_property_value(val.clone())
-                        .map_err(|e| GraphError::QueryError(format!("Invalid property value in MERGE/ON MATCH: {}", e)))?;
-                    
-                    let vertex_identifier = Identifier::from_uuid(vertex.id.0) 
-                        .map_err(|e| GraphError::InternalError(format!("Invalid Identifier from Uuid: {}", e)))?;
-                                
-                    let set_op = GraphOp::SetVertexProperty(
-                        vertex_identifier,
-                        Identifier::from(prop_key.as_str()),
-                        property_value
+                    // --- MPI LOGICAL VALIDATION ---
+                    // Setup context to verify if this specific vertex satisfies query constraints
+                    let mut variables = HashMap::new();
+                    variables.insert(
+                        var_name.clone(), 
+                        CypherValue::Vertex(vertex.clone())
                     );
-                    match_mutations.push(set_op);
-                }
-
-                for op in match_mutations {
-                    self.storage.append(op).await?;
-                }
-                    
-                let mut result = ExecutionResult::new();
-                result.add_updated_node(vertex.id.0);
-                    
-                Ok(result)
-            },
-            Ok(None) => {
-                // --- ON CREATE PATH (Not Found or WHERE Failed) ---
-                
-                if node_patterns.len() > 1 || !rel_patterns.is_empty() {
-                    info!("===> MERGE: Path NOT MATCHED. Falling back to path CREATE.");
-
-                    let mut execution_result = ExecutionResult::new();
-                    let mut mutations = Vec::new();
-                    let mut initial_bindings = HashMap::new(); 
-                    
-                    let get_uuid = |bindings: &HashMap<String, Value>, var: &str| -> GraphResult<Uuid> {
-                        let binding_value = bindings.get(var)
-                            .ok_or_else(|| GraphError::ValidationError(format!("Variable '{}' not found.", var)))?;
-                        let id_str = binding_value.as_str().ok_or_else(|| 
-                            GraphError::InternalError(format!("Variable '{}' not a string UUID.", var)))?;
-                        uuid::Uuid::parse_str(id_str)
-                            .map_err(|e| GraphError::InternalError(format!("Invalid UUID: {}", e)))
+                    let ctx = EvaluationContext {
+                        variables,
+                        parameters: HashMap::new(),
                     };
-                    
-                    let (_, node_patterns_to_create, rel_patterns_to_create) = &patterns[0];
-                    let node_var_names: Vec<Option<String>> = node_patterns_to_create.iter()
-                        .map(|(var, _, _)| var.clone())
-                        .collect();
 
-                    // 1. Nodes
-                    for node_pattern in node_patterns_to_create {
-                        let (var_name_opt, label_opt, properties) = node_pattern;
-                        let var_name = var_name_opt.clone().unwrap_or_default();
-                        
-                        if !var_name.is_empty() && initial_bindings.contains_key(&var_name) {
-                            continue;
-                        }
-                        
-                        let node_uuid = Uuid::new_v4();
-                        let label_val = label_opt.clone()
-                            .ok_or_else(|| GraphError::ValidationError("Node label required.".into()))?;
-                        
-                        let now: BincodeDateTime = Utc::now().into();
-                        let mut new_vertex = Vertex {
-                            id: SerializableUuid(node_uuid),
-                            label: Identifier::new(label_val).map_err(|e| GraphError::InternalError(e.to_string()))?,
-                            properties: HashMap::new(),
-                            created_at: now,
-                            updated_at: now,
-                        };
-                        
-                        let mut all_properties = properties.clone();
-                        for (var, prop_key, val) in &on_create_set {
+                    let where_passed = match where_clause.as_ref() {
+                        Some(wc) => wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false),
+                        None => true,
+                    };
+
+                    let with_passed = match with_clause.as_ref() {
+                        Some(pw) => pw.where_clause.as_ref().map_or(true, |wc| {
+                            wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false)
+                        }),
+                        None => true,
+                    };
+
+                    if where_passed && with_passed {
+                        // --- ON MATCH ---
+                        // FIX: Pass the variable name as the first argument
+                        let eval_ctx = EvaluationContext::from_vertex(&var_name, &vertex);
+                        let mut updated_vertex = vertex.clone();
+                        let mut changed = false;
+
+                        for (var, key, expr) in &on_match_set {
                             if var_name_opt.as_ref() == Some(var) {
-                                all_properties.insert(prop_key.clone(), val.clone());
+                                let val = expr.evaluate(&eval_ctx)?;
+                                // Using PropertyValue::from for cleaner conversion
+                                updated_vertex.properties.insert(key.clone(), PropertyValue::from(val));
+                                changed = true;
                             }
                         }
-
-                        for (key, val) in &all_properties {
-                            new_vertex.properties.insert(key.clone(), to_property_value(val.clone().into())?);
+                        
+                        if changed {
+                            updated_vertex.updated_at = chrono::Utc::now().into();
+                            self.storage.update_vertex(updated_vertex).await?;
+                            execution_result.add_updated_node(current_id);
                         }
-                        
-                        mutations.push(GraphOp::InsertVertex(new_vertex));
-                        execution_result.add_created_node(node_uuid);
-                        if let Some(var_name) = var_name_opt {
-                            initial_bindings.insert(var_name.clone(), json!(node_uuid.to_string()));
-                        }
+                        current_id
+                    } else {
+                        // Logic mismatch: Treat as non-match for MPI golden record isolation
+                        self.create_new_merge_vertex(
+                            provided_id, 
+                            labels, 
+                            props, 
+                            var_name_opt, 
+                            &on_create_set, 
+                            &mut execution_result
+                        ).await?
                     }
-
-                    // 2. Edges
-                    for (idx, rel_pattern) in rel_patterns_to_create.iter().enumerate() {
-                        let (var_name_opt, rel_type_opt, _, properties, _) = rel_pattern;
-                        let source_var = node_var_names[idx].as_ref().unwrap();
-                        let target_var = node_var_names[idx+1].as_ref().unwrap();
-                        
-                        let source_id = get_uuid(&initial_bindings, source_var)?;
-                        let target_id = get_uuid(&initial_bindings, target_var)?;
-                        
-                        let rel_type = rel_type_opt.clone().unwrap();
-                        let edge_uuid = Uuid::new_v4();
-                        let mut new_edge = Edge {
-                            id: SerializableUuid(edge_uuid),
-                            outbound_id: SerializableUuid(source_id),
-                            edge_type: Identifier::new(rel_type.clone()).map_err(|e| GraphError::InternalError(e.to_string()))?,
-                            inbound_id: SerializableUuid(target_id),
-                            label: rel_type,
-                            properties: BTreeMap::new(),
-                        };
-                        
-                        for (key, val) in properties {
-                            new_edge.properties.insert(key.clone(), to_property_value(val.clone().into())?);
-                        }
-                        
-                        mutations.push(GraphOp::InsertEdge(new_edge));
-                        execution_result.add_created_edge(edge_uuid);
-                    }
-                    
-                    for op in mutations { self.storage.append(op).await?; }
-                    return Ok(execution_result);
-                } 
-                
-                // --- Simple Node CREATE ---
-                let new_uuid = Uuid::new_v4();
-                let mut properties_to_set = node_properties.clone();
-                for (var, prop_key, val) in &on_create_set {
-                    if node_pattern.0.as_ref() == Some(var) {
-                        properties_to_set.insert(prop_key.clone(), val.clone());
-                    }
+                },
+                None => {
+                    // --- ON CREATE ---
+                    self.create_new_merge_vertex(
+                        provided_id, 
+                        labels, 
+                        props, 
+                        var_name_opt, 
+                        &on_create_set, 
+                        &mut execution_result
+                    ).await?
                 }
+            };
 
-                let now: BincodeDateTime = Utc::now().into();
-                let mut new_vertex = Vertex {
-                    id: SerializableUuid(new_uuid),
-                    label: Identifier::new(label).map_err(|e| GraphError::InternalError(e.to_string()))?,
-                    properties: HashMap::new(),
-                    created_at: now,
-                    updated_at: now,
-                };
-                
-                for (key, val) in properties_to_set {
-                    new_vertex.properties.insert(key, to_property_value(val)?);
-                }
-                
-                self.storage.append(GraphOp::InsertVertex(new_vertex)).await?;
-                let mut result = ExecutionResult::new();
-                result.add_created_node(new_uuid);
-                Ok(result)
-            },
-            Err(e) => Err(e),
+            if let Some(var) = var_name_opt {
+                bindings.insert(var.clone(), node_id);
+            }
         }
+
+        // 2. Process Path Relationships 
+        for (idx, rel_pat) in rel_patterns.iter().enumerate() {
+            let (_, r_type_opt, _, props, _) = rel_pat;
+            let (s_var_opt, _, _) = &node_patterns[idx];
+            let (t_var_opt, _, _) = &node_patterns[idx+1];
+            
+            let s_id = bindings.get(s_var_opt.as_ref().unwrap()).ok_or_else(|| GraphError::InternalError("Source ID unbound".into()))?;
+            let t_id = bindings.get(t_var_opt.as_ref().unwrap()).ok_or_else(|| GraphError::InternalError("Target ID unbound".into()))?;
+            let r_type = r_type_opt.clone().unwrap_or_else(|| "RELATED".to_string());
+
+            let new_e = Edge {
+                id: SerializableUuid(Uuid::new_v4()),
+                outbound_id: SerializableUuid(*s_id),
+                inbound_id: SerializableUuid(*t_id),
+                edge_type: Identifier::new(r_type.clone()).map_err(|e| GraphError::InternalError(e.to_string()))?,
+                label: r_type,
+                properties: props.iter()
+                .map(|(k, v)| {
+                    // We pass a reference (&v) to satisfy the From<&Value> implementation 
+                    // for CypherValue
+                    let cv = CypherValue::from(v); 
+                    (k.clone(), PropertyValue::from(cv))
+                })
+                .collect(),
+            };
+
+            self.storage.create_edge(new_e.clone()).await?;
+            execution_result.add_created_edge(new_e.id.0);
+        }
+
+        Ok(execution_result)
     }
 
+    /// Helper to handle the "ON CREATE" logic shared by physical misses and logical mismatches
+    async fn create_new_merge_vertex(
+        &self,
+        provided_id: Option<Uuid>,
+        labels: &[String],
+        props: &HashMap<String, Value>,
+        var_name_opt: &Option<String>,
+        on_create_set: &[(String, String, Expression)],
+        execution_result: &mut ExecutionResult,
+    ) -> GraphResult<Uuid> {
+        let new_uuid = provided_id.unwrap_or_else(Uuid::new_v4);
+        let now: BincodeDateTime = chrono::Utc::now().into();
+        
+        // Determine the variable name for context resolution
+        let var_name = var_name_opt.as_deref().unwrap_or("node");
+
+        // Safely extract the primary label
+        let primary_label = labels.first()
+            .cloned()
+            .unwrap_or_else(|| "Entity".to_string());
+
+        let mut new_v = Vertex {
+            id: SerializableUuid(new_uuid),
+            label: Identifier::new(primary_label).map_err(|e| GraphError::InternalError(e.to_string()))?,
+            properties: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Initialize properties from the MERGE pattern
+        for (k, v) in props {
+            // FIX: Convert Value to CypherValue first, then to PropertyValue
+            // CypherValue::from_json(v.clone()) handles the recursive conversion
+            let cv = CypherValue::from_json(v.clone());
+            new_v.properties.insert(k.clone(), PropertyValue::from(cv));
+        }
+
+        // --- CONTEXT FOR ON CREATE SET ---
+        // FIX: Pass the variable name as the first argument as required by query_types.rs
+        let ctx = EvaluationContext::from_vertex(var_name, &new_v);
+        
+        for (var, key, expr) in on_create_set {
+            if var_name_opt.as_ref() == Some(var) {
+                let val = expr.evaluate(&ctx)?;
+                // Use the From implementation for PropertyValue to ensure consistent MPI data types
+                new_v.properties.insert(key.clone(), PropertyValue::from(val));
+            }
+        }
+
+        // Commit to storage and log the event
+        self.storage.create_vertex(new_v).await?;
+        execution_result.add_created_node(new_uuid);
+        
+        Ok(new_uuid)
+    }
     // =========================================================================
     // READ & TRAVERSAL OPERATIONS
     // =========================================================================
@@ -2368,7 +2732,71 @@ impl GraphService {
             .filter_map(|id| graph.vertices.get(&id).cloned())
             .collect()
     }
-    
+  
+    /// This utilizes the robust result-parsing tactic from get_patient_by_mrn to 
+    /// navigate the nested Cypher engine response.
+    pub async fn get_patient_by_external_id(
+        &self, 
+        id_value: &str, 
+        id_property_name: &str
+    ) -> Result<Option<Patient>> {
+        
+        // 1. Sanitize the property name and value to prevent Cypher injection
+        let safe_value = id_value.replace('\'', "\\'");
+        let safe_prop_name = id_property_name.chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>();
+        
+        // 2. Construct the query targeting the GoldenRecord label
+        // We return 'p' as the node, which contains all properties for deserialization
+        let query = format!(
+            "MATCH (p:Patient:GoldenRecord {{ {}: '{}' }}) RETURN p",
+            safe_prop_name, safe_value
+        );
+
+        // 3. Execute and get the top-level array
+        let results_vec = self.execute_cypher_read(&query, json!({})).await
+            .context("GraphService failed to execute external ID patient retrieval")?;
+            
+        let cypher_json_value = results_vec.into_iter().next()
+            .ok_or_else(|| anyhow!("Cypher execution returned an empty top-level array."))?;
+
+        // 4. Navigate the results -> vertices JSON path
+        let results_array = cypher_json_value.as_object()
+            .and_then(|obj| obj.get("results"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Cypher response missing 'results' array."))?;
+
+        let first_result_block = results_array.get(0)
+            .ok_or_else(|| anyhow!("Cypher 'results' array was empty."))?;
+
+        let vertices = first_result_block.as_object()
+            .and_then(|obj| obj.get("vertices"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Cypher result block missing 'vertices' array."))?;
+
+        // 5. Handle empty matches
+        if vertices.is_empty() {
+            return Ok(None);
+        }
+
+        // 6. Extract the vertex JSON node
+        let vertex_json_value = vertices.get(0)
+            .ok_or_else(|| anyhow!("Vertices array was unexpectedly empty."))?;
+
+        // 7. Deserialize into Patient struct
+        // Since get_patient_by_mrn returns Option<Vertex>, we use the parser 
+        // specialized for the Patient model here.
+        match parse_patient_from_cypher_result(vertex_json_value.clone()) {
+            Ok(patient) => Ok(Some(patient)),
+            Err(e) => {
+                error!("Failed to hydrate Patient from external ID lookup: {}", e);
+                // Return None or Err depending on if you want to skip malformed records
+                Err(anyhow!("Failed to parse patient JSON: {}", e))
+            }
+        }
+    }
+
     // In graph_service.rs or a storage trait:
     pub async fn get_vertex_by_internal_id(&self, internal_id: i32) -> GraphResult<Vertex> {
         

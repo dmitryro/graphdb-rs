@@ -7,7 +7,7 @@
 use graphdb_server::cli::cli::start_cli;
 use anyhow::Result;
 use tokio::signal::unix::{signal, SignalKind};
-use log::{info, debug, warn, error, trace};
+use log::{ info }; //, debug, warn, error, trace};
 
 async fn handle_signals() {
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
