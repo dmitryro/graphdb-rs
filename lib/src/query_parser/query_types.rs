@@ -217,15 +217,21 @@ pub type PatternsReturnType = std::vec::Vec<(
 
 // 1. crate::query::QueryReturnItem
 // Represents an expression returned or projected (e.g., n.name, COUNT(n), x AS alias)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
 pub struct QueryReturnItem {
+    pub expression: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
+pub struct WithItem {
     pub expression: String,
     pub alias: Option<String>,
 }
 
 // 2. crate::query::OrderByItem
 // Represents a field and its sort order in ORDER BY clause
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize )]
 pub struct OrderByItem {
     pub expression: String,
     pub ascending: bool, // true for ASC, false for DESC
@@ -233,7 +239,7 @@ pub struct OrderByItem {
 
 // 3. crate::query::RemoveItem
 // Represents an item being removed (a label or a property)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
 pub enum RemoveItem {
     Label {
         variable: String,
@@ -374,12 +380,6 @@ pub enum CypherQuery {
         on_create_set: Vec<(String, String, Expression)>, 
         on_match_set: Vec<(String, String, Expression)>,
     },
-    ReturnStatement {
-        projection_string: String,
-        order_by: Vec<OrderByItem>, // Placeholder for ORDER BY expressions
-        skip: Option<i64>,        // Parsed value for SKIP
-        limit: Option<i64>,       // Parsed value for LIMIT
-    },
     // NEW: Standalone SET clause for chaining
     SetStatement { 
         assignments: Vec<(String, String, Expression)>, 
@@ -394,8 +394,14 @@ pub enum CypherQuery {
     RemoveStatement { 
         removals: Vec<(String, String)>, // e.g., ("n", "label") or ("n", "property")
     },
-    Batch(Vec<CypherQuery>),
+    ReturnStatement {
+        projection_string: String,
+        order_by: Vec<OrderByItem>, // Placeholder for ORDER BY expressions
+        skip: Option<i64>,        // Parsed value for SKIP
+        limit: Option<i64>,       // Parsed value for LIMIT
+    },
     Chain(Vec<CypherQuery>),
+    Batch(Vec<CypherQuery>),
     Union(Box<CypherQuery>, bool, Box<CypherQuery>),
 }
 
@@ -465,6 +471,17 @@ pub enum Expression {
     },
     And { left: Box<Expression>, right: Box<Expression> },
     Or { left: Box<Expression>, right: Box<Expression> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectionItem {
+    Variable(String),
+    Property(PropertyAccess),
+    Alias {
+        expression: Expression,
+        alias: String,
+    },
+    Expression(Expression),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -931,32 +948,101 @@ impl Expression {
                             Err(GraphError::EvaluationError("ID() requires a variable".into()))
                         }
                     },
+                    "LEVENSHTEIN" => {
+                        if args.len() != 2 {
+                            return Err(GraphError::EvaluationError(
+                                "levenshtein() requires exactly 2 string arguments".into()
+                            ));
+                        }
+
+                        let left = args[0].evaluate(ctx)?;
+                        let right = args[1].evaluate(ctx)?;
+
+                        let s1 = match left {
+                            CypherValue::String(s) => s,
+                            CypherValue::Null => return Ok(CypherValue::Null),
+                            _ => return Err(GraphError::EvaluationError(
+                                "levenshtein(): first argument must be string".into()
+                            )),
+                        };
+
+                        let s2 = match right {
+                            CypherValue::String(s) => s,
+                            CypherValue::Null => return Ok(CypherValue::Null),
+                            _ => return Err(GraphError::EvaluationError(
+                                "levenshtein(): second argument must be string".into()
+                            )),
+                        };
+
+                        let distance = strsim::levenshtein(&s1, &s2) as i64;
+                        Ok(CypherValue::Integer(distance))
+                    },
                     _ => Err(GraphError::EvaluationError(format!("Unknown function: {}", name)))
                 }
             }
+            // Inside your Expression::evaluate implementation:
             Expression::PropertyComparison { variable, property, operator, value } => {
-                let target = ctx.variables.get(variable)
-                    .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{variable}' not found")))?;
-                
-                let left_val = match target {
-                    CypherValue::Vertex(v) => v.properties.get(property)
-                        .map(property_value_to_cypher)
-                        .unwrap_or(CypherValue::Null),
-                    CypherValue::Edge(e) => e.properties.get(property)
-                        .map(property_value_to_cypher)
-                        .unwrap_or(CypherValue::Null),
-                    _ => return Err(GraphError::EvaluationError(format!("Variable '{variable}' is not a Vertex or Edge"))),
+                let var_value = ctx.variables.get(variable)
+                    .ok_or_else(|| GraphError::QueryError(format!("Variable '{}' not found", variable)))?;
+
+                let left_hand_side = if property.is_empty() {
+                    var_value.clone()
+                } else {
+                    match var_value {
+                        CypherValue::Vertex(v) => {
+                            v.properties.get(property)
+                                .map(|pv| CypherValue::from(pv.clone())) 
+                                .unwrap_or(CypherValue::Null)
+                        },
+                        CypherValue::Edge(e) => {
+                            e.properties.get(property)
+                                .map(|pv| CypherValue::from(pv.clone()))
+                                .unwrap_or(CypherValue::Null)
+                        },
+                        _ => return Err(GraphError::QueryError(format!("Variable '{}' is not a Vertex or Edge", variable))),
+                    }
                 };
 
-                let op_upper = operator.to_uppercase();
-                if op_upper == "IS NOT NULL" {
-                    return Ok(CypherValue::Bool(!matches!(left_val, CypherValue::Null)));
-                } else if op_upper == "IS NULL" {
-                    return Ok(CypherValue::Bool(matches!(left_val, CypherValue::Null)));
-                }
+                let right_hand_side = CypherValue::from_json(value.clone());
 
-                let right_val = CypherValue::from_json(value.clone());
-                evaluate_comparison(&left_val, operator, &right_val)
+                // MANUAL COMPARISON BLOCK
+                // This bypasses the need for CypherValue to implement PartialOrd
+                let result = match (left_hand_side, right_hand_side) {
+                    (CypherValue::Integer(a), CypherValue::Integer(b)) => match operator.as_str() {
+                        ">" => a > b, "<" => a < b, ">=" => a >= b, "<=" => a <= b, "=" | "==" => a == b, "!=" | "<>" => a != b,
+                        _ => false,
+                    },
+                    (CypherValue::Float(a), CypherValue::Float(b)) => match operator.as_str() {
+                        ">" => a > b, "<" => a < b, ">=" => a >= b, "<=" => a <= b, "=" | "==" => a == b, "!=" | "<>" => a != b,
+                        _ => false,
+                    },
+                    (CypherValue::Integer(a), CypherValue::Float(b)) => match operator.as_str() {
+                        ">" => (a as f64) > b, "<" => (a as f64) < b, ">=" => (a as f64) >= b, "<=" => (a as f64) <= b,
+                        _ => false,
+                    },
+                    (CypherValue::Float(a), CypherValue::Integer(b)) => match operator.as_str() {
+                        ">" => a > (b as f64), "<" => a < (b as f64), ">=" => a >= (b as f64), "<=" => a <= (b as f64),
+                        _ => false,
+                    },
+                    (CypherValue::String(a), CypherValue::String(b)) => match operator.as_str() {
+                        ">" => a > b, "<" => a < b, ">=" => a >= b, "<=" => a <= b, "=" | "==" => a == b, "!=" | "<>" => a != b,
+                        _ => false,
+                    },
+                    (CypherValue::Bool(a), CypherValue::Bool(b)) => match operator.as_str() {
+                        "=" | "==" => a == b, "!=" | "<>" => a != b,
+                        _ => false,
+                    },
+                    (l, r) => {
+                        if operator == "=" || operator == "==" { l == r }
+                        else if operator == "!=" || operator == "<>" { l != r }
+                        else {
+                            println!("===> Cannot compare {:?} and {:?} with {}", l, r, operator);
+                            false
+                        }
+                    }
+                };
+
+                Ok(CypherValue::Bool(result))
             }
             Expression::StartsWith { variable, property, prefix } => {
                 let target = ctx.variables.get(variable)

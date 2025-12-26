@@ -1,5 +1,5 @@
 // models/src/medical/patient.rs
-use std::collections::{ HashMap };
+use std::collections::{ HashMap, BTreeMap };
 use std::fmt;
 use bincode::{Encode, Decode};
 use serde::{Serialize, Deserialize};

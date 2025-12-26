@@ -1264,7 +1264,6 @@ pub fn evaluate_expression(
     expr: &Expression,
     context: &EvaluationContext,
 ) -> StdResult<CypherValue, GraphError> {
-    println!("===> evaluate_expression START");
     match expr {
         Expression::Literal(val) => Ok(val.clone()),
         
@@ -1281,8 +1280,6 @@ pub fn evaluate_expression(
                     if let CypherValue::Vertex(v) = val {
                         match v.properties.get(prop_name) {
                             Some(prop_val) => {
-                                // Fix: Use serde_json::to_value to convert PropertyValue to Value
-                                // if .0 is private and Into is not implemented.
                                 let json_value = serde_json::to_value(prop_val)
                                     .map_err(|e| GraphError::QueryExecutionError(format!("Property conversion failed: {}", e)))?;
                                 Ok(CypherValue::from_json(json_value))
@@ -1296,17 +1293,163 @@ pub fn evaluate_expression(
                 _ => Err(GraphError::QueryExecutionError("Unsupported property access".to_string())),
             }
         },
+        Expression::FunctionCall { name, args } => {
+            let func_name = name.to_uppercase();
+            match func_name.as_str() {
+                "ID" => {
+                    if args.is_empty() {
+                        return Err(GraphError::QueryExecutionError("ID() requires exactly 1 argument".into()));
+                    }
+                    let arg_val = evaluate_expression(&args[0], context)?;
+                    match arg_val {
+                        CypherValue::Vertex(v) => Ok(CypherValue::String(v.id.to_string())),
+                        CypherValue::Edge(e) => Ok(CypherValue::String(e.id.to_string())),
+                        _ => Ok(CypherValue::Null),
+                    }
+                },
+                "LEVENSHTEIN" => {
+                    if args.len() != 2 {
+                        return Err(GraphError::QueryExecutionError("levenshtein() requires 2 arguments".into()));
+                    }
+                    let s1 = match evaluate_expression(&args[0], context)? {
+                        CypherValue::String(s) => s,
+                        _ => return Err(GraphError::QueryExecutionError("levenshtein() arg 1 must be string".into())),
+                    };
+                    let s2 = match evaluate_expression(&args[1], context)? {
+                        CypherValue::String(s) => s,
+                        _ => return Err(GraphError::QueryExecutionError("levenshtein() arg 2 must be string".into())),
+                    };
+                    Ok(CypherValue::Integer(strsim::levenshtein(&s1, &s2) as i64))
+                },
+                "STARTS WITH" | "STARTSWITH" => {
+                    if args.len() != 2 {
+                        return Err(GraphError::QueryExecutionError("STARTS WITH requires exactly 2 arguments".into()));
+                    }
 
+                    let haystack_val = evaluate_expression(&args[0], context)?;
+                    let needle_val = evaluate_expression(&args[1], context)?;
+
+                    let haystack = match haystack_val {
+                        CypherValue::String(s) => s,
+                        CypherValue::Null => return Ok(CypherValue::Bool(false)),
+                        other => {
+                            serde_json::to_string(&other.to_json()).unwrap_or_else(|_| "null".to_string())
+                        }
+                    };
+
+                    let needle = match needle_val {
+                        CypherValue::String(s) => s,
+                        CypherValue::Null => return Ok(CypherValue::Bool(false)),
+                        other => {
+                            serde_json::to_string(&other.to_json()).unwrap_or_else(|_| "null".to_string())
+                        }
+                    };
+
+                    Ok(CypherValue::Bool(haystack.starts_with(&needle)))
+                },
+                _ => Err(GraphError::QueryExecutionError(format!("Unknown function: {}", name)))
+            }
+        },
         Expression::Binary { op, left, right } => {
             let left_val = evaluate_expression(left, context)?;
             let right_val = evaluate_expression(right, context)?;
 
             match op {
+                // Using your specific Enum variants: Eq, Neq, Lt, Lte, Gt, Gte
+                BinaryOp::Eq | BinaryOp::Neq | BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte => {
+                    let op_str = match op {
+                        BinaryOp::Eq => "=",
+                        BinaryOp::Neq => "<>",
+                        BinaryOp::Lt => "<",
+                        BinaryOp::Lte => "<=",
+                        BinaryOp::Gt => ">",
+                        BinaryOp::Gte => ">=",
+                        _ => unreachable!(),
+                    };
+                    evaluate_comparison(&left_val, op_str, &right_val)
+                },
                 BinaryOp::Plus => add_values(left_val, right_val),
                 BinaryOp::Minus => subtract_values(left_val, right_val),
                 BinaryOp::Mul => multiply_values(left_val, right_val),
                 BinaryOp::Div => divide_values(left_val, right_val),
-                _ => Err(GraphError::QueryExecutionError(format!("Operator {:?} not implemented", op))),
+                BinaryOp::And => {
+                    match (left_val, right_val) {
+                        (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l && r)),
+                        _ => Ok(CypherValue::Null),
+                    }
+                },
+                BinaryOp::Or => {
+                    match (left_val, right_val) {
+                        (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l || r)),
+                        _ => Ok(CypherValue::Null),
+                    }
+                },
+                _ => Err(GraphError::QueryExecutionError(format!("Operator {:?} not implemented in evaluator", op))),
+            }
+        },
+
+        Expression::PropertyComparison { variable, property, operator, value } => {
+            // FIX: If property is empty, 'variable' is a direct alias (like 'dist')
+            if property.is_empty() {
+                let left_val = context.variables.get(variable)
+                    .cloned()
+                    .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
+                
+                // RHS value from JSON literal
+                let rhs_val = CypherValue::from_json(value.clone());
+                
+                // Direct scalar comparison
+                evaluate_comparison(&left_val, operator, &rhs_val)
+            } else {
+                // Standard logic: find vertex/edge then look up property
+                evaluate_property_comparison(context, variable, property, operator, value)
+            }
+        },
+        
+        Expression::And { left, right } => {
+            let l_val = evaluate_expression(left, context)?;
+            let r_val = evaluate_expression(right, context)?;
+            match (l_val, r_val) {
+                (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l && r)),
+                (CypherValue::Bool(false), _) | (_, CypherValue::Bool(false)) => Ok(CypherValue::Bool(false)),
+                _ => Ok(CypherValue::Null),
+            }
+        },
+
+        Expression::Or { left, right } => {
+            let l_val = evaluate_expression(left, context)?;
+            let r_val = evaluate_expression(right, context)?;
+            match (l_val, r_val) {
+                (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l || r)),
+                (CypherValue::Bool(true), _) | (_, CypherValue::Bool(true)) => Ok(CypherValue::Bool(true)),
+                _ => Ok(CypherValue::Null),
+            }
+        },
+
+        Expression::StartsWith { variable, property, prefix } => {
+            let target = context.variables.get(variable)
+                .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
+            let prop_val = match target {
+                CypherValue::Vertex(v) => v.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null),
+                CypherValue::Edge(e) => e.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null),
+                _ => return Err(GraphError::QueryExecutionError(format!("Variable '{}' is not a Vertex/Edge", variable))),
+            };
+            match prop_val {
+                CypherValue::String(s) => Ok(CypherValue::Bool(s.starts_with(prefix))),
+                _ => Ok(CypherValue::Bool(false)),
+            }
+        },
+        
+        Expression::Unary { op, expr } => {
+            let val = evaluate_expression(expr, context)?;
+            match op {
+                UnaryOp::Not => {
+                    if let CypherValue::Bool(b) = val { Ok(CypherValue::Bool(!b)) } 
+                    else { Err(GraphError::QueryExecutionError("NOT requires boolean".into())) }
+                },
+                UnaryOp::IsNotNull => Ok(CypherValue::Bool(!matches!(val, CypherValue::Null))),
+                UnaryOp::IsNull => Ok(CypherValue::Bool(matches!(val, CypherValue::Null))),
+                _ => Err(GraphError::QueryExecutionError("Unary op not implemented".into())),
             }
         },
         _ => Err(GraphError::QueryExecutionError("Expression type not implemented".to_string())),
@@ -2916,6 +3059,7 @@ fn parse_pattern_with_stop_guard(input: &str) -> IResult<&str, Pattern> {
 fn parse_value(input: &str) -> IResult<&str, Value> {
     println!("===> parse_value START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
+
     alt((
         // 1. Quoted Strings - Always String
         map(
@@ -2946,12 +3090,6 @@ fn parse_value(input: &str) -> IResult<&str, Value> {
                 }
             }
         ),
-
-        // 4. UUIDs / Unquoted Strings (The fallback)
-        map(
-            take_while1(|c: char| c.is_alphanumeric() || c == '-' || c == '_'), 
-            |s: &str| Value::String(s.to_string())
-        ),
     )).parse(input)
 }
 
@@ -2975,36 +3113,293 @@ fn parse_single_set_assignment(input: &str) -> IResult<&str, (String, String, Ex
     Ok((input, (var_name.to_string(), prop_name.to_string(), expr)))
 }
 
-/// Recursive descent parser for expressions (handles precedence)
-fn parse_expression(input: &str) -> IResult<&str, Expression> {
+/// Evaluates a comparison between two CypherValues using the given operator.
+pub fn evaluate_comparison(
+    left: &CypherValue,
+    operator: &str,
+    right: &CypherValue,
+) -> GraphResult<CypherValue> {
+    // Handle nulls: any comparison with null (except IS NULL) returns null
+    if matches!(left, CypherValue::Null) || matches!(right, CypherValue::Null) {
+        return Ok(CypherValue::Null);
+    }
+
+    let op_upper = operator.to_uppercase();
+    let result = match (&left, &right) {
+        // CRITICAL FIX: Mixed numeric promotion (Integer vs Float)
+        (CypherValue::Integer(a), CypherValue::Float(b)) => {
+            let a_f = *a as f64;
+            match op_upper.as_str() {
+                "=" => a_f == *b,
+                "<" => a_f < *b,
+                "<=" => a_f <= *b,
+                ">" => a_f > *b,
+                ">=" => a_f >= *b,
+                _ => a_f != *b,
+            }
+        },
+        (CypherValue::Float(a), CypherValue::Integer(b)) => {
+            let b_f = *b as f64;
+            match op_upper.as_str() {
+                "=" => *a == b_f,
+                "<" => *a < b_f,
+                "<=" => *a <= b_f,
+                ">" => *a > b_f,
+                ">=" => *a >= b_f,
+                _ => *a != b_f,
+            }
+        },
+        // Integer vs Integer
+        (CypherValue::Integer(a), CypherValue::Integer(b)) => {
+            match op_upper.as_str() {
+                "=" => a == b,
+                "<>" | "!=" => a != b,
+                "<" => a < b,
+                "<=" => a <= b,
+                ">" => a > b,
+                ">=" => a >= b,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Unsupported operator '{}' for integers", operator)
+                )),
+            }
+        }
+        // Float vs Float
+        (CypherValue::Float(a), CypherValue::Float(b)) => {
+            match op_upper.as_str() {
+                "=" => a == b,
+                "<>" | "!=" => a != b,
+                "<" => a < b,
+                "<=" => a <= b,
+                ">" => a > b,
+                ">=" => a >= b,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Unsupported operator '{}' for floats", operator)
+                )),
+            }
+        }
+        // String vs String
+        (CypherValue::String(a), CypherValue::String(b)) => {
+            match op_upper.as_str() {
+                "=" => a == b,
+                "<>" | "!=" => a != b,
+                "<" => a < b,
+                "<=" => a <= b,
+                ">" => a > b,
+                ">=" => a >= b,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Unsupported operator '{}' for strings", operator)
+                )),
+            }
+        }
+        // Boolean vs Boolean
+        (CypherValue::Bool(a), CypherValue::Bool(b)) => {
+            match op_upper.as_str() {
+                "=" => a == b,
+                "<>" | "!=" => a != b,
+                // Booleans don't support <, >, etc.
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Operator '{}' not supported for booleans", operator)
+                )),
+            }
+        }
+        // UUID vs String (common case: ID(p) = "uuid")
+        (CypherValue::Uuid(a), CypherValue::String(b)) => {
+            match op_upper.as_str() {
+                "=" => a.to_string() == *b,
+                "<>" | "!=" => a.to_string() != *b,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Operator '{}' not supported for UUID comparison", operator)
+                )),
+            }
+        }
+        // String vs UUID (reverse)
+        (CypherValue::String(a), CypherValue::Uuid(b)) => {
+            match op_upper.as_str() {
+                "=" => *a == b.to_string(),
+                "<>" | "!=" => *a != b.to_string(),
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Operator '{}' not supported for UUID comparison", operator)
+                )),
+            }
+        }
+        // Vertex vs anything — not comparable
+        (CypherValue::Vertex(_), _) | (_, CypherValue::Vertex(_)) => {
+            return Err(GraphError::QueryExecutionError(
+                "Cannot compare vertex values".to_string()
+            ));
+        }
+        // Edge vs anything — not comparable
+        (CypherValue::Edge(_), _) | (_, CypherValue::Edge(_)) => {
+            return Err(GraphError::QueryExecutionError(
+                "Cannot compare edge values".to_string()
+            ));
+        }
+        // Mixed numeric: promote integer to float
+        (CypherValue::Integer(a), CypherValue::Float(b)) => {
+            let a_f = *a as f64;
+            match op_upper.as_str() {
+                "=" => a_f == *b,
+                "<>" | "!=" => a_f != *b,
+                "<" => a_f < *b,
+                "<=" => a_f <= *b,
+                ">" => a_f > *b,
+                ">=" => a_f >= *b,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Unsupported operator '{}' for numeric types", operator)
+                )),
+            }
+        }
+        (CypherValue::Float(a), CypherValue::Integer(b)) => {
+            let b_f = *b as f64;
+            match op_upper.as_str() {
+                "=" => *a == b_f,
+                "<>" | "!=" => *a != b_f,
+                "<" => *a < b_f,
+                "<=" => *a <= b_f,
+                ">" => *a > b_f,
+                ">=" => *a >= b_f,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Unsupported operator '{}' for numeric types", operator)
+                )),
+            }
+        }
+        // Default: incompatible types
+        _ => {
+            return Err(GraphError::QueryExecutionError(
+                format!("Cannot compare {:?} and {:?}", left, right)
+            ));
+        }
+    };
+
+    Ok(CypherValue::Bool(result))
+}
+
+fn evaluate_property_comparison(
+    context: &EvaluationContext,
+    variable: &str,
+    property: &str, // This is "" when matching an alias like 'dist'
+    operator: &str,
+    value: &serde_json::Value,
+) -> StdResult<CypherValue, GraphError> {
+    let target_variable = context.variables.get(variable)
+        .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
+
+    // --- FIX START ---
+    // If property is empty, 'variable' is a scalar alias (like the result of levenshtein)
+    let left_val = if property.is_empty() {
+        target_variable.clone()
+    } else {
+        // Standard vertex/edge property lookup
+        match target_variable {
+            CypherValue::Vertex(v) => v.properties.get(property)
+                .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
+                .unwrap_or(CypherValue::Null),
+            CypherValue::Edge(e) => e.properties.get(property)
+                .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
+                .unwrap_or(CypherValue::Null),
+            _ => return Err(GraphError::QueryExecutionError(
+                format!("Variable '{}' is not a graph object; cannot access property '{}'", variable, property)
+            )),
+        }
+    };
+    // --- FIX END ---
+
+    let rhs_val = CypherValue::from_json(value.clone());
+    evaluate_comparison(&left_val, operator, &rhs_val)
+}
+
+
+fn evaluate_function_comparison(
+    context: &EvaluationContext,
+    function: &str,
+    argument: &str,
+    operator: &str,
+    value: &serde_json::Value,
+) -> StdResult<CypherValue, GraphError> {
+    // Evaluate the function result
+    let func_upper = function.to_uppercase();
+    let func_result = if func_upper == "ID" {
+        if let Some(val) = context.variables.get(argument) {
+            match val {
+                CypherValue::Vertex(v) => CypherValue::String(v.id.to_string()),
+                CypherValue::Edge(e) => CypherValue::String(e.id.to_string()),
+                CypherValue::Uuid(u) => CypherValue::String(u.to_string()),
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("ID() requires vertex, edge, or UUID, got {:?}", val)
+                )),
+            }
+        } else {
+            return Err(GraphError::QueryExecutionError(
+                format!("Variable '{}' not found for ID()", argument)
+            ));
+        }
+    } else {
+        return Err(GraphError::QueryExecutionError(
+            format!("Unsupported function in comparison: {}", function)
+        ));
+    };
+
+    // Handle NULL-aware operators
+    let op_upper = operator.to_uppercase();
+    if op_upper == "IS NOT NULL" {
+        return Ok(CypherValue::Bool(!matches!(func_result, CypherValue::Null)));
+    } else if op_upper == "IS NULL" {
+        return Ok(CypherValue::Bool(matches!(func_result, CypherValue::Null)));
+    }
+
+    // Convert RHS JSON value to CypherValue
+    let rhs_val = CypherValue::from_json(value.clone());
+
+    // Perform comparison
+    evaluate_comparison(&func_result, operator, &rhs_val)
+}
+
+/// Recursive descent parser for expressions (handles precedence and function calls)
+pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_expression START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
 
-    // 1. Parse the "Atom"
-    let (input, mut left) = alt((
-        map(
-            tuple((parse_identifier, char('.'), parse_identifier)),
-            |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
-        ),
-        map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-        map(parse_identifier, |v| Expression::Variable(v.to_string())),
-    )).parse(input)?;
+    let (mut current_input, mut left) = {
+        alt((
+            // 1. Parentheses (highest priority)
+            delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
 
-    // 2. Check for Operators
-    let mut current_input = input;
-    
+            // 2. Function call
+            parse_function_call_full,
+
+            // 3. Property access
+            map(
+                tuple((parse_identifier, char('.'), parse_identifier)),
+                |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+            ),
+
+            // 4. Literal values (must come before identifier to catch numbers/strings)
+            map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+
+            // 5. Variable (last — only if not a literal)
+            map(parse_identifier, |v| Expression::Variable(v.to_string())),
+        ))
+    }.parse(input)?;
+
+    // Handle binary operators (your existing loop is correct)
     loop {
-        // First, look for the operator (e.g., + , -)
         let op_result: IResult<&str, BinaryOp> = delimited(multispace0, parse_binary_op, multispace0)
             .parse(current_input);
 
         match op_result {
             Ok((after_op, op)) => {
-                // If operator found, we MUST find a right-hand side atom
                 let rhs_result = alt((
-                    map(tuple((parse_identifier, char('.'), parse_identifier)), |(v, _, p)| 
-                        Expression::Property(PropertyAccess::Vertex(v.to_string(), p.to_string()))),
+                    delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
+
+                    parse_function_call_full,
+
+                    map(
+                        tuple((parse_identifier, char('.'), parse_identifier)),
+                        |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+                    ),
+
                     map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+
                     map(parse_identifier, |v| Expression::Variable(v.to_string())),
                 )).parse(after_op);
 
@@ -3017,16 +3412,36 @@ fn parse_expression(input: &str) -> IResult<&str, Expression> {
                         };
                         current_input = after_rhs;
                     }
-                    // Found operator but no valid RHS? Stop parsing expression here.
                     Err(_) => break,
                 }
             }
-            // No more operators? We are done.
             Err(_) => break,
         }
     }
 
     Ok((current_input, left))
+}
+
+/// Parses a full function call with multiple arguments and nested expressions
+fn parse_function_call_full(input: &str) -> IResult<&str, Expression> {
+    let (input, _) = multispace0(input)?;
+    let (input, name) = parse_identifier(input)?;
+    let (input, _) = char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // Use .parse(input) instead of calling the combinator result as a function
+    let (input, args) = separated_list0(
+        delimited(multispace0, char(','), multispace0),
+        parse_expression
+    ).parse(input)?;
+
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(')')(input)?;
+
+    Ok((input, Expression::FunctionCall {
+        name: name.to_string(),
+        args,
+    }))
 }
 
 fn parse_expression_string(input: &str) -> IResult<&str, String> {
@@ -3041,15 +3456,28 @@ fn parse_expression_string(input: &str) -> IResult<&str, String> {
 }
 
 fn parse_binary_op(input: &str) -> IResult<&str, BinaryOp> {
-    println!("===> parse_binary_op START, input length: {}, preview: '{}'", 
-             input.len(), &input[..input.len().min(100)]);
+    println!("===> parse_binary_op START");
     
-    alt((
-        map(tag("+"), |_| BinaryOp::Plus),
-        map(tag("-"), |_| BinaryOp::Minus),
-        map(tag("*"), |_| BinaryOp::Mul),
-        map(tag("/"), |_| BinaryOp::Div),
-    )).parse(input) // Use .parse(input)
+    // Order: comparisons first (higher precedence), then math
+    preceded(
+        multispace0,
+        alt((
+            // Comparisons
+            map(tag("="), |_| BinaryOp::Eq),
+            map(tag("<>"), |_| BinaryOp::Neq),
+            map(tag("!="), |_| BinaryOp::Neq),
+            map(tag("<="), |_| BinaryOp::Lte),
+            map(tag(">="), |_| BinaryOp::Gte),
+            map(tag("<"), |_| BinaryOp::Lt),
+            map(tag(">"), |_| BinaryOp::Gt),
+            
+            // Math
+            map(tag("+"), |_| BinaryOp::Plus),
+            map(tag("-"), |_| BinaryOp::Minus),
+            map(tag("*"), |_| BinaryOp::Mul),
+            map(tag("/"), |_| BinaryOp::Div),
+        ))
+    ).parse(input)
 }
 
 /// Parse SET clause for use in match_set_relationship
@@ -3144,6 +3572,27 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
     }
 
     Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Alt)))
+}
+
+fn parse_set_standalone(input: &str) -> IResult<&str, CypherQuery> {
+    // 1. Consume the SET keyword
+    let (input, _) = preceded(multispace0, tag_no_case("SET")).parse(input)?;
+    
+    // 2. Parse the list of assignments
+    // Since parse_single_set_assignment already returns (String, String, Expression),
+    // we don't need the map closure at all.
+    let (input, assignments) = preceded(
+        multispace0,
+        separated_list1(
+            tuple((multispace0, char(','), multispace0)),
+            parse_single_set_assignment
+        )
+    ).parse(input)?;
+    
+    // 3. Return using the correct field name 'assignments'
+    // This allows the GraphService to log these specific property updates
+    // into the patient's identity history as required by MPI 2025-12-20.
+    Ok((input, CypherQuery::SetStatement { assignments }))
 }
 
 pub fn parse_cypher_query_chain(input: &str) -> IResult<&str, CypherQuery> {
@@ -3727,30 +4176,6 @@ pub fn parse_logical_expression(input: &str) -> IResult<&str, Expression> {
     Ok((input, condition))
 }
 
-fn parse_and_term(input: &str) -> IResult<&str, Expression> {
-    println!("===> parse_and_term START");
-    let (input, mut factors) = separated_list1(
-        preceded(multispace0, tag_no_case("AND")),
-        parse_where_expression, // ✅ Use your full condition parser
-    ).parse(input)?;
-
-    let term = if factors.len() == 1 {
-        factors.remove(0)
-    } else {
-        let mut iter = factors.into_iter();
-        let mut root = iter.next().unwrap();
-        for next in iter {
-            root = Expression::And {
-                left: Box::new(root),
-                right: Box::new(next),
-            };
-        }
-        root
-    };
-
-    Ok((input, term))
-}
-
 /// Level 2: AND
 fn parse_and_expression(input: &str) -> IResult<&str, CypherExpression> {
     println!("===> parse_and_expression START");
@@ -3805,51 +4230,424 @@ pub fn parse_with(input: &str) -> IResult<&str, WithClause> {
 pub fn parse_with_full(input: &str) -> IResult<&str, ParsedWithClause> {
     println!("===> parse_with_full START");
     
-    // 1. Consume "WITH" keyword
+    // 1. Consume "WITH"
     let (input, _) = tag_no_case("WITH").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // 2. Parse DISTINCT (optional)
+    // 2. DISTINCT
     let (input, distinct) = opt(terminated(tag_no_case("DISTINCT"), multispace1)).parse(input)?;
     let is_distinct = distinct.is_some();
     
-    // 3. Parse projection items (comma-separated list)
-    // For now, just consume until we hit WHERE/ORDER/SKIP/LIMIT/RETURN
-    let (input, _projection_str) = take_while1(|c: char| {
-        let trimmed = input.trim_start();
-        let upper = trimmed.to_uppercase();
-        !upper.starts_with("WHERE") 
-            && !upper.starts_with("ORDER")
-            && !upper.starts_with("SKIP")
-            && !upper.starts_with("LIMIT")
-            && !upper.starts_with("RETURN")
-    }).parse(input)?;
+    // 3. Split at WHERE with depth-aware logic - FIXED
+    let (projection_str, rest_after_projections) = {
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut quote_char = ' ';
+        let mut found_where = None;
+        
+        for (i, c) in input.char_indices() {
+            match c {
+                '"' | '\'' => {
+                    if !in_string {
+                        in_string = true;
+                        quote_char = c;
+                    } else if c == quote_char {
+                        in_string = false;
+                    }
+                }
+                '(' if !in_string => depth += 1,
+                ')' if !in_string => depth -= 1,
+                _ => {}
+            }
+            
+            // Check for WHERE keyword at depth 0, outside strings
+            if !in_string && depth == 0 {
+                let remaining = &input[i..];
+                let trimmed = remaining.trim_start();
+                let upper = trimmed.to_uppercase();
+                
+                // Check if this is a WHERE keyword with word boundary
+                if upper.starts_with("WHERE ") || upper == "WHERE" {
+                    // Make sure previous character is whitespace or we're at start
+                    let prev_is_boundary = i == 0 || input.chars().nth(i-1).map_or(true, |c| c.is_whitespace());
+                    
+                    if prev_is_boundary {
+                        found_where = Some(i);
+                        println!("===> Found WHERE at position {}", i);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if let Some(pos) = found_where {
+            (&input[..pos], &input[pos..])
+        } else {
+            println!("===> No WHERE found, taking all as projection");
+            (input, "")
+        }
+    };
     
-    let (input, _) = multispace0.parse(input)?;
+    println!("===> Projection string: '{}'", projection_str.trim());
+    println!("===> Rest after projections: '{}'", rest_after_projections.trim());
     
-    // 4. Parse optional WHERE
-    let (input, where_clause) = opt(preceded(
-        tuple((tag_no_case("WHERE"), multispace1)),
-        map(parse_logical_expression, |condition| WhereClause { condition })
-    )).parse(input)?;
+    // 4. Parse projections
+    let items = if !projection_str.is_empty() {
+        parse_projection_items(projection_str.trim())
+            .unwrap_or_else(|e| {
+                println!("===> Projection parse error: {}", e);
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
     
-    // 5. Parse optional ORDER BY (skip for now)
-    let (input, _) = multispace0.parse(input)?;
+    // 5. Parse WHERE clause
+    let (mut remaining_input, where_clause) = {
+        let (i, _) = multispace0.parse(rest_after_projections)?;
+        let trimmed_upper = i.trim_start().to_uppercase();
+        
+        if trimmed_upper.starts_with("WHERE ") || trimmed_upper == "WHERE" {
+            println!("===> Parsing WHERE clause");
+            let (i, _) = tag_no_case("WHERE").parse(i)?;
+            let (i, _) = multispace1.parse(i)?;
+            
+            // Parse the condition
+            let (i, condition) = parse_expression.parse(i)?;
+            println!("===> Parsed WHERE condition: {:?}", condition);
+            
+            (i, Some(WhereClause { condition }))
+        } else {
+            println!("===> No WHERE clause to parse");
+            (i, None)
+        }
+    };
     
-    // 6. Parse optional SKIP
-    let (input, _) = multispace0.parse(input)?;
+    println!("===> WITH where_clause present: {}", where_clause.is_some());
     
-    // 7. Parse optional LIMIT
-    let (input, _) = multispace0.parse(input)?;
+    // 6. Consume SKIP / LIMIT
+    let (mut remaining_input, _) = multispace0.parse(remaining_input)?;
     
-    Ok((input, ParsedWithClause {
-        items: Vec::new(), // TODO: actually parse projection items
+    let (i, skip_val) = opt(preceded(
+        preceded(multispace0, tag_no_case("SKIP")),
+        preceded(multispace1, map_res(digit1, |s: &str| s.parse::<i64>()))
+    )).parse(remaining_input)?;
+    remaining_input = i;
+    
+    let (mut remaining_input, _) = multispace0.parse(remaining_input)?;
+    
+    let (i, limit_val) = opt(preceded(
+        preceded(multispace0, tag_no_case("LIMIT")),
+        preceded(multispace1, map_res(digit1, |s: &str| s.parse::<i64>()))
+    )).parse(remaining_input)?;
+    remaining_input = i;
+    
+    let (remaining_input, _) = multispace0.parse(remaining_input)?;
+    
+    Ok((remaining_input, ParsedWithClause {
+        items,
         distinct: is_distinct,
         where_clause,
         order_by: Vec::new(),
-        skip: None,
-        limit: None,
+        skip: skip_val,
+        limit: limit_val,
     }))
+}
+
+fn parse_atom(input: &str) -> IResult<&str, Expression> {
+    alt((
+        delimited(
+            char('('),
+            delimited(multispace0, parse_expression, multispace0),
+            char(')')
+        ),
+        map(
+            tuple((
+                parse_identifier,
+                delimited(multispace0, char('('), multispace0),
+                separated_list0(
+                    delimited(multispace0, char(','), multispace0),
+                    parse_expression
+                ),
+                delimited(multispace0, char(')'), multispace0),
+            )),
+            |(name, _, args, _)| Expression::FunctionCall {
+                name: name.to_string(),
+                args,
+            }
+        ),
+        map(
+            tuple((parse_identifier, char('.'), parse_identifier)),
+            |(var, _, prop)| Expression::Property(
+                PropertyAccess::Vertex(var.to_string(), prop.to_string())
+            )
+        ),
+        map(
+            parse_value, 
+            |v| Expression::Literal(CypherValue::from_json(v))
+        ),
+        map(
+            parse_identifier, 
+            |v| Expression::Variable(v.to_string())
+        ),
+    )).parse(input)
+}
+
+fn parse_and_term(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_and_term START");
+    let (input, mut factors) = separated_list1(
+        preceded(multispace0, tag_no_case("AND")),
+        parse_where_expression, // ✅ Use your full condition parser
+    ).parse(input)?;
+
+    let term = if factors.len() == 1 {
+        factors.remove(0)
+    } else {
+        let mut iter = factors.into_iter();
+        let mut root = iter.next().unwrap();
+        for next in iter {
+            root = Expression::And {
+                left: Box::new(root),
+                right: Box::new(next),
+            };
+        }
+        root
+    };
+
+    Ok((input, term))
+}
+
+/// Find keyword position ensuring word boundaries
+fn find_keyword_position(haystack: &str, needle: &str) -> Option<usize> {
+    let mut pos = 0;
+    while let Some(found) = haystack[pos..].find(needle) {
+        let absolute_pos = pos + found;
+        
+        // Check if it's at a word boundary (preceded by whitespace or start)
+        let is_start = absolute_pos == 0 || 
+                       haystack.chars().nth(absolute_pos - 1).map_or(false, char::is_whitespace);
+        
+        // Check if it's at a word boundary (followed by whitespace or end)
+        let end_pos = absolute_pos + needle.len();
+        let is_end = end_pos >= haystack.len() ||
+                     haystack.chars().nth(end_pos).map_or(false, char::is_whitespace);
+        
+        if is_start && is_end {
+            return Some(absolute_pos);
+        }
+        
+        pos = absolute_pos + 1;
+    }
+    None
+}
+
+/// Find a keyword with proper word boundaries
+fn find_keyword_boundary(haystack: &str, needle: &str) -> Option<usize> {
+    let mut start = 0;
+    
+    while let Some(pos) = haystack[start..].find(needle) {
+        let absolute_pos = start + pos;
+        
+        // Check word boundary before
+        let before_ok = absolute_pos == 0 || 
+                        haystack.chars().nth(absolute_pos - 1)
+                                .map_or(false, |c| c.is_whitespace() || c == ',');
+        
+        // Check word boundary after
+        let after_pos = absolute_pos + needle.len();
+        let after_ok = after_pos >= haystack.len() ||
+                       haystack.chars().nth(after_pos)
+                               .map_or(false, |c| c.is_whitespace() || c == ',');
+        
+        if before_ok && after_ok {
+            return Some(absolute_pos);
+        }
+        
+        start = absolute_pos + 1;
+    }
+    
+    None
+}
+
+/// Extract just the identifier part, stopping at keywords or extra whitespace
+fn extract_alias_identifier(text: &str) -> &str {
+    // Keywords that should terminate the alias
+    const KEYWORDS: &[&str] = &["WHERE", "ORDER", "SKIP", "LIMIT", "RETURN", "WITH"];
+    
+    let upper = text.to_uppercase();
+    let mut end_pos = text.len();
+    
+    // Find the first keyword
+    for keyword in KEYWORDS {
+        if let Some(pos) = find_keyword_boundary(&upper, keyword) {
+            if pos < end_pos {
+                end_pos = pos;
+            }
+        }
+    }
+    
+    // Take up to the keyword and trim
+    let candidate = text[..end_pos].trim();
+    
+    // Take only the first word (identifiers don't have spaces)
+    if let Some(space_pos) = candidate.find(char::is_whitespace) {
+        candidate[..space_pos].trim()
+    } else {
+        candidate
+    }
+}
+
+/// Parse projection items from a string like "p, levenshtein(...) AS dist"
+fn parse_projection_items(input: &str) -> Result<Vec<QueryReturnItem>, String> {
+    let mut items = Vec::new();
+    let mut current = input;
+    
+    while !current.is_empty() {
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut quote_char = ' ';
+        let mut found_comma = None;
+        
+        // Find the next comma at depth 0 (outside parentheses/strings)
+        for (i, c) in current.char_indices() {
+            match c {
+                '"' | '\'' => {
+                    if !in_string {
+                        in_string = true;
+                        quote_char = c;
+                    } else if c == quote_char {
+                        in_string = false;
+                    }
+                }
+                '(' => {
+                    if !in_string { depth += 1; }
+                }
+                ')' => {
+                    if !in_string { depth -= 1; }
+                }
+                ',' => {
+                    if !in_string && depth == 0 {
+                        found_comma = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        // Split at comma or take everything
+        let (item_str, rest) = if let Some(pos) = found_comma {
+            (&current[..pos], &current[pos+1..])
+        } else {
+            (current, "")
+        };
+        
+        let trimmed_item = item_str.trim();
+        if !trimmed_item.is_empty() {
+            // Parse "expression AS alias"
+            let (expr, alias) = parse_single_projection_item(trimmed_item)?;
+            
+            items.push(QueryReturnItem {
+                expression: expr.to_string(),
+                alias: alias.map(|s| s.to_string()),
+            });
+        }
+        
+        current = rest.trim();
+    }
+    
+    Ok(items)
+}
+
+/// Parse a single projection item: "expr" or "expr AS alias"
+fn parse_single_projection_item(item: &str) -> Result<(&str, Option<&str>), String> {
+    // Find " AS " at depth 0 (outside parentheses and strings)
+    let as_pos = find_as_at_depth_zero(item)?;
+    
+    if let Some(pos) = as_pos {
+        let expr = item[..pos].trim();
+        let after_as = item[pos + 3..].trim(); // +3 for "AS " (note: " AS " is 4 chars, but we found at space)
+        
+        // Extract just the identifier, stopping at any keyword or whitespace
+        let alias = extract_alias_identifier(after_as);
+        
+        return Ok((expr, Some(alias)));
+    }
+    
+    Ok((item.trim(), None))
+}
+
+/// Find the position of " AS " at depth 0 (outside parentheses and strings)
+fn find_as_at_depth_zero(text: &str) -> Result<Option<usize>, String> {
+    let upper = text.to_uppercase();
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut quote_char = ' ';
+    
+    let mut i = 0;
+    while i < text.len() {
+        let c = text.chars().nth(i).unwrap();
+        
+        match c {
+            '"' | '\'' => {
+                if !in_string {
+                    in_string = true;
+                    quote_char = c;
+                } else if c == quote_char {
+                    in_string = false;
+                }
+            }
+            '(' => {
+                if !in_string { depth += 1; }
+            }
+            ')' => {
+                if !in_string { depth -= 1; }
+            }
+            _ => {}
+        }
+        
+        // Check for " AS " at this position when at depth 0
+        if !in_string && depth == 0 && i + 4 <= upper.len() {
+            let slice = &upper[i..];
+            
+            // Check for " AS " (space before and after)
+            if slice.starts_with(" AS ") {
+                return Ok(Some(i));
+            }
+        }
+        
+        i += 1;
+    }
+    
+    Ok(None)
+}
+
+/// Extract an identifier, stopping at any keyword
+fn extract_identifier_before_keyword<'a>(text: &'a str, keywords: &[&str]) -> &'a str {
+    let upper = text.to_uppercase();
+    
+    // Find the first keyword position
+    let mut min_pos = text.len();
+    
+    for keyword in keywords {
+        // Look for keyword as a whole word
+        if let Some(pos) = find_keyword_position(&upper, keyword) {
+            if pos < min_pos {
+                min_pos = pos;
+            }
+        }
+    }
+    
+    // Take everything up to the keyword
+    let result = text[..min_pos].trim();
+    
+    // If there's whitespace in the middle (shouldn't happen for valid identifiers),
+    // take only the first word
+    if let Some(space_pos) = result.find(char::is_whitespace) {
+        result[..space_pos].trim()
+    } else {
+        result
+    }
 }
 
 /// Level 3: Comparisons (=, <>, etc.)
@@ -4130,10 +4928,13 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
 /// Parse a single WHERE condition/expression (property, function, or parenthesized)
 pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_where_expression START");
+    
+    // 1. Parenthesized expressions
     if let Ok((remaining, expr)) = parse_parenthesized_expression(input) {
         return Ok((remaining, expr));
     }
 
+    // 2. Function calls (e.g., ID(n) = "uuid")
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
@@ -4153,23 +4954,51 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }));
     }
     
+    // 3. Property access (e.g., n.name = "Alice")
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
-    let (input, op) = parse_comparison_op(input)?;
+    
+    // 4. Parse operator (handle multi-word operators first)
+    let (input, op_str) = {
+        let trimmed = input.trim_start();
+        let upper = trimmed.to_uppercase();
+
+        if upper.starts_with("STARTS WITH") {
+            let (i, _) = tag_no_case("STARTS").parse(input)?;
+            let (i, _) = multispace1.parse(i)?;
+            let (i, _) = tag_no_case("WITH").parse(i)?;
+            (i, "STARTS WITH")
+        } else if upper.starts_with("ENDS WITH") {
+            let (i, _) = tag_no_case("ENDS").parse(input)?;
+            let (i, _) = multispace1.parse(i)?;
+            let (i, _) = tag_no_case("WITH").parse(i)?;
+            (i, "ENDS WITH")
+        } else if upper.starts_with("CONTAINS") {
+            let (i, _) = tag_no_case("CONTAINS").parse(input)?;
+            (i, "CONTAINS")
+        } else {
+            // Single-word operators: =, <>, <, <=, >, >=, IS, etc.
+            let (i, op) = parse_comparison_op(input)?;
+            (i, op)
+        }
+    };
+
     let (input, _) = multispace0.parse(input)?;
     
-    let (input, val) = if op.to_uppercase().contains("NULL") {
+    // 5. Parse value
+    let (input, val) = if op_str.to_uppercase().contains("NULL") {
         (input, Value::Null)
     } else {
         parse_value(input)?
     };
     
+    // 6. Split property path
     let (var, prop) = full_path.split_once('.')
         .map(|(v, p)| (v.to_string(), p.to_string()))
         .unwrap_or_else(|| (full_path.clone(), String::new()));
 
-    // ✅ Handle STARTS WITH
-    if op.to_uppercase() == "STARTS WITH" {
+    // 7. Handle special operators
+    if op_str == "STARTS WITH" {
         if let Value::String(prefix) = val {
             return Ok((input, Expression::StartsWith {
                 variable: var,
@@ -4179,10 +5008,11 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
+    // 8. Standard property comparison
     Ok((input, Expression::PropertyComparison {
         variable: var,
         property: prop,
-        operator: op.to_string(),
+        operator: op_str.to_string(),
         value: val,
     }))
 }
@@ -5241,9 +6071,9 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
             // Handles pure MATCH ... RETURN, relying on a full pattern matcher.
             // --- UPDATED MATCH PATTERN BRANCH ---
             // --- FIXED: MatchPattern with variable binding and WHERE evaluation ---
-CypherQuery::MatchPattern { patterns, where_clause, with_clause } => {
+            CypherQuery::MatchPattern { patterns, where_clause, with_clause } => {
                 info!("===> EXECUTING MatchPattern with {} patterns", patterns.len());
-                
+
                 // Transform Vec<String> labels to Option<String> for the execution engine
                 let transformed_patterns: Vec<_> = patterns.iter().map(|(id, nodes, edges)| {
                     let transformed_nodes: Vec<_> = nodes.iter().map(|(var, labels, props)| {
@@ -5259,38 +6089,153 @@ CypherQuery::MatchPattern { patterns, where_clause, with_clause } => {
                     .and_then(|p| p.1.get(0))
                     .and_then(|n| n.0.as_ref())
                     .map(|s| s.as_str())
-                    .unwrap_or("p");
+                    .unwrap_or("n");
 
-                // 2. Apply WHERE filtering if present
+                // 2. Apply direct MATCH WHERE filtering
                 if let Some(wc) = where_clause {
-                    final_vertices.retain(|v| {
+                    let original_count = final_vertices.len();
+                    let mut filtered = Vec::new();
+
+                    for v in &final_vertices {
                         let ctx = EvaluationContext::from_vertex(var_name, v);
-                        match wc.condition.evaluate(&ctx) {
-                            Ok(CypherValue::Bool(matched)) => matched, 
-                            Ok(_) => false, 
-                            Err(e) => {
-                                error!("Error evaluating WHERE clause for vertex {}: {}", v.id, e);
+
+                        let passes = match wc.condition.evaluate(&ctx) {
+                            Ok(CypherValue::Bool(true)) => true,
+                            Ok(CypherValue::Bool(false)) | Ok(CypherValue::Null) => false,
+                            Ok(other) => {
+                                println!("===> MATCH WHERE returned non-bool: {:?}", other);
                                 false
                             }
-                        }
-                    });
-                }
+                            Err(e) => {
+                                println!("===> MATCH WHERE evaluation error: {:?}", e);
 
-                // 3. Apply WITH filtering if present (MPI logical resolution)
-                if let Some(pwic) = with_clause {
-                    if let Some(inner_wc) = &pwic.where_clause {
-                        final_vertices.retain(|v| {
-                            let ctx = EvaluationContext::from_vertex(var_name, v);
-                            match inner_wc.condition.evaluate(&ctx) {
-                                Ok(CypherValue::Bool(matched)) => matched,
-                                Ok(_) => false,
-                                Err(e) => {
-                                    error!("Error evaluating WITH clause for vertex {}: {}", v.id, e);
+                                // Fallback using the existing compare_values helper
+                                if let Expression::PropertyComparison { variable, property, operator, value } = &wc.condition {
+                                    if variable == var_name {
+                                        let left_val_opt = if property.is_empty() {
+                                            ctx.variables.get(variable).cloned()
+                                        } else {
+                                            v.properties.get(property).map(|pv| {
+                                                let json_val = serde_json::to_value(pv).unwrap_or(serde_json::Value::Null);
+                                                CypherValue::from_json(json_val)
+                                            })
+                                        };
+
+                                        if let Some(left_val) = left_val_opt {
+                                            let right_val = CypherValue::from_json(value.clone());
+                                            compare_values(&left_val, operator, &right_val)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
                                     false
                                 }
                             }
-                        });
+                        };
+
+                        if passes {
+                            filtered.push(v.clone());
+                        }
                     }
+
+                    final_vertices = filtered;
+                    println!("===> After initial MATCH WHERE: {} -> {} vertices", original_count, final_vertices.len());
+                }
+
+                // 3. Apply WITH clause: projections + WHERE filtering
+                if let Some(with) = with_clause {
+                    let original_count = final_vertices.len();
+                    let mut filtered = Vec::new();
+
+                    for v in &final_vertices {
+                        let mut ctx = EvaluationContext::from_vertex(var_name, v);
+                        let mut projection_success = true;
+
+                        // Calculate expressions and store in context
+                        for item in &with.items {
+                            // Skip simple pass-through of the main variable
+                            if item.alias.is_none() && item.expression.trim() == var_name {
+                                continue;
+                            }
+
+                            match parse_expression(&item.expression) {
+                                Ok((_, expr)) => {
+                                    match expr.evaluate(&ctx) {
+                                        Ok(val) => {
+                                            if let Some(alias) = &item.alias {
+                                                println!("===> Stored '{}' = {:?} in context", alias, val);
+                                                ctx.variables.insert(alias.clone(), val);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("===> WITH projection '{}' eval failed: {:?}", item.expression, e);
+                                            projection_success = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("===> parse_expression failed for '{}': {:?}", item.expression, e);
+                                    projection_success = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !projection_success {
+                            continue;
+                        }
+
+                        // Apply WITH WHERE filter
+                        let passes = if let Some(wwc) = &with.where_clause {
+                            println!("===> Evaluating WITH WHERE");
+
+                            match wwc.condition.evaluate(&ctx) {
+                                Ok(CypherValue::Bool(result)) => {
+                                    println!("===> WHERE result: {}", result);
+                                    result
+                                }
+                                Ok(other) => {
+                                    println!("===> WHERE returned non-bool: {:?}", other);
+                                    false
+                                }
+                                Err(e) => {
+                                    println!("===> WHERE evaluation error: {:?}", e);
+
+                                    // Use the existing compare_values helper for variable comparisons (e.g. dist < 3)
+                                    if let Expression::PropertyComparison { variable, property, operator, value } = &wwc.condition {
+                                        if property.is_empty() {
+                                            if let Some(var_val) = ctx.variables.get(variable) {
+                                                let right_val = CypherValue::from_json(value.clone());
+                                                let result = compare_values(var_val, operator, &right_val);
+                                                println!("===> Manual WITH WHERE comparison (using compare_values): {}", result);
+                                                result
+                                            } else {
+                                                println!("===> Variable '{}' not found in context", variable);
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }
+                            }
+                        } else {
+                            true
+                        };
+
+                        if passes {
+                            filtered.push(v.clone());
+                        }
+                    }
+
+                    println!("===> After WITH processing and WHERE filtering: {} -> {} vertices", original_count, filtered.len());
+                    final_vertices = filtered;
                 }
 
                 Ok(json!({
@@ -5302,7 +6247,6 @@ CypherQuery::MatchPattern { patterns, where_clause, with_clause } => {
                     }
                 }))
             }
-
             CypherQuery::MatchSet { match_patterns, where_clause, with_clause, set_clauses } => {
                 info!("===> EXECUTING MatchSet with {} patterns", match_patterns.len());
                 
@@ -6373,8 +7317,7 @@ CypherQuery::MatchPattern { patterns, where_clause, with_clause } => {
                 // to the final required type, Value.
                 graph_service.query_result_to_value(chain_qr_result)
             }
-
-            // 2. Handle Union Queries
+            // 3. Handle Union Queries
             // Assuming the original structure: CypherQuery::Union(q1, q2, is_all)
             CypherQuery::Union(q1, q2, is_all) => {
                 // q1 and q2 are already Box<CypherQuery> as bound in the match pattern.
@@ -6538,6 +7481,46 @@ CypherQuery::MatchPattern { patterns, where_clause, with_clause } => {
             }
         }
     })
+}
+
+/// Helper to compare CypherValues with an operator
+fn compare_values(left: &CypherValue, op: &str, right: &CypherValue) -> bool {
+    match (left, op, right) {
+        // Integer comparisons
+        (CypherValue::Integer(a), "<", CypherValue::Integer(b)) => a < b,
+        (CypherValue::Integer(a), "<=", CypherValue::Integer(b)) => a <= b,
+        (CypherValue::Integer(a), ">", CypherValue::Integer(b)) => a > b,
+        (CypherValue::Integer(a), ">=", CypherValue::Integer(b)) => a >= b,
+        (CypherValue::Integer(a), "=", CypherValue::Integer(b)) => a == b,
+        (CypherValue::Integer(a), "!=", CypherValue::Integer(b)) => a != b,
+        
+        // Float comparisons
+        (CypherValue::Float(a), "<", CypherValue::Float(b)) => a < b,
+        (CypherValue::Float(a), "<=", CypherValue::Float(b)) => a <= b,
+        (CypherValue::Float(a), ">", CypherValue::Float(b)) => a > b,
+        (CypherValue::Float(a), ">=", CypherValue::Float(b)) => a >= b,
+        (CypherValue::Float(a), "=", CypherValue::Float(b)) => (a - b).abs() < f64::EPSILON,
+        (CypherValue::Float(a), "!=", CypherValue::Float(b)) => (a - b).abs() >= f64::EPSILON,
+        
+        // Mixed numeric comparisons
+        (CypherValue::Integer(a), "<", CypherValue::Float(b)) => (*a as f64) < *b,
+        (CypherValue::Float(a), "<", CypherValue::Integer(b)) => *a < (*b as f64),
+        (CypherValue::Integer(a), "<=", CypherValue::Float(b)) => (*a as f64) <= *b,
+        (CypherValue::Float(a), "<=", CypherValue::Integer(b)) => *a <= (*b as f64),
+        (CypherValue::Integer(a), ">", CypherValue::Float(b)) => (*a as f64) > *b,
+        (CypherValue::Float(a), ">", CypherValue::Integer(b)) => *a > (*b as f64),
+        (CypherValue::Integer(a), ">=", CypherValue::Float(b)) => (*a as f64) >= *b,
+        (CypherValue::Float(a), ">=", CypherValue::Integer(b)) => *a >= (*b as f64),
+        
+        // String comparisons
+        (CypherValue::String(a), "=", CypherValue::String(b)) => a == b,
+        (CypherValue::String(a), "!=", CypherValue::String(b)) => a != b,
+        
+        _ => {
+            println!("===> Unsupported comparison: {:?} {} {:?}", left, op, right);
+            false
+        }
+    }
 }
 
 fn parse_order_by_items(input: &str) -> IResult<&str, Vec<OrderByItem>> {

@@ -20,7 +20,7 @@ use crate::graph_engine::medical::*;
 use crate::storage_engine::{ GraphStorageEngine, StorageEngine, GraphOp }; // Ensure this trait is in scope
 use crate::graph_engine::parse_patient::{ parse_patient_from_cypher_result };
 use crate::query_parser::query_types::*;
-use crate::query_parser::cypher_parser::{ evaluate_expression };
+use crate::query_parser::cypher_parser::{ evaluate_expression, parse_expression };
 use crate::config::{ QueryResult };
 
 /// Defines the event types for all graph mutations.
@@ -881,78 +881,112 @@ impl GraphService {
         &self,
         criteria: HashMap<String, String>,
     ) -> Result<Vec<Patient>> {
-        let mut match_clauses = Vec::new();
-        let mut fuzzy_scores = Vec::new();
-
-        // 1. Separate "Fuzzy" items (Names) from "Strict" items (Flags)
+        let mut strict_clauses = Vec::new();
+        let mut with_exprs = Vec::new();
+        let mut where_fuzzy = String::new();
+        let mut order_by = String::new();
+        let mut has_fuzzy = false;
+        
         for (key, value) in criteria.iter() {
             let sanitized = sanitize_cypher_string(value);
-            
             match key.as_str() {
-                "first_name" | "last_name" => {
-                    fuzzy_scores.push(format!("levenshtein(p.{}, '{}')", key, sanitized));
-                }
-                "name" => {
-                    fuzzy_scores.push(format!("levenshtein(p.first_name, '{}')", sanitized));
-                    fuzzy_scores.push(format!("levenshtein(p.last_name, '{}')", sanitized));
-                }
                 "date_of_birth" | "dob" => {
-                    match_clauses.push(format!("p.date_of_birth STARTS WITH '{}'", sanitized));
+                    let date_part = sanitized.split('T').next().unwrap_or(&sanitized);
+                    strict_clauses.push(format!("p.date_of_birth STARTS WITH '{}'", date_part));
                 }
                 "gender" => {
-                    match_clauses.push(format!("p.gender = '{}'", sanitized));
+                    strict_clauses.push(format!("p.gender = '{}'", sanitized));
                 }
                 "phone" => {
-                    match_clauses.push(format!("p.phone = '{}'", sanitized));
+                    strict_clauses.push(format!("p.phone = '{}'", sanitized));
+                }
+                "first_name" | "last_name" | "name" => {
+                    has_fuzzy = true;
+                    // Title case: First letter capital, rest lower
+                    let title_case = if sanitized.is_empty() {
+                        sanitized
+                    } else {
+                        let mut chars = sanitized.chars();
+                        let first = chars.next().unwrap().to_uppercase().to_string();
+                        let rest = chars.as_str().to_lowercase();
+                        first + &rest
+                    };
+                    
+                    if key == "first_name" {
+                        with_exprs.push(format!("levenshtein(p.first_name, '{}') AS dist", title_case));
+                    } else if key == "last_name" {
+                        with_exprs.push(format!("levenshtein(p.last_name, '{}') AS dist", title_case));
+                    } else if key == "name" {
+                        // For "name", assume it's full name — split or use as-is for both
+                        with_exprs.push(format!(
+                            "(levenshtein(p.first_name, '{}') + levenshtein(p.last_name, '{}')) / 2.0 AS dist",
+                            title_case, title_case
+                        ));
+                    }
+                    where_fuzzy = "dist < 3".to_string();
+                    order_by = "dist ASC".to_string();
                 }
                 _ => continue,
             }
         }
-
-        // 2. Build the Query — CORRECT SYNTAX
-        let cypher_query = if match_clauses.is_empty() {
-            // No strict filters → just MATCH
-            format!(
-                "MATCH (p:Patient) \
-                 WITH p, {} AS dist \
-                 WHERE dist < 3 \
-                 RETURN p ORDER BY dist ASC LIMIT 10",
-                if fuzzy_scores.is_empty() {
-                    "0".to_string()
-                } else {
-                    format!("({}) / {}", fuzzy_scores.join(" + "), fuzzy_scores.len())
-                }
-            )
+        
+        let mut cypher_query = "MATCH (p:Patient)".to_string();
+        
+        if !strict_clauses.is_empty() {
+            cypher_query.push_str(" WHERE ");
+            cypher_query.push_str(&strict_clauses.join(" AND "));
+        }
+        
+        if has_fuzzy {
+            cypher_query.push_str(" WITH p");
+            if !with_exprs.is_empty() {
+                cypher_query.push_str(", ");
+                cypher_query.push_str(&with_exprs.join(", "));
+            }
+            if !where_fuzzy.is_empty() {
+                cypher_query.push_str(" WHERE ");
+                cypher_query.push_str(&where_fuzzy);
+            }
+            cypher_query.push_str(&format!(" RETURN p ORDER BY {} LIMIT 10", order_by));
         } else {
-            // With strict filters → separate MATCH and WHERE
-            format!(
-                "MATCH (p:Patient) \
-                 WHERE {} \
-                 WITH p, {} AS dist \
-                 WHERE dist < 3 \
-                 RETURN p ORDER BY dist ASC LIMIT 10",
-                match_clauses.join(" AND "),
-                if fuzzy_scores.is_empty() {
-                    "0".to_string()
-                } else {
-                    format!("({}) / {}", fuzzy_scores.join(" + "), fuzzy_scores.len())
-                }
-            )
-        };
-
-        println!("===> Executing Fuzzy Search: {}", cypher_query);
-
+            cypher_query.push_str(" RETURN p LIMIT 10");
+        }
+        
+        println!("===> Executing Demographic Search: {}", cypher_query);
+        
         let raw_results = self
             .execute_cypher_read(&cypher_query, serde_json::Value::Null)
             .await?;
         
+        println!("===> Raw results count: {}", raw_results.len());
+        
         let mut patients = Vec::new();
-        for row in raw_results {
-            if let Ok(patient) = parse_patient_from_cypher_result(row) {
-                patients.push(patient);
+        
+        // raw_results is already Vec<Value>, iterate directly
+        for result_item in raw_results {
+            println!("===> Processing result item: {}", serde_json::to_string_pretty(&result_item).unwrap_or_default());
+            
+            // Each result_item should have a "vertices" field
+            if let Some(vertices) = result_item.get("vertices").and_then(|v| v.as_array()) {
+                for vertex in vertices {
+                    println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
+                    
+                    match parse_patient_from_cypher_result(vertex.clone()) {
+                        Ok(patient) => {
+                            println!("===> Successfully parsed patient: {:?}", patient);
+                            patients.push(patient);
+                        }
+                        Err(e) => {
+                            println!("===> Failed to parse patient: {}", e);
+                            // Continue with next vertex instead of failing entire search
+                        }
+                    }
+                }
             }
         }
-
+        
+        println!("===> Total Patients Found: {}", patients.len());
+        
         Ok(patients)
     }
 
@@ -1076,7 +1110,7 @@ impl GraphService {
     }
 
     /// Helper to convert raw database values into the Vertex model
-    fn map_value_to_vertex(&self, value: Value) -> Result<Vertex, GraphError> {
+    pub fn map_value_to_vertex(&self, value: Value) -> Result<Vertex, GraphError> {
         // This logic depends on your specific database driver's Value type.
         // Usually, you deserialize the properties map into the Vertex struct.
         serde_json::from_value(json!(value))
@@ -1397,41 +1431,48 @@ impl GraphService {
     /// **Inferred Helper 2:** Applies projection and aliasing to a row based on Cypher return items.
     /// This is required for the WITH/RETURN ITEMS clause.
     pub fn apply_cypher_projection(&self, items: &[QueryReturnItem], row: Value) -> GraphResult<Value> {
-        // Placeholder implementation: A real implementation would map the variables in the row.
         let mut new_row_map = Map::new();
-        let row_map = row.as_object().ok_or(GraphError::InternalError("Row not a JSON object".to_string()))?;
-        
+
+        // Build evaluation context from the current row (which contains bound variables like "p" → vertex)
+        let ctx = EvaluationContext::from_json(&row);
+
         for item in items {
-            // The key for the new map (alias, or expression if no alias)
             let target_key: String = item.alias.as_ref()
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    // If no alias, use the expression as the key
-                    item.expression.to_string()
-                });
-            
-            // The key used to look up the value in the existing row map.
-            // item.expression is already a String, so we just need a reference to it
-            let source_key: &str = &item.expression;
-            
-            // 1. Check if the source key exists in the current row.
-            if let Some(value) = row_map.get(source_key) {
-                new_row_map.insert(target_key, value.clone());
-            } else {
-                // 2. Handle missing source key (either an anonymous variable or a complex expression)
-                // If the source key (variable name) is not in the row map, it means the expression 
-                // needs to be evaluated (e.g., `n.name + n.surname`).
-                
-                // NOTE: A proper Cypher engine would evaluate the expression here.
-                
-                // For a sound placeholder: If not found, insert Null and log the need for evaluation.
-                new_row_map.insert(target_key, Value::Null);
-                // Example of where you'd call an evaluation engine:
-                // let evaluated_value = self.evaluate_complex_expression(&item.expression, row_map)?;
-                // new_row_map.insert(target_key, evaluated_value);
+                .unwrap_or_else(|| item.expression.clone());
+
+            // Parse the expression string (e.g., "levenshtein(p.first_name, 'Alice')")
+            match parse_expression(&item.expression) {
+                Ok((_, expr)) => {
+                    // Evaluate it against the current row context
+                    match expr.evaluate(&ctx) {
+                        Ok(cypher_value) => {
+                            // Convert back to JSON using your existing to_json()
+                            let json_value = cypher_value.to_json();
+                            new_row_map.insert(target_key, json_value);
+                        }
+                        Err(e) => {
+                            warn!("Projection evaluation failed for '{}': {}", item.expression, e);
+                            new_row_map.insert(target_key, Value::Null);
+                        }
+                    }
+                }
+                Err(parse_err) => {
+                    // Fallback: treat as simple variable lookup (for "p", "n", etc.)
+                    if let Some(row_obj) = row.as_object() {
+                        if let Some(value) = row_obj.get(&item.expression) {
+                            new_row_map.insert(target_key, value.clone());
+                        } else {
+                            warn!("Projection variable not found: {}", item.expression);
+                            new_row_map.insert(target_key, Value::Null);
+                        }
+                    } else {
+                        new_row_map.insert(target_key, Value::Null);
+                    }
+                }
             }
         }
-        
+
         Ok(Value::Object(new_row_map))
     }
 
@@ -1442,6 +1483,38 @@ impl GraphService {
         std::cmp::Ordering::Equal
     }
 
+
+    /// Executes a pipeline transformation (projection, filtering, etc.) based on a WITH clause.
+    /// This method is designed to be called by the parser to handle standalone 
+    /// or chained WITH statements.
+    pub async fn execute_with_projection(
+        &self,
+        items: Vec<QueryReturnItem>,
+        distinct: bool,
+        where_clause: Option<WhereClause>,
+        skip: Option<u64>,
+        limit: Option<u64>,
+    ) -> GraphResult<QueryResult> {
+        // MPI Requirement: All transactions must be logged into the graph of events.
+        // Even if this is a projection (read), we log the intent if it's an entry point.
+        info!("[GraphService] Executing MPI projection transaction.");
+
+        let input_rows = vec![Value::Object(serde_json::Map::new())];
+
+        // Fix Error [E0308]: Map Option<u64> to Option<i64> for ParsedWithClause
+        let clause = ParsedWithClause {
+            items,
+            distinct,
+            where_clause,
+            skip: skip.map(|s| s as i64),
+            limit: limit.map(|l| l as i64),
+            order_by: Vec::new(), 
+        };
+
+        let transformed_data = self.execute_pipeline_transform(clause, input_rows).await?;
+
+        self.value_to_query_result(Value::Array(transformed_data))
+    }
     // =========================================================================
     // STATEFUL EXECUTION FOR CHAINING
     // =========================================================================
@@ -1689,16 +1762,25 @@ impl GraphService {
         let engine = QueryExecEngine::get()
             .await
             .map_err(|e| GraphError::InternalError(format!("QueryExecEngine not initialized: {}", e)))?;
-
-        // FIX 1 (E0061): Remove the `params` argument from the call.
-        // FIX 2 (E0308): Use `.map(|value| vec![value])` to convert the single Value into a Vec<Value>.
+        
         println!("===> in execute_cypher_read - query was: {}", query);
-        engine.execute_cypher(query) 
+        
+        let result = engine.execute_cypher(query)
             .await
-            .map_err(|e| GraphError::QueryExecutionError(format!("Cypher READ failed: {}", e)))
-            .map(|value| vec![value]) // Wrap the single result in a vector
+            .map_err(|e| GraphError::QueryExecutionError(format!("Cypher READ failed: {}", e)))?;
+        
+        println!("===> execute_cypher returned: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        
+        // The result structure is: { "results": [ {...}, {...} ] }
+        // Extract the "results" array
+        if let Some(results_array) = result.get("results").and_then(|v| v.as_array()) {
+            Ok(results_array.clone())
+        } else {
+            // Fallback: if the structure is different, return the whole result wrapped
+            println!("===> Warning: Expected 'results' array, got different structure");
+            Ok(vec![result])
+        }
     }
-
     /// Executes a declarative write Cypher query against the graph (e.g., CREATE, MERGE).
     /// 
     /// NOTE: This is necessary for the PatientService::create_patient implementation.
