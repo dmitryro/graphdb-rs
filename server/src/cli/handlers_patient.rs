@@ -367,8 +367,8 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 mrn: Some(mrn_fixed), // Patient struct requires Option<String> but we wrap the fixed string
                 ssn: Some(ssn_fixed), 
                 
-                first_name, // Guaranteed Some
-                last_name,  // Guaranteed Some (or "UNSPECIFIED")
+                first_name: Some(first_name), // Guaranteed Some
+                last_name: Some(last_name),  // Guaranteed Some (or "UNSPECIFIED")
                 // FIX: Correctly assign the wrapped value to the `gender` field.
                 gender: Some(gender),
                 address: address_opt, 
@@ -376,7 +376,7 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 phone_mobile: Some(phone_fixed),
 
                 // Calculated/Default fields
-                id: 0, 
+                id: Some(0), 
                 date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -387,7 +387,7 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 // adjusted elsewhere to handle these remaining Nones, or the graph layer is tolerant of them).
                 // However, since the error was on ssn/mrn, we must treat them as mandatory strings 
                 // (even if empty) for the Cypher query builder.
-                user_id: None, middle_name: None, suffix: None,
+                vertex_id: None, user_id: None, middle_name: None, suffix: None,
                 preferred_name: None,
                 date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, phone_home: None,
@@ -555,8 +555,8 @@ pub async fn handle_patient_command_interactive(
                 mrn: Some(mrn_fixed), 
                 ssn: Some(ssn_fixed), 
                 
-                first_name, // Guaranteed Some
-                last_name,  // Guaranteed Some (or "UNSPECIFIED")
+                first_name: Some(first_name), // Guaranteed Some
+                last_name: Some(last_name),  // Guaranteed Some (or "UNSPECIFIED")
                 // FIX: Correctly assign the wrapped value to the `gender` field.
                 gender: Some(gender),
                 
@@ -564,13 +564,13 @@ pub async fn handle_patient_command_interactive(
                 // FIX: Use the fixed (non-null) strings
                 phone_mobile: Some(phone_fixed),
 
-                id: 0, 
+                id: Some(0), 
                 date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 patient_status: Some("ACTIVE".to_string()), 
 
-                user_id: None, middle_name: None, suffix: None,
+                vertex_id: None, user_id: None, middle_name: None, suffix: None,
                 preferred_name: None,
                 date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
                 pronouns: None, address_id: None, phone_home: None,

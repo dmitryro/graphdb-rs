@@ -109,71 +109,115 @@ fn get_external_ids(_value: &Value, _key: &str) -> Result<Vec<ExternalId>> {
 /// Fully implements the function to parse a Patient struct from the raw Cypher result Value (JSON map).
 /// 
 /// This performs necessary conversions and field mapping to align with the actual `models::Patient` struct.
+
+/// Parses a Patient from the raw Cypher result Value.
+///
+/// The Cypher engine may return either:
+/// - Direct node properties: { "id": ..., "first_name": ..., ... }
+/// - Wrapped node: { "p": { "id": ..., "first_name": ..., ... } }
+///
+/// This function handles both cases robustly.
 pub fn parse_patient_from_cypher_result(value: Value) -> Result<Patient> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Result is not a JSON object"))?;
     
-    let mut map_value = value.as_object()
-        .context("Cypher result value is not a JSON object (node properties).")?
-        .clone();
-
-    // 1. Correct and Convert Required Fields based on `Patient` struct definition.
+    // The vertex structure has properties nested inside a "properties" field
+    let props = obj.get("properties")
+        .and_then(|p| p.as_object())
+        .ok_or_else(|| anyhow!("Missing 'properties' field"))?;
     
-    // id: i32 (Required)
-    let patient_id = get_required_i32(&Value::Object(map_value.clone()), "id")?;
-    map_value.insert("id".to_string(), Value::Number(serde_json::Number::from(patient_id)));
-
-    // date_of_birth: DateTime<Utc> (Required)
-    let dob_key = if map_value.contains_key("date_of_birth") { "date_of_birth" } else { "dob" };
-    let date_of_birth = get_required_dob(&Value::Object(map_value.clone()), dob_key)?;
-    map_value.insert("date_of_birth".to_string(), Value::String(date_of_birth.to_rfc3339()));
-    map_value.remove("dob"); // Remove temporary/legacy field
-
-    // created_at / updated_at: DateTime<Utc> (Required)
-    let created_at = get_required_datetime(&Value::Object(map_value.clone()), "created_at")?;
-    let updated_at = get_required_datetime(&Value::Object(map_value.clone()), "updated_at")?;
-    map_value.insert("created_at".to_string(), Value::String(created_at.to_rfc3339()));
-    map_value.insert("updated_at".to_string(), Value::String(updated_at.to_rfc3339()));
+    // Also get top-level fields (created_at, updated_at)
+    let created_at_str = obj.get("created_at")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing created_at"))?;
+    let updated_at_str = obj.get("updated_at")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing updated_at"))?;
     
-    // first_name, last_name, gender, patient_status: String (Required)
-    let first_name_str = get_optional_string(&Value::Object(map_value.clone()), "first_name")
-        .or_else(|| get_optional_string(&Value::Object(map_value.clone()), "name").map(|n| n.split_whitespace().next().unwrap_or("").to_string()))
-        .unwrap_or_else(|| "".to_string());
-    map_value.insert("first_name".to_string(), Value::String(first_name_str));
-
-    let last_name_str = get_optional_string(&Value::Object(map_value.clone()), "last_name")
-        .or_else(|| get_optional_string(&Value::Object(map_value.clone()), "name").map(|n| n.split_whitespace().skip(1).collect::<Vec<&str>>().join(" ")))
-        .unwrap_or_else(|| "".to_string());
-    map_value.insert("last_name".to_string(), Value::String(last_name_str));
-    map_value.remove("name"); // Remove temporary/legacy field
-
-    if !map_value.contains_key("gender") {
-        map_value.insert("gender".to_string(), Value::String("UNKNOWN".to_string()));
+    let mut cleaned = serde_json::Map::new();
+    
+    // ID - now looking in properties
+    let id = props
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .or_else(|| props.get("id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i32>().ok().map(|i| i as i64)))
+        .ok_or_else(|| anyhow!("Missing or invalid 'id' in properties"))?;
+    cleaned.insert("id".to_string(), Value::Number(id.into()));
+    
+    // First name (fallback to split "name" if needed)
+    let first_name = props
+        .get("first_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| props.get("name").and_then(|v| v.as_str()).and_then(|n| n.split_whitespace().next()))
+        .unwrap_or("")
+        .to_string();
+    cleaned.insert("first_name".to_string(), Value::String(first_name));
+    
+    // Last name
+    let last_name = props
+        .get("last_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            props.get("name").and_then(|v| v.as_str()).map(|n| {
+                let mut parts = n.split_whitespace();
+                parts.next(); // skip first
+                parts.collect::<Vec<&str>>().join(" ")
+            })
+        })
+        .unwrap_or_default();
+    cleaned.insert("last_name".to_string(), Value::String(last_name));
+    
+    // DOB
+    let dob_str = props
+        .get("date_of_birth")
+        .or_else(|| props.get("dob"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing date_of_birth"))?;
+    
+    let dob = if let Ok(dt) = DateTime::parse_from_rfc3339(dob_str) {
+        dt.with_timezone(&Utc)
+    } else if let Ok(naive) = NaiveDate::parse_from_str(dob_str, "%Y-%m-%d") {
+        naive.and_hms_opt(0, 0, 0).unwrap().and_utc()
+    } else {
+        return Err(anyhow!("Invalid DOB format: {}", dob_str));
+    };
+    cleaned.insert("date_of_birth".to_string(), Value::String(dob.to_rfc3339()));
+    
+    // created_at / updated_at from top level
+    let created_at = created_at_str.parse::<DateTime<Utc>>()?;
+    let updated_at = updated_at_str.parse::<DateTime<Utc>>()?;
+    
+    cleaned.insert("created_at".to_string(), Value::String(created_at.to_rfc3339()));
+    cleaned.insert("updated_at".to_string(), Value::String(updated_at.to_rfc3339()));
+    
+    // Defaults
+    let gender = props.get("gender").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+    let status = props.get("patient_status").and_then(|v| v.as_str()).unwrap_or("ACTIVE");
+    cleaned.insert("gender".to_string(), Value::String(gender.to_string()));
+    cleaned.insert("patient_status".to_string(), Value::String(status.to_string()));
+    
+    // Optional fields
+    if let Some(mrn) = props.get("mrn").and_then(|v| v.as_str()) {
+        cleaned.insert("mrn".to_string(), Value::String(mrn.to_string()));
     }
-    if !map_value.contains_key("patient_status") {
-        map_value.insert("patient_status".to_string(), Value::String("ACTIVE".to_string()));
+    
+    if let Some(ssn) = props.get("ssn").and_then(|v| v.as_str()) {
+        cleaned.insert("ssn".to_string(), Value::String(ssn.to_string()));
     }
-
-    // 2. Handle Address and Phone Number Aliases
     
-    // address: Option<Address>
-    let address_struct = get_optional_address(&Value::Object(map_value.clone()), "address");
-    map_value.insert("address".to_string(), serde_json::to_value(address_struct).unwrap_or(Value::Null));
+    if let Some(phone) = props.get("phone").and_then(|v| v.as_str()) {
+        cleaned.insert("phone_mobile".to_string(), Value::String(phone.to_string()));
+    }
     
-    // phone_home, phone_mobile, phone_work: Map CLI/temp 'phone' to 'phone_mobile'
-    if let Some(temp_phone) = get_optional_string(&Value::Object(map_value.clone()), "phone") {
-        if !map_value.contains_key("phone_mobile") {
-             map_value.insert("phone_mobile".to_string(), Value::String(temp_phone));
+    if let Some(addr_str) = props.get("address").and_then(|v| v.as_str()) {
+        if let Ok(addr) = serde_json::from_str::<Address>(addr_str) {
+            cleaned.insert("address".to_string(), serde_json::to_value(addr)?);
         }
-        map_value.remove("phone"); // Remove temporary field
     }
     
-    // 3. Final Deserialization using serde_json::from_value
-    let final_json_value = Value::Object(map_value); 
-    
-    // FIX: Clone the value before the move into from_value, and use the clone in the closure.
-    let final_json_value_clone = final_json_value.clone(); 
-
-    let patient: Patient = from_value(final_json_value) // final_json_value moved here
-        .with_context(|| format!("Final Deserialization of Patient struct failed from: {}", final_json_value_clone))?; // clone used here
-
-    Ok(patient)
+    let final_value = Value::Object(cleaned);
+    from_value(final_value.clone())
+        .with_context(|| format!("Failed to deserialize Patient: {}", final_value))
 }

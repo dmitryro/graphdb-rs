@@ -1,9 +1,13 @@
 // models/src/medical/master_patient_index.rs
+use serde::{Deserialize, Serialize};
+use std::{cmp::Ordering, fmt, str::FromStr};
+use core::{hash::Hash, ops::Deref};
+use bincode::{Encode, Decode, BorrowDecode};
 use chrono::{DateTime, Utc};
 use crate::{Vertex, ToVertex, identifiers::Identifier};
 use crate::medical::Address;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MasterPatientIndex {
     pub id: i32,
     pub patient_id: Option<i32>,

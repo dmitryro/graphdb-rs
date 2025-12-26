@@ -10,6 +10,7 @@ pub mod to_vertex;
 pub mod to_edge;
 pub mod medical;
 pub mod timestamp;
+pub mod evolution;
 
 pub use self::bulk_insert::BulkInsertItem;
 pub use self::edges::Edge;
@@ -22,6 +23,7 @@ pub use self::properties::{
     VertexProperties,
     VertexProperty,
 };
+pub use self::evolution::*;
 pub use self::timestamp::*;
 pub use self::queries::*;
 pub use self::vertices::Vertex;
