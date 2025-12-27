@@ -2207,15 +2207,15 @@ fn convert_parsed_patterns_to_execution_format(
 }
 
 fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
-    println!("===> full_statement_parser  START, input length: {}, preview: '{}'", 
+    println!("===> full_statement_parser START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
     let mut all_patterns: Vec<Pattern> = Vec::new();
     let mut on_create_set: Vec<(String, String, Expression)> = Vec::new();
     let mut on_match_set: Vec<(String, String, Expression)> = Vec::new();
     let mut input_current = input;
-    let mut return_clause_found = false;
     let mut captured_where: Option<WhereClause> = None;
     let mut captured_with: Option<ParsedWithClause> = None;
+    let mut captured_return: Option<ReturnClause> = None;
 
     // --- 1. PARSE MANDATORY FIRST CLAUSE ---
     let (input_after_clause, clause_type_str) = preceded(
@@ -2279,10 +2279,9 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     // --- 4. PARSE OPTIONAL WITH CLAUSE ---
     let (input_after_with, with_clause_raw) = opt(preceded(
         multispace0,
-        parse_with_full, // Returns ParsedWithClause
+        parse_with_full, 
     )).parse(input_current)?;
 
-    // FIX: with_clause_raw is already ParsedWithClause — no conversion needed
     captured_with = with_clause_raw;
     input_current = input_after_with;
 
@@ -2328,13 +2327,12 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         tuple((multispace0, tag_no_case("CREATE"), multispace1)),
         separated_list1(
             tuple((multispace0, char(','), multispace0)),
-            parse_single_pattern  // Use this instead - it handles relationships
+            parse_single_pattern 
         )
     )).parse(input_current)?;
 
-    // Convert the parsed patterns
     let create_patterns: Vec<Pattern> = match create_patterns_raw {
-        Some(raw_patterns) => raw_patterns,  // Already in Pattern format
+        Some(raw_patterns) => raw_patterns,
         None => Vec::new(),
     };
 
@@ -2360,19 +2358,18 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     )).parse(input_current)?;
     input_current = input_after_remove;
 
-    // --- 9. FINAL CONSUMPTION ---
-    let (input_ws, _) = multispace0.parse(input_current)?;
-    let next_upper = input_ws.trim_start().to_uppercase();
-    let input_final = if next_upper.starts_with("RETURN") || next_upper.starts_with("UNION") {
-        return_clause_found = true;
-        let (i, _) = take_while(|_| true).parse(input_ws)?;
-        i
-    } else {
-        let (i, _) = opt(preceded(multispace0, alt((tag(";"), multispace1)))).parse(input_ws)?;
-        i
-    };
+    // --- 9. PARSE RETURN CLAUSE ---
+    let (input_after_return, return_opt) = opt(preceded(
+        multispace0,
+        parse_return_clause_as_struct 
+    )).parse(input_current)?;
+    captured_return = return_opt;
+    input_current = input_after_return;
 
-    // --- 10. ANONYMOUS VARIABLES ---
+    // --- 10. FINAL CONSUMPTION ---
+    let (input_final, _) = opt(preceded(multispace0, alt((tag(";"), multispace1)))).parse(input_current)?;
+
+    // --- 11. ANONYMOUS VARIABLES ---
     let set_clauses = set_clauses_opt.unwrap_or_default();
     let remove_clauses = remove_clauses_opt.unwrap_or_default();
 
@@ -2389,7 +2386,7 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         }
     }
 
-    // --- 11. DISPATCH ---
+    // --- 12. DISPATCH ---
     if is_merge {
         Ok((input_final, CypherQuery::Merge { 
             patterns: all_patterns, 
@@ -2423,7 +2420,8 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         Ok((input_final, CypherQuery::MatchPattern { 
             patterns: all_patterns, 
             where_clause: captured_where,
-            with_clause: captured_with 
+            with_clause: captured_with,
+            return_clause: captured_return
         }))
     }
 }
@@ -3529,44 +3527,21 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
     println!("===> parse_single_query_clause START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
 
-    // 1. Try MERGE
-    if let Ok(result) = parse_merge(input) {
-        return Ok(result);
+    let trimmed = input.trim_start();
+    let upper = trimmed.to_uppercase();
+
+    // 1. Prioritize full_statement_parser for MATCH/MERGE to capture WITH, WHERE, and RETURN correctly.
+    // This avoids the manual conversion logic that was stripping details from ParsedWithClause.
+    if upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH") || upper.starts_with("MERGE") {
+        return full_statement_parser(input);
     }
 
-    // 2. MATCH handling with WHERE and WITH
-    if let Ok((input_after_match, patterns)) = parse_match_clause(input) {
-        // Parse optional WHERE
-        let (input_after_where, where_clause) = opt(parse_where)
-            .parse(input_after_match)?;
-
-        // Parse optional WITH — returns Option<WithClause>
-        let (remaining, with_clause_simple) = opt(preceded(multispace0, parse_with))
-            .parse(input_after_where)?;
-
-        // Convert WithClause → ParsedWithClause to satisfy enum type
-        let with_clause = with_clause_simple.map(|wc| ParsedWithClause {
-            items: Vec::new(),
-            distinct: false,
-            where_clause: Some(WhereClause { condition: wc.condition }),
-            order_by: Vec::new(),
-            skip: None,
-            limit: None,
-        });
-
-        return Ok((remaining, CypherQuery::MatchPattern {
-            patterns,
-            where_clause,
-            with_clause, // ✅ Now included
-        }));
-    }
-
-    // 3. Try standalone WITH
+    // 2. Fallback for standalone WITH (used in chainable queries)
     if let Ok(result) = parse_with_clause(input) {
         return Ok(result);
     }
 
-    // 4. Try CREATE
+    // 3. Fallback for standalone CREATE
     if let Ok((remaining, patterns)) = parse_create_clause(input) {
         return Ok((remaining, CypherQuery::CreateStatement {
             patterns,
@@ -3574,9 +3549,21 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
         }));
     }
 
-    // 5. Try modifying clauses (SET, DELETE, etc.)
+    // 4. Fallback for specialized mutation clauses (SET, DELETE, REMOVE)
     if let Ok(result) = parse_modifying_clause(input) {
         return Ok(result);
+    }
+
+    // 5. Explicitly handle standalone RETURN if not caught by full_statement_parser
+    if upper.starts_with("RETURN") {
+        if let Ok((remaining, ret_struct)) = parse_return_clause_as_struct(input) {
+             return Ok((remaining, CypherQuery::MatchPattern {
+                patterns: vec![],
+                where_clause: None,
+                with_clause: None,
+                return_clause: Some(ret_struct),
+            }));
+        }
     }
 
     Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Alt)))
@@ -3674,122 +3661,19 @@ pub fn parse_cypher_query_chain(input: &str) -> IResult<&str, CypherQuery> {
 fn parse_cypher_statement(input: &str) -> IResult<&str, CypherQuery> {
     println!("===> parse_cypher_statement START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
-    // 1. Match mandatory "MATCH" or "OPTIONAL MATCH"
-    let (input, _) = alt((
-        tag_no_case("MATCH"), 
-        tag_no_case("OPTIONAL MATCH")
-    )).parse(input)?;
-    let (input, _) = multispace1(input)?;
 
-    // 2. Consume patterns for the MATCH clause
-    let (input, patterns) = separated_list1(
-        tuple((multispace0, char(','), multispace0)),
-        parse_pattern_restricted,
-    ).parse(input)?;
+    // Delegate to the comprehensive full_statement_parser.
+    // This ensures that WITH, WHERE, and RETURN clauses are parsed with 
+    // their full metadata (distinct, order_by, etc.) rather than 
+    // being manually reconstructed and losing information.
+    let (input, query) = full_statement_parser(input)?;
 
-    // 3. Handle additional OPTIONAL MATCH clauses
-    let (input, additional_patterns) = many0(preceded(
-        multispace0,
-        preceded(
-            tag_no_case("OPTIONAL MATCH"),
-            preceded(multispace1, parse_pattern_restricted)
-        )
-    )).parse(input)?;
-    
-    let mut all_match_patterns = patterns;
-    all_match_patterns.extend(additional_patterns);
-
-    // 4. Consume WHERE clause
-    let (input, where_clause) = opt(preceded(
-        multispace0,
-        parse_where 
-    )).parse(input)?;
-
-    // 5. ✅ PARSE WITH CLAUSE — this was missing!
-    let (input, with_clause_raw) = opt(preceded(
-        multispace0,
-        parse_with  // returns WithClause { condition: Expression }
-    )).parse(input)?;
-
-    // 6. Convert WithClause → ParsedWithClause to satisfy enum type
-    let with_clause: Option<ParsedWithClause> = with_clause_raw.map(|wc| ParsedWithClause {
-        items: Vec::new(),
-        distinct: false,
-        where_clause: Some(WhereClause { condition: wc.condition }),
-        order_by: Vec::new(),
-        skip: None,
-        limit: None,
-    });
-
-    // 7. Consume SET clause 
-    let (input, set_clauses_opt) = opt(preceded(
-        multispace0,
-        preceded(
-            terminated(tag_no_case("SET"), multispace1),
-            separated_list1(
-                tuple((multispace0, char(','), multispace0)),
-                parse_single_set_assignment,
-            ),
-        )
-    )).parse(input)?;
-
-    // 8. Consume CREATE clause
-    let (input, create_patterns_opt) = opt(preceded(
-        multispace0,
-        preceded(
-            terminated(tag_no_case("CREATE"), multispace1),
-            separated_list1(
-                tuple((multispace0, char(','), multispace0)),
-                parse_pattern_restricted,
-            ),
-        )
-    )).parse(input)?;
-
-    // 9. Consume REMOVE clause
-    let (input, remove_clauses_opt) = opt(preceded(
-        multispace0,
-        preceded(
-            terminated(tag_no_case("REMOVE"), multispace1),
-            separated_list1(
-                tuple((multispace0, char(','), multispace0)),
-                parse_remove_clause,
-            ),
-        )
-    )).parse(input)?;
-
-    // 10. Final cleanup
+    // We still perform the final whitespace/semicolon cleanup here to satisfy the 
+    // original function's contract of consuming the end of the statement.
     let (input, _) = opt(preceded(multispace0, char(';'))).parse(input)?;
     let (input, _) = multispace0(input)?;
 
-    // 11. Dispatch with `with_clause` included in all variants
-    if let Some(set_list) = set_clauses_opt {
-        Ok((input, CypherQuery::MatchSet {
-            match_patterns: all_match_patterns,
-            where_clause,
-            with_clause,  // ✅ now included
-            set_clauses: set_list, 
-        }))
-    } else if let Some(create_list) = create_patterns_opt {
-        Ok((input, CypherQuery::MatchCreate {
-            match_patterns: all_match_patterns,
-            where_clause,
-            with_clause,  // ✅ now included
-            create_patterns: create_list,
-        }))
-    } else if let Some(remove_list) = remove_clauses_opt {
-        Ok((input, CypherQuery::MatchRemove {
-            match_patterns: all_match_patterns,
-            where_clause,
-            with_clause,  // ✅ now included
-            remove_clauses: remove_list,
-        }))
-    } else {
-        Ok((input, CypherQuery::MatchPattern { 
-            patterns: all_match_patterns, 
-            where_clause,
-            with_clause,  // ✅ now included
-        }))
-    }
+    Ok((input, query))
 }
 
 fn parse_pattern_restricted(input: &str) -> IResult<&str, Pattern> {
@@ -5272,6 +5156,70 @@ fn parse_where_clause(input: &str) -> IResult<&str, String> {
     Ok((input, condition.to_string()))
 }
 
+fn parse_return_clause_as_struct(input: &str) -> IResult<&str, ReturnClause> {
+    println!("===> parse_return_clause_as_struct START");
+
+    // 1. Consume 'RETURN' and check for 'DISTINCT'
+    let (input, _) = preceded(multispace0, tag_no_case("RETURN")).parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    let (input, distinct_opt) = opt(terminated(tag_no_case("DISTINCT"), multispace1)).parse(input)?;
+    let is_distinct = distinct_opt.is_some();
+
+    // 2. Parse Projection Items
+    let (input, items_raw) = separated_list1(
+        delimited(multispace0, char(','), multispace0),
+        parse_single_return_item
+    ).parse(input)?;
+
+    // 3. Parse ORDER BY and map OrderByItem -> (String, bool)
+    let (input, order_by_raw) = opt(preceded(
+        tuple((multispace0, tag_no_case("ORDER BY"), multispace1)),
+        parse_order_by_items,
+    )).parse(input)?;
+
+    // Map Vec<OrderByItem> to Vec<(String, bool)>
+    // NOTE: item.ascending (true) becomes descending (false)
+    let order_by = order_by_raw.map(|items| {
+        items.into_iter().map(|item| {
+            (item.expression, !item.ascending) 
+        }).collect::<Vec<(String, bool)>>()
+    });
+
+    // 4. Parse SKIP
+    let (input, skip) = opt(preceded(
+        tuple((multispace0, tag_no_case("SKIP"), multispace1)),
+        map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<usize>())
+    )).parse(input)?;
+
+    // 5. Parse LIMIT
+    let (input, limit) = opt(preceded(
+        tuple((multispace0, tag_no_case("LIMIT"), multispace1)),
+        map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<usize>())
+    )).parse(input)?;
+
+    Ok((input, ReturnClause {
+        items: items_raw,
+        distinct: is_distinct,
+        order_by,
+        skip,
+        limit,
+    }))
+}
+
+fn parse_single_return_item(input: &str) -> IResult<&str, ReturnItem> {
+    // Captures "expression AS alias" or just "expression"
+    let (input, expression) = take_while1(|c: char| c != ',' && !c.is_whitespace()).parse(input)?;
+    let (input, alias_opt) = opt(preceded(
+        tuple((multispace1, tag_no_case("AS"), multispace1)),
+        take_while1(|c: char| c != ',' && !c.is_whitespace())
+    )).parse(input)?;
+
+    Ok((input, ReturnItem {
+        expression: expression.trim().to_string(),
+        alias: alias_opt.map(|s| s.trim().to_string()),
+    }))
+}
+
 fn parse_return_expression(input: &str) -> IResult<&str, String> {
     // Capture everything until comma or end of line and convert to String
     println!("===> parse_return_expression START"); 
@@ -6079,10 +6027,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
             // Handles pure MATCH ... RETURN, relying on a full pattern matcher.
             // --- UPDATED MATCH PATTERN BRANCH ---
             // --- FIXED: MatchPattern with variable binding and WHERE evaluation ---
-            CypherQuery::MatchPattern { patterns, where_clause, with_clause } => {
+            CypherQuery::MatchPattern { patterns, where_clause, with_clause, return_clause } => {
                 info!("===> EXECUTING MatchPattern with {} patterns", patterns.len());
 
-                // Transform Vec<String> labels to Option<String> for the execution engine
+                // 1. Restore exact label transformation logic
                 let transformed_patterns: Vec<_> = patterns.iter().map(|(id, nodes, edges)| {
                     let transformed_nodes: Vec<_> = nodes.iter().map(|(var, labels, props)| {
                         (var.clone(), labels.first().cloned(), props.clone())
@@ -6092,105 +6040,65 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
 
                 let (mut final_vertices, final_edges) = exec_cypher_pattern(transformed_patterns, &graph_service).await?;
 
-                // Use indices to extract variable names from the tuples
                 let var_name = patterns.get(0)
                     .and_then(|p| p.1.get(0))
                     .and_then(|n| n.0.as_ref())
                     .map(|s| s.as_str())
                     .unwrap_or("n");
 
-                // Destructure the edge tuple (assuming index 0 is the variable name)
                 let edge_var_name = patterns.get(0)
                     .and_then(|p| p.2.get(0))
-                    .and_then(|edge_tuple| edge_tuple.0.as_ref()) // Accessing by index .0
+                    .and_then(|edge_tuple| edge_tuple.0.as_ref()) 
                     .map(|s| s.as_str())
                     .unwrap_or("r");
 
-                // 2. Apply direct MATCH WHERE filtering
+                // 2. Restore exact MATCH WHERE filtering with manual PropertyComparison fallback
                 if let Some(wc) = where_clause {
                     let original_count = final_vertices.len();
                     let mut filtered = Vec::new();
 
                     for (idx, v) in final_vertices.iter().enumerate() {
-                        // We initialize the context, but we will rely more on manual extraction
-                        // for properties to avoid the "Variable 'r' is not a Vertex or Edge" error.
                         let mut ctx = EvaluationContext::from_vertex(var_name, v);
-                        
-                        // Inject the edge as a variable for simple (non-property) references
                         if let Some(edge) = final_edges.get(idx) {
                             let edge_json = serde_json::to_value(edge).unwrap_or(serde_json::Value::Null);
                             ctx.variables.insert(edge_var_name.to_string(), CypherValue::from_json(edge_json));
                         }
 
-                        // Try standard evaluation first
                         let passes = match wc.condition.evaluate(&ctx) {
                             Ok(CypherValue::Bool(true)) => true,
                             Ok(CypherValue::Bool(false)) | Ok(CypherValue::Null) => false,
                             _ => {
-                                // If standard evaluation fails or returns unexpected types, 
-                                // we manually handle PropertyComparison.
+                                // Manual PropertyComparison fallback preserved from your repo
                                 if let Expression::PropertyComparison { variable, property, operator, value } = &wc.condition {
-                                    
-                                    // 1. Determine which entity we are looking at and get its properties
                                     let left_val_opt = if variable == var_name {
-                                        // Logic for Node (v)
-                                        if property.is_empty() {
-                                            Some(CypherValue::Vertex(v.clone()))
-                                        } else {
-                                            v.properties.get(property).map(|pv| {
-                                                let json_val = serde_json::to_value(pv).unwrap_or(serde_json::Value::Null);
-                                                CypherValue::from_json(json_val)
-                                            })
-                                        }
+                                        if property.is_empty() { Some(CypherValue::Vertex(v.clone())) }
+                                        else { v.properties.get(property).map(|pv| CypherValue::from_json(serde_json::to_value(pv).unwrap_or(serde_json::Value::Null))) }
                                     } else if variable == edge_var_name {
-                                        // Logic for Edge (r)
                                         final_edges.get(idx).and_then(|e| {
-                                            if property.is_empty() {
-                                                // This handles 'WHERE r = ...'
-                                                let edge_json = serde_json::to_value(e).unwrap_or(serde_json::Value::Null);
-                                                Some(CypherValue::from_json(edge_json))
-                                            } else {
-                                                // This handles 'WHERE r.type = ...' bypasses the evaluator's entity check
-                                                e.properties.get(property).map(|pv| {
-                                                    let json_val = serde_json::to_value(pv).unwrap_or(serde_json::Value::Null);
-                                                    CypherValue::from_json(json_val)
-                                                })
-                                            }
+                                            if property.is_empty() { Some(CypherValue::from_json(serde_json::to_value(e).unwrap_or(serde_json::Value::Null))) }
+                                            else { e.properties.get(property).map(|pv| CypherValue::from_json(serde_json::to_value(pv).unwrap_or(serde_json::Value::Null))) }
                                         })
-                                    } else {
-                                        None
-                                    };
+                                    } else { None };
 
-                                    // 2. Perform the comparison
                                     if let Some(left_val) = left_val_opt {
-                                        let right_val = CypherValue::from_json(value.clone());
-                                        compare_values(&left_val, operator, &right_val)
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
+                                        compare_values(&left_val, operator, &CypherValue::from_json(value.clone()))
+                                    } else { false }
+                                } else { false }
                             }
                         };
-
-                        if passes {
-                            filtered.push(v.clone());
-                        }
+                        if passes { filtered.push(v.clone()); }
                     }
-
                     final_vertices = filtered;
                     println!("===> After initial MATCH WHERE: {} -> {} vertices", original_count, final_vertices.len());
                 }
 
-                // 3. Apply WITH clause
+                // 3. Restore exact WITH clause logic (including WHERE dist < 2 support)
                 if let Some(with) = with_clause {
                     let original_count = final_vertices.len();
                     let mut filtered = Vec::new();
 
                     for (idx, v) in final_vertices.iter().enumerate() {
                         let mut ctx = EvaluationContext::from_vertex(var_name, v);
-                        
                         if let Some(edge) = final_edges.get(idx) {
                             let edge_json = serde_json::to_value(edge).unwrap_or(serde_json::Value::Null);
                             ctx.variables.insert(edge_var_name.to_string(), CypherValue::from_json(edge_json));
@@ -6198,18 +6106,11 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
 
                         let mut projection_success = true;
                         for item in &with.items {
-                            if item.alias.is_none() && item.expression.trim() == var_name {
-                                continue;
-                            }
-
+                            if item.alias.is_none() && item.expression.trim() == var_name { continue; }
                             match parse_expression(&item.expression) {
                                 Ok((_, expr)) => {
                                     match expr.evaluate(&ctx) {
-                                        Ok(val) => {
-                                            if let Some(alias) = &item.alias {
-                                                ctx.variables.insert(alias.clone(), val);
-                                            }
-                                        }
+                                        Ok(val) => { if let Some(alias) = &item.alias { ctx.variables.insert(alias.clone(), val); } }
                                         Err(_) => { projection_success = false; break; }
                                     }
                                 }
@@ -6219,15 +6120,16 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
 
                         if !projection_success { continue; }
 
+                        // Restore the WITH WHERE condition evaluation
                         let passes = if let Some(wwc) = &with.where_clause {
                             match wwc.condition.evaluate(&ctx) {
                                 Ok(CypherValue::Bool(result)) => result,
                                 _ => {
+                                    // Manual check for aliases like 'dist'
                                     if let Expression::PropertyComparison { variable, property, operator, value } = &wwc.condition {
                                         if property.is_empty() {
                                             if let Some(var_val) = ctx.variables.get(variable) {
-                                                let right_val = CypherValue::from_json(value.clone());
-                                                compare_values(var_val, operator, &right_val)
+                                                compare_values(var_val, operator, &CypherValue::from_json(value.clone()))
                                             } else { false }
                                         } else { false }
                                     } else { false }
@@ -6238,15 +6140,33 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         if passes { filtered.push(v.clone()); }
                     }
                     final_vertices = filtered;
+                    println!("===> After WITH WHERE: {} -> {} vertices", original_count, final_vertices.len());
+                }
+
+                // 4. Restore Comprehensive Output while respecting RETURN LIMIT/SKIP
+                let mut final_v = final_vertices;
+                let mut final_e = final_edges.clone();
+
+                if let Some(ret) = return_clause {
+                    if let Some(skip) = ret.skip {
+                        final_v = final_v.into_iter().skip(skip).collect();
+                        final_e = final_e.into_iter().skip(skip).collect();
+                    }
+                    if let Some(limit) = ret.limit {
+                        final_v.truncate(limit);
+                        final_e.truncate(limit);
+                    }
                 }
 
                 Ok(json!({
-                    "vertices": final_vertices,
-                    "edges": final_edges,
-                    "stats": {
-                        "vertices_matched": final_vertices.len(),
-                        "edges_matched": final_edges.len()
-                    }
+                    "results": [{
+                        "vertices": final_v,
+                        "edges": final_e,
+                        "stats": {
+                            "vertices_matched": final_v.len(),
+                            "edges_matched": final_e.len()
+                        }
+                    }]
                 }))
             }
             CypherQuery::MatchSet { match_patterns, where_clause, with_clause, set_clauses } => {
@@ -7823,17 +7743,23 @@ mod multiple_records_tests {
         assert_eq!(parse_variable_length("*1..").unwrap().1, (Some(1), None));
     }
 
-    #[test]
+   #[test]
     fn test_match_all_nodes() {
         let query = "MATCH (n:Person) RETURN n";
-        // Using parse_cypher (which likely calls parse_cypher_statement)
+        // Using parse_cypher (which calls parse_cypher_statement/full_statement_parser)
         let result = parse_cypher(query).unwrap();
         
-        // FIX: Include where_clause in the match pattern
+        // FIX: Match against all 4 fields: patterns, where_clause, with_clause, return_clause
         match result {
-            CypherQuery::MatchPattern { patterns, where_clause } => {
+            CypherQuery::MatchPattern { patterns, where_clause, with_clause, return_clause } => {
                 assert_eq!(patterns.len(), 1);
-                assert!(where_clause.is_none()); // "RETURN n" shouldn't count as WHERE
+                assert!(where_clause.is_none());
+                assert!(with_clause.is_none());
+                
+                // Verify RETURN clause is captured
+                let ret = return_clause.expect("Should have a return clause");
+                assert_eq!(ret.items.len(), 1);
+                assert_eq!(ret.items[0].expression, "n");
             }
             _ => panic!("Should parse as MatchPattern, got {:?}", result),
         }
@@ -7845,10 +7771,17 @@ mod multiple_records_tests {
         let result = parse_cypher(query).unwrap();
         
         match result {
-            CypherQuery::MatchPattern { patterns, where_clause } => {
+            CypherQuery::MatchPattern { patterns, where_clause, with_clause, return_clause } => {
                 // Should handle both patterns
                 assert_eq!(patterns.len(), 2);
                 assert!(where_clause.is_none());
+                assert!(with_clause.is_none());
+
+                // Verify RETURN clause captures both 'a' and 'b'
+                let ret = return_clause.expect("Should have a return clause");
+                assert_eq!(ret.items.len(), 2);
+                assert_eq!(ret.items[0].expression, "a");
+                assert_eq!(ret.items[1].expression, "b");
             }
             _ => panic!("Should handle multiple patterns, got {:?}", result),
         }

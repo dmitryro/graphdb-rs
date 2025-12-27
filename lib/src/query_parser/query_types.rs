@@ -232,6 +232,10 @@ pub struct WithItem {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnClause {
     pub items: Vec<ReturnItem>,
+    pub distinct: bool,
+    pub order_by: Option<Vec<(String, bool)>>,
+    pub skip: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -316,7 +320,7 @@ pub enum CypherQuery {
         patterns: Vec<Pattern>,
         where_clause: Option<WhereClause>, 
         with_clause: Option<ParsedWithClause>,
-       // return_clause: Option<ReturnClause>, 
+        return_clause: Option<ReturnClause>, 
     },
     MatchSet {
         match_patterns: Vec<Pattern>, // Adjust type name to match your codebase
