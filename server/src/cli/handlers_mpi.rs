@@ -28,6 +28,7 @@ use medical_knowledge::mpi_identity_resolution::{MpiIdentityResolutionService, P
 use models::errors::GraphError;
 use models::identifiers::Identifier;
 use models::evolution::*;
+use models::dashboard::*;
 use crate::cli::{ get_storage_engine_singleton };
 
 // Placeholder types needed for function signatures
@@ -849,62 +850,83 @@ impl MPIHandlers {
         slice: Option<String>,
         system: Option<String>,
     ) -> Result<(), GraphError> {
-        // 2025-12-20: Fetching username for audit trail
-        let requested_by = whoami::username(); 
-         
+        let requested_by = whoami::username();
+
         println!("=== MPI GLOBAL STEWARDSHIP DASHBOARD ===");
-        
-        // 1. Fetch data with corrected argument order (requested_by last)
-        let raw_data = self.mpi_service
+
+        let raw_data = self
+            .mpi_service
             .get_comprehensive_status_data(only_conflicts, limit, slice, system, &requested_by)
             .await
             .map_err(|e| GraphError::InternalError(format!("MPI Service Error: {}", e)))?;
 
-        // 2. FIX E0609: Deserialize Value into typed MpiStewardshipDashboard
         let dashboard: MpiStewardshipDashboard = serde_json::from_value(raw_data)
             .map_err(|e| GraphError::InternalError(format!("Dashboard mapping failed: {}", e)))?;
 
-        println!("Summary: {} Golden Records | {} Total Identities | {} Active Conflicts", 
-            dashboard.golden_count, dashboard.total_patient_count, dashboard.conflict_count);
+        println!(
+            "Summary: {} Golden Records | {} Total Identities | {} Active Conflicts",
+            dashboard.golden_count,
+            dashboard.total_patient_count,
+            dashboard.conflict_count
+        );
         println!("{:=<100}", "");
 
-        // 3. Render Records
-        for record in dashboard.records {
-            let conflict_flag = if record.has_unresolved_conflict { "🚩 [CONFLICT]" } else { "✅ [STABLE]" };
-            
-            println!("GOLDEN RECORD: {} {} {}", 
-                record.first_name, record.last_name, conflict_flag);
-            println!("  ├─ Primary MRN: {}", record.primary_mrn.as_deref().unwrap_or("NONE"));
+        if dashboard.records.is_empty() {
+            println!("No Golden Records match the current filters.");
+            return Ok(());
+        }
+
+        for record in &dashboard.records {
+            let conflict_flag = if record.has_unresolved_conflict {
+                "🚩 [CONFLICT]"
+            } else {
+                "✅ [STABLE]"
+            };
+
+            println!(
+                "GOLDEN RECORD: {} {} {}",
+                record.first_name, record.last_name, conflict_flag
+            );
+            println!(
+                "  ├─ Primary MRN: {}",
+                record.primary_mrn.as_deref().unwrap_or("NONE")
+            );
             println!("  ├─ Status:      {}", record.status);
-            
+
             if !record.source_links.is_empty() {
                 println!("  ├─ Related Identities (Source Systems):");
-                for link in record.source_links {
-                    println!("  │    • System: {:<12} | Ext ID: {:<15} | Internal Name: {}", 
-                        link.system_name, link.external_id, link.local_alias);
+                for link in &record.source_links {
+                    println!(
+                        "  │    • System: {:<12} | Ext ID: {:<15} | Internal Name: {}",
+                        link.system_name, link.external_id, link.local_alias
+                    );
                 }
             }
 
-            // The Graph of Events Loop: Evolution of the record
             if !record.recent_events.is_empty() {
                 println!("  └─ Evolution (Recent Graph Events):");
-                for event in record.recent_events {
+                for event in &record.recent_events {
                     let type_icon = match event.event_type.as_str() {
-                        "MERGE"  => "🔗",
-                        "SPLIT"  => "✂️",
+                        "MERGE" => "🔗",
+                        "SPLIT" => "✂️",
                         "UPDATE" => "📝",
-                        _        => "🔹",
+                        "SYNC_DETAILS" => "📡",
+                        "MEMORY_INDEX_SYNC" => "🧠",
+                        _ => "🔹",
                     };
-                    println!("      {} [{}] {:<8} - {}", 
-                        type_icon, 
-                        event.timestamp.format("%Y-%m-%d %H:%M"), 
-                        event.event_type, 
+                    println!(
+                        "      {} [{}] {:<18} - {}",
+                        type_icon,
+                        event.timestamp.format("%Y-%m-%d %H:%M"),
+                        event.event_type,
                         event.description
                     );
                 }
             }
+
             println!("{:-<100}", "");
         }
+
         Ok(())
     }
 
@@ -922,51 +944,77 @@ impl MPIHandlers {
     ) -> Result<(), GraphError> {
         let requested_by = "whoami";
 
-        println!("=== MPI IDENTITY LINEAGE & TRANSACTION TRACE ===");
+        println!("\n=== MPI IDENTITY LINEAGE & TRANSACTION TRACE ===");
         
-        // 1. Fetch raw Value
         let raw_report = self.mpi_service
             .get_lineage_data(id, id_type, from, to, head, tail, depth, requested_by)
             .await
             .map_err(|e| GraphError::InternalError(format!("Trace failed: {}", e)))?;
 
-        // 2. FIX E0609: Deserialize into our typed Trace structure
+        // Deserialize into the struct updated in evolution.rs
         let report: LineageReportTrace = serde_json::from_value(raw_report)
             .map_err(|e| GraphError::InternalError(format!("Lineage data mapping failed: {}", e)))?;
 
-        println!("Canonical Identity: {} {}", report.first_name, report.last_name);
-        println!("Trace Depth: {:<5} | Active Red Flags: {}", depth.unwrap_or(1), report.red_flag_count);
+        println!("Canonical Identity: {} {}", 
+            report.first_name.as_deref().unwrap_or("Unknown"), 
+            report.last_name.as_deref().unwrap_or("Unknown")
+        );
+        
+        println!("Trace Depth: {:<5} | Active Red Flags: {}", 
+            depth.unwrap_or(1), 
+            report.red_flag_count.unwrap_or(0)
+        );
         println!("{:=<100}", "");
 
-        // Comprehensive History Loop
-        for (i, entry) in report.history_chain.iter().enumerate() {
-            println!("#{:02} [{}] TRANSACTION: {}", 
-                i + 1, 
-                entry.timestamp.format("%Y-%m-%d %H:%M:%S"), 
-                entry.action_type
-            );
-            println!("    Actor:  {:<15} | Source: {}", entry.user_id, entry.source_system);
-            
-            if let Some(reason) = &entry.change_reason {
-                println!("    Reason: {}", reason);
-            }
+        // Comprehensive History Loop - handle Option<Vec<HistoryEntry>>
+        if let Some(chain) = report.history_chain {
+            for (i, entry) in chain.iter().enumerate() {
+                // Handle optional timestamp formatting
+                let ts_str = entry.timestamp
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "0000-00-00 00:00:00".to_string());
 
-            // Display logical diffs instead of raw JSON
-            if !entry.mutations.is_empty() {
-                println!("    Changes:");
-                for mutation in &entry.mutations {
-                    println!("      Δ {}: '{}' ➔ '{}'", mutation.field, mutation.old_val, mutation.new_val);
-                }
-            }
-
-            // Highlight Structural Evolution (Merges/Splits)
-            if entry.is_structural {
-                println!("    ⚠️  STRUCTURAL EVOLUTION: Identity '{}' was {} into this record.", 
-                    entry.involved_identity_alias, 
-                    if entry.action_type == "MERGE" { "absorbed" } else { "extracted" }
+                println!("#{:02} [{}] TRANSACTION: {}", 
+                    i + 1, 
+                    ts_str, 
+                    entry.action_type.as_deref().unwrap_or("UNKNOWN_ACTION")
                 );
+
+                println!("    Actor:  {:<15} | Source: {}", 
+                    entry.user_id.as_deref().unwrap_or("system"), 
+                    entry.source_system.as_deref().unwrap_or("MPI")
+                );
+                
+                if let Some(reason) = &entry.change_reason {
+                    println!("    Reason: {}", reason);
+                }
+
+                // Handle Option<Vec<FieldMutation>>
+                if let Some(muts) = &entry.mutations {
+                    if !muts.is_empty() {
+                        println!("    Changes:");
+                        for mutation in muts {
+                            println!("      Δ {}: '{}' ➔ '{}'", 
+                                mutation.field.as_deref().unwrap_or("unknown_field"), 
+                                mutation.old_val.as_deref().unwrap_or("null"), 
+                                mutation.new_val.as_deref().unwrap_or("null")
+                            );
+                        }
+                    }
+                }
+
+                // Handle Option<bool>
+                if entry.is_structural.unwrap_or(false) {
+                    let action = entry.action_type.as_deref().unwrap_or("");
+                    println!("    ⚠️  STRUCTURAL EVOLUTION: Identity '{}' was {} into this record.", 
+                        entry.involved_identity_alias.as_deref().unwrap_or("Unknown"), 
+                        if action == "MERGE" { "absorbed" } else { "extracted" }
+                    );
+                }
+                println!("{:-<60}", "");
             }
-            println!("{:-<60}", "");
+        } else {
+            println!("No history entries found for this identity.");
         }
         
         Ok(())

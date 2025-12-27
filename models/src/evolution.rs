@@ -39,27 +39,6 @@ pub struct LineageReport {
     pub steps: Vec<EvolutionStep>,
 }
 
-/// A summary item for the Data Stewardship Dashboard.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DashboardItem {
-    /// The primary identifier (usually the Canonical MRN).
-    pub id: String,
-    /// The internal Golden Record UUID.
-    pub internal_id: SerializableUuid,
-    /// Number of Patient records merged into this Golden Record.
-    pub link_density: usize,
-    /// List of active Red Flags requiring review.
-    pub active_flags: Vec<String>,
-    /// Raw ISO timestamp from the graph.
-    pub last_event: String,
-    /// Computed display timestamp (maps to last_updated in your service).
-    pub last_updated: String,
-    /// Current status (e.g., "REQUIRES_REVIEW", "RESOLVED").
-    pub stewardship_status: String,
-    /// "HEALTHY" or "CRITICAL" based on the presence of flags.
-    pub health_status: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MpiSnapshot {
     pub first_name: String,
@@ -78,62 +57,29 @@ pub struct SnapshotXRef {
     pub status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LineageReportTrace {
-    pub first_name: String,
-    pub last_name: String,
-    pub red_flag_count: usize,
-    pub history_chain: Vec<HistoryEntry>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub red_flag_count:Option<usize>,
+    pub history_chain: Option<Vec<HistoryEntry>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
-    pub timestamp: DateTime<Utc>,
-    pub action_type: String,
-    pub user_id: String,
-    pub source_system: String,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub action_type: Option<String>,
+    pub user_id: Option<String>,
+    pub source_system: Option<String>,
     pub change_reason: Option<String>,
-    pub mutations: Vec<FieldMutation>,
-    pub is_structural: bool,
-    pub involved_identity_alias: String,
+    pub mutations: Option<Vec<FieldMutation>>,
+    pub is_structural: Option<bool>,
+    pub involved_identity_alias: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FieldMutation {
-    pub field: String,
-    pub old_val: String,
-    pub new_val: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MpiStewardshipDashboard {
-    pub golden_count: usize,
-    pub total_patient_count: usize,
-    pub conflict_count: usize,
-    pub records: Vec<StewardshipRecord>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StewardshipRecord {
-    pub first_name: String,
-    pub last_name: String,
-    pub has_unresolved_conflict: bool,
-    pub primary_mrn: Option<String>,
-    pub status: String,
-    pub source_links: Vec<SourceLink>,
-    pub recent_events: Vec<GraphEventSummary>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SourceLink {
-    pub system_name: String,
-    pub external_id: String,
-    pub local_alias: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GraphEventSummary {
-    pub event_type: String,
-    pub timestamp: DateTime<Utc>,
-    pub description: String,
+    pub field: Option<String>,
+    pub old_val: Option<String>,
+    pub new_val: Option<String>,
 }

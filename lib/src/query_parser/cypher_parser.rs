@@ -1148,36 +1148,6 @@ fn parse_create_node(input: &str) -> IResult<&str, CypherQuery> {
     }))
 }
 
-// Helper function to convert PropertyValue to serde_json::Value
-fn property_value_to_json(prop_val: PropertyValue) -> Value {
-    println!("===> property_value_to_json START");
-    match prop_val {
-        PropertyValue::String(s) => Value::String(s),
-        PropertyValue::Integer(i) => Value::Number(i.into()),
-        PropertyValue::I32(i) => Value::Number(i.into()),
-        PropertyValue::Float(f) => Value::Number(serde_json::Number::from_f64(f.0).unwrap_or(serde_json::Number::from(0))),
-        PropertyValue::Boolean(b) => Value::Bool(b),
-        PropertyValue::Uuid(uuid) => Value::String(uuid.to_string()),
-        PropertyValue::Byte(b) => Value::Number(b.into()),
-        PropertyValue::Vertex(v) => {
-            Value::String(format!("Vertex({:?})", v.0))
-        },
-        PropertyValue::Map(map) => {
-            let mut obj = serde_json::Map::new();
-            for (key, val) in map.0.into_iter() {
-                obj.insert(key.0.to_string(), property_value_to_json(val));
-            }
-            Value::Object(obj)
-        },
-        // Fix: Added missing arms to satisfy exhaustiveness check
-        PropertyValue::Null => Value::Null,
-        PropertyValue::List(list) => {
-            Value::Array(list.into_iter().map(property_value_to_json).collect())
-        }
-    }
-}
-
-
 // Required to parse key=value assignments for SET and MERGE clauses: `n.name = 'Joe'`
 // Returns (String, String, Value) because that's what the rest of the code expects
 fn parse_set_assignment_tuple(input: &str) -> IResult<&str, (String, String, Value)> {
@@ -1260,6 +1230,14 @@ pub fn parse_merge(input: &str) -> IResult<&str, CypherQuery> {
     ).parse(input)
 }
 
+fn parse_null_operator(input: &str) -> IResult<&str, UnaryOp> {
+    // We use .parse(input) instead of calling the alt block as a function
+    alt((
+        map(preceded(multispace1, tag_no_case("IS NOT NULL")), |_| UnaryOp::IsNotNull),
+        map(preceded(multispace1, tag_no_case("IS NULL")), |_| UnaryOp::IsNull),
+    )).parse(input) 
+}
+
 pub fn evaluate_expression(
     expr: &Expression,
     context: &EvaluationContext,
@@ -1304,6 +1282,28 @@ pub fn evaluate_expression(
                     match arg_val {
                         CypherValue::Vertex(v) => Ok(CypherValue::String(v.id.to_string())),
                         CypherValue::Edge(e) => Ok(CypherValue::String(e.id.to_string())),
+                        _ => Ok(CypherValue::Null),
+                    }
+                },
+                "TYPE" => {
+                    let val = args.get(0)
+                        .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 arg".into()))?
+                        .evaluate(context)?; // Ensure you use 'ctx' or 'context' consistently
+                    match val {
+                        // Convert Identifier to String
+                        CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
+                        _ => Ok(CypherValue::Null),
+                    }
+                },
+                "LABELS" => {
+                    let val = args.get(0)
+                        .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 arg".into()))?
+                        .evaluate(context)?;
+                    match val {
+                        // Convert Identifier to String here as well
+                        CypherValue::Vertex(v) => Ok(CypherValue::List(vec![
+                            CypherValue::String(v.label.to_string())
+                        ])),
                         _ => Ok(CypherValue::Null),
                     }
                 },
@@ -3359,29 +3359,30 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_expression START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
 
+    // --- STEP 1: Parse the "Atom" (The left-most part of an expression) ---
     let (mut current_input, mut left) = {
         alt((
-            // 1. Parentheses (highest priority)
             delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
-
-            // 2. Function call
             parse_function_call_full,
-
-            // 3. Property access
             map(
                 tuple((parse_identifier, char('.'), parse_identifier)),
                 |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
             ),
-
-            // 4. Literal values (must come before identifier to catch numbers/strings)
             map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-
-            // 5. Variable (last — only if not a literal)
             map(parse_identifier, |v| Expression::Variable(v.to_string())),
         ))
     }.parse(input)?;
 
-    // Handle binary operators (your existing loop is correct)
+    // --- STEP 2: Check for Postfix Unary Operators (IS NULL / IS NOT NULL) ---
+    if let Ok((after_null, op)) = parse_null_operator(current_input) {
+        left = Expression::Unary {
+            op,
+            expr: Box::new(left),
+        };
+        current_input = after_null;
+    }
+
+    // --- STEP 3: Handle Binary Operators (AND, OR, =, etc.) ---
     loop {
         let op_result: IResult<&str, BinaryOp> = delimited(multispace0, parse_binary_op, multispace0)
             .parse(current_input);
@@ -3390,27 +3391,34 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
             Ok((after_op, op)) => {
                 let rhs_result = alt((
                     delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
-
                     parse_function_call_full,
-
                     map(
                         tuple((parse_identifier, char('.'), parse_identifier)),
                         |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
                     ),
-
                     map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-
                     map(parse_identifier, |v| Expression::Variable(v.to_string())),
                 )).parse(after_op);
 
                 match rhs_result {
-                    Ok((after_rhs, right_atom)) => {
+                    Ok((after_rhs, mut right_atom)) => {
+                        // Check if the RHS itself has a postfix null operator (e.g., "a = b IS NULL")
+                        let final_after_rhs = if let Ok((after_rhs_null, rhs_op)) = parse_null_operator(after_rhs) {
+                            right_atom = Expression::Unary {
+                                op: rhs_op,
+                                expr: Box::new(right_atom),
+                            };
+                            after_rhs_null
+                        } else {
+                            after_rhs
+                        };
+
                         left = Expression::Binary {
                             op,
                             left: Box::new(left),
                             right: Box::new(right_atom),
                         };
-                        current_input = after_rhs;
+                        current_input = final_after_rhs;
                     }
                     Err(_) => break,
                 }
@@ -5380,8 +5388,8 @@ async fn exec_cypher_pattern(
     let mut var_bindings: HashMap<String, HashSet<SerializableUuid>> = HashMap::new();
 
     for (pattern_idx, pattern) in patterns.iter().enumerate() {
-        println!("===> Processing pattern {}: {} nodes, {} relationships", 
-                 pattern_idx, pattern.1.len(), pattern.2.len());
+        //println!("===> Processing pattern {}: {} nodes, {} relationships", 
+        //         pattern_idx, pattern.1.len(), pattern.2.len());
         
         let nodes = &pattern.1;
         let rels = &pattern.2;
@@ -5396,8 +5404,8 @@ async fn exec_cypher_pattern(
             // Check if variable is already bound from a previous pattern
             if let Some(var) = var_name {
                 if let Some(bound_ids) = var_bindings.get(var) {
-                    println!("===> Variable '{}' already bound to {} vertices from previous pattern", 
-                             var, bound_ids.len());
+                    //println!("===> Variable '{}' already bound to {} vertices from previous pattern", 
+                     //        var, bound_ids.len());
                     
                     // If there are additional constraints, filter the bound set
                     if label_constraint.is_some() || !prop_constraints.is_empty() {
@@ -5455,7 +5463,7 @@ async fn exec_cypher_pattern(
                     pattern_vertex_ids.insert(v.id);
                     matched_vertex_ids.insert(v.id);
                     matched_for_this_var.insert(v.id);
-                    println!("===> Matched vertex: {:?} (label: {})", v.id, v.label.as_ref());
+                    //println!("===> Matched vertex: {:?} (label: {})", v.id, v.label.as_ref());
                 }
             }
             
@@ -5580,8 +5588,8 @@ async fn exec_cypher_pattern(
                     println!("===> Examining {} edges for matches", all_edges.len());
 
                     for edge in &all_edges {
-                        println!("===> Checking edge {:?}: {} -> {}, type: {}",
-                                 edge.id, edge.outbound_id, edge.inbound_id, edge.label);
+                        //println!("===> Checking edge {:?}: {} -> {}, type: {}",
+                        //         edge.id, edge.outbound_id, edge.inbound_id, edge.label);
                         
                         // Check type constraint
                         let type_matches = rel_type.as_ref().map_or(true, |rt| {
@@ -5589,7 +5597,7 @@ async fn exec_cypher_pattern(
                         });
                         
                         if !type_matches {
-                            println!("=====> Type mismatch, skipping");
+                           // println!("=====> Type mismatch, skipping");
                             continue;
                         }
 
@@ -5604,8 +5612,8 @@ async fn exec_cypher_pattern(
 
                         let connects = connects_outbound || connects_inbound;
                         
-                        println!("=====> Connection check: connects_outbound={}, connects_inbound={}, connects={}",
-                                 connects_outbound, connects_inbound, connects);
+                        //println!("=====> Connection check: connects_outbound={}, connects_inbound={}, connects={}",
+                                 //connects_outbound, connects_inbound, connects);
                         
                         if connects {
                             matched_edge_ids.insert(edge.id);
@@ -5627,7 +5635,7 @@ async fn exec_cypher_pattern(
                             
                             println!("=====> MATCHED! Edge {:?} added", edge.id);
                         } else {
-                            println!("=====> Not matched (type_matches={}, connects={})", type_matches, connects);
+                            //println!("=====> Not matched (type_matches={}, connects={})", type_matches, connects);
                         }
                     }
                 }
@@ -5643,7 +5651,7 @@ async fn exec_cypher_pattern(
         .filter(|e| matched_edge_ids.contains(&e.id))
         .collect();
 
-    println!("===> FINAL RESULTS: {} vertices, {} edges", final_vertices.len(), final_edges.len());
+    // println!("===> FINAL RESULTS: {} vertices, {} edges", final_vertices.len(), final_edges.len());
 
     Ok((final_vertices, final_edges))
 }
@@ -6082,51 +6090,81 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     (id.clone(), transformed_nodes, edges.clone())
                 }).collect();
 
-                // 1. Get the raw matched vertices and edges.
                 let (mut final_vertices, final_edges) = exec_cypher_pattern(transformed_patterns, &graph_service).await?;
 
+                // Use indices to extract variable names from the tuples
                 let var_name = patterns.get(0)
                     .and_then(|p| p.1.get(0))
                     .and_then(|n| n.0.as_ref())
                     .map(|s| s.as_str())
                     .unwrap_or("n");
 
+                // Destructure the edge tuple (assuming index 0 is the variable name)
+                let edge_var_name = patterns.get(0)
+                    .and_then(|p| p.2.get(0))
+                    .and_then(|edge_tuple| edge_tuple.0.as_ref()) // Accessing by index .0
+                    .map(|s| s.as_str())
+                    .unwrap_or("r");
+
                 // 2. Apply direct MATCH WHERE filtering
                 if let Some(wc) = where_clause {
                     let original_count = final_vertices.len();
                     let mut filtered = Vec::new();
 
-                    for v in &final_vertices {
-                        let ctx = EvaluationContext::from_vertex(var_name, v);
+                    for (idx, v) in final_vertices.iter().enumerate() {
+                        // We initialize the context, but we will rely more on manual extraction
+                        // for properties to avoid the "Variable 'r' is not a Vertex or Edge" error.
+                        let mut ctx = EvaluationContext::from_vertex(var_name, v);
+                        
+                        // Inject the edge as a variable for simple (non-property) references
+                        if let Some(edge) = final_edges.get(idx) {
+                            let edge_json = serde_json::to_value(edge).unwrap_or(serde_json::Value::Null);
+                            ctx.variables.insert(edge_var_name.to_string(), CypherValue::from_json(edge_json));
+                        }
 
+                        // Try standard evaluation first
                         let passes = match wc.condition.evaluate(&ctx) {
                             Ok(CypherValue::Bool(true)) => true,
                             Ok(CypherValue::Bool(false)) | Ok(CypherValue::Null) => false,
-                            Ok(other) => {
-                                println!("===> MATCH WHERE returned non-bool: {:?}", other);
-                                false
-                            }
-                            Err(e) => {
-                                println!("===> MATCH WHERE evaluation error: {:?}", e);
-
-                                // Fallback using the existing compare_values helper
+                            _ => {
+                                // If standard evaluation fails or returns unexpected types, 
+                                // we manually handle PropertyComparison.
                                 if let Expression::PropertyComparison { variable, property, operator, value } = &wc.condition {
-                                    if variable == var_name {
-                                        let left_val_opt = if property.is_empty() {
-                                            ctx.variables.get(variable).cloned()
+                                    
+                                    // 1. Determine which entity we are looking at and get its properties
+                                    let left_val_opt = if variable == var_name {
+                                        // Logic for Node (v)
+                                        if property.is_empty() {
+                                            Some(CypherValue::Vertex(v.clone()))
                                         } else {
                                             v.properties.get(property).map(|pv| {
                                                 let json_val = serde_json::to_value(pv).unwrap_or(serde_json::Value::Null);
                                                 CypherValue::from_json(json_val)
                                             })
-                                        };
-
-                                        if let Some(left_val) = left_val_opt {
-                                            let right_val = CypherValue::from_json(value.clone());
-                                            compare_values(&left_val, operator, &right_val)
-                                        } else {
-                                            false
                                         }
+                                    } else if variable == edge_var_name {
+                                        // Logic for Edge (r)
+                                        final_edges.get(idx).and_then(|e| {
+                                            if property.is_empty() {
+                                                // This handles 'WHERE r = ...'
+                                                let edge_json = serde_json::to_value(e).unwrap_or(serde_json::Value::Null);
+                                                Some(CypherValue::from_json(edge_json))
+                                            } else {
+                                                // This handles 'WHERE r.type = ...' bypasses the evaluator's entity check
+                                                e.properties.get(property).map(|pv| {
+                                                    let json_val = serde_json::to_value(pv).unwrap_or(serde_json::Value::Null);
+                                                    CypherValue::from_json(json_val)
+                                                })
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    };
+
+                                    // 2. Perform the comparison
+                                    if let Some(left_val) = left_val_opt {
+                                        let right_val = CypherValue::from_json(value.clone());
+                                        compare_values(&left_val, operator, &right_val)
                                     } else {
                                         false
                                     }
@@ -6145,18 +6183,21 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     println!("===> After initial MATCH WHERE: {} -> {} vertices", original_count, final_vertices.len());
                 }
 
-                // 3. Apply WITH clause: projections + WHERE filtering
+                // 3. Apply WITH clause
                 if let Some(with) = with_clause {
                     let original_count = final_vertices.len();
                     let mut filtered = Vec::new();
 
-                    for v in &final_vertices {
+                    for (idx, v) in final_vertices.iter().enumerate() {
                         let mut ctx = EvaluationContext::from_vertex(var_name, v);
-                        let mut projection_success = true;
+                        
+                        if let Some(edge) = final_edges.get(idx) {
+                            let edge_json = serde_json::to_value(edge).unwrap_or(serde_json::Value::Null);
+                            ctx.variables.insert(edge_var_name.to_string(), CypherValue::from_json(edge_json));
+                        }
 
-                        // Calculate expressions and store in context
+                        let mut projection_success = true;
                         for item in &with.items {
-                            // Skip simple pass-through of the main variable
                             if item.alias.is_none() && item.expression.trim() == var_name {
                                 continue;
                             }
@@ -6166,75 +6207,36 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                     match expr.evaluate(&ctx) {
                                         Ok(val) => {
                                             if let Some(alias) = &item.alias {
-                                                println!("===> Stored '{}' = {:?} in context", alias, val);
                                                 ctx.variables.insert(alias.clone(), val);
                                             }
                                         }
-                                        Err(e) => {
-                                            println!("===> WITH projection '{}' eval failed: {:?}", item.expression, e);
-                                            projection_success = false;
-                                            break;
-                                        }
+                                        Err(_) => { projection_success = false; break; }
                                     }
                                 }
-                                Err(e) => {
-                                    println!("===> parse_expression failed for '{}': {:?}", item.expression, e);
-                                    projection_success = false;
-                                    break;
-                                }
+                                Err(_) => { projection_success = false; break; }
                             }
                         }
 
-                        if !projection_success {
-                            continue;
-                        }
+                        if !projection_success { continue; }
 
-                        // Apply WITH WHERE filter
                         let passes = if let Some(wwc) = &with.where_clause {
-                            println!("===> Evaluating WITH WHERE");
-
                             match wwc.condition.evaluate(&ctx) {
-                                Ok(CypherValue::Bool(result)) => {
-                                    println!("===> WHERE result: {}", result);
-                                    result
-                                }
-                                Ok(other) => {
-                                    println!("===> WHERE returned non-bool: {:?}", other);
-                                    false
-                                }
-                                Err(e) => {
-                                    println!("===> WHERE evaluation error: {:?}", e);
-
-                                    // Use the existing compare_values helper for variable comparisons (e.g. dist < 3)
+                                Ok(CypherValue::Bool(result)) => result,
+                                _ => {
                                     if let Expression::PropertyComparison { variable, property, operator, value } = &wwc.condition {
                                         if property.is_empty() {
                                             if let Some(var_val) = ctx.variables.get(variable) {
                                                 let right_val = CypherValue::from_json(value.clone());
-                                                let result = compare_values(var_val, operator, &right_val);
-                                                println!("===> Manual WITH WHERE comparison (using compare_values): {}", result);
-                                                result
-                                            } else {
-                                                println!("===> Variable '{}' not found in context", variable);
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
+                                                compare_values(var_val, operator, &right_val)
+                                            } else { false }
+                                        } else { false }
+                                    } else { false }
                                 }
                             }
-                        } else {
-                            true
-                        };
+                        } else { true };
 
-                        if passes {
-                            filtered.push(v.clone());
-                        }
+                        if passes { filtered.push(v.clone()); }
                     }
-
-                    println!("===> After WITH processing and WHERE filtering: {} -> {} vertices", original_count, filtered.len());
                     final_vertices = filtered;
                 }
 

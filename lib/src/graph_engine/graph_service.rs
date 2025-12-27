@@ -1019,7 +1019,7 @@ impl GraphService {
         let event_id = Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().to_rfc3339();
 
-        // QUERY 1: Assert Source and Event in a single path
+        // Always create the event from a Patient (source)
         let q1 = format!(
             "MERGE (s:Patient {{id: '{source_id}'}})-[:PARTICIPATED_IN]->(e:IdentityEvent {{
                 id: '{event_id}', 
@@ -1031,21 +1031,24 @@ impl GraphService {
         );
         self.execute_cypher_write(&q1, serde_json::json!({}))
             .await
-            .map_err(|e| anyhow::anyhow!("Structural log Step 1 failed: {}", e))?;
+            .map_err(|e| anyhow!("Audit log Step 1 failed: {}", e))?;
 
-        // QUERY 2: Assert Link from Event to Golden Record
-        let q2 = format!(
-            "MERGE (e:IdentityEvent {{id: '{event_id}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
-        );
-        self.execute_cypher_write(&q2, serde_json::json!({}))
-            .await
-            .map_err(|e| anyhow::anyhow!("Structural log Step 2 failed: {}", e))?;
+        // ONLY link to GoldenRecord if target_id is NOT nil
+        if target_id != Uuid::nil() {
+            let q2 = format!(
+                "MERGE (e:IdentityEvent {{id: '{event_id}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
+            );
+            self.execute_cypher_write(&q2, serde_json::json!({}))
+                .await
+                .map_err(|e| anyhow::anyhow!("Audit log Step 2 failed: {}", e))?;
+        }
+        // If target_id is nil → this is a system event → no GoldenRecord touch → safe
 
         Ok(())
     }
 
     /// PERSISTENCE: Records detailed metadata into the 'Graph of Events'.
-    /// FIX: Returns Result<(), anyhow::Error> and uses path-merging.
+    /// SAFE FIX: Does NOT create GoldenRecord when target_id is nil.
     pub async fn persist_mpi_change_event(
         &self,
         source_id: Uuid,
@@ -1057,8 +1060,7 @@ impl GraphService {
         let timestamp = chrono::Utc::now().to_rfc3339();
         let metadata_str = metadata.to_string();
 
-        // STEP 1: Link Source -> Event (Path MERGE)
-        // We interpolate the UUID as a string into the Cypher template
+        // Always create the event from source Patient
         let q1 = format!(
             "MERGE (p:Patient {{id: '{source_id}'}})-[:PARTICIPATED_IN]->(e:IdentityEvent {{
                 id: '{event_uuid}', 
@@ -1071,13 +1073,16 @@ impl GraphService {
             .await
             .map_err(|e| anyhow::anyhow!("Metadata log failed at source: {}", e))?;
 
-        // STEP 2: Link Event -> Target (Path MERGE)
-        let q2 = format!(
-            "MERGE (e:IdentityEvent {{id: '{event_uuid}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
-        );
-        self.execute_cypher_write(&q2, serde_json::json!({}))
-            .await
-            .map_err(|e| anyhow::anyhow!("Metadata log failed at target: {}", e))?;
+        // ONLY link to GoldenRecord if target_id is real (not nil)
+        if target_id != Uuid::nil() {
+            let q2 = format!(
+                "MERGE (e:IdentityEvent {{id: '{event_uuid}'}})-[:RESULTED_IN]->(t:GoldenRecord {{id: '{target_id}'}})"
+            );
+            self.execute_cypher_write(&q2, serde_json::json!({}))
+                .await
+                .map_err(|e| anyhow::anyhow!("Metadata log failed at target: {}", e))?;
+        }
+        // System/audit events (dashboard access, etc.) stay isolated — no garbage GoldenRecords
 
         Ok(event_uuid)
     }
@@ -1769,7 +1774,7 @@ impl GraphService {
             .await
             .map_err(|e| GraphError::QueryExecutionError(format!("Cypher READ failed: {}", e)))?;
         
-        println!("===> execute_cypher returned: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        //println!("===> execute_cypher returned: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
         
         // The result structure is: { "results": [ {...}, {...} ] }
         // Extract the "results" array
@@ -2223,66 +2228,71 @@ impl GraphService {
         }
     }
 
-
     /// Finds a single Patient vertex by its Medical Record Number (MRN) using a Cypher query.
     pub async fn get_patient_by_mrn(&self, mrn: &str) -> Result<Option<Vertex>, GraphError> {
-        
         // Construct the Cypher query
         let query = format!(
             "MATCH (p:Patient {{mrn: '{}'}}) RETURN p",
             // Use basic escaping for the single quote within the MRN value
-            mrn.replace('\'', "\\'") 
+            mrn.replace('\'', "\\'")
         );
-
-        // Execute the read query.
+        
+        println!("===> get_patient_by_mrn query: {}", query);
+        
+        // Execute the read query
         let results_vec = self.execute_cypher_read(&query, json!({})).await?;
         
-        // The immediate Vec<Value> (results_vec) returned by execute_cypher_read 
-        // should contain the overall Cypher JSON response as its first (and usually only) element.
-        let cypher_json_value = results_vec.into_iter().next()
-            .ok_or_else(|| GraphError::DeserializationError("Cypher execution returned an empty top-level array.".into()))?;
-
-        // --- Start Robust Parsing of the Query Engine Result Structure ---
+        println!("===> get_patient_by_mrn results: {}", serde_json::to_string_pretty(&results_vec).unwrap_or_default());
         
-        // 1. Get the 'results' array from the top-level JSON object.
-        let results_array = cypher_json_value.as_object()
-            .and_then(|obj| obj.get("results"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| GraphError::DeserializationError("Cypher response missing top-level 'results' array.".into()))?;
-
-        // 2. Get the first result block (which contains vertices/edges/stats).
-        let first_result_block = results_array.get(0)
-            .ok_or_else(|| GraphError::DeserializationError("Cypher 'results' array was empty.".into()))?;
-
-        // 3. Extract the 'vertices' array (the list of matched nodes).
-        let vertices = first_result_block.as_object()
-            .and_then(|obj| obj.get("vertices"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| GraphError::DeserializationError("Cypher result block missing 'vertices' array.".into()))?;
-
-        // >>> CRITICAL FIX: Gracefully handle the empty match. <<<
-        if vertices.is_empty() {
+        // The result structure is: Vec<Value> where each Value is:
+        // {
+        //   "vertices": [...],
+        //   "edges": [...],
+        //   "stats": {...}
+        // }
+        
+        let mut found_vertices = Vec::new();
+        
+        for result_item in results_vec {
+            // Extract vertices array from each result item
+            if let Some(vertices_array) = result_item.get("vertices").and_then(|v| v.as_array()) {
+                for vertex_value in vertices_array {
+                    match serde_json::from_value::<Vertex>(vertex_value.clone()) {
+                        Ok(vertex) => {
+                            // Filter to only Patient vertices with matching MRN
+                            let label = vertex.label.clone();
+                            if label.to_string() == "Patient" {
+                                if let Some(PropertyValue::String(vertex_mrn)) = vertex.properties.get("mrn") {
+                                    if vertex_mrn == mrn {
+                                        found_vertices.push(vertex);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to deserialize vertex JSON for MRN '{}': {}", mrn, e);
+                            return Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Handle empty match gracefully
+        if found_vertices.is_empty() {
+            println!("===> No Patient found with MRN '{}'", mrn);
             return Ok(None);
         }
         
-        // 4. Check for multiple matches (unexpected for MRN lookup).
-        if vertices.len() > 1 {
-            warn!("MRN lookup returned {} vertices. Returning the first one.", vertices.len());
+        // Check for multiple matches (unexpected for MRN lookup)
+        if found_vertices.len() > 1 {
+            warn!("MRN lookup for '{}' returned {} vertices. Returning the first one.", mrn, found_vertices.len());
         }
-
-        // 5. Extract the first vertex JSON value.
-        let vertex_json_value = vertices.get(0)
-            .ok_or_else(|| GraphError::DeserializationError("Vertices array was unexpectedly empty.".into()))?;
-
-        // 6. Convert the extracted node structure into our Rust Vertex model.
-        // We use serde_json::from_value to safely deserialize.
-        match serde_json::from_value(vertex_json_value.clone()) {
-            Ok(vertex) => Ok(Some(vertex)),
-            Err(e) => {
-                error!("Failed to deserialize JSON to Vertex: {}", e);
-                Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)))
-            }
-        }
+        
+        println!("===> Found Patient vertex with MRN '{}': {:?}", mrn, found_vertices[0].id);
+        
+        // Return the first valid vertex
+        Ok(Some(found_vertices.remove(0)))
     }
 
     // =========================================================================

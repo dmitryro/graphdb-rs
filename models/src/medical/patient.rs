@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{Vertex, ToVertex, identifiers::Identifier};
 use crate::errors::{GraphError};
 use crate::medical::Address;   // or wherever it lives
-use crate::properties::{ PropertyValue, UnhashableVertex }; // <--- ADD THIS IMPORT
+use crate::properties::{ PropertyValue, UnhashableVertex, SerializableDateTime }; // <--- ADD THIS IMPORT
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Patient {
@@ -111,333 +111,350 @@ pub struct Patient {
 impl ToVertex for Patient {
     fn to_vertex(&self) -> Vertex {
         // Initialize with "Patient" label
-        let mut v = Vertex::new(Identifier::new("Patient".to_string()).unwrap());
+        let label_str = "Patient";
+        let identifier = Identifier::new(label_str.to_string()).unwrap_or_else(|_| {
+            println!("[ToVertex] CRITICAL: Failed to create identifier for 'Patient'");
+            panic!("Invalid Label");
+        });
+        
+        let mut v = Vertex::new(identifier);
+
+        println!("[ToVertex] Starting conversion for MRN: {:?}", self.mrn);
 
         // --- PRIMARY IDENTIFIERS ---
-        // These are the core keys for the MPI and Golden Record
         if let Some(id_val) = self.id {
-            v.add_property("id", &id_val.to_string());
+            v.properties.insert("id".to_string(), PropertyValue::Integer(id_val as i64));
         }
+        
         if let Some(ref val) = self.user_id {
-            v.add_property("user_id", &val.to_string());
+            v.properties.insert("user_id".to_string(), PropertyValue::String(val.to_string()));
         }
-        // Vertex ID is crucial for the graph of changes/events
+        
+        // Vertex ID is crucial for the graph of changes/events (MPI requirement)
         if let Some(ref val) = self.vertex_id {
-            v.add_property("vertex_id", &val.to_string());
+            v.properties.insert("vertex_id".to_string(), PropertyValue::String(val.to_string()));
         }
+        
         if let Some(ref val) = self.mrn {
-            v.add_property("mrn", val);
+            v.properties.insert("mrn".to_string(), PropertyValue::String(val.clone()));
         }
+        
         if let Some(ref val) = self.ssn {
-            v.add_property("ssn", val);
+            v.properties.insert("ssn".to_string(), PropertyValue::String(val.clone()));
         }
 
         // --- DEMOGRAPHICS ---
         if let Some(ref val) = self.first_name {
-            v.add_property("first_name", val);
+            v.properties.insert("first_name".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.middle_name {
-            v.add_property("middle_name", val);
+            v.properties.insert("middle_name".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.last_name {
-            v.add_property("last_name", val);
+            v.properties.insert("last_name".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.suffix {
-            v.add_property("suffix", val);
+            v.properties.insert("suffix".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.preferred_name {
-            v.add_property("preferred_name", val);
+            v.properties.insert("preferred_name".to_string(), PropertyValue::String(val.clone()));
         }
 
-        v.add_property("date_of_birth", &self.date_of_birth.to_rfc3339());
+        // --- DATE FIELDS (Using Explicit SerializableDateTime Wrapper) ---
+        v.properties.insert(
+            "date_of_birth".to_string(), 
+            PropertyValue::DateTime(SerializableDateTime(self.date_of_birth))
+        );
 
         if let Some(ref val) = self.date_of_death {
-            v.add_property("date_of_death", &val.to_rfc3339());
+            v.properties.insert(
+                "date_of_death".to_string(), 
+                PropertyValue::DateTime(SerializableDateTime(*val))
+            );
         }
         
         if let Some(ref val) = self.gender { 
-            v.add_property("gender", val);
+            v.properties.insert("gender".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.sex_assigned_at_birth {
-            v.add_property("sex_assigned_at_birth", val);
+            v.properties.insert("sex_assigned_at_birth".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.gender_identity {
-            v.add_property("gender_identity", val);
+            v.properties.insert("gender_identity".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.pronouns {
-            v.add_property("pronouns", val);
+            v.properties.insert("pronouns".to_string(), PropertyValue::String(val.clone()));
         }
 
         // --- CONTACT INFORMATION ---
         if let Some(ref addr_id) = self.address_id {
-            v.add_property("address_id", &addr_id.to_string());
+            v.properties.insert("address_id".to_string(), PropertyValue::String(addr_id.to_string()));
         }
         if let Some(ref addr) = self.address {
-            // Serialization ensures complex address structs are stored as JSON strings in the property
-            v.add_property("address", &serde_json::to_string(addr).expect("Address serialization failed"));
+            match serde_json::to_string(addr) {
+                Ok(s) => { v.properties.insert("address".to_string(), PropertyValue::String(s)); }
+                Err(e) => { println!("[ToVertex] Error serializing address: {}", e); }
+            }
         }
         if let Some(ref val) = self.phone_home {
-            v.add_property("phone_home", val);
+            v.properties.insert("phone_home".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.phone_mobile {
-            v.add_property("phone_mobile", val);
+            v.properties.insert("phone_mobile".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.phone_work {
-            v.add_property("phone_work", val);
+            v.properties.insert("phone_work".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.email {
-            v.add_property("email", val);
+            v.properties.insert("email".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.preferred_contact_method {
-            v.add_property("preferred_contact_method", val);
+            v.properties.insert("preferred_contact_method".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.preferred_language {
-            v.add_property("preferred_language", val);
+            v.properties.insert("preferred_language".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(interpreter_needed) = self.interpreter_needed {
-            v.add_property("interpreter_needed", &interpreter_needed.to_string()); 
+            v.properties.insert("interpreter_needed".to_string(), PropertyValue::Boolean(interpreter_needed)); 
         }
 
         // --- EMERGENCY CONTACT ---
         if let Some(ref val) = self.emergency_contact_name {
-            v.add_property("emergency_contact_name", val);
+            v.properties.insert("emergency_contact_name".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.emergency_contact_relationship {
-            v.add_property("emergency_contact_relationship", val);
+            v.properties.insert("emergency_contact_relationship".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.emergency_contact_phone {
-            v.add_property("emergency_contact_phone", val);
+            v.properties.insert("emergency_contact_phone".to_string(), PropertyValue::String(val.clone()));
         }
 
         // --- DEMOGRAPHIC DETAILS ---
         if let Some(ref val) = self.marital_status {
-            v.add_property("marital_status", val);
+            v.properties.insert("marital_status".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.race {
-            v.add_property("race", val);
+            v.properties.insert("race".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.ethnicity {
-            v.add_property("ethnicity", val);
+            v.properties.insert("ethnicity".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.religion {
-            v.add_property("religion", val);
+            v.properties.insert("religion".to_string(), PropertyValue::String(val.clone()));
         }
 
         // --- INSURANCE & FINANCIAL ---
         if let Some(ref val) = self.primary_insurance {
-            v.add_property("primary_insurance", val);
+            v.properties.insert("primary_insurance".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.primary_insurance_id {
-            v.add_property("primary_insurance_id", val);
+            v.properties.insert("primary_insurance_id".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.secondary_insurance {
-            v.add_property("secondary_insurance", val);
+            v.properties.insert("secondary_insurance".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.secondary_insurance_id {
-            v.add_property("secondary_insurance_id", val);
+            v.properties.insert("secondary_insurance_id".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.guarantor_name {
-            v.add_property("guarantor_name", val);
+            v.properties.insert("guarantor_name".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.guarantor_relationship {
-            v.add_property("guarantor_relationship", val);
+            v.properties.insert("guarantor_relationship".to_string(), PropertyValue::String(val.clone()));
         }
 
         // --- CLINICAL INFORMATION ---
         if let Some(ref val) = self.primary_care_provider_id {
-            v.add_property("primary_care_provider_id", &val.to_string());
+            v.properties.insert("primary_care_provider_id".to_string(), PropertyValue::String(val.to_string()));
         }
         if let Some(ref val) = self.blood_type {
-            v.add_property("blood_type", val);
+            v.properties.insert("blood_type".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.organ_donor {
-            v.add_property("organ_donor", &val.to_string());
+            v.properties.insert("organ_donor".to_string(), PropertyValue::Boolean(*val));
         }
 
         // --- DIRECTIVE STATUS ---
         if let Some(val) = self.advance_directive_on_file {
-            v.add_property("advance_directive_on_file", &val.to_string());
+            v.properties.insert("advance_directive_on_file".to_string(), PropertyValue::Boolean(val));
         }
         if let Some(ref val) = self.dni_status {
-            v.add_property("dni_status", val);
+            v.properties.insert("dni_status".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.dnr_status {
-            v.add_property("dnr_status", val);
+            v.properties.insert("dnr_status".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.code_status {
-            v.add_property("code_status", val);
+            v.properties.insert("code_status".to_string(), PropertyValue::String(val.clone()));
         }
 
         // --- ADMINISTRATIVE ---
         if let Some(ref val) = self.patient_status {
-            v.add_property("patient_status", val.as_str()); 
+            v.properties.insert("patient_status".to_string(), PropertyValue::String(val.clone())); 
         }
         if let Some(val) = self.vip_flag {
-            v.add_property("vip_flag", &val.to_string());
+            v.properties.insert("vip_flag".to_string(), PropertyValue::Boolean(val));
         } 
         if let Some(val) = self.confidential_flag {
-            v.add_property("confidential_flag", &val.to_string());
+            v.properties.insert("confidential_flag".to_string(), PropertyValue::Boolean(val));
         }
         if let Some(ref val) = self.research_consent {
-            v.add_property("research_consent", &val.to_string());
+            v.properties.insert("research_consent".to_string(), PropertyValue::Boolean(*val));
         }
         if let Some(ref val) = self.marketing_consent {
-            v.add_property("marketing_consent", &val.to_string());
+            v.properties.insert("marketing_consent".to_string(), PropertyValue::Boolean(*val));
         }
 
         // --- SOCIAL DETERMINANTS OF HEALTH ---
         if let Some(ref val) = self.employment_status {
-            v.add_property("employment_status", val);
+            v.properties.insert("employment_status".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.housing_status {
-            v.add_property("housing_status", val);
+            v.properties.insert("housing_status".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.education_level {
-            v.add_property("education_level", val);
+            v.properties.insert("education_level".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.financial_strain {
-            v.add_property("financial_strain", val);
+            v.properties.insert("financial_strain".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(val) = self.food_insecurity {
-            v.add_property("food_insecurity", &val.to_string());
+            v.properties.insert("food_insecurity".to_string(), PropertyValue::Boolean(val));
         }
         if let Some(val) = self.transportation_needs {
-            v.add_property("transportation_needs", &val.to_string());
+            v.properties.insert("transportation_needs".to_string(), PropertyValue::Boolean(val));
         }
         if let Some(ref val) = self.social_isolation {
-            v.add_property("social_isolation", val);
+            v.properties.insert("social_isolation".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.veteran_status {
-            v.add_property("veteran_status", &val.to_string());
+            v.properties.insert("veteran_status".to_string(), PropertyValue::Boolean(*val));
         }
         if let Some(ref val) = self.disability_status {
-            v.add_property("disability_status", val);
+            v.properties.insert("disability_status".to_string(), PropertyValue::String(val.clone()));
         }
 
         // --- CLINICAL ALERTS ---
         if let Some(ref val) = self.alert_flags {
-            v.add_property("alert_flags", val);
+            v.properties.insert("alert_flags".to_string(), PropertyValue::String(val.clone()));
         }
         if let Some(ref val) = self.special_needs {
-            v.add_property("special_needs", val);
+            v.properties.insert("special_needs".to_string(), PropertyValue::String(val.clone()));
         }
 
-        // --- AUDIT TRAIL ---
-        // Ensuring UTC timestamps are stored in ISO format for temporal queries
-        v.add_property("created_at", &self.created_at.to_rfc3339());
-        v.add_property("updated_at", &self.updated_at.to_rfc3339());
+        // --- AUDIT TRAIL (Native DateTime variants using SerializableDateTime) ---
+        v.properties.insert(
+            "created_at".to_string(), 
+            PropertyValue::DateTime(SerializableDateTime(self.created_at))
+        );
+        v.properties.insert(
+            "updated_at".to_string(), 
+            PropertyValue::DateTime(SerializableDateTime(self.updated_at))
+        );
+        
         if let Some(ref val) = self.created_by {
-            v.add_property("created_by", &val.to_string());
+            v.properties.insert("created_by".to_string(), PropertyValue::String(val.to_string()));
         }
         if let Some(ref val) = self.updated_by {
-            v.add_property("updated_by", &val.to_string());
+            v.properties.insert("updated_by".to_string(), PropertyValue::String(val.to_string()));
         }
         if let Some(ref val) = self.last_visit_date {
-            v.add_property("last_visit_date", &val.to_rfc3339());
+            v.properties.insert(
+                "last_visit_date".to_string(), 
+                PropertyValue::DateTime(SerializableDateTime(*val))
+            );
         }
 
         v
     }
 }
 
-/// Normalizes vertex properties by converting legacy aliases to canonical field names
-/// and ensuring required fields have non-null string representations.
 fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
     let mut normalized = vertex.clone();
     
-    // --- 1. NEW: Handle vertex_id mapping ---
-    // Extract the physical graph vertex ID and ensure it's in the properties for the struct mapper
+    // --- 1. Vertex ID mapping ---
     normalized.properties.insert(
         "vertex_id".to_string(),
         PropertyValue::String(vertex.id.0.to_string())
     );
     
-    // --- 2. Handle legacy "dob" field and ensure "date_of_birth" is present ---
+    // --- 2. Handle numeric ID types to prevent conversion errors ---
+    if let Some(id_val) = normalized.properties.get("id").cloned() {
+        if let PropertyValue::String(s) = id_val {
+            if let Ok(parsed) = s.parse::<i64>() {
+                normalized.properties.insert("id".to_string(), PropertyValue::Integer(parsed));
+            }
+        }
+    }
+
+    // --- 3. Handle legacy "dob" field and ensure "date_of_birth" is a DateTime variant ---
     let dob_key = "date_of_birth".to_string();
-    if !normalized.properties.contains_key(&dob_key) {
-        // Attempt to convert "dob"
-        let dob_string_to_convert: Option<String> = normalized.properties.get("dob").and_then(|v| {
-            if let PropertyValue::String(s) = v {
-                Some(s.clone())
-            } else {
+    
+    // Helper to attempt conversion of existing value to DateTime variant
+    let try_to_datetime = |val: &PropertyValue| -> Option<PropertyValue> {
+        match val {
+            PropertyValue::DateTime(_) => Some(val.clone()),
+            PropertyValue::String(s) => {
+                // Try RFC3339 first
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                    return Some(PropertyValue::DateTime(dt.with_timezone(&chrono::Utc).into()));
+                }
+                // Try Naive date yyyy-mm-dd
+                if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                    let dt = nd.and_hms_opt(0, 0, 0).unwrap().and_utc();
+                    return Some(PropertyValue::DateTime(dt.into()));
+                }
                 None
             }
-        });
+            _ => None,
+        }
+    };
 
-        let mut date_found = false;
-        if let Some(dob_value) = dob_string_to_convert {
-            // CRITICAL FIX: Convert "YYYY-MM-DD" to RFC3339 format
-            if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(&dob_value, "%Y-%m-%d") {
-                let date_time = naive_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-                
-                normalized.properties.insert(
-                    dob_key.clone(),
-                    PropertyValue::String(date_time.to_rfc3339())
-                );
-                date_found = true;
+    // If date_of_birth is missing but legacy 'dob' exists, move it
+    if !normalized.properties.contains_key(&dob_key) {
+        if let Some(legacy_dob) = normalized.properties.get("dob") {
+            if let Some(dt_val) = try_to_datetime(legacy_dob) {
+                normalized.properties.insert(dob_key.clone(), dt_val);
                 normalized.properties.remove("dob");
             }
         }
-        
-        // NEW FIX: If "date_of_birth" is still missing, set a default to prevent deserialization failure
-        if !date_found {
-            // Default to 1900-01-01T00:00:00+00:00 (A safe fallback date)
-            let default_date = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .to_rfc3339();
-                
-            normalized.properties.insert(dob_key, PropertyValue::String(default_date));
+    }
+
+    // Ensure date_of_birth is now a DateTime variant if it was a String
+    if let Some(current_dob) = normalized.properties.get(&dob_key).cloned() {
+        if let Some(dt_val) = try_to_datetime(&current_dob) {
+            normalized.properties.insert(dob_key.clone(), dt_val);
         }
+    } else {
+        // Ultimate fallback for missing DOB
+        let default_dt = chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        normalized.properties.insert(dob_key, PropertyValue::DateTime(default_dt.into()));
     }
     
-    // --- 3. Handle legacy "name" field ---
-    // This logic attempts to split 'name' into 'first_name' and 'last_name' if they are missing
+    // --- 4. Handle legacy "name" field ---
     let mut names_set = normalized.properties.contains_key("first_name") && normalized.properties.contains_key("last_name");
     
     if !names_set {
         let name_string_to_split: Option<String> = normalized.properties.get("name").and_then(|v| {
-            if let PropertyValue::String(s) = v {
-                Some(s.clone()) 
-            } else {
-                None
-            }
+            if let PropertyValue::String(s) = v { Some(s.clone()) } else { None }
         });
 
         if let Some(name_value) = name_string_to_split {
             let parts: Vec<&str> = name_value.split_whitespace().collect();
-            
-            // Insert first_name
             if let Some(first) = parts.first() {
-                normalized.properties.insert(
-                    "first_name".to_string(),
-                    PropertyValue::String(first.to_string()) 
-                );
+                normalized.properties.insert("first_name".to_string(), PropertyValue::String(first.to_string()));
             }
-            
-            // Insert last_name (all remaining parts)
             if parts.len() > 1 {
                 let last = parts[1..].join(" ");
-                normalized.properties.insert(
-                    "last_name".to_string(),
-                    PropertyValue::String(last) 
-                );
-            } else if parts.len() == 1 {
-                // If only one part, set last_name to empty
-                normalized.properties.insert(
-                    "last_name".to_string(),
-                    PropertyValue::String("".to_string()) 
-                );
+                normalized.properties.insert("last_name".to_string(), PropertyValue::String(last));
+            } else {
+                normalized.properties.insert("last_name".to_string(), PropertyValue::String("".to_string()));
             }
-            
             normalized.properties.remove("name");
             names_set = true;
         }
     }
     
-    // NEW FIX: Ensure first_name and last_name exist as strings after conversion attempt
     if !normalized.properties.contains_key("first_name") {
         normalized.properties.insert("first_name".to_string(), PropertyValue::String("".to_string()));
     }
@@ -445,109 +462,92 @@ fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
         normalized.properties.insert("last_name".to_string(), PropertyValue::String("".to_string()));
     }
     
-    // --- 4. Ensure other required/default fields are present ---
+    // --- 5. Fix Boolean fields from Strings ---
+    let bool_fields = [
+        "interpreter_needed", "advance_directive_on_file", "vip_flag", 
+        "confidential_flag", "food_insecurity", "transportation_needs",
+        "organ_donor", "research_consent", "marketing_consent", "veteran_status"
+    ];
 
-    // Ensure required fields have defaults if missing
+    for field in bool_fields {
+        if let Some(PropertyValue::String(s)) = normalized.properties.get(field) {
+            let b_val = s.to_lowercase() == "true";
+            normalized.properties.insert(field.to_string(), PropertyValue::Boolean(b_val));
+        }
+    }
+
+    // --- 6. Defaults and Audit Timestamps (ensure DateTime variants) ---
     if !normalized.properties.contains_key("patient_status") {
-        normalized.properties.insert(
-            "patient_status".to_string(),
-            PropertyValue::String("ACTIVE".to_string())
-        );
+        normalized.properties.insert("patient_status".to_string(), PropertyValue::String("ACTIVE".to_string()));
     }
     
-    if !normalized.properties.contains_key("gender") {
-        normalized.properties.insert(
-            "gender".to_string(),
-            PropertyValue::String("UNKNOWN".to_string())
-        );
-    }
-    
-    // Ensure boolean fields have defaults
-    if !normalized.properties.contains_key("interpreter_needed") {
-        normalized.properties.insert(
-            "interpreter_needed".to_string(),
-            PropertyValue::String("false".to_string())
-        );
-    }
-    
-    if !normalized.properties.contains_key("advance_directive_on_file") {
-        normalized.properties.insert(
-            "advance_directive_on_file".to_string(),
-            PropertyValue::String("false".to_string())
-        );
-    }
-    
-    if !normalized.properties.contains_key("vip_flag") {
-        normalized.properties.insert(
-            "vip_flag".to_string(),
-            PropertyValue::String("false".to_string())
-        );
-    }
-    
-    if !normalized.properties.contains_key("confidential_flag") {
-        normalized.properties.insert(
-            "confidential_flag".to_string(),
-            PropertyValue::String("false".to_string())
-        );
-    }
-    
-    if !normalized.properties.contains_key("food_insecurity") {
-        normalized.properties.insert(
-            "food_insecurity".to_string(),
-            PropertyValue::String("false".to_string())
-        );
-    }
-    
-    if !normalized.properties.contains_key("transportation_needs") {
-        normalized.properties.insert(
-            "transportation_needs".to_string(),
-            PropertyValue::String("false".to_string())
-        );
-    }
-    
-    // Ensure timestamp fields exist
-    if !normalized.properties.contains_key("created_at") {
-        normalized.properties.insert(
-            "created_at".to_string(),
-            PropertyValue::String(chrono::Utc::now().to_rfc3339())
-        );
-    }
-    
-    if !normalized.properties.contains_key("updated_at") {
-        normalized.properties.insert(
-            "updated_at".to_string(),
-            PropertyValue::String(chrono::Utc::now().to_rfc3339())
-        );
+    let now = chrono::Utc::now();
+    for audit_field in ["created_at", "updated_at"] {
+        let existing = normalized.properties.get(audit_field).cloned();
+        if let Some(val) = existing {
+            if let Some(dt_val) = try_to_datetime(&val) {
+                normalized.properties.insert(audit_field.to_string(), dt_val);
+            }
+        } else {
+            normalized.properties.insert(audit_field.to_string(), PropertyValue::DateTime(now.into()));
+        }
     }
     
     normalized
 }
 
-
 impl Patient {
     pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
         if vertex.label.as_ref() != "Patient" { 
+            println!("[Patient::from_vertex] Failed: Label is not Patient, found: {}", vertex.label.as_ref());
             return None; 
         }
         
-        // Normalize the vertex properties first
         let normalized = normalize_patient_vertex(vertex);
         
-        Some(Patient {
-            // NEW: Graph vertex ID for tracing and relating events
+        // --- DEFENSIVE DATE EXTRACTION HELPER ---
+        // Handles both String (from manual insert) and DateTime (from DB casting/native storage)
+        let extract_date = |key: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+            let val = normalized.properties.get(key);
+            match val {
+                Some(PropertyValue::DateTime(dt)) => Some(dt.0.with_timezone(&chrono::Utc)),
+                Some(PropertyValue::String(s)) => {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                },
+                _ => None,
+            }
+        };
+
+        // --- CRITICAL FIELD: DATE OF BIRTH ---
+        let dob = extract_date("date_of_birth");
+        if dob.is_none() {
+            println!(
+                "[Patient::from_vertex] Error: date_of_birth missing or unparseable. Raw value: {:?}", 
+                normalized.properties.get("date_of_birth")
+            );
+        }
+
+        // --- AUDIT FIELDS (CRITICAL FOR MPI LOGGING) ---
+        // Fallback to vertex root audit if property map doesn't contain them
+        let created_at = extract_date("created_at").unwrap_or(vertex.created_at.0);
+        let updated_at = extract_date("updated_at").unwrap_or(vertex.updated_at.0);
+
+        let patient = Patient {
             vertex_id: normalized.properties.get("vertex_id")
                 .and_then(|v| v.as_str())
-                .and_then(|s| Uuid::parse_str(s).ok()),
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .or_else(|| Some(vertex.id.0)),
 
-            // Primary identifiers
-            id: {
-                let prop = normalized.properties.get("id");
-                let id_str = match prop {
-                    Some(PropertyValue::String(s)) => Some(s.clone()),
-                    Some(PropertyValue::Integer(i)) => Some(i.to_string()),
-                    _ => None,
-                };
-                id_str.and_then(|s| s.parse::<i32>().ok())
+            id: match normalized.properties.get("id") {
+                Some(PropertyValue::Integer(i)) => Some(*i as i32),
+                Some(PropertyValue::String(s)) => {
+                    let p = s.parse::<i32>().ok();
+                    if p.is_none() { println!("[Patient::from_vertex] Warn: id string '{}' failed to parse to i32", s); }
+                    p
+                },
+                _ => None,
             },
             
             user_id: normalized.properties.get("user_id")
@@ -560,7 +560,6 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Demographics
             first_name: normalized.properties.get("first_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -577,14 +576,10 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            date_of_birth: chrono::DateTime::parse_from_rfc3339(
-                normalized.properties.get("date_of_birth")?.as_str()?
-            ).ok()?.with_timezone(&chrono::Utc),
+            // Extract the DOB or return None for the whole record
+            date_of_birth: dob?,
             
-            date_of_death: normalized.properties.get("date_of_death")
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            date_of_death: extract_date("date_of_death"),
             
             gender: normalized.properties.get("gender")
                 .and_then(|v| v.as_str())
@@ -600,7 +595,6 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Contact Information
             address_id: normalized.properties.get("address_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| uuid::Uuid::parse_str(s).ok()),
@@ -626,11 +620,12 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
                 
-            interpreter_needed: normalized.properties.get("interpreter_needed")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
+            interpreter_needed: match normalized.properties.get("interpreter_needed") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
 
-            // Emergency Contact
             emergency_contact_name: normalized.properties.get("emergency_contact_name")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -641,7 +636,6 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Demographic Details
             marital_status: normalized.properties.get("marital_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -655,7 +649,6 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Insurance & Financial
             primary_insurance: normalized.properties.get("primary_insurance")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -675,21 +668,23 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Clinical Information
             primary_care_provider_id: normalized.properties.get("primary_care_provider_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
             blood_type: normalized.properties.get("blood_type")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            organ_donor: normalized.properties.get("organ_donor")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
+            organ_donor: match normalized.properties.get("organ_donor") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
 
-            // Directive Status
-            advance_directive_on_file: normalized.properties.get("advance_directive_on_file")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
+            advance_directive_on_file: match normalized.properties.get("advance_directive_on_file") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
             dni_status: normalized.properties.get("dni_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -700,25 +695,31 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Administrative
             patient_status: normalized.properties.get("patient_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| Some("ACTIVE".to_string())),
-            vip_flag: normalized.properties.get("vip_flag")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
-            confidential_flag: normalized.properties.get("confidential_flag")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
-            research_consent: normalized.properties.get("research_consent")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
-            marketing_consent: normalized.properties.get("marketing_consent")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
+            vip_flag: match normalized.properties.get("vip_flag") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
+            confidential_flag: match normalized.properties.get("confidential_flag") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
+            research_consent: match normalized.properties.get("research_consent") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
+            marketing_consent: match normalized.properties.get("marketing_consent") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
 
-            // Social Determinants of Health
             employment_status: normalized.properties.get("employment_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -731,23 +732,28 @@ impl Patient {
             financial_strain: normalized.properties.get("financial_strain")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            food_insecurity: normalized.properties.get("food_insecurity")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
-            transportation_needs: normalized.properties.get("transportation_needs")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
+            food_insecurity: match normalized.properties.get("food_insecurity") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
+            transportation_needs: match normalized.properties.get("transportation_needs") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
             social_isolation: normalized.properties.get("social_isolation")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            veteran_status: normalized.properties.get("veteran_status")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok()),
+            veteran_status: match normalized.properties.get("veteran_status") {
+                Some(PropertyValue::Boolean(b)) => Some(*b),
+                Some(PropertyValue::String(s)) => s.parse().ok(),
+                _ => None,
+            },
             disability_status: normalized.properties.get("disability_status")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             
-            // Clinical Alerts
             alert_flags: normalized.properties.get("alert_flags")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
@@ -755,56 +761,64 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Audit Trail
-            created_at: chrono::DateTime::parse_from_rfc3339(
-                normalized.properties.get("created_at")?.as_str()?
-            ).ok()?.with_timezone(&chrono::Utc),
-            updated_at: chrono::DateTime::parse_from_rfc3339(
-                normalized.properties.get("updated_at")?.as_str()?
-            ).ok()?.with_timezone(&chrono::Utc),
+            created_at,
+            updated_at,
+            
             created_by: normalized.properties.get("created_by")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
             updated_by: normalized.properties.get("updated_by")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok()),
-            last_visit_date: normalized.properties.get("last_visit_date")
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc)),
-        })
+            last_visit_date: extract_date("last_visit_date"),
+        };
+
+        // Final sanity check for MPI logging consistency
+        if patient.mrn.is_none() {
+            println!("[Patient::from_vertex] Warn: Successfully parsed Patient but MRN is missing.");
+        }
+
+        Some(patient)
     }
 
     pub fn from_vertex_value(value: &PropertyValue) -> Option<Self> {
-        // 1. Check if the PropertyValue contains the canonical Vertex structure.
         if let PropertyValue::Vertex(unhashable_vertex) = value {
-            let vertex = &unhashable_vertex.0;
-            return Patient::from_vertex(vertex); 
+            return Patient::from_vertex(&unhashable_vertex.0); 
         }
 
-        // 2. Fallback check for PropertyValue::Map
         if let PropertyValue::Map(hashable_map) = value {
-            let property_map = &hashable_map.0; 
-
-            let properties: HashMap<String, PropertyValue> = property_map
+            let properties: HashMap<String, PropertyValue> = hashable_map.0
                 .iter()
                 .map(|(id, value)| (id.to_string(), value.clone()))
                 .collect();
 
-            let label = Identifier::new("Patient".to_string()).ok()?; 
+            let label = Identifier::new("Patient".to_string()).ok();
+            if label.is_none() { println!("[Patient::from_vertex_value] Error: Failed to create Label identifier"); return None; }
 
             let vertex = Vertex {
                 id: Default::default(),
-                label,
+                label: label.unwrap(),
                 properties,
                 created_at: Utc::now().into(),
                 updated_at: Utc::now().into(),
             };
-
             return Patient::from_vertex(&vertex); 
         }
         
+        println!("[Patient::from_vertex_value] Error: PropertyValue is neither Vertex nor Map. Found: {:?}", value);
         None
+    }
+}
+
+fn extract_date(val: Option<&PropertyValue>) -> Option<chrono::DateTime<chrono::Utc>> {
+    match val {
+        Some(PropertyValue::DateTime(dt)) => Some(dt.0.with_timezone(&chrono::Utc)),
+        Some(PropertyValue::String(s)) => {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        },
+        _ => None,
     }
 }
 

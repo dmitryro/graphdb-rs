@@ -1581,7 +1581,7 @@ pub async fn run_single_command(
                         system,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("MPI status retrieval failed: {}", e))?;
+                    .map_err(|e| anyhow!("MPI status retrieval failed: {}", e))?;
                 }
             }
 

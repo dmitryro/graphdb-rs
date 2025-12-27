@@ -229,6 +229,17 @@ pub struct WithItem {
     pub alias: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnClause {
+    pub items: Vec<ReturnItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnItem {
+    pub expression: String,
+    pub alias: Option<String>,
+}
+
 // 2. crate::query::OrderByItem
 // Represents a field and its sort order in ORDER BY clause
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize )]
@@ -303,8 +314,9 @@ pub enum CypherQuery {
     },
     MatchPattern {
         patterns: Vec<Pattern>,
-        where_clause: Option<WhereClause>, // Added
+        where_clause: Option<WhereClause>, 
         with_clause: Option<ParsedWithClause>,
+       // return_clause: Option<ReturnClause>, 
     },
     MatchSet {
         match_patterns: Vec<Pattern>, // Adjust type name to match your codebase
@@ -614,24 +626,28 @@ impl From<PropertyValue> for CypherValue {
             PropertyValue::String(s) => CypherValue::String(s),
             PropertyValue::Uuid(u) => CypherValue::String(u.0.to_string()),
             PropertyValue::Byte(b) => CypherValue::Integer(b as i64),
+
+            PropertyValue::DateTime(dt) => {
+                // Convert DateTime<Utc> to ISO 8601 / RFC 3339 string
+                // This is the standard way Cypher represents datetime values as strings
+                CypherValue::String(dt.0.to_rfc3339())
+            }
+
             PropertyValue::List(list) => {
-                // map consumes the list; no mut required
                 CypherValue::List(list.into_iter().map(CypherValue::from).collect())
             }
+
             PropertyValue::Map(map) => {
                 let mut cypher_map = std::collections::HashMap::new();
-                // map.0 accesses the inner HashMap<Identifier, PropertyValue>
                 for (k, v) in map.0 {
-                    // Convert Identifier k to String for CypherValue::Map
                     cypher_map.insert(k.to_string(), CypherValue::from(v));
                 }
                 CypherValue::Map(cypher_map)
             }
+
             PropertyValue::Vertex(v) => {
                 let mut vertex_map = std::collections::HashMap::new();
-                // v is UnhashableVertex(Vertex), so we use v.0.properties
                 for (k, val) in v.0.properties {
-                    // Convert Identifier k to String
                     vertex_map.insert(k.to_string(), CypherValue::from(val));
                 }
                 CypherValue::Map(vertex_map)
@@ -948,6 +964,28 @@ impl Expression {
                             Err(GraphError::EvaluationError("ID() requires a variable".into()))
                         }
                     },
+                    "TYPE" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            // Use to_string() to convert Identifier -> String
+                            CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
+                            _ => Ok(CypherValue::Null),
+                        }
+                    },
+                    "LABELS" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            // Use to_string() here as well for the list element
+                            CypherValue::Vertex(v) => Ok(CypherValue::List(vec![
+                                CypherValue::String(v.label.to_string())
+                            ])),
+                            _ => Ok(CypherValue::Null),
+                        }
+                    },
                     "LEVENSHTEIN" => {
                         if args.len() != 2 {
                             return Err(GraphError::EvaluationError(
@@ -1262,11 +1300,17 @@ pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
         PropertyValue::String(s) => CypherValue::String(s.clone()),
         PropertyValue::Uuid(u) => CypherValue::Uuid(u.clone()),
         PropertyValue::Byte(b) => CypherValue::Integer(*b as i64),
+
+        PropertyValue::DateTime(dt) => {
+            // Convert to RFC 3339 / ISO 8601 string – standard for Cypher datetime parameters
+            CypherValue::String(dt.0.to_rfc3339())
+        }
+
         PropertyValue::List(list) => {
             CypherValue::List(list.iter().map(property_value_to_cypher).collect())
         }
+
         PropertyValue::Map(map) => {
-            // FIX: Convert Identifier keys to String keys
             let new_map: HashMap<String, CypherValue> = map
                 .0
                 .iter()
@@ -1274,7 +1318,41 @@ pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
                 .collect();
             CypherValue::Map(new_map)
         }
+
         PropertyValue::Vertex(_) => CypherValue::Null,
+    }
+}
+
+// Helper function to convert PropertyValue to serde_json::Value
+fn property_value_to_json(prop_val: PropertyValue) -> Value {
+    println!("===> property_value_to_json START");
+    match prop_val {
+        PropertyValue::String(s) => Value::String(s),
+        PropertyValue::Integer(i) => Value::Number(i.into()),
+        PropertyValue::I32(i) => Value::Number(i.into()),
+        PropertyValue::Float(f) => Value::Number(serde_json::Number::from_f64(f.0).unwrap_or(serde_json::Number::from(0))),
+        PropertyValue::Boolean(b) => Value::Bool(b),
+        PropertyValue::Uuid(uuid) => Value::String(uuid.to_string()),
+        PropertyValue::Byte(b) => Value::Number(b.into()),
+        PropertyValue::Vertex(v) => {
+            Value::String(format!("Vertex({:?})", v.0))
+        },
+        PropertyValue::DateTime(dt) => {
+            // Convert to RFC 3339 / ISO 8601 string (standard JSON timestamp format)
+            Value::String(dt.0.to_rfc3339())
+        },
+        PropertyValue::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (key, val) in map.0.into_iter() {
+                obj.insert(key.0.to_string(), property_value_to_json(val));
+            }
+            Value::Object(obj)
+        },
+        // Fix: Added missing arms to satisfy exhaustiveness check
+        PropertyValue::Null => Value::Null,
+        PropertyValue::List(list) => {
+            Value::Array(list.into_iter().map(property_value_to_json).collect())
+        }
     }
 }
 
