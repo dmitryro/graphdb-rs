@@ -1820,7 +1820,7 @@ impl MpiIdentityResolutionService {
     }
 
     /// LINEAGE: Fetches filtered lineage report from the Graph of Events.
-pub async fn get_lineage_data(
+    pub async fn get_lineage_data(
         &self,
         mpi_id: String,
         _id_type: Option<String>,
@@ -1963,7 +1963,45 @@ pub async fn get_lineage_data(
         }))
     }
     
-    /// SNAPSHOT: Reconstructed state with simplified temporal query logic to bypass parser limitations.
+    /// SNAPSHOT: Temporal Reconstruction of Patient Identity State
+    /// 
+    /// Returns the state of a patient's identity as it existed at a specific point in time
+    /// (T_snapshot), accounting for record merges, identity resolution, and data lineage.
+    /// 
+    /// # Purpose in MPI Workflow
+    /// 
+    /// Unlike a standard "fetch" which returns current state, this method provides:
+    /// 
+    /// 1. **Resolved Golden Record (Demographics)**
+    ///    - Follows merge chains to find the canonical "Survivor" record
+    ///    - Returns demographics as they existed at T_snapshot
+    ///    - Handles retired/merged MRNs transparently
+    /// 
+    /// 2. **Identity Resolution Trace**
+    ///    - trace_path: List of UUIDs from requested record → canonical record
+    ///    - merge_hops: Count of transitions in the merge chain
+    ///    - Provides transparency into how the system resolved the identity
+    /// 
+    /// 3. **History Chain (Temporal Validity)**
+    ///    - Returns relationships/attributes valid at T_snapshot
+    ///    - Filters based on: valid_from ≤ T_snapshot AND (valid_until > T_snapshot OR valid_until IS NULL)
+    ///    - Includes linked MRNs, addresses, and cross-references active at that time
+    /// 
+    /// 4. **Audit & Compliance Metadata (2025-12-20 Requirement)**
+    ///    - Logs to Graph of Changes: Structural traceability
+    ///    - Logs to Graph of Events: Detailed temporal query metadata
+    ///    - Records: original_request_id, mpi_id, requested_by, as_of timestamp
+    /// 
+    /// # Returns
+    /// 
+    /// JSON payload containing:
+    /// - `record`: Demographics from the canonical record
+    /// - `history_chain`: Temporally-filtered relationships valid at T_snapshot
+    /// - `trace_path`: Resolution path (UUIDs from input → canonical)
+    /// - `merge_hops`: Number of merge transitions
+    /// - `as_of`: The snapshot timestamp
+    /// - `mpi_id`: Final canonical Golden Record UUID
+    /// - `original_request_id`: What the user actually queried
     pub async fn get_snapshot_data(
         &self,
         mpi_id: String,
@@ -1972,117 +2010,208 @@ pub async fn get_lineage_data(
     ) -> Result<serde_json::Value> {
         let iso_time = as_of.to_rfc3339();
         let gs = &self.graph_service;
-
-        // 1. RESOLVE STARTING POINT (Consistent with Lineage logic)
         let clean_id = mpi_id.trim_matches(|c| c == '\'' || c == '"');
-        let start_vertex = if clean_id.starts_with('M') {
-            gs.get_patient_by_mrn(clean_id).await?
-                .ok_or_else(|| anyhow!("No patient found with MRN: {}", clean_id))?
-        } else {
-            let uuid = Uuid::parse_str(clean_id)
-                .map_err(|_| anyhow!("Invalid UUID format: {}", clean_id))?;
-            gs.storage.get_vertex(&uuid).await?
-                .ok_or_else(|| anyhow!("No patient found with UUID: {}", clean_id))?
-        };
 
-        // 2. FOLLOW MERGE CHAIN (Find the Golden Record)
+        info!("[MPI] Snapshot reconstruction for identifier: '{}' as of {}", clean_id, iso_time);
+        println!(" [MPI] get_snapshot_data - STEP 1");
+        // ═════════════════════════════════════════════════════════════════════════
+        // PHASE 1: IDENTITY RESOLUTION
+        // ═════════════════════════════════════════════════════════════════════════
+        let id_type = Self::identify_id_type(clean_id);
+        info!("[MPI] Identified ID type: {:?}", id_type);
+
+        let start_vertex: Vertex = match id_type {
+            IdentifierType::MRN => {
+                info!("[MPI] Looking up by MRN: '{}'", clean_id);
+                gs.get_patient_by_mrn(clean_id).await
+                    .map_err(|e| anyhow!("Service call failed during MRN lookup: {}", e))?
+                    .ok_or_else(|| anyhow!("MPI Identity Resolution: MRN '{}' not found", clean_id))?
+            },
+            IdentifierType::InternalID => {
+                let numeric_id = clean_id.parse::<i32>()
+                    .map_err(|_| anyhow!("Invalid internal ID format: {}", clean_id))?;
+                gs.get_patient_vertex_by_internal_id(numeric_id).await?
+                    .ok_or_else(|| anyhow!("No patient record found with Internal ID: {}", numeric_id))?
+            },
+            IdentifierType::UUID | _ => {
+                let uuid = Uuid::parse_str(clean_id)
+                    .map_err(|_| anyhow!("Invalid UUID format: {}", clean_id))?;
+                gs.storage.get_vertex(&uuid).await?
+                    .ok_or_else(|| anyhow!("No patient record found with UUID: {}", clean_id))?
+            }
+        };
+        println!(" [MPI] get_snapshot_data - STEP 2");
+        // ═════════════════════════════════════════════════════════════════════════
+        // PHASE 2: RESOLVE SIBLING/SURVIVOR (Merge Chain Traversal)
+        // ═════════════════════════════════════════════════════════════════════════
         let mut canonical_vertex = start_vertex.clone();
         let mut merge_hops = 0;
+        let mut trace_path = vec![start_vertex.id.0];
         const MAX_MERGE_HOPS: u32 = 10;
-        
+
         while let Some(PropertyValue::String(target_uuid_str)) = canonical_vertex.properties.get("merged_into_uuid") {
             if merge_hops >= MAX_MERGE_HOPS {
-                return Err(anyhow!("Merge chain too deep or circular"));
+                error!("[MPI] Circular merge chain detected at {}", canonical_vertex.id.0);
+                return Err(anyhow!("Merge chain too deep or circular - possible data corruption"));
             }
-            let target_uuid = Uuid::parse_str(target_uuid_str)?;
+            
+           println!("[MPI] Following merge chain hop {} to {}", merge_hops + 1, target_uuid_str);
+            let target_uuid = Uuid::parse_str(target_uuid_str.as_str())?;
+            
             canonical_vertex = gs.storage.get_vertex(&target_uuid).await?
-                .ok_or_else(|| anyhow!("Merge target vertex {} not found", target_uuid_str))?;
+                .ok_or_else(|| anyhow!("Merge target vertex {} not found - broken chain", target_uuid_str))?;
+            
             merge_hops += 1;
+            trace_path.push(canonical_vertex.id.0);
         }
-        
+        println!(" [MPI] get_snapshot_data - STEP 3");
+        // CHECK FOR GOLDEN RECORD SIBLING if demographics missing
+        if canonical_vertex.properties.get("first_name").is_none() {
+            info!("[MPI] Demographics missing on vertex {}, checking for GoldenRecord sibling...", canonical_vertex.id.0);
+            let sibling_query = format!(
+                "MATCH (n {{id: '{}'}})-[:RESULTED_IN|MERGED_INTO]->(golden:GoldenRecord) RETURN golden",
+                canonical_vertex.id.0
+            );
+            
+            if let Ok(results) = gs.execute_cypher_read(&sibling_query, json!({})).await {
+                if let Some(row) = results.get(0) {
+                    if let Some(v_data) = row.get("results")
+                        .and_then(|r| r.as_array())
+                        .and_then(|a| a.get(0))
+                        .and_then(|i| i.get("vertices"))
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.get(0)) {
+                            
+                        let g_uuid = Uuid::parse_str(v_data.get("id").and_then(|i| i.as_str()).unwrap_or(""))?;
+                        if let Ok(Some(g_vertex)) = gs.storage.get_vertex(&g_uuid).await {
+                            info!("[MPI] Resolved to Golden Sibling: {}", g_uuid);
+                            canonical_vertex = g_vertex;
+                            trace_path.push(canonical_vertex.id.0);
+                        }
+                    }
+                }
+            }
+        }
+        println!(" [MPI] get_snapshot_data - STEP 3.1");
+        println!("=====> Canonical Vertex in MPI Snapshot {:?}", canonical_vertex);
         let target_uuid = canonical_vertex.id.0.to_string();
         let log_uid = canonical_vertex.id.0;
 
-        // 3. EXTRACT DEMOGRAPHICS (Option-safe)
+        // ═════════════════════════════════════════════════════════════════════════
+        // PHASE 3: ROBUST DEMOGRAPHIC EXTRACTION
+        // ═════════════════════════════════════════════════════════════════════════
         let props = &canonical_vertex.properties;
-        let get_prop_str = |key: &str| {
+        
+        let get_prop_str = |key: &str| -> String {
             props.get(key).and_then(|v| match v {
                 PropertyValue::String(s) => Some(s.clone()),
                 PropertyValue::DateTime(dt) => Some(dt.0.to_rfc3339()),
-                _ => None,
-            })
+                PropertyValue::I32(i) => Some(i.to_string()),
+                PropertyValue::Integer(i) => Some(i.to_string()),
+                _ => v.as_str().map(|s| s.to_string())
+            }).unwrap_or_default()
         };
 
-        let demographics = serde_json::json!({
-            "first_name": get_prop_str("first_name"),
-            "last_name": get_prop_str("last_name"),
-            "dob": get_prop_str("date_of_birth"),
-            "gender": get_prop_str("gender"),
-            "mrn": get_prop_str("mrn"),
-        });
+        let first_name = get_prop_str("first_name");
+        let last_name = get_prop_str("last_name");
+        let dob = get_prop_str("date_of_birth");
+        let gender = props.get("gender").and_then(|v| v.as_str().map(|s| s.to_string()));
+        let last_mod = get_prop_str("updated_at");
 
-        // 4. SIMPLIFIED HISTORY QUERY
-        // We fetch all relationships and filter in Rust to avoid Cypher parser Tag errors
-        // 4. PROPERTY-BASED HISTORY QUERY
-                // Removed type(r) and labels(other) to bypass parser limitations
-                let history_query = format!(
-                    "MATCH (n {{id: '{target_uuid}'}})-[r]-(other) 
-                     RETURN r.label as rel_type, 
-                            other.label as node_label, 
-                            other.id as node_id, 
-                            r.created_at as valid_from, 
-                            r.deleted_at as valid_until"
-                );
-
-                let result_vec = gs.execute_cypher_read(&history_query, serde_json::json!({})).await?;
+        println!(" [MPI] get_snapshot_data - STEP 4");
+        // ═════════════════════════════════════════════════════════════════════════
+        // PHASE 4: TEMPORAL HISTORY QUERY & XREF EXTRACTION
+        // ═════════════════════════════════════════════════════════════════════════
+        let history_query = format!("MATCH (n {{id: '{}'}})-[r]-(other) RETURN r, other", target_uuid);
+        let result_vec = gs.execute_cypher_read(&history_query, json!({})).await
+            .map_err(|e| anyhow!("History query failed: {}", e))?;
+        
+        let iso_ref = iso_time.as_str();
+        let mut cross_refs = Vec::new();
+        let history: Vec<serde_json::Value> = result_vec.iter()
+            .filter_map(|row| {
+                let res_item = row.get("results")?.as_array()?.get(0)?;
+                let edges = res_item.get("edges")?.as_array()?;
+                let vertices = res_item.get("vertices")?.as_array()?;
                 
-                let iso_ref = iso_time.as_str();
+                let edge = edges.get(0)?;
+                let edge_label = edge.get("label").and_then(|l| l.as_str()).unwrap_or("LINKED");
+                let edge_props = edge.get("properties")?;
+                
+                let created_at = edge_props.get("created_at")?.as_str()?;
+                let deleted_at = edge_props.get("deleted_at").and_then(|v| v.as_str());
+                
+                if created_at <= iso_ref && deleted_at.map_or(true, |until| until > iso_ref) {
+                    let other_vertex = vertices.iter().find(|v| {
+                        v.get("id").and_then(|id| id.as_str()) != Some(&target_uuid)
+                    }).or_else(|| vertices.get(0))?;
+
+                    let other_props = other_vertex.get("properties")?;
+                    
+                    // Populate SnapshotXRef if it's a Patient link
+                    if edge_label == "LINKED" || edge_label == "MERGED_INTO" {
+                        cross_refs.push(json!({
+                            "system": other_props.get("source_system").and_then(|v| v.as_str()).unwrap_or("UNKNOWN"),
+                            "mrn": other_props.get("mrn").and_then(|v| v.as_str()).unwrap_or("N/A"),
+                            "status": other_props.get("patient_status").and_then(|v| v.as_str()).unwrap_or("ACTIVE"),
+                        }));
+                    }
+
+                    Some(json!({
+                        "relationship_type": edge_label,
+                        "connected_entity_id": other_vertex.get("id").and_then(|id| id.as_str()),
+                        "valid_from": created_at,
+                        "valid_until": deleted_at,
+                    }))
+                } else { None }
+            })
+            .collect();
+
+        println!(" [MPI] get_snapshot_data - STEP 5");
+        // ═════════════════════════════════════════════════════════════════════════
+        // PHASE 5: COMPLIANCE LOGGING (2025-12-20)
+        // ═════════════════════════════════════════════════════════════════════════
+        gs.log_mpi_transaction(
+            start_vertex.id.0, log_uid, "SNAPSHOT_RECONSTRUCT", 
+            &format!("Resolved via {} hops. Path: {:?}", merge_hops, trace_path), 
+            requested_by
+        ).await.ok();
         
-        // 5. TEMPORAL FILTERING IN RUST
-                let history: Vec<serde_json::Value> = result_vec.iter()
-                    .filter_map(|row| {
-                        // Safely extract values from the row
-                        let valid_from = row.get("valid_from").and_then(|v| v.as_str())?;
-                        let valid_until = row.get("valid_until").and_then(|v| v.as_str());
-
-                        // Temporal Logic: must be created before/at snapshot, and not yet deleted
-                        let is_valid = valid_from <= iso_ref && 
-                            valid_until.map_or(true, |until| until > iso_ref);
-
-                        if is_valid {
-                            Some(serde_json::json!({
-                                // Fallback to "LINKED" or "Entity" if properties are missing
-                                "rel_type": row.get("rel_type").and_then(|v| v.as_str()).unwrap_or("LINKED"),
-                                "node_label": row.get("node_label").and_then(|v| v.as_str()).unwrap_or("Entity"),
-                                "node_id": row.get("node_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                                "valid_from": valid_from,
-                                "valid_until": valid_until,
-                            }))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-        // 6. 2-LAYER LOGGING (Compliance 2025-12-20)
-        gs.log_mpi_transaction(start_vertex.id.0, log_uid, "SNAPSHOT_RECONSTRUCT", 
-            &format!("Target: {} (Hops: {})", target_uuid, merge_hops), requested_by).await.ok();
-        
-        gs.persist_mpi_change_event(start_vertex.id.0, log_uid, "TEMPORAL_QUERY_EXECUTED", 
-            serde_json::json!({ 
-                "as_of": iso_time, 
+        gs.persist_mpi_change_event(
+            start_vertex.id.0, log_uid, "TEMPORAL_QUERY_EXECUTED", 
+            json!({ 
+                "query_type": "SNAPSHOT_RECONSTRUCTION",
+                "as_of": iso_time,
                 "requested_by": requested_by,
-                "merge_hops": merge_hops 
-            })).await.ok();
-
-        // 7. FINAL PAYLOAD (Matches LineageReportTrace style)
-        Ok(serde_json::json!({
-            "record": demographics,
-            "history_chain": history,
-            "as_of": iso_time,
-            "mpi_id": target_uuid,
-            "original_request_id": clean_id,
-            "red_flag_count": props.get("red_flags").and_then(|v| v.as_str()).map(|s| s.split(',').count()).unwrap_or(0)
+                "id_type": format!("{:?}", id_type),
+                "resolution_path": trace_path,
+                "relationships_found": history.len(),
+                "timestamp": Utc::now().to_rfc3339()
+            })
+        ).await.ok();
+        println!(" [MPI] get_snapshot_data - STEP 6");
+        // ═════════════════════════════════════════════════════════════════════════
+        // PHASE 6: PAYLOAD ASSEMBLY (Aligned to models/src/evolution.rs MpiSnapshot)
+        // ═════════════════════════════════════════════════════════════════════════
+        Ok(json!({
+            "first_name": first_name,
+            "last_name": last_name,
+            "dob": dob,
+            "gender": gender,
+            "cross_refs": cross_refs,
+            "version_id": target_uuid,
+            "last_modified": last_mod,
+            
+            // Retaining trace data in a sub-object for debugging, but root satisfies MpiSnapshot
+            "resolution_trace": {
+                "original_id": clean_id,
+                "canonical_id": target_uuid,
+                "trace_path": trace_path,
+                "merge_hops": merge_hops,
+                "id_type": format!("{:?}", id_type),
+                "history_chain": history,
+            },
+            "audit": { "requested_by": requested_by, "logged": true }
         }))
     }
 

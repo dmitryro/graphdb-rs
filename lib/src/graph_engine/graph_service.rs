@@ -2230,68 +2230,67 @@ impl GraphService {
 
     /// Finds a single Patient vertex by its Medical Record Number (MRN) using a Cypher query.
     pub async fn get_patient_by_mrn(&self, mrn: &str) -> Result<Option<Vertex>, GraphError> {
-        // Construct the Cypher query
+        // 1. Construct the Cypher query with basic escaping
         let query = format!(
             "MATCH (p:Patient {{mrn: '{}'}}) RETURN p",
-            // Use basic escaping for the single quote within the MRN value
             mrn.replace('\'', "\\'")
         );
         
         println!("===> get_patient_by_mrn query: {}", query);
         
-        // Execute the read query
-        let results_vec = self.execute_cypher_read(&query, json!({})).await?;
+        // 2. Execute the read query
+        let results_vec = self.execute_cypher_read(&query, serde_json::json!({})).await?;
         
         println!("===> get_patient_by_mrn results: {}", serde_json::to_string_pretty(&results_vec).unwrap_or_default());
         
-        // The result structure is: Vec<Value> where each Value is:
-        // {
-        //   "vertices": [...],
-        //   "edges": [...],
-        //   "stats": {...}
-        // }
-        
         let mut found_vertices = Vec::new();
         
-        for result_item in results_vec {
-            // Extract vertices array from each result item
-            if let Some(vertices_array) = result_item.get("vertices").and_then(|v| v.as_array()) {
-                for vertex_value in vertices_array {
-                    match serde_json::from_value::<Vertex>(vertex_value.clone()) {
-                        Ok(vertex) => {
-                            // Filter to only Patient vertices with matching MRN
-                            let label = vertex.label.clone();
-                            if label.to_string() == "Patient" {
-                                if let Some(PropertyValue::String(vertex_mrn)) = vertex.properties.get("mrn") {
-                                    if vertex_mrn == mrn {
-                                        found_vertices.push(vertex);
+        // 3. Unpack the nested structure
+        // Log shows structure: Vec -> [ { "results": [ { "vertices": [...] } ] } ]
+        for result_envelope in results_vec {
+            // Access the inner 'results' array
+            if let Some(inner_results) = result_envelope.get("results").and_then(|r| r.as_array()) {
+                for result_item in inner_results {
+                    // Extract vertices from each inner result item
+                    if let Some(vertices_array) = result_item.get("vertices").and_then(|v| v.as_array()) {
+                        for vertex_value in vertices_array {
+                            match serde_json::from_value::<Vertex>(vertex_value.clone()) {
+                                Ok(vertex) => {
+                                    // Robust label check: Strip quotes that may come from Enum serialization
+                                    let label_str = vertex.label.to_string().replace('"', "");
+                                    
+                                    if label_str == "Patient" {
+                                        if let Some(PropertyValue::String(vertex_mrn)) = vertex.properties.get("mrn") {
+                                            if vertex_mrn == mrn {
+                                                found_vertices.push(vertex);
+                                            }
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    error!("Failed to deserialize vertex JSON for MRN '{}': {}", mrn, e);
+                                    return Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)));
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("Failed to deserialize vertex JSON for MRN '{}': {}", mrn, e);
-                            return Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)));
                         }
                     }
                 }
             }
         }
         
-        // Handle empty match gracefully
+        // 4. Handle results based on MPI workflow
         if found_vertices.is_empty() {
-            println!("===> No Patient found with MRN '{}'", mrn);
+            println!("===> No Patient found with MRN '{}' after unpacking", mrn);
             return Ok(None);
         }
         
-        // Check for multiple matches (unexpected for MRN lookup)
         if found_vertices.len() > 1 {
             warn!("MRN lookup for '{}' returned {} vertices. Returning the first one.", mrn, found_vertices.len());
         }
         
         println!("===> Found Patient vertex with MRN '{}': {:?}", mrn, found_vertices[0].id);
         
-        // Return the first valid vertex
+        // Return the first valid vertex to the caller (snapshot or lineage)
         Ok(Some(found_vertices.remove(0)))
     }
 
