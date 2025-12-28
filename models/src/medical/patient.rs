@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::{Vertex, ToVertex, identifiers::Identifier};
 use crate::errors::{GraphError};
 use crate::medical::Address;   // or wherever it lives
-use crate::properties::{ PropertyValue, UnhashableVertex, SerializableDateTime }; // <--- ADD THIS IMPORT
+use crate::properties::{ PropertyValue, UnhashableVertex, SerializableDateTime }; 
+use crate::timestamp::{ BincodeDateTime };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Patient {
@@ -24,8 +25,8 @@ pub struct Patient {
     pub last_name: Option<String>,
     pub suffix: Option<String>,  // Jr, Sr, III, etc.
     pub preferred_name: Option<String>,
-    pub date_of_birth: DateTime<Utc>,
-    pub date_of_death: Option<DateTime<Utc>>,
+    pub date_of_birth: Option<SerializableDateTime>,
+    pub date_of_death: Option<SerializableDateTime>,
     // FIX: Change from String to Option<String> to support merging logic (gender.or(...))
     pub gender: Option<String>,  // MALE, FEMALE, OTHER, UNKNOWN
     pub sex_assigned_at_birth: Option<String>,  // MALE, FEMALE, INTERSEX
@@ -98,11 +99,11 @@ pub struct Patient {
     pub special_needs: Option<String>,
 
     // Audit Trail
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Option<SerializableDateTime>,
+    pub updated_at: Option<SerializableDateTime>,
     pub created_by: Option<i32>,
     pub updated_by: Option<i32>,
-    pub last_visit_date: Option<DateTime<Utc>>,
+    pub last_visit_date: Option<SerializableDateTime>,
 
     // Graph vertex ID
     pub vertex_id: Option<Uuid>,
@@ -160,16 +161,18 @@ impl ToVertex for Patient {
             v.properties.insert("preferred_name".to_string(), PropertyValue::String(val.clone()));
         }
 
-        // --- DATE FIELDS (Using Explicit SerializableDateTime Wrapper) ---
-        v.properties.insert(
-            "date_of_birth".to_string(), 
-            PropertyValue::DateTime(SerializableDateTime(self.date_of_birth))
-        );
+        // --- DATE FIELDS (Handling Option<SerializableDateTime>) ---
+        if let Some(ref dob) = self.date_of_birth {
+            v.properties.insert(
+                "date_of_birth".to_string(), 
+                PropertyValue::DateTime(dob.clone())
+            );
+        }
 
-        if let Some(ref val) = self.date_of_death {
+        if let Some(ref dod) = self.date_of_death {
             v.properties.insert(
                 "date_of_death".to_string(), 
-                PropertyValue::DateTime(SerializableDateTime(*val))
+                PropertyValue::DateTime(dod.clone())
             );
         }
         
@@ -342,15 +345,19 @@ impl ToVertex for Patient {
             v.properties.insert("special_needs".to_string(), PropertyValue::String(val.clone()));
         }
 
-        // --- AUDIT TRAIL (Native DateTime variants using SerializableDateTime) ---
-        v.properties.insert(
-            "created_at".to_string(), 
-            PropertyValue::DateTime(SerializableDateTime(self.created_at))
-        );
-        v.properties.insert(
-            "updated_at".to_string(), 
-            PropertyValue::DateTime(SerializableDateTime(self.updated_at))
-        );
+        // --- AUDIT TRAIL (Handling Option<SerializableDateTime>) ---
+        if let Some(ref created) = self.created_at {
+            v.properties.insert(
+                "created_at".to_string(), 
+                PropertyValue::DateTime(created.clone())
+            );
+        }
+        if let Some(ref updated) = self.updated_at {
+            v.properties.insert(
+                "updated_at".to_string(), 
+                PropertyValue::DateTime(updated.clone())
+            );
+        }
         
         if let Some(ref val) = self.created_by {
             v.properties.insert("created_by".to_string(), PropertyValue::String(val.to_string()));
@@ -358,10 +365,10 @@ impl ToVertex for Patient {
         if let Some(ref val) = self.updated_by {
             v.properties.insert("updated_by".to_string(), PropertyValue::String(val.to_string()));
         }
-        if let Some(ref val) = self.last_visit_date {
+        if let Some(ref lvd) = self.last_visit_date {
             v.properties.insert(
                 "last_visit_date".to_string(), 
-                PropertyValue::DateTime(SerializableDateTime(*val))
+                PropertyValue::DateTime(lvd.clone())
             );
         }
 
@@ -390,19 +397,19 @@ fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
     // --- 3. Handle legacy "dob" field and ensure "date_of_birth" is a DateTime variant ---
     let dob_key = "date_of_birth".to_string();
     
-    // Helper to attempt conversion of existing value to DateTime variant
+    // Helper to attempt conversion of existing value to SerializableDateTime
     let try_to_datetime = |val: &PropertyValue| -> Option<PropertyValue> {
         match val {
-            PropertyValue::DateTime(_) => Some(val.clone()),
+            PropertyValue::DateTime(dt) => Some(PropertyValue::DateTime(dt.clone())),
             PropertyValue::String(s) => {
                 // Try RFC3339 first
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-                    return Some(PropertyValue::DateTime(dt.with_timezone(&chrono::Utc).into()));
+                    return Some(PropertyValue::DateTime(SerializableDateTime(dt.with_timezone(&chrono::Utc))));
                 }
                 // Try Naive date yyyy-mm-dd
                 if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
                     let dt = nd.and_hms_opt(0, 0, 0).unwrap().and_utc();
-                    return Some(PropertyValue::DateTime(dt.into()));
+                    return Some(PropertyValue::DateTime(SerializableDateTime(dt)));
                 }
                 None
             }
@@ -428,7 +435,7 @@ fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
     } else {
         // Ultimate fallback for missing DOB
         let default_dt = chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc();
-        normalized.properties.insert(dob_key, PropertyValue::DateTime(default_dt.into()));
+        normalized.properties.insert(dob_key, PropertyValue::DateTime(SerializableDateTime(default_dt)));
     }
     
     // --- 4. Handle legacy "name" field ---
@@ -489,7 +496,7 @@ fn normalize_patient_vertex(vertex: &Vertex) -> Vertex {
                 normalized.properties.insert(audit_field.to_string(), dt_val);
             }
         } else {
-            normalized.properties.insert(audit_field.to_string(), PropertyValue::DateTime(now.into()));
+            normalized.properties.insert(audit_field.to_string(), PropertyValue::DateTime(SerializableDateTime(now)));
         }
     }
     
@@ -506,33 +513,26 @@ impl Patient {
         let normalized = normalize_patient_vertex(vertex);
         
         // --- DEFENSIVE DATE EXTRACTION HELPER ---
-        // Handles both String (from manual insert) and DateTime (from DB casting/native storage)
-        let extract_date = |key: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        let extract_date = |key: &str| -> Option<SerializableDateTime> {
             let val = normalized.properties.get(key);
             match val {
-                Some(PropertyValue::DateTime(dt)) => Some(dt.0.with_timezone(&chrono::Utc)),
+                Some(PropertyValue::DateTime(dt)) => Some(dt.clone()),
                 Some(PropertyValue::String(s)) => {
                     chrono::DateTime::parse_from_rfc3339(s)
                         .ok()
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .map(|dt| SerializableDateTime(dt.with_timezone(&chrono::Utc)))
                 },
                 _ => None,
             }
         };
 
-        // --- CRITICAL FIELD: DATE OF BIRTH ---
-        let dob = extract_date("date_of_birth");
-        if dob.is_none() {
-            println!(
-                "[Patient::from_vertex] Error: date_of_birth missing or unparseable. Raw value: {:?}", 
-                normalized.properties.get("date_of_birth")
-            );
-        }
-
         // --- AUDIT FIELDS (CRITICAL FOR MPI LOGGING) ---
-        // Fallback to vertex root audit if property map doesn't contain them
-        let created_at = extract_date("created_at").unwrap_or(vertex.created_at.0);
-        let updated_at = extract_date("updated_at").unwrap_or(vertex.updated_at.0);
+        // vertex.created_at is BincodeDateTime. We convert it to SerializableDateTime for the Patient struct.
+        let created_at = extract_date("created_at")
+            .unwrap_or_else(|| SerializableDateTime(vertex.created_at.0));
+            
+        let updated_at = extract_date("updated_at")
+            .unwrap_or_else(|| SerializableDateTime(vertex.updated_at.0));
 
         let patient = Patient {
             vertex_id: normalized.properties.get("vertex_id")
@@ -576,9 +576,7 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            // Extract the DOB or return None for the whole record
-            date_of_birth: dob?,
-            
+            date_of_birth: extract_date("date_of_birth"),
             date_of_death: extract_date("date_of_death"),
             
             gender: normalized.properties.get("gender")
@@ -761,8 +759,8 @@ impl Patient {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
 
-            created_at,
-            updated_at,
+            created_at: Some(created_at),
+            updated_at: Some(updated_at),
             
             created_by: normalized.properties.get("created_by")
                 .and_then(|v| v.as_str())
@@ -773,7 +771,6 @@ impl Patient {
             last_visit_date: extract_date("last_visit_date"),
         };
 
-        // Final sanity check for MPI logging consistency
         if patient.mrn.is_none() {
             println!("[Patient::from_vertex] Warn: Successfully parsed Patient but MRN is missing.");
         }
@@ -793,14 +790,18 @@ impl Patient {
                 .collect();
 
             let label = Identifier::new("Patient".to_string()).ok();
-            if label.is_none() { println!("[Patient::from_vertex_value] Error: Failed to create Label identifier"); return None; }
+            if label.is_none() { 
+                println!("[Patient::from_vertex_value] Error: Failed to create Label identifier"); 
+                return None; 
+            }
 
+            // vertex metadata fields use BincodeDateTime wrapper
             let vertex = Vertex {
                 id: Default::default(),
                 label: label.unwrap(),
                 properties,
-                created_at: Utc::now().into(),
-                updated_at: Utc::now().into(),
+                created_at: BincodeDateTime(Utc::now()),
+                updated_at: BincodeDateTime(Utc::now()),
             };
             return Patient::from_vertex(&vertex); 
         }

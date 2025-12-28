@@ -2,6 +2,7 @@ use lib::graph_engine::graph_service::{GraphService};
 use medical_knowledge::patient_service::PatientService;
 use models::medical::{Patient, Problem, Prescription, Allergy, Referral, Address};
 use models::identifiers::{ Identifier };
+use models::properties::{ SerializableDateTime };
 use models::errors::{ GraphError, GraphResult };
 use lib::commands::{PatientCommand, JourneyFormat, AlertFormat, AlertSeverity, CreatePatientArgs};
 // FIX: Need to import the storage trait used in the MPI file
@@ -270,7 +271,7 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
             let mut phone_opt: Option<String> = None;
 
             if let Some(json_str) = &args.batch {
-                // CASE 1: Batch JSON is provided (Parsing remains the same)
+                // CASE 1: Batch JSON is provided
                 match serde_json::from_str::<serde_json::Value>(&json_str) {
                     Ok(json_value) => {
                         parsed_first_name = json_value.get("first_name").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -286,8 +287,6 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 }
             } else {
                 // CASE 2: Individual flags were provided (Non-Batch).
-                
-                // Set non-name fields
                 dob_opt = args.dob.clone();
                 gender_opt = args.gender.clone(); 
                 ssn_opt = args.ssn.clone();
@@ -295,21 +294,15 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 address_raw_opt = args.address.clone();
                 phone_opt = args.phone.clone();
 
-                // Handle Name Parsing Logic (Uses the priority established in CLI parser)
                 if args.first_name.is_some() || args.last_name.is_some() {
-                    // Highest Priority: Explicit first and last names are provided (even if --name was also passed).
                     parsed_first_name = args.first_name.clone();
                     parsed_last_name = args.last_name.clone();
                 } else if let Some(full_name) = &args.name {
-                    // Second Priority: Single combined --name flag is provided. Split it.
                     let name_parts: Vec<&str> = full_name.splitn(2, ' ').collect();
-                    
                     if name_parts.len() == 2 {
-                        // Assume first word is first name, the rest is last name
                         parsed_first_name = Some(name_parts[0].trim().to_string());
                         parsed_last_name = Some(name_parts[1].trim().to_string());
                     } else if name_parts.len() == 1 {
-                        // Only one name provided. Use it as first name.
                         parsed_first_name = Some(name_parts[0].trim().to_string());
                         parsed_last_name = None;
                     } 
@@ -318,20 +311,13 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
             
             // --- 2. Validation and Extraction ---
             
-            // Validate that required fields (first name and DOB) are present.
-            // Other fields (last_name, gender) are resolved to defaults if missing.
             let (first_name, last_name, dob, gender) = match (parsed_first_name, dob_opt) {
                 (Some(fnm), Some(dob_str)) => {
-                    // If last name is missing (e.g., from one word in --name), use placeholder.
                     let lnm = parsed_last_name.unwrap_or_else(|| "UNSPECIFIED".to_string());
-                    
-                    // If gender is missing, use placeholder.
                     let g = gender_opt.unwrap_or_else(|| "UNSPECIFIED".to_string());
-                    
                     (fnm, lnm, dob_str, g)
                 },
                 _ => {
-                    // This block catches missing first_name OR missing dob.
                     if args.batch.is_some() {
                         return format!("Error: Batch JSON missing required field(s). Required: first_name, dob");
                     } else {
@@ -340,13 +326,11 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 }
             };
             
-            // Use the new helper function to parse date with multiple formats
             let dob_parsed = match parse_dob(&dob) {
                 Ok(d) => d,
                 Err(e) => return format!("Error: DOB Parsing Failed - {}", e),
             };
 
-            // Parse raw address string into an Address struct
             let address_opt = match address_raw_opt {
                 Some(raw_addr) => match parse_address(raw_addr) {
                     Ok(addr) => Some(addr),
@@ -355,60 +339,94 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
                 None => None,
             };
 
-            // FIX: Replace None/null values for optional string fields with ""
             let ssn_fixed = ssn_opt.unwrap_or_else(|| "".to_string());
             let mrn_fixed = mrn_opt.unwrap_or_else(|| "".to_string());
             let phone_fixed = phone_opt.unwrap_or_else(|| "".to_string());
             
+            // Prepare Serializable timestamps
+            let now = Utc::now();
+            let serializable_now = Some(SerializableDateTime(now));
+            let serializable_dob = Some(SerializableDateTime(
+                dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc()
+            ));
+
             // --- 3. Build Patient Struct and Call Service ---
             
             let new_patient = Patient {
-                // FIX: Use the fixed (non-null) strings
-                mrn: Some(mrn_fixed), // Patient struct requires Option<String> but we wrap the fixed string
+                mrn: Some(mrn_fixed), 
                 ssn: Some(ssn_fixed), 
                 
-                first_name: Some(first_name), // Guaranteed Some
-                last_name: Some(last_name),  // Guaranteed Some (or "UNSPECIFIED")
-                // FIX: Correctly assign the wrapped value to the `gender` field.
+                first_name: Some(first_name),
+                last_name: Some(last_name), 
                 gender: Some(gender),
                 address: address_opt, 
-                // FIX: Use the fixed (non-null) strings
                 phone_mobile: Some(phone_fixed),
 
-                // Calculated/Default fields
+                // Calculated/Default fields - FIXED: Wrapped in Some(SerializableDateTime)
                 id: Some(0), 
-                date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                date_of_birth: serializable_dob,
+                created_at: serializable_now.clone(),
+                updated_at: serializable_now,
                 patient_status: Some("ACTIVE".to_string()), 
 
-                // Default/None fields (These must also be fixed if they are String properties in the DB, 
-                // but since we only fixed the command line ones, we'll assume the model fields are 
-                // adjusted elsewhere to handle these remaining Nones, or the graph layer is tolerant of them).
-                // However, since the error was on ssn/mrn, we must treat them as mandatory strings 
-                // (even if empty) for the Cypher query builder.
-                vertex_id: None, user_id: None, middle_name: None, suffix: None,
+                // Administrative / Default fields
+                vertex_id: None, 
+                user_id: None, 
+                middle_name: None, 
+                suffix: None,
                 preferred_name: None,
-                date_of_death: None, sex_assigned_at_birth: None, gender_identity: None,
-                pronouns: None, address_id: None, phone_home: None,
-                phone_work: None, email: None, preferred_contact_method: None,
-                preferred_language: None, interpreter_needed: Some(false), emergency_contact_name: None,
-                emergency_contact_relationship: None, emergency_contact_phone: None,
-                marital_status: None, race: None, ethnicity: None, religion: None,
-                primary_insurance: None, primary_insurance_id: None, secondary_insurance: None,
-                secondary_insurance_id: None, guarantor_name: None, guarantor_relationship: None,
-                primary_care_provider_id: None, blood_type: None, organ_donor: None,
-                advance_directive_on_file: Some(false), dni_status: None, dnr_status: None,
-                code_status: None, vip_flag: Some(false),
-                confidential_flag: Some(false), research_consent: None, marketing_consent: None,
-                employment_status: None, housing_status: None, education_level: None,
-                financial_strain: None, food_insecurity: Some(false), transportation_needs: Some(false),
-                social_isolation: None, veteran_status: None, disability_status: None,
-                alert_flags: None, special_needs: None, created_by: None, updated_by: None, last_visit_date: None,
+                date_of_death: None, 
+                sex_assigned_at_birth: None, 
+                gender_identity: None,
+                pronouns: None, 
+                address_id: None, 
+                phone_home: None,
+                phone_work: None, 
+                email: None, 
+                preferred_contact_method: None,
+                preferred_language: None, 
+                interpreter_needed: Some(false), 
+                emergency_contact_name: None,
+                emergency_contact_relationship: None, 
+                emergency_contact_phone: None,
+                marital_status: None, 
+                race: None, 
+                ethnicity: None, 
+                religion: None,
+                primary_insurance: None, 
+                primary_insurance_id: None, 
+                secondary_insurance: None,
+                secondary_insurance_id: None, 
+                guarantor_name: None, 
+                guarantor_relationship: None,
+                primary_care_provider_id: None, 
+                blood_type: None, 
+                organ_donor: None,
+                advance_directive_on_file: Some(false), 
+                dni_status: None, 
+                dnr_status: None,
+                code_status: None, 
+                vip_flag: Some(false),
+                confidential_flag: Some(false), 
+                research_consent: None, 
+                marketing_consent: None,
+                employment_status: None, 
+                housing_status: None, 
+                education_level: None,
+                financial_strain: None, 
+                food_insecurity: Some(false), 
+                transportation_needs: Some(false),
+                social_isolation: None, 
+                veteran_status: None, 
+                disability_status: None,
+                alert_flags: None, 
+                special_needs: None, 
+                created_by: None, 
+                updated_by: None, 
+                last_visit_date: None,
             };
             handlers.create_patient(new_patient).await
-        }
-        // ... (other PatientCommand variants remain the same)
+        },
         PatientCommand::View { patient_id } => handlers.view_patient(patient_id).await,
         PatientCommand::Search { query } => handlers.search_patients(&query).await,
         PatientCommand::Timeline { patient_id } => handlers.get_timeline(patient_id).await,
@@ -419,7 +437,7 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
         PatientCommand::Referrals { patient_id } => handlers.get_referrals(patient_id).await,
         PatientCommand::Journey { patient_id, pathway, show_completed, show_deviations_only, format } => {
             handlers.get_journey(patient_id, pathway, show_completed, show_deviations_only, format).await
-        }
+        },
         PatientCommand::DrugAlerts { patient_id, severity, include_resolved, include_overridden, drug_class, format, include_inactive, severity_filter } => {
             handlers.get_drug_alerts(patient_id, severity, include_resolved, include_overridden, drug_class, format, include_inactive, severity_filter).await
         }
@@ -441,6 +459,7 @@ pub async fn handle_patient_command(action: PatientCommand) -> String {
 pub async fn handle_patient_command_interactive(
     action: PatientCommand,
 ) -> Result<(), anyhow::Error> {
+    use chrono::Utc;
     
     let handlers = PatientHandlers::new().await?;
 
@@ -458,7 +477,7 @@ pub async fn handle_patient_command_interactive(
             let mut phone_opt: Option<String> = None;
 
             if let Some(json_str) = &args.batch {
-                // CASE 1: Batch JSON is provided (Parsing remains the same)
+                // CASE 1: Batch JSON is provided
                 match serde_json::from_str::<serde_json::Value>(&json_str) {
                     Ok(json_value) => {
                         parsed_first_name = json_value.get("first_name").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -474,8 +493,6 @@ pub async fn handle_patient_command_interactive(
                 }
             } else {
                 // CASE 2: Individual flags were provided (Non-Batch).
-                
-                // Set non-name fields
                 dob_opt = args.dob.clone();
                 gender_opt = args.gender.clone(); 
                 ssn_opt = args.ssn.clone();
@@ -483,21 +500,16 @@ pub async fn handle_patient_command_interactive(
                 address_raw_opt = args.address.clone();
                 phone_opt = args.phone.clone();
                 
-                // Handle Name Parsing Logic (Uses the priority established in CLI parser)
                 if args.first_name.is_some() || args.last_name.is_some() {
-                    // Highest Priority: Explicit first and last names are provided (even if --name was also passed).
                     parsed_first_name = args.first_name.clone();
                     parsed_last_name = args.last_name.clone();
                 } else if let Some(full_name) = &args.name {
-                    // Second Priority: Single combined --name flag is provided. Split it.
                     let name_parts: Vec<&str> = full_name.splitn(2, ' ').collect();
                     
                     if name_parts.len() == 2 {
-                        // Assume first word is first name, the rest is last name
                         parsed_first_name = Some(name_parts[0].trim().to_string());
                         parsed_last_name = Some(name_parts[1].trim().to_string());
                     } else if name_parts.len() == 1 {
-                        // Only one name provided. Use it as first name.
                         parsed_first_name = Some(name_parts[0].trim().to_string());
                         parsed_last_name = None;
                     } 
@@ -506,20 +518,13 @@ pub async fn handle_patient_command_interactive(
             
             // --- 2. Validation and Extraction ---
             
-            // Validate that required fields (first name and DOB) are present.
-            // Other fields (last_name, gender) are resolved to defaults if missing.
             let (first_name, last_name, dob, gender) = match (parsed_first_name, dob_opt) {
                 (Some(fnm), Some(dob_str)) => {
-                    // If last name is missing, use placeholder.
                     let lnm = parsed_last_name.unwrap_or_else(|| "UNSPECIFIED".to_string());
-                    
-                    // If gender is missing, use placeholder. 
                     let g = gender_opt.unwrap_or_else(|| "UNSPECIFIED".to_string());
-                    
                     (fnm, lnm, dob_str, g)
                 },
                 _ => {
-                    // This block catches missing first_name OR missing dob.
                     if args.batch.is_some() {
                         return Err(anyhow!("Batch JSON missing required field(s). Required: first_name, dob"));
                     } else {
@@ -528,13 +533,11 @@ pub async fn handle_patient_command_interactive(
                 }
             };
             
-            // Use the new helper function to parse date with multiple formats
             let dob_parsed = match parse_dob(&dob) {
                 Ok(d) => d,
                 Err(e) => return Err(anyhow!("DOB Parsing Failed - {}", e)),
             };
             
-            // Parse raw address string into an Address struct
             let address_opt = match address_raw_opt {
                 Some(raw_addr) => match parse_address(raw_addr) {
                     Ok(addr) => Some(addr),
@@ -543,31 +546,35 @@ pub async fn handle_patient_command_interactive(
                 None => None,
             };
 
-            // FIX: Replace None/null values for optional string fields with ""
             let ssn_fixed = ssn_opt.unwrap_or_else(|| "".to_string());
             let mrn_fixed = mrn_opt.unwrap_or_else(|| "".to_string());
             let phone_fixed = phone_opt.unwrap_or_else(|| "".to_string());
             
+            // Prepare Serializable timestamps
+            let now = Utc::now();
+            let serializable_now = Some(SerializableDateTime(now));
+            let serializable_dob = Some(SerializableDateTime(
+                dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc()
+            ));
+            
             // --- 3. Build Patient Struct and Call Service ---
             
             let new_patient = Patient {
-                // FIX: Use the fixed (non-null) strings
                 mrn: Some(mrn_fixed), 
                 ssn: Some(ssn_fixed), 
                 
-                first_name: Some(first_name), // Guaranteed Some
-                last_name: Some(last_name),  // Guaranteed Some (or "UNSPECIFIED")
-                // FIX: Correctly assign the wrapped value to the `gender` field.
+                first_name: Some(first_name), 
+                last_name: Some(last_name), 
                 gender: Some(gender),
                 
                 address: address_opt, 
-                // FIX: Use the fixed (non-null) strings
                 phone_mobile: Some(phone_fixed),
 
+                // Calculated/Default fields - FIXED: Wrapped in Some(SerializableDateTime)
                 id: Some(0), 
-                date_of_birth: dob_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                date_of_birth: serializable_dob,
+                created_at: serializable_now.clone(),
+                updated_at: serializable_now,
                 patient_status: Some("ACTIVE".to_string()), 
 
                 vertex_id: None, user_id: None, middle_name: None, suffix: None,
@@ -590,8 +597,7 @@ pub async fn handle_patient_command_interactive(
                 alert_flags: None, special_needs: None, created_by: None, updated_by: None, last_visit_date: None,
             };
             handlers.create_patient(new_patient).await
-        }
-        // ... (other PatientCommand variants remain the same)
+        },
         PatientCommand::View { patient_id } => handlers.view_patient(patient_id).await,
         PatientCommand::Search { query } => handlers.search_patients(&query).await,
         PatientCommand::Timeline { patient_id } => handlers.get_timeline(patient_id).await,

@@ -1238,6 +1238,7 @@ fn parse_null_operator(input: &str) -> IResult<&str, UnaryOp> {
     )).parse(input) 
 }
 
+
 pub fn evaluate_expression(
     expr: &Expression,
     context: &EvaluationContext,
@@ -1269,6 +1270,19 @@ pub fn evaluate_expression(
                     }
                 },
                 _ => Err(GraphError::QueryExecutionError("Unsupported property access".to_string())),
+            }
+        },
+        Expression::LabelPredicate { variable, label } => {
+            let val = context.variables.get(variable)
+                .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
+            
+            match val {
+                CypherValue::Vertex(v) => {
+                    // Conversion to string for comparison against the String 'label'
+                    // Using .to_string() or accessing the internal field (e.g., v.label.0)
+                    Ok(CypherValue::Bool(v.label.to_string() == *label))
+                },
+                _ => Ok(CypherValue::Bool(false)),
             }
         },
         Expression::FunctionCall { name, args } => {
@@ -3128,7 +3142,7 @@ pub fn evaluate_comparison(
         (CypherValue::Integer(a), CypherValue::Float(b)) => {
             let a_f = *a as f64;
             match op_upper.as_str() {
-                "=" => a_f == *b,
+                "=" | "==" => a_f == *b,
                 "<" => a_f < *b,
                 "<=" => a_f <= *b,
                 ">" => a_f > *b,
@@ -3139,7 +3153,7 @@ pub fn evaluate_comparison(
         (CypherValue::Float(a), CypherValue::Integer(b)) => {
             let b_f = *b as f64;
             match op_upper.as_str() {
-                "=" => *a == b_f,
+                "=" | "==" => *a == b_f,
                 "<" => *a < b_f,
                 "<=" => *a <= b_f,
                 ">" => *a > b_f,
@@ -3150,7 +3164,7 @@ pub fn evaluate_comparison(
         // Integer vs Integer
         (CypherValue::Integer(a), CypherValue::Integer(b)) => {
             match op_upper.as_str() {
-                "=" => a == b,
+                "=" | "==" => a == b,
                 "<>" | "!=" => a != b,
                 "<" => a < b,
                 "<=" => a <= b,
@@ -3164,7 +3178,7 @@ pub fn evaluate_comparison(
         // Float vs Float
         (CypherValue::Float(a), CypherValue::Float(b)) => {
             match op_upper.as_str() {
-                "=" => a == b,
+                "=" | "==" => a == b,
                 "<>" | "!=" => a != b,
                 "<" => a < b,
                 "<=" => a <= b,
@@ -3178,7 +3192,7 @@ pub fn evaluate_comparison(
         // String vs String
         (CypherValue::String(a), CypherValue::String(b)) => {
             match op_upper.as_str() {
-                "=" => a == b,
+                "=" | "==" => a == b,
                 "<>" | "!=" => a != b,
                 "<" => a < b,
                 "<=" => a <= b,
@@ -3192,9 +3206,8 @@ pub fn evaluate_comparison(
         // Boolean vs Boolean
         (CypherValue::Bool(a), CypherValue::Bool(b)) => {
             match op_upper.as_str() {
-                "=" => a == b,
+                "=" | "==" => a == b,
                 "<>" | "!=" => a != b,
-                // Booleans don't support <, >, etc.
                 _ => return Err(GraphError::QueryExecutionError(
                     format!("Operator '{}' not supported for booleans", operator)
                 )),
@@ -3203,7 +3216,7 @@ pub fn evaluate_comparison(
         // UUID vs String (common case: ID(p) = "uuid")
         (CypherValue::Uuid(a), CypherValue::String(b)) => {
             match op_upper.as_str() {
-                "=" => a.to_string() == *b,
+                "=" | "==" => a.to_string() == *b,
                 "<>" | "!=" => a.to_string() != *b,
                 _ => return Err(GraphError::QueryExecutionError(
                     format!("Operator '{}' not supported for UUID comparison", operator)
@@ -3213,7 +3226,7 @@ pub fn evaluate_comparison(
         // String vs UUID (reverse)
         (CypherValue::String(a), CypherValue::Uuid(b)) => {
             match op_upper.as_str() {
-                "=" => *a == b.to_string(),
+                "=" | "==" => *a == b.to_string(),
                 "<>" | "!=" => *a != b.to_string(),
                 _ => return Err(GraphError::QueryExecutionError(
                     format!("Operator '{}' not supported for UUID comparison", operator)
@@ -3232,11 +3245,11 @@ pub fn evaluate_comparison(
                 "Cannot compare edge values".to_string()
             ));
         }
-        // Mixed numeric: promote integer to float
+        // Mixed numeric: promote integer to float (redundant but kept for structure)
         (CypherValue::Integer(a), CypherValue::Float(b)) => {
             let a_f = *a as f64;
             match op_upper.as_str() {
-                "=" => a_f == *b,
+                "=" | "==" => a_f == *b,
                 "<>" | "!=" => a_f != *b,
                 "<" => a_f < *b,
                 "<=" => a_f <= *b,
@@ -3250,7 +3263,7 @@ pub fn evaluate_comparison(
         (CypherValue::Float(a), CypherValue::Integer(b)) => {
             let b_f = *b as f64;
             match op_upper.as_str() {
-                "=" => *a == b_f,
+                "=" | "==" => *a == b_f,
                 "<>" | "!=" => *a != b_f,
                 "<" => *a < b_f,
                 "<=" => *a <= b_f,
@@ -3275,37 +3288,26 @@ pub fn evaluate_comparison(
 fn evaluate_property_comparison(
     context: &EvaluationContext,
     variable: &str,
-    property: &str, // This is "" when matching an alias like 'dist'
+    property: &str,
     operator: &str,
     value: &serde_json::Value,
 ) -> StdResult<CypherValue, GraphError> {
-    let target_variable = context.variables.get(variable)
+    let target = context.variables.get(variable)
         .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
 
-    // --- FIX START ---
-    // If property is empty, 'variable' is a scalar alias (like the result of levenshtein)
-    let left_val = if property.is_empty() {
-        target_variable.clone()
-    } else {
-        // Standard vertex/edge property lookup
-        match target_variable {
-            CypherValue::Vertex(v) => v.properties.get(property)
-                .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
-                .unwrap_or(CypherValue::Null),
-            CypherValue::Edge(e) => e.properties.get(property)
-                .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
-                .unwrap_or(CypherValue::Null),
-            _ => return Err(GraphError::QueryExecutionError(
-                format!("Variable '{}' is not a graph object; cannot access property '{}'", variable, property)
-            )),
-        }
+    let left_val = match target {
+        CypherValue::Vertex(v) => v.properties.get(property)
+            .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
+            .unwrap_or(CypherValue::Null),
+        CypherValue::Edge(e) => e.properties.get(property)
+            .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
+            .unwrap_or(CypherValue::Null),
+        _ => return Err(GraphError::QueryExecutionError(format!("'{}' is not a graph object", variable))),
     };
-    // --- FIX END ---
 
     let rhs_val = CypherValue::from_json(value.clone());
     evaluate_comparison(&left_val, operator, &rhs_val)
 }
-
 
 fn evaluate_function_comparison(
     context: &EvaluationContext,
@@ -4046,11 +4048,10 @@ pub fn parse_logical_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_logical_expression START");
     // Parse sequence of OR-separated terms
     let (input, mut terms) = separated_list1(
-        preceded(multispace0, tag_no_case("OR")),
-        parse_and_term,
+        delimited(multispace0, tag_no_case("OR"), multispace0),
+        parse_and_term, // Higher precedence: AND
     ).parse(input)?;
 
-    // Fold into Expression::Or
     let condition = if terms.len() == 1 {
         terms.remove(0)
     } else {
@@ -4064,7 +4065,6 @@ pub fn parse_logical_expression(input: &str) -> IResult<&str, Expression> {
         }
         root
     };
-
     Ok((input, condition))
 }
 
@@ -4287,15 +4287,15 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
 
 fn parse_and_term(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_and_term START");
-    let (input, mut factors) = separated_list1(
-        preceded(multispace0, tag_no_case("AND")),
-        parse_where_expression, // ✅ Use your full condition parser
+    let (input, mut expressions) = separated_list1(
+        delimited(multispace0, tag_no_case("AND"), multispace0),
+        parse_where_expression
     ).parse(input)?;
 
-    let term = if factors.len() == 1 {
-        factors.remove(0)
+    let res = if expressions.len() == 1 {
+        expressions.remove(0)
     } else {
-        let mut iter = factors.into_iter();
+        let mut iter = expressions.into_iter();
         let mut root = iter.next().unwrap();
         for next in iter {
             root = Expression::And {
@@ -4305,8 +4305,7 @@ fn parse_and_term(input: &str) -> IResult<&str, Expression> {
         }
         root
     };
-
-    Ok((input, term))
+    Ok((input, res))
 }
 
 /// Find keyword position ensuring word boundaries
@@ -4776,9 +4775,7 @@ pub fn parse_where(input: &str) -> IResult<&str, WhereClause> {
     let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // ✅ Use precedence-aware logical expression parser to support AND/OR
-    // This replaces the flat AND-only parser to enable MPI identity resolution
-    // with conditions like: a.mrn = b.mrn OR a.ssn = b.ssn
+    // Parse using the precedence-aware logical tree
     let (input, condition) = parse_logical_expression(input)?;
     
     Ok((input, WhereClause { condition }))
@@ -4818,15 +4815,33 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
 }
 
 /// Parse a single WHERE condition/expression (property, function, or parenthesized)
+/// Parse a single WHERE condition/expression (label check, property, function, or parenthesized)
 pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_where_expression START");
     
-    // 1. Parenthesized expressions
+    // 1. Parenthesized expressions (Recursion handles complex OR/AND inside)
     if let Ok((remaining, expr)) = parse_parenthesized_expression(input) {
         return Ok((remaining, expr));
     }
 
-    // 2. Function calls (e.g., ID(n) = "uuid")
+    // 2. Label Predicate check: (e:IdentityEvent)
+    // We check for the ':' which distinguishes a Label check from a Property access.
+    if let Ok((remaining, _)) = char::<&str, nom::error::Error<&str>>('(').parse(input) {
+        if let Ok((remaining2, (var, _, label, _))) = tuple((
+            parse_identifier,
+            char(':'),
+            parse_identifier,
+            char(')'),
+        )).parse(remaining) {
+            return Ok((remaining2, Expression::LabelPredicate {
+                // Convert &str to owned String
+                variable: var.to_string(),
+                label: label.to_string(),
+            }));
+        }
+    }
+
+    // 3. Function calls (e.g., ID(n) = "uuid")
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
@@ -4846,11 +4861,11 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }));
     }
     
-    // 3. Property access (e.g., n.name = "Alice")
+    // 4. Property access (e.g., n.name = "Alice")
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    // 4. Parse operator (handle multi-word operators first)
+    // 5. Parse operator (handle multi-word operators first)
     let (input, op_str) = {
         let trimmed = input.trim_start();
         let upper = trimmed.to_uppercase();
@@ -4869,7 +4884,6 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
             let (i, _) = tag_no_case("CONTAINS").parse(input)?;
             (i, "CONTAINS")
         } else {
-            // Single-word operators: =, <>, <, <=, >, >=, IS, etc.
             let (i, op) = parse_comparison_op(input)?;
             (i, op)
         }
@@ -4877,19 +4891,19 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
 
     let (input, _) = multispace0.parse(input)?;
     
-    // 5. Parse value
+    // 6. Parse value
     let (input, val) = if op_str.to_uppercase().contains("NULL") {
         (input, Value::Null)
     } else {
         parse_value(input)?
     };
     
-    // 6. Split property path
+    // 7. Split property path
     let (var, prop) = full_path.split_once('.')
         .map(|(v, p)| (v.to_string(), p.to_string()))
         .unwrap_or_else(|| (full_path.clone(), String::new()));
 
-    // 7. Handle special operators
+    // 8. Handle special operators
     if op_str == "STARTS WITH" {
         if let Value::String(prefix) = val {
             return Ok((input, Expression::StartsWith {
@@ -4900,7 +4914,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 8. Standard property comparison
+    // 9. Standard property comparison
     Ok((input, Expression::PropertyComparison {
         variable: var,
         property: prop,
@@ -4908,33 +4922,16 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         value: val,
     }))
 }
-
 /// The WHERE clause parser itself - updated for legacy compatibility with AND support
 fn parse_where_clause_content(input: &str) -> IResult<&str, String> {
     println!("===> parse_where_clause_content START");
     let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // Parse the full chain of expressions
-    let (input, mut expressions) = separated_list1(
-        tuple((multispace1, tag_no_case("AND"), multispace1)),
-        parse_where_expression
-    ).parse(input)?;
+    // ✅ Call the new precedence-aware logical parser
+    let (input, final_expr) = parse_logical_expression(input)?;
 
-    let final_expr = if expressions.len() == 1 {
-        expressions.remove(0)
-    } else {
-        let mut iter = expressions.into_iter();
-        let mut root = iter.next().unwrap();
-        for next_expr in iter {
-            root = Expression::And {
-                left: Box::new(root),
-                right: Box::new(next_expr),
-            };
-        }
-        root
-    };
-
+    // Return debug format for legacy string-based return types
     Ok((input, format!("{:?}", final_expr)))
 }
 

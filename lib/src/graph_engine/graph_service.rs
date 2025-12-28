@@ -962,26 +962,40 @@ impl GraphService {
         
         let mut patients = Vec::new();
         
-        // raw_results is already Vec<Value>, iterate directly
-        for result_item in raw_results {
-            println!("===> Processing result item: {}", serde_json::to_string_pretty(&result_item).unwrap_or_default());
+        // FIXED: Properly traverse the response structure
+        // raw_results is Vec<Value>, each element has structure: {"results": [{"vertices": [...], "edges": [], "stats": {}}]}
+        for result_wrapper in &raw_results {
+            println!("===> Processing result wrapper: {}", serde_json::to_string_pretty(&result_wrapper).unwrap_or_default());
             
-            // Each result_item should have a "vertices" field
-            if let Some(vertices) = result_item.get("vertices").and_then(|v| v.as_array()) {
-                for vertex in vertices {
-                    println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
-                    
-                    match parse_patient_from_cypher_result(vertex.clone()) {
-                        Ok(patient) => {
-                            println!("===> Successfully parsed patient: {:?}", patient);
-                            patients.push(patient);
+            // Get the "results" array from the wrapper
+            if let Some(results_array) = result_wrapper.get("results").and_then(|v| v.as_array()) {
+                println!("===> Found results array with {} items", results_array.len());
+                
+                // Each item in results has vertices, edges, and stats
+                for result_item in results_array {
+                    if let Some(vertices) = result_item.get("vertices").and_then(|v| v.as_array()) {
+                        println!("===> Found {} vertices in result_item", vertices.len());
+                        
+                        for vertex in vertices {
+                            println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
+                            
+                            match parse_patient_from_cypher_result(vertex.clone()) {
+                                Ok(patient) => {
+                                    println!("===> Successfully parsed patient: {:?}", patient);
+                                    patients.push(patient);
+                                }
+                                Err(e) => {
+                                    println!("===> Failed to parse patient: {}", e);
+                                    // Continue with next vertex instead of failing entire search
+                                }
+                            }
                         }
-                        Err(e) => {
-                            println!("===> Failed to parse patient: {}", e);
-                            // Continue with next vertex instead of failing entire search
-                        }
+                    } else {
+                        println!("===> No vertices found in result_item");
                     }
                 }
+            } else {
+                println!("===> No results array found in wrapper");
             }
         }
         
@@ -2034,6 +2048,32 @@ impl GraphService {
         Ok(current_results)
     }
 
+    pub async fn get_vertex_by_uuid_cypher(&self, uuid: &Uuid) -> Result<Vertex, String> {
+        let query = format!("MATCH (v) WHERE v.id = '{}' RETURN v LIMIT 1", uuid);
+        
+        // 1. Execute the read (returns Vec<serde_json::Value>)
+        let results = self.execute_cypher_read(&query, serde_json::Value::Null)
+            .await
+            .map_err(|e| format!("Graph read failed: {}", e))?;
+
+        // 2. Extract the nested vertex from the structure:
+        // results[0]["results"][0]["vertices"][0]
+        let vertex_json = results.first()
+            .and_then(|r| r.get("results"))
+            .and_then(|r_inner| r_inner.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first_res| first_res.get("vertices"))
+            .and_then(|v_arr| v_arr.as_array())
+            .and_then(|v_list| v_list.first())
+            .ok_or_else(|| format!("Vertex {} not found in graph results", uuid))?;
+
+        // 3. Deserialize into the Vertex struct
+        let vertex: Vertex = serde_json::from_value(vertex_json.clone())
+            .map_err(|e| format!("Failed to parse vertex JSON: {}", e))?;
+
+        Ok(vertex)
+    }
+
     /// Core implementation for executing a list of Cypher queries sequentially,
     /// passing variable bindings (context) from one clause to the next.
     /// This method replaces the functionality of the standalone `execute_chain_internal`.
@@ -2449,16 +2489,30 @@ impl GraphService {
     /// Deletes an edge from memory and fires the mutation hook.
     pub async fn delete_edge(&self, edge_id: Identifier) -> Result<(), GraphError> {
         let edge_id_uuid = Uuid::from_str(edge_id.0.as_ref())
-            .map_err(|e| GraphError::InternalError(format!("Invalid UUID format for edge deletion: {}", e)))?;
+            .map_err(|e| GraphError::InternalError(format!("Invalid UUID format: {}", e)))?;
         
+        // 1. Retrieve the edge first to get the components required by the storage trait
         let edge_opt = { self.graph.read().await.edges.get(&edge_id_uuid).cloned() };
-        let edge = edge_opt.ok_or_else(|| GraphError::InternalError(format!("Edge {} not found for deletion.", edge_id_uuid)))?;
+        let edge = edge_opt.ok_or_else(|| {
+            GraphError::InternalError(format!("Edge {} not found for deletion.", edge_id_uuid))
+        })?;
 
-        // 1. Modify in-memory graph
+        // 2. PHYSICAL DELETION: Invoke the storage engine
+        // The trait requires &Uuid, &Identifier, &Uuid
+        self.storage
+            .delete_edge(
+                &edge.outbound_id.0, 
+                &edge.edge_type, 
+                &edge.inbound_id.0
+            )
+            .await?;
+
+        // 3. IN-MEMORY CLEANUP
         self.delete_edge_from_memory(&edge).await?;
 
-        // 2. Notify observers
+        // 4. NOTIFY OBSERVERS
         self.notify_mutation(GraphEvent::DeleteEdge(edge_id));
+        
         Ok(())
     }
 

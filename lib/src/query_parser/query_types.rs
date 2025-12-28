@@ -463,7 +463,10 @@ pub enum Expression {
         op: UnaryOp,
         expr: Box<Expression>,
     },
-    // --- ADD THIS VARIANT ---
+    LabelPredicate {
+        variable: String,
+        label: String,
+    },
     FunctionCall {
         name: String,
         args: Vec<Expression>,
@@ -898,6 +901,7 @@ impl Expression {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{name}' not found"))),
+            
             Expression::Property(access) => match access {
                 PropertyAccess::Vertex(var, prop) => {
                     if let Some(CypherValue::Vertex(v)) = ctx.variables.get(var) {
@@ -925,11 +929,30 @@ impl Expression {
                     .cloned()
                     .ok_or_else(|| GraphError::EvaluationError(format!("Parameter '${name}' not provided"))),
             },
+
+            Expression::LabelPredicate { variable, label } => {
+                if let Some(val) = ctx.variables.get(variable) {
+                    match val {
+                        CypherValue::Vertex(v) => {
+                            // Since v.label is an 'Identifier' and label is a 'String',
+                            // we convert the Identifier to a string for the comparison.
+                            Ok(CypherValue::Bool(v.label.to_string() == *label))
+                        }
+                        _ => Ok(CypherValue::Bool(false)),
+                    }
+                } else {
+                    Err(GraphError::EvaluationError(format!(
+                        "Variable '{variable}' not found for label check"
+                    )))
+                }
+            },
+
             Expression::Binary { op, left, right } => {
                 let l = left.evaluate(ctx)?;
                 let r = right.evaluate(ctx)?;
                 op.apply(&l, &r)
             },
+
             Expression::Unary { op, expr } => {
                 let val = expr.evaluate(ctx)?;
                 match op {
@@ -951,6 +974,7 @@ impl Expression {
                     UnaryOp::IsNull => Ok(CypherValue::Bool(matches!(val, CypherValue::Null))),
                 }
             },  
+
             Expression::FunctionCall { name, args } => {
                 match name.to_uppercase().as_str() {
                     "ID" => {
@@ -973,7 +997,6 @@ impl Expression {
                             .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 argument".into()))?
                             .evaluate(ctx)?;
                         match val {
-                            // Use to_string() to convert Identifier -> String
                             CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
                             _ => Ok(CypherValue::Null),
                         }
@@ -983,7 +1006,6 @@ impl Expression {
                             .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 argument".into()))?
                             .evaluate(ctx)?;
                         match val {
-                            // Use to_string() here as well for the list element
                             CypherValue::Vertex(v) => Ok(CypherValue::List(vec![
                                 CypherValue::String(v.label.to_string())
                             ])),
@@ -996,33 +1018,25 @@ impl Expression {
                                 "levenshtein() requires exactly 2 string arguments".into()
                             ));
                         }
-
                         let left = args[0].evaluate(ctx)?;
                         let right = args[1].evaluate(ctx)?;
-
                         let s1 = match left {
                             CypherValue::String(s) => s,
                             CypherValue::Null => return Ok(CypherValue::Null),
-                            _ => return Err(GraphError::EvaluationError(
-                                "levenshtein(): first argument must be string".into()
-                            )),
+                            _ => return Err(GraphError::EvaluationError("levenshtein(): first argument must be string".into())),
                         };
-
                         let s2 = match right {
                             CypherValue::String(s) => s,
                             CypherValue::Null => return Ok(CypherValue::Null),
-                            _ => return Err(GraphError::EvaluationError(
-                                "levenshtein(): second argument must be string".into()
-                            )),
+                            _ => return Err(GraphError::EvaluationError("levenshtein(): second argument must be string".into())),
                         };
-
                         let distance = strsim::levenshtein(&s1, &s2) as i64;
                         Ok(CypherValue::Integer(distance))
                     },
                     _ => Err(GraphError::EvaluationError(format!("Unknown function: {}", name)))
                 }
             }
-            // Inside your Expression::evaluate implementation:
+
             Expression::PropertyComparison { variable, property, operator, value } => {
                 let var_value = ctx.variables.get(variable)
                     .ok_or_else(|| GraphError::QueryError(format!("Variable '{}' not found", variable)))?;
@@ -1047,8 +1061,6 @@ impl Expression {
 
                 let right_hand_side = CypherValue::from_json(value.clone());
 
-                // MANUAL COMPARISON BLOCK
-                // This bypasses the need for CypherValue to implement PartialOrd
                 let result = match (left_hand_side, right_hand_side) {
                     (CypherValue::Integer(a), CypherValue::Integer(b)) => match operator.as_str() {
                         ">" => a > b, "<" => a < b, ">=" => a >= b, "<=" => a <= b, "=" | "==" => a == b, "!=" | "<>" => a != b,
@@ -1077,15 +1089,12 @@ impl Expression {
                     (l, r) => {
                         if operator == "=" || operator == "==" { l == r }
                         else if operator == "!=" || operator == "<>" { l != r }
-                        else {
-                            println!("===> Cannot compare {:?} and {:?} with {}", l, r, operator);
-                            false
-                        }
+                        else { false }
                     }
                 };
-
                 Ok(CypherValue::Bool(result))
             }
+
             Expression::StartsWith { variable, property, prefix } => {
                 let target = ctx.variables.get(variable)
                     .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{variable}' not found")))?;
@@ -1102,16 +1111,15 @@ impl Expression {
 
                 match prop_val {
                     CypherValue::String(s) => Ok(CypherValue::Bool(s.starts_with(prefix))),
-                    CypherValue::Null => Ok(CypherValue::Bool(false)),
-                    _ => Ok(CypherValue::Bool(false)), // Non-string properties don't match STARTS WITH
+                    _ => Ok(CypherValue::Bool(false)),
                 }
             }
+
             Expression::FunctionComparison { function, argument, operator, value } => {
                 let left_val = match function.to_uppercase().as_str() {
                     "ID" => {
                         let target = ctx.variables.get(argument)
                             .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{argument}' not found")))?;
-                        
                         match target {
                             CypherValue::Vertex(v) => CypherValue::String(v.id.to_string()),
                             CypherValue::Edge(e) => CypherValue::String(e.id.to_string()),
@@ -1137,10 +1145,10 @@ impl Expression {
 
                 evaluate_comparison(&left_val, operator, &right_val)
             }
+
             Expression::And { left, right } => {
                 let l_val = left.evaluate(ctx)?;
                 let r_val = right.evaluate(ctx)?;
-
                 match (l_val, r_val) {
                     (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l && r)),
                     (CypherValue::Bool(false), _) | (_, CypherValue::Bool(false)) => Ok(CypherValue::Bool(false)),
@@ -1148,10 +1156,10 @@ impl Expression {
                     _ => Err(GraphError::EvaluationError("Logical AND requires boolean operands".into())),
                 }
             }
+
             Expression::Or { left, right } => {
                 let l_val = left.evaluate(ctx)?;
                 let r_val = right.evaluate(ctx)?;
-
                 match (l_val, r_val) {
                     (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l || r)),
                     (CypherValue::Bool(true), _) | (_, CypherValue::Bool(true)) => Ok(CypherValue::Bool(true)),
@@ -1487,22 +1495,42 @@ impl From<CypherExpression> for Expression {
                         left: Box::new(Expression::from(*left)),
                         right: Box::new(Expression::from(*right)),
                     },
+                    ":" => {
+                        // Use references to check without moving values
+                        if let (CypherExpression::Variable(var), CypherExpression::Variable(label)) = (&*left, &*right) {
+                            return Expression::LabelPredicate {
+                                variable: var.clone(),
+                                label: label.clone(),
+                            };
+                        }
+                        panic!("Label predicate ':' requires variable on left and label on right");
+                    },
                     "STARTS WITH" => {
-                        // Convert BinaryOp "STARTS WITH" into StartsWith expression
-                        // Assumes left is PropertyLookup { var, prop }, right is Literal(String)
-                        if let CypherExpression::PropertyLookup { var, prop } = *left {
-                            if let CypherExpression::Literal(serde_json::Value::String(prefix)) = *right {
+                        if let CypherExpression::PropertyLookup { var, prop } = &*left {
+                            if let CypherExpression::Literal(serde_json::Value::String(prefix)) = &*right {
                                 return Expression::StartsWith {
-                                    variable: var,
-                                    property: prop,
-                                    prefix,
+                                    variable: var.clone(),
+                                    property: prop.clone(),
+                                    prefix: prefix.clone(),
                                 };
                             }
                         }
-                        // Fallback if structure doesn't match
                         panic!("STARTS WITH requires left=property, right=string literal");
                     },
                     _ => {
+                        // Optimized check for PropertyComparison using references to prevent partial moves
+                        if let CypherExpression::PropertyLookup { var, prop } = &*left {
+                            if let CypherExpression::Literal(val) = &*right {
+                                return Expression::PropertyComparison {
+                                    variable: var.clone(),
+                                    property: prop.clone(),
+                                    operator: op,
+                                    value: val.clone(),
+                                };
+                            }
+                        }
+
+                        // If it wasn't a specialized optimized expression, fall back to standard BinaryOp
                         let binary_op = match op_upper.as_str() {
                             "=" | "==" => BinaryOp::Eq,
                             "!=" | "<>" => BinaryOp::Neq,
@@ -1510,8 +1538,13 @@ impl From<CypherExpression> for Expression {
                             "<" => BinaryOp::Lt,
                             ">=" => BinaryOp::Gte,
                             "<=" => BinaryOp::Lte,
+                            "+" => BinaryOp::Plus,
+                            "-" => BinaryOp::Minus,
+                            "*" => BinaryOp::Mul,
+                            "/" => BinaryOp::Div,
                             _ => panic!("Unsupported operator for MPI resolution: {}", op),
                         };
+
                         Expression::Binary {
                             op: binary_op,
                             left: Box::new(Expression::from(*left)),

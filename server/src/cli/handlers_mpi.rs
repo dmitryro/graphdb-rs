@@ -17,6 +17,7 @@ use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use log::{info, error, warn};
 use whoami;
+use uuid::Uuid;
 use std::sync::Arc;
 // Removed: tokio::sync::Mutex as TokioMutex (no longer used in local storage init)
 use lib::commands::{ MPICommand, NameMatchAlgorithm };
@@ -27,6 +28,7 @@ use models::medical::{MasterPatientIndex, Patient, Address, ExternalId, IdType, 
 use medical_knowledge::mpi_identity_resolution::{MpiIdentityResolutionService, PatientCandidate};
 use models::errors::GraphError;
 use models::identifiers::Identifier;
+use models::properties::{ SerializableDateTime };
 use models::evolution::*;
 use models::dashboard::*;
 use crate::cli::{ get_storage_engine_singleton };
@@ -372,7 +374,21 @@ impl MPIHandlers {
             // --- Search Command Routing (NOW NON-STATIC) ---
             MPICommand::Search { name, first_name, last_name, dob, address, phone } => 
                 self.handle_search(name, first_name, last_name, dob, address, phone).await,
-
+            MPICommand::Rollback {
+                event_uuid,
+                id,
+                mrn,
+                requested_by,
+                reason,
+            } => {
+                self.handle_rollback(
+                    event_uuid,
+                    id,
+                    mrn,
+                    requested_by,
+                    reason
+                ).await
+            },
             // --- Split Command Routing ---
             MPICommand::Split {
                 merged_id, new_patient_data_json, reason, split_patient_id_str,
@@ -446,7 +462,12 @@ impl MPIHandlers {
         let display_last = new_patient.last_name.as_deref().unwrap_or("N/A");
         println!(" Name: {} {}", display_first, display_last);
         
-        println!(" DOB: {}", new_patient.date_of_birth.format("%Y-%m-%d"));
+        println!(
+            " DOB: {}", 
+            new_patient.date_of_birth.as_ref()
+                .map(|dt| dt.0.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "N/A".to_string())
+        );
         println!();
         
         // 2. Call the core service method
@@ -748,12 +769,17 @@ impl MPIHandlers {
             println!(" Name: {} {}", first, last);
 
 
-            if patient.date_of_birth.naive_utc().date().year() > 1900 {
-                println!(" DOB: {}", patient.date_of_birth.format("%Y-%m-%d"));
+            if let Some(dob) = patient.date_of_birth.as_ref() {
+                // Check if the year is valid (greater than our 1900 sentinel)
+                if dob.0.naive_utc().date().year() > 1900 {
+                    println!(" DOB: {}", dob.0.format("%Y-%m-%d"));
+                } else {
+                    println!(" DOB: Not Provided");
+                }
             } else {
                 println!(" DOB: Not Provided");
             }
-            
+                        
             if let Some(ref addr) = patient.address {
                 println!(" Address: {}", addr.address_line1);
             }
@@ -1081,7 +1107,7 @@ impl MPIHandlers {
 
     /// Resolve - Finds the canonical MPI ID for a given external identifier.
     /// Combines the logic of handle_mpi_resolve from the previous context, but uses &self.
-    #[allow(clippy::too_many_arguments)]
+   #[allow(clippy::too_many_arguments)]
     pub async fn handle_resolve(
         &self,
         id: Option<String>, 
@@ -1092,27 +1118,17 @@ impl MPIHandlers {
         system: Option<String>,
     ) -> Result<(), GraphError> {
         let requested_by = whoami::username(); 
+        
         // FIX 1: Correctly derive final_id by using .as_ref() and .cloned() on the Option<String> inputs.
-        // This avoids moving the original variables (id, external_id, source_mrn).
-        // The original variable names are reused in the closures for clarity, but they refer to the borrowed content.
         let final_id = id.as_ref().cloned()
             .or_else(|| external_id.as_ref().cloned())
             .or_else(|| source_mrn.as_ref().cloned())
             .context("At least one ID field (--id, --external-id, or --source-mrn) is required for resolve operation.")?;
         
-        // The original variables (external_id, id_type, system, source_mrn) are now available here.
-
-        // The ID used for the consolidate operation must be handled separately. 
-        // We assume the consolidate operation is skipped if only 'id' is present.
-        
-        if let (Some(ext_id), Some(id_t), Some(sys), Some(src_mrn_val)) = 
+        if let (Some(ext_id), Some(id_t), Some(sys), Some(_src_mrn_val)) = 
             (external_id.clone(), id_type.clone(), system.clone(), source_mrn.clone()) 
         {
             // If all external ID components are present, call consolidate_id.
-            // NOTE: The previous code block attempting to re-derive final_id is removed as it is now redundant/incorrect.
-            // Instead, we call consolidate_id with the necessary arguments.
-            
-            // Assuming consolidate_id is called here if needed for linking:
             self.consolidate_id(
                 final_id.clone(), // raw_patient_id_str (the resolved ID)
                 ext_id,           // external_id
@@ -1121,9 +1137,6 @@ impl MPIHandlers {
             ).await?;
         }
         
-        // The second attempt to derive final_id (lines 758-762 in the original code) is removed as final_id is derived once.
-
-
         info!(
             "Starting non-interactive MPI resolve and fetch for ID: {} (Type: {:?}, System: {:?})", 
             final_id, 
@@ -1145,7 +1158,7 @@ impl MPIHandlers {
             system: system, 
         };
         
-        // FIX 4: Add .await to the asynchronous call (already present in the previous fix)
+        // FIX 4: Add .await to the asynchronous call
         let (resolved_id, patient_record) = self.mpi_service
             .resolve_and_fetch_patient(external_id_struct, final_id_type, &requested_by)
             .await
@@ -1166,8 +1179,12 @@ impl MPIHandlers {
 
         println!("Patient Name: {} {}", first, last);
 
-        // FIX: If date_of_birth is also an Option, handle it before calling .format()
-        println!("Date of Birth: {}", patient_record.date_of_birth.format("%Y-%m-%d"));
+        // FIX: Safely handle Option<SerializableDateTime> for Date of Birth
+        let dob_display = patient_record.date_of_birth.as_ref()
+            .map(|dt| dt.0.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "N/A".to_string());
+            
+        println!("Date of Birth: {}", dob_display);
 
         // Use debug print for Address
         let address_str = patient_record.address.as_ref()
@@ -1179,8 +1196,18 @@ impl MPIHandlers {
 
         // Output Metadata
         println!("\n### METADATA ###");
-        println!("Record Creation Date: {}", patient_record.created_at.to_rfc3339());
-        println!("Record Last Updated: {}", patient_record.updated_at.to_rfc3339());
+
+        // FIX: Safely handle Option<SerializableDateTime> for audit timestamps
+        let created_display = patient_record.created_at.as_ref()
+            .map(|dt| dt.0.to_rfc3339())
+            .unwrap_or_else(|| "N/A".to_string());
+
+        let updated_display = patient_record.updated_at.as_ref()
+            .map(|dt| dt.0.to_rfc3339())
+            .unwrap_or_else(|| "N/A".to_string());
+
+        println!("Record Creation Date: {}", created_display);
+        println!("Record Last Updated: {}", updated_display);
         
         // Display the primary identifiers explicitly
         println!("External IDs Linked (Primary):");
@@ -1342,7 +1369,7 @@ impl MPIHandlers {
                 println!("\n===================================================");
                 println!("[Result {} / {}]", index + 1, search_results.len());
                 
-                // FIX: patient.id is Option<i32>. We map it to a String or default to "0".
+                // patient.id is Option<i32>. We map it to a String or default to "0".
                 let patient_id_str = patient.id
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "0".to_string());
@@ -1353,13 +1380,17 @@ impl MPIHandlers {
                 // Output Patient Data (Golden Record)
                 println!("\n### GOLDEN RECORD DATA ###");
                 
-                // FIX: first_name and last_name are Option<String>. 
-                // We use as_deref().unwrap_or("N/A") to satisfy the Display requirement.
                 let first = patient.first_name.as_deref().unwrap_or("N/A");
                 let last = patient.last_name.as_deref().unwrap_or("N/A");
                 
+                // FIX: Access inner .0 of SerializableDateTime for formatting
+                let dob_display = patient.date_of_birth.as_ref()
+                    .map(|d| d.0.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+
                 println!("Full Name: {} {}", first, last);
-                println!("Date of Birth: {}", patient.date_of_birth.format("%Y-%m-%d").to_string());
+                println!("Date of Birth: {}", dob_display);
+                
                 // Use debug print for Address
                 let address_str = patient.address.as_ref()
                     .map(|a| format!("{:?}", a))
@@ -1370,8 +1401,18 @@ impl MPIHandlers {
 
                 // Output Metadata
                 println!("\n### METADATA ###");
-                println!("Record Creation Date: {}", patient.created_at.to_rfc3339());
-                println!("Record Last Updated: {}", patient.updated_at.to_rfc3339());
+                
+                // FIX: Extract ISO strings from optional timestamps
+                let created_display = patient.created_at.as_ref()
+                    .map(|d| d.0.to_rfc3339())
+                    .unwrap_or_else(|| "N/A".to_string());
+                
+                let updated_display = patient.updated_at.as_ref()
+                    .map(|d| d.0.to_rfc3339())
+                    .unwrap_or_else(|| "N/A".to_string());
+
+                println!("Record Creation Date: {}", created_display);
+                println!("Record Last Updated: {}", updated_display);
                 
                 println!("External IDs Linked:");
                 
@@ -1464,20 +1505,20 @@ impl MPIHandlers {
         };
         let last_name = parts.last().unwrap().to_string();
 
-        // Parse and convert date of birth to DateTime<Utc>
-        // Note: The logic handles both Some(dob) parsing and a None fallback, 
-        // converting the final NaiveDate to DateTime<Utc>.
-        let date_of_birth = dob
+        // Parse and convert date of birth to Option<SerializableDateTime>
+        let date_of_birth_raw = dob
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
             // Use a sentinel date if DOB is missing or invalid (1900-01-01)
             .unwrap_or_else(|| NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()) 
             .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| GraphError::InvalidRequest("Invalid date".into()))?
+            .ok_or_else(|| GraphError::InvalidRequest("Invalid date calculation".into()))?
             .and_utc();
+        
+        // Wrap for the Patient struct
+        let date_of_birth = Some(SerializableDateTime(date_of_birth_raw));
 
         // Create Address struct (only if address_str is provided)
         let address_tuple = address_str.map(|address_line1| {
-            // NOTE: Using placeholder values for city, state, etc., as before.
             Address::new(
                 address_line1,
                 None,
@@ -1489,11 +1530,13 @@ impl MPIHandlers {
         });
 
         let now = Utc::now();
+        let serializable_now = Some(SerializableDateTime(now));
         
         // Return minimal Patient for matching
         Ok(Patient {
             // Primary identifiers
-            id: Some(rand::random()),
+            id: Some(rand::random::<i16>() as i32),
+            vertex_id: Some(Uuid::new_v4()),
             user_id: None,
             mrn: None,
             ssn: None,
@@ -1506,7 +1549,6 @@ impl MPIHandlers {
             preferred_name: None,
             date_of_birth,
             date_of_death: None,
-            // FIX: Wrap the String in Some() to match the Option<String> field type
             gender: Some("Unknown".to_string()), 
             
             // Contact - used for matching
@@ -1519,9 +1561,9 @@ impl MPIHandlers {
             vip_flag: Some(false),
             confidential_flag: Some(false),
             
-            // Audit Trail
-            created_at: now,
-            updated_at: now,
+            // Audit Trail - FIXED: Now uses Option<SerializableDateTime>
+            created_at: serializable_now.clone(),
+            updated_at: serializable_now,
             created_by: None,
             updated_by: None,
             last_visit_date: None,
@@ -1530,7 +1572,7 @@ impl MPIHandlers {
             ..Patient::default() 
         })
     }
-    
+
     pub async fn retrieve_and_convert_patient(&self, mrn: &str) -> Result<Option<Patient>, GraphError> {
         // Access the GraphService through the appropriate field path
         let vertex_opt = self.mpi_service.graph_service.get_patient_by_mrn(mrn).await?;
@@ -1599,7 +1641,6 @@ impl MPIHandlers {
             }
             
             // Case 4: No names provided and no existing record - use placeholder values
-            // This allows MRN-only indexing for new records
             (None, None, None) => {
                 ("Unknown".to_string(), "Unknown".to_string())
             }
@@ -1617,11 +1658,13 @@ impl MPIHandlers {
         // Start with existing patient data or a default patient struct
         let mut patient_to_index = existing_patient_opt.unwrap_or_else(Patient::default);
 
-        // Parse Date of Birth (use new DOB if supplied, otherwise use existing, fallback to sentinel)
+        // Parse Date of Birth (resolves to Option<SerializableDateTime>)
         let date_of_birth = dob
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
             .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc())
-            .unwrap_or(patient_to_index.date_of_birth);
+            .map(SerializableDateTime) // Wrap in our serializable struct
+            .map(Some)                  // Wrap in Option
+            .unwrap_or(patient_to_index.date_of_birth); // Fallback to existing Option
 
         
         // Create Address struct (or use existing address, merging data)
@@ -1637,6 +1680,7 @@ impl MPIHandlers {
         }).or_else(|| patient_to_index.address.clone());
 
         let now = Utc::now();
+        let serializable_now = Some(SerializableDateTime(now));
         
         // Apply resolved/new values
         patient_to_index.mrn = Some(mrn);
@@ -1655,12 +1699,17 @@ impl MPIHandlers {
         // Silence unused variable warning for 'system'
         let _ = system;
         
-        patient_to_index.updated_at = now;
+        patient_to_index.updated_at = serializable_now.clone();
         
         // Only assign new IDs and created_at if it's genuinely a new record
-        if patient_to_index.created_at.timestamp() == 0 {
-            patient_to_index.id = Some(rand::random());
-            patient_to_index.created_at = now;
+        // We check if created_at is None or if it matches the default/zero timestamp
+        let is_new_record = patient_to_index.created_at.as_ref()
+            .map(|dt| dt.0.timestamp() == 0)
+            .unwrap_or(true);
+
+        if is_new_record {
+            patient_to_index.id = Some(rand::random::<i16>() as i32); // Ensure fit for i32
+            patient_to_index.created_at = serializable_now;
         }
         
         Ok(patient_to_index)
@@ -1756,6 +1805,69 @@ impl MPIHandlers {
     }
 
     // =========================================================================
+    // Identity Management Operations - Rollback
+    // =========================================================================
+    async fn handle_rollback(
+        &self,
+        event_uuid: Option<String>,
+        id: Option<String>,
+        mrn: Option<String>,
+        requested_by: String, // From CLI context or whoami
+        reason: Option<String>,
+    ) -> Result<(), GraphError> {
+        let actual_requester = if requested_by.is_empty() {
+            whoami::username()
+        } else {
+            requested_by
+        };
+
+        println!("=== MPI Merge Rollback (Event Reversal) ===");
+        println!("Reversing a merge and restoring edge lineage...\n");
+
+        // 1. Determine the identifier to display
+        let identifier = event_uuid
+            .clone()
+            .or_else(|| id.clone())
+            .or_else(|| mrn.clone())
+            .ok_or_else(|| GraphError::InvalidRequest("Rollback requires an identifier (--event-uuid, --id, or --mrn)".to_string()))?;
+
+        println!("Discovery Identifier: {}", identifier);
+        println!("Reason for Rollback: {}", reason.as_deref().unwrap_or("None provided"));
+        println!("Requested By: {}", actual_requester);
+        println!();
+
+        println!("⚠ WARNING: This operation will:");
+        println!(" 1. Identify the latest merge event for this patient/event.");
+        println!(" 2. Restore all clinical edges (lab, meds, obs) to the source record.");
+        println!(" 3. Re-activate the source patient record.");
+        println!(" 4. Generate a new Golden Record for the restored identity.");
+        println!(" 5. Log a 'MERGE_ROLLBACK_EXECUTED' event (2025-12-20 Traceability).");
+        println!();
+
+        // 2. Call the core service method
+        let result = self.mpi_service
+            .rollback_merge(identifier.clone(), &actual_requester)
+            .await;
+
+        match result {
+            Ok(_) => {
+                println!("✓ Rollback completed successfully");
+                println!(" Reference Identifier: {}", identifier);
+                println!(" Source identity has been restored and clinical data re-linked.");
+            }
+            Err(e) => {
+                eprintln!("✗ Rollback failed: {}", e);
+                eprintln!("\nPossible causes:");
+                eprintln!(" - No merge event found for the provided identifier");
+                eprintln!(" - Source or Target vertices have been deleted");
+                return Err(GraphError::InternalError(e.to_string()));
+            }
+        }
+        
+        Ok(())
+    }
+
+    // =========================================================================
     // Identity Management Operations
     // =========================================================================
     async fn handle_split(
@@ -1835,18 +1947,17 @@ impl MPIHandlers {
             Ok(golden_patient) => {
                 println!("✓ Golden Record successfully retrieved.");
                 
-                // FIX: first_name and last_name are Option<String>. 
-                // We use as_deref().unwrap_or("N/A") to satisfy the Display requirement.
                 let first = golden_patient.first_name.as_deref().unwrap_or("N/A");
                 let last = golden_patient.last_name.as_deref().unwrap_or("N/A");
                 
+                // Use as_ref() to check the Option, and .0 to access the inner DateTime
+                let dob_display = golden_patient.date_of_birth.as_ref()
+                    .map(|dt| dt.0.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+
                 println!(" Full Name: {} {}", first, last);
-                println!(" Date of Birth: {}", golden_patient.date_of_birth.format("%Y-%m-%d"));
+                println!(" Date of Birth: {}", dob_display);
                 println!(" MRN: {}", golden_patient.mrn.as_deref().unwrap_or("N/A"));
-                
-                // Further logic to print address, phone, etc., would go here.
-                // Note: address and phone likely also need .as_deref().unwrap_or("N/A") 
-                // if they are also Option types.
                 
                 Ok(())
             }
@@ -2219,6 +2330,46 @@ pub async fn handle_mpi_audit_interactive(
     .map_err(|e| anyhow!("MPI audit operation failed: {}", e))
 }
 
+/// Delegates the interactive MPI Rollback command to the internal handler.
+/// This fulfills the 2025-12-20 audit requirements by ensuring user identity 
+/// and justification are captured before the state reversal.
+pub async fn handle_mpi_rollback_interactive(
+    event_uuid: Option<String>,
+    id: Option<String>,
+    mrn: Option<String>,
+    user_id: String, 
+    reason: Option<String>,
+    mpi_handlers_state: MpiHandlersStateRef,
+) -> Result<()> {
+    // 1. Lock the state and retrieve the handler instance from the mutex.
+    let handlers_lock = mpi_handlers_state.lock().await;
+    let handlers_arc = handlers_lock
+        .as_ref()
+        .context("MPIHandlers not initialized in state mutex. Ensure mpi_services are started.")?;
+    let handlers = handlers_arc;
+
+    // 2. Validate discovery keys. Interactive mode should ensure we have a starting point.
+    if event_uuid.is_none() && id.is_none() && mrn.is_none() {
+        return Err(anyhow!(
+            "Rollback requires at least one identifier: --event-uuid, --id, or --mrn."
+        ));
+    }
+
+    // 3. Ensure a reason is provided for the audit trail (consistent with Split).
+    let required_reason = reason.context("MPI Rollback requires a 'reason' for the audit trail (2025-12-20 Compliance).")?;
+
+    // 4. Call the non-static instance method on the handler.
+    // We pass user_id as 'requested_by' and the reason as an Option to match the signature.
+    handlers.handle_rollback(
+        event_uuid,
+        id,
+        mrn,
+        user_id,
+        Some(required_reason),
+    ).await
+    .map_err(|e| anyhow!("MPI rollback operation failed: {}", e))
+}
+
 /// Delegates the interactive MPI Split command to the internal handler (UPDATED).
 pub async fn handle_mpi_split_interactive(
     merged_id: String,
@@ -2415,6 +2566,37 @@ pub async fn handle_mpi_merge(
         duplicate_mrn,
         resolution_policy,
         user_id,
+        reason,
+    ).await
+}
+
+/// Handle MPI Rollback command in non-interactive mode.
+/// This reverses a previous merge by restoring edge lineage to the source patient.
+pub async fn handle_mpi_rollback(
+    storage: Arc<dyn GraphStorageEngine>,
+    event_uuid: Option<String>,
+    id: Option<String>,
+    mrn: Option<String>,
+    user_id: Option<String>, 
+    reason: Option<String>,
+) -> Result<(), GraphError> {
+    // 1. Retrieve or initialize the MPIHandlers via the singleton pattern.
+    let handlers_arc = get_or_init_handlers_from_singleton(storage)
+        .await
+        .map_err(|e| GraphError::InternalError(format!("Failed to initialize MPI handlers: {}", e)))?;
+
+    // 2. Extract the requester. In non-interactive mode, if user_id isn't passed, 
+    // we use an empty string so the internal handler can fall back to whoami::username().
+    let requested_by = user_id.unwrap_or_default();
+
+    // 3. Call the core handler logic (non-static instance method).
+    // This ensures compliance with 2025-12-20 audit requirements by passing the 
+    // reason and requested_by into the Graph of Changes.
+    handlers_arc.as_ref().handle_rollback(
+        event_uuid,
+        id,
+        mrn,
+        requested_by,
         reason,
     ).await
 }
