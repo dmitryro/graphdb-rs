@@ -1212,7 +1212,7 @@ impl MpiIdentityResolutionService {
 
         Ok(())
     }
-
+    
     pub async fn manual_merge_records(
         &self,
         source_id_str: String,
@@ -1242,6 +1242,20 @@ impl MpiIdentityResolutionService {
         println!("===> DEBUG: Source Patient UUID: {}", source_vertex.id.0);
         println!("===> DEBUG: Target Patient UUID: {}", target_vertex.id.0);
 
+        // Helper to get human-readable identity string (MRN preferred, fallback to UUID)
+        let identity_label = |v: &Vertex| -> String {
+            v.properties.get("mrn")
+                .and_then(|pv| pv.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("MRN {}", s))
+                .unwrap_or_else(|| format!("UUID {}", v.id.0))
+        };
+
+        let source_label = identity_label(&source_vertex);
+        let target_label = identity_label(&target_vertex);
+
+        println!("===> Merging {} into {}", source_label, target_label);
+
         // 2. Ensure Golden Record exists for the target (the survivor)
         self.ensure_golden_record_and_link(&target_vertex, requested_by)
             .await
@@ -1264,24 +1278,25 @@ impl MpiIdentityResolutionService {
                 "requested_by": acting_user,
                 "policy": policy,
                 "reason": merge_reason,
+                "source_identity": source_label,
+                "target_identity": target_label,
                 "timestamp": Utc::now().to_rfc3339()
             })
         ).await.map_err(|e| format!("Failed to log merge event: {}", e))?;
 
-        // --- OPTION 1: MANUAL PROPERTY PATCH START ---
-        // Ensure everything is populated as top-level properties for the rollback tool
+        // --- MANUAL PROPERTY PATCH: Ensure rollback compatibility ---
         let mut rollback_patch = HashMap::new();
         rollback_patch.insert("source_uuid".to_string(), PropertyValue::String(source_vertex.id.0.to_string()));
         rollback_patch.insert("target_uuid".to_string(), PropertyValue::String(target_vertex.id.0.to_string()));
         rollback_patch.insert("action".to_string(), PropertyValue::String("MANUAL_MERGE_EXECUTION".to_string()));
+        rollback_patch.insert("source_identity".to_string(), PropertyValue::String(source_label.clone()));
+        rollback_patch.insert("target_identity".to_string(), PropertyValue::String(target_label.clone()));
         
         gs.update_vertex_properties(merge_event_id, rollback_patch).await.ok();
-        // --- OPTION 1: MANUAL PROPERTY PATCH END ---
 
-        // COMPLIANCE FIX: Link Event to Patient using INTERNAL UUID to satisfy [2025-12-20]
+        // COMPLIANCE: Link Event to both Patients
         let edge_type_event = Identifier::new("LOGGED_FOR".to_string()).unwrap();
 
-        // Link Event -> Source Patient
         let compliance_edge_source = Edge::new(
             merge_event_id, 
             edge_type_event.clone(), 
@@ -1289,7 +1304,6 @@ impl MpiIdentityResolutionService {
         );
         gs.create_edge(compliance_edge_source).await.ok();
 
-        // Link Event -> Target Patient
         let compliance_edge_target = Edge::new(
             merge_event_id, 
             edge_type_event, 
@@ -1332,7 +1346,7 @@ impl MpiIdentityResolutionService {
                 source_vertex.id.0,
                 *old_gr,
                 "IDENTITY_LINK_ABANDONED",
-                "Moving patient to a different Golden Record due to merge",
+                &format!("Moving patient {} to new Golden Record due to merge into {}", source_label, target_label),
                 &acting_user
             ).await.ok();
         }
@@ -1341,13 +1355,14 @@ impl MpiIdentityResolutionService {
         source_set.insert(source_vertex.id.0);
         gs.delete_edges_touching_vertices(&source_set).await.ok();
 
-        // Create New Patient -> GoldenRecord edge
+        // Create new HAS_GOLDEN_RECORD edge
         let edge_type_gr = Identifier::new("HAS_GOLDEN_RECORD".to_string()).unwrap();
         let mut merge_edge = Edge::new(source_vertex.id, edge_type_gr, target_gr_uuid);
         
         merge_edge.properties.insert("policy".to_string(), PropertyValue::String(policy.clone()));
         merge_edge.properties.insert("merge_event_id".to_string(), PropertyValue::String(merge_event_id.to_string()));
         merge_edge.properties.insert("requested_by".to_string(), PropertyValue::String(acting_user.clone()));
+        merge_edge.properties.insert("source_identity".to_string(), PropertyValue::String(source_label.clone()));
 
         gs.create_edge(merge_edge).await
             .map_err(|e| format!("Failed to link source to target golden record: {}", e))?;
@@ -1371,6 +1386,7 @@ impl MpiIdentityResolutionService {
             if should_migrate {
                 new_edge.properties.insert("migrated_from_uuid".to_string(), PropertyValue::String(source_vertex.id.0.to_string()));
                 new_edge.properties.insert("migration_event_id".to_string(), PropertyValue::String(merge_event_id.to_string()));
+                new_edge.properties.insert("source_identity".to_string(), PropertyValue::String(source_label.clone()));
                 
                 if gs.create_edge(new_edge).await.is_ok() {
                     migration_count += 1;
@@ -1397,12 +1413,10 @@ impl MpiIdentityResolutionService {
         let p = &target_vertex.properties;
         let legacy_id = (target_vertex.id.0.as_u128() & 0x7FFFFFFF) as i32;
 
-        // Helper function to extract string from PropertyValue
         let get_str = |key: &str| -> Option<String> {
             p.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
         };
 
-        // Parse date_of_birth from PropertyValue
         let date_of_birth = p.get("date_of_birth")
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -1542,6 +1556,7 @@ impl MpiIdentityResolutionService {
 
                 let target_from_merged = source_patient.properties.get("merged_into_uuid")
                     .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty() && s.len() == 36) // Valid UUID check
                     .and_then(|s| Uuid::parse_str(s).ok())
                     .ok_or("Could not resolve target from merged_into_uuid on source patient")?;
 
@@ -1569,6 +1584,30 @@ impl MpiIdentityResolutionService {
             .map_err(|e| format!("Failed to log rollback event: {}", e))?;
 
         println!("[MPI] Created rollback audit event: {}", rollback_event_id);
+
+        // COMPLIANCE FIX: Link rollback event to both patients for lineage traceability
+        let edge_type_event = Identifier::new("LOGGED_FOR".to_string())
+            .map_err(|e| format!("Failed to create edge identifier: {}", e))?;
+
+        // Link Event -> Source Patient
+        let compliance_edge_source = Edge::new(
+            SerializableUuid(rollback_event_id), 
+            edge_type_event.clone(), 
+            SerializableUuid(source_uuid)
+        );
+        gs.create_edge(compliance_edge_source).await
+            .map_err(|e| format!("Failed to link rollback event to source: {}", e))?;
+
+        // Link Event -> Target Patient
+        let compliance_edge_target = Edge::new(
+            SerializableUuid(rollback_event_id), 
+            edge_type_event, 
+            SerializableUuid(target_uuid)
+        );
+        gs.create_edge(compliance_edge_target).await
+            .map_err(|e| format!("Failed to link rollback event to target: {}", e))?;
+
+        println!("[MPI] Linked rollback event to source {} and target {}", source_uuid, target_uuid);
 
         let all_edges = gs.get_all_edges().await.map_err(|e| e.to_string())?;
         let event_id_str = merge_event_uuid.to_string();
@@ -2046,7 +2085,7 @@ impl MpiIdentityResolutionService {
     }
 
     /// LINEAGE: Fetches filtered lineage report from the Graph of Events.
-    pub async fn get_lineage_data(
+     pub async fn get_lineage_data(
         &self,
         mpi_id: String,
         _id_type: Option<String>,
@@ -2078,8 +2117,8 @@ impl MpiIdentityResolutionService {
             IdentifierType::UUID | _ => {
                 let uuid = Uuid::parse_str(clean_id)
                     .map_err(|_| anyhow!("Invalid UUID format: {}", clean_id))?;
-                gs.storage.get_vertex(&uuid).await?
-                    .ok_or_else(|| anyhow!("No patient found with UUID: {}", clean_id))?
+                gs.get_vertex_by_uuid_cypher(&uuid).await
+                    .map_err(|e| anyhow!("No patient found with UUID {}: {}", clean_id, e))?
             }
         };
 
@@ -2089,15 +2128,34 @@ impl MpiIdentityResolutionService {
         let mut trace_path = vec![start_vertex.id.0];
         const MAX_MERGE_HOPS: u32 = 10;
 
-        while let Some(PropertyValue::String(target_uuid_str)) = canonical_vertex.properties.get("merged_into_uuid") {
+        let get_merged_target = |vertex: &Vertex| -> Option<Uuid> {
+            vertex.properties.get("merged_into_uuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+
+        while let Some(target_uuid) = get_merged_target(&canonical_vertex) {
             if merge_hops >= MAX_MERGE_HOPS {
                 return Err(anyhow!("Merge chain too deep or circular for patient {}", clean_id));
             }
-            
-            let target_uuid = Uuid::parse_str(target_uuid_str)?;
-            canonical_vertex = gs.storage.get_vertex(&target_uuid).await?
-                .ok_or_else(|| anyhow!("Merge target vertex {} not found", target_uuid_str))?;
-            
+
+            println!("[MPI] Following merge chain: {} -> {}", canonical_vertex.id.0, target_uuid);
+
+            let next_vertex_opt = gs.storage.get_vertex(&target_uuid).await
+                .map_err(|e| anyhow!("Storage error during direct lookup for {}: {}", target_uuid, e))?;
+
+            let next_vertex = if let Some(v) = next_vertex_opt {
+                println!("[MPI] Found merge target {} via direct storage lookup", target_uuid);
+                v
+            } else {
+                println!("[MPI] Direct lookup failed for {} — falling back to Cypher", target_uuid);
+                gs.get_vertex_by_uuid_cypher(&target_uuid).await
+                    .map_err(|e| anyhow!("Merge target {} not found even via Cypher: {}", target_uuid, e))?
+            };
+
+            canonical_vertex = next_vertex;
             merge_hops += 1;
             trace_path.push(canonical_vertex.id.0);
         }
@@ -2105,10 +2163,12 @@ impl MpiIdentityResolutionService {
         let target_uuid = canonical_vertex.id.0.to_string();
         let log_uid = canonical_vertex.id.0;
 
-        // 3. EXTRACT DEMOGRAPHICS & RED FLAGS (Strictly Stringify)
+        println!("[MPI] Canonical (survivor) vertex resolved: {} (after {} hops)", canonical_vertex.id.0, merge_hops);
+
+        // 3. EXTRACT DEMOGRAPHICS & RED FLAGS
         let first_name = canonical_vertex.properties.get("first_name")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string()); // Becomes Some(String) or None, mapping to Option<String>
+            .map(|s| s.to_string());
             
         let last_name = canonical_vertex.properties.get("last_name")
             .and_then(|v| v.as_str())
@@ -2124,16 +2184,21 @@ impl MpiIdentityResolutionService {
         );
 
         let mut filters = Vec::new();
-        if let Some(f) = &from { filters.push(format!("e.timestamp >= '{f}'")); }
-        if let Some(t) = &to { filters.push(format!("e.timestamp <= '{t}'")); }
+        if let Some(f) = &from { filters.push(format!("e.timestamp >= '{}'", f)); }
+        if let Some(t) = &to { filters.push(format!("e.timestamp <= '{}'", t)); }
         if !filters.is_empty() {
             query.push_str(&format!("WHERE {} ", filters.join(" AND ")));
         }
 
-        query.push_str("RETURN DISTINCT e.id as id, e.event_type as event_type, e.timestamp as timestamp, e.metadata as metadata, e.user_id as user_id, e.source_system as source_system, e.reason as reason, e.action as action ORDER BY e.timestamp ASC ");
+        query.push_str("RETURN DISTINCT e ORDER BY e.timestamp ASC ");
         if let Some(h) = head { query.push_str(&format!("LIMIT {} ", h)); }
 
-        let events = gs.execute_cypher_read(&query, serde_json::json!({})).await?;
+        println!("===> Lineage query: {}", query);
+
+        let events_results = gs.execute_cypher_read(&query, serde_json::json!({})).await
+            .map_err(|e| anyhow!("Lineage query failed: {}", e))?;
+
+        println!("===> Lineage query returned {} result wrappers", events_results.len());
 
         // 5. 2-LAYER LOGGING (Compliance 2025-12-20)
         gs.log_mpi_transaction(start_vertex.id.0, log_uid, "IDENTITY_LINEAGE_REVEAL", 
@@ -2147,27 +2212,63 @@ impl MpiIdentityResolutionService {
                 "hops": merge_hops
             })).await.ok();
 
-        // 6. MAP HISTORY CHAIN (Ensure NO nulls for required fields)
+        // 6. MAP HISTORY CHAIN
         let default_ts = chrono::Utc::now().to_rfc3339();
+        let empty_map = serde_json::Map::new(); // Long-lived fallback
 
-        let history_entries: Vec<serde_json::Value> = events.iter()
-            .map(|row| {
-                let event_type = row.get("event_type").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
-                
+        let structural_events = ["MERGE", "SPLIT", "MANUAL_MERGE_INITIATED", "MANUAL_MERGE_EXECUTION"];
+
+        let history_entries: Vec<serde_json::Value> = events_results.iter()
+            .flat_map(|result_wrapper| {
+                result_wrapper.get("results")
+                    .and_then(|r| r.as_array())
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|result_item| {
+                        result_item.get("vertices")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                    })
+            })
+            .map(|event_vertex| {
+                let props = event_vertex.get("properties")
+                    .and_then(|p| p.as_object())
+                    .unwrap_or(&empty_map);
+
+                let event_type = props.get("event_type")
+                    .or_else(|| props.get("action"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN");
+
+                let timestamp = props.get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&default_ts);
+
+                let user_id = props.get("user_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("system");
+
+                let source_system = props.get("source_system")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("MPI");
+
+                let reason = props.get("reason")
+                    .and_then(|v| v.as_str());
+
+                let metadata = props.get("metadata")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
                 serde_json::json!({
-                    // Required String in HistoryEntry - MUST NOT BE NULL
-                    "timestamp": row.get("timestamp").and_then(|v| v.as_str()).unwrap_or(&default_ts),
+                    "timestamp": timestamp,
                     "action_type": event_type,
-                    "user_id": row.get("user_id").and_then(|v| v.as_str()).unwrap_or("system"),
-                    "source_system": row.get("source_system").and_then(|v| v.as_str()).unwrap_or("MPI"),
-                    
-                    // Optional fields (can be null in JSON if Option<T> in Rust)
-                    "change_reason": row.get("reason").and_then(|v| v.as_str()),
-                    "involved_identity_alias": row.get("metadata").and_then(|m| m.get("input_id")).and_then(|v| v.as_str()),
-                    
-                    // Required collections
-                    "mutations": row.get("metadata").and_then(|m| m.get("mutations")).unwrap_or(&serde_json::json!([])),
-                    "is_structural": event_type == "MERGE" || event_type == "SPLIT"
+                    "user_id": user_id,
+                    "source_system": source_system,
+                    "change_reason": reason,
+                    "involved_identity_alias": metadata.as_ref().and_then(|m| m.get("input_id")).and_then(|v| v.as_str()),
+                    "mutations": metadata.as_ref().and_then(|m| m.get("mutations")).unwrap_or(&serde_json::json!([])),
+                    "is_structural": structural_events.contains(&event_type)
                 })
             })
             .collect();
@@ -2179,8 +2280,7 @@ impl MpiIdentityResolutionService {
             history_entries
         };
 
-        // 7. RETURN ENRICHED PAYLOAD (Matched to LineageReportTrace)
-        // Since fields in LineageReportTrace are Option<T>, we pass them through
+        // 7. RETURN ENRICHED PAYLOAD
         Ok(serde_json::json!({
             "first_name": first_name,
             "last_name": last_name,
@@ -2188,7 +2288,7 @@ impl MpiIdentityResolutionService {
             "history_chain": final_history
         }))
     }
-    
+
     /// SNAPSHOT: Temporal Reconstruction of Patient Identity State
     /// 
     /// Returns the state of a patient's identity as it existed at a specific point in time
@@ -2240,6 +2340,7 @@ impl MpiIdentityResolutionService {
 
         info!("[MPI] Snapshot reconstruction for identifier: '{}' as of {}", clean_id, iso_time);
         println!(" [MPI] get_snapshot_data - STEP 1");
+        
         // ═════════════════════════════════════════════════════════════════════════
         // PHASE 1: IDENTITY RESOLUTION
         // ═════════════════════════════════════════════════════════════════════════
@@ -2262,11 +2363,13 @@ impl MpiIdentityResolutionService {
             IdentifierType::UUID | _ => {
                 let uuid = Uuid::parse_str(clean_id)
                     .map_err(|_| anyhow!("Invalid UUID format: {}", clean_id))?;
-                gs.storage.get_vertex(&uuid).await?
-                    .ok_or_else(|| anyhow!("No patient record found with UUID: {}", clean_id))?
+                gs.get_vertex_by_uuid_cypher(&uuid).await
+                    .map_err(|e| anyhow!("No patient found with UUID {}: {}", clean_id, e))?
             }
         };
+        
         println!(" [MPI] get_snapshot_data - STEP 2");
+        
         // ═════════════════════════════════════════════════════════════════════════
         // PHASE 2: RESOLVE SIBLING/SURVIVOR (Merge Chain Traversal)
         // ═════════════════════════════════════════════════════════════════════════
@@ -2275,22 +2378,31 @@ impl MpiIdentityResolutionService {
         let mut trace_path = vec![start_vertex.id.0];
         const MAX_MERGE_HOPS: u32 = 10;
 
-        while let Some(PropertyValue::String(target_uuid_str)) = canonical_vertex.properties.get("merged_into_uuid") {
+        // FIXED: Helper function to check if a patient is merged
+        let is_merged = |vertex: &Vertex| -> Option<Uuid> {
+            vertex.properties.get("merged_into_uuid")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && s.len() == 36) // Valid UUID length
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+
+        while let Some(target_uuid) = is_merged(&canonical_vertex) {
             if merge_hops >= MAX_MERGE_HOPS {
                 error!("[MPI] Circular merge chain detected at {}", canonical_vertex.id.0);
                 return Err(anyhow!("Merge chain too deep or circular - possible data corruption"));
             }
             
-           println!("[MPI] Following merge chain hop {} to {}", merge_hops + 1, target_uuid_str);
-            let target_uuid = Uuid::parse_str(target_uuid_str.as_str())?;
+            println!("[MPI] Following merge chain hop {} to {}", merge_hops + 1, target_uuid);
             
-            canonical_vertex = gs.storage.get_vertex(&target_uuid).await?
-                .ok_or_else(|| anyhow!("Merge target vertex {} not found - broken chain", target_uuid_str))?;
+            canonical_vertex = gs.get_vertex_by_uuid_cypher(&target_uuid).await
+                .map_err(|e| anyhow!("Merge target vertex {} not found - broken chain: {}", target_uuid, e))?;
             
             merge_hops += 1;
             trace_path.push(canonical_vertex.id.0);
         }
+        
         println!(" [MPI] get_snapshot_data - STEP 3");
+        
         // CHECK FOR GOLDEN RECORD SIBLING if demographics missing
         if canonical_vertex.properties.get("first_name").is_none() {
             info!("[MPI] Demographics missing on vertex {}, checking for GoldenRecord sibling...", canonical_vertex.id.0);
@@ -2300,16 +2412,18 @@ impl MpiIdentityResolutionService {
             );
             
             if let Ok(results) = gs.execute_cypher_read(&sibling_query, json!({})).await {
-                if let Some(row) = results.get(0) {
-                    if let Some(v_data) = row.get("results")
-                        .and_then(|r| r.as_array())
-                        .and_then(|a| a.get(0))
-                        .and_then(|i| i.get("vertices"))
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.get(0)) {
-                            
-                        let g_uuid = Uuid::parse_str(v_data.get("id").and_then(|i| i.as_str()).unwrap_or(""))?;
-                        if let Ok(Some(g_vertex)) = gs.storage.get_vertex(&g_uuid).await {
+                if let Some(golden_vertex) = results.iter()
+                    .find_map(|result_wrapper| {
+                        result_wrapper.get("results")?.as_array()?
+                            .iter()
+                            .find_map(|result_item| {
+                                result_item.get("vertices")?.as_array()?
+                                    .first()
+                            })
+                    }) {
+                    let g_uuid_str = golden_vertex.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if let Ok(g_uuid) = Uuid::parse_str(g_uuid_str) {
+                        if let Ok(g_vertex) = gs.get_vertex_by_uuid_cypher(&g_uuid).await {
                             info!("[MPI] Resolved to Golden Sibling: {}", g_uuid);
                             canonical_vertex = g_vertex;
                             trace_path.push(canonical_vertex.id.0);
@@ -2318,6 +2432,7 @@ impl MpiIdentityResolutionService {
                 }
             }
         }
+        
         println!(" [MPI] get_snapshot_data - STEP 3.1");
         println!("=====> Canonical Vertex in MPI Snapshot {:?}", canonical_vertex);
         let target_uuid = canonical_vertex.id.0.to_string();
@@ -2345,6 +2460,7 @@ impl MpiIdentityResolutionService {
         let last_mod = get_prop_str("updated_at");
 
         println!(" [MPI] get_snapshot_data - STEP 4");
+        
         // ═════════════════════════════════════════════════════════════════════════
         // PHASE 4: TEMPORAL HISTORY QUERY & XREF EXTRACTION
         // ═════════════════════════════════════════════════════════════════════════
@@ -2394,6 +2510,7 @@ impl MpiIdentityResolutionService {
             .collect();
 
         println!(" [MPI] get_snapshot_data - STEP 5");
+        
         // ═════════════════════════════════════════════════════════════════════════
         // PHASE 5: COMPLIANCE LOGGING (2025-12-20)
         // ═════════════════════════════════════════════════════════════════════════
@@ -2415,7 +2532,9 @@ impl MpiIdentityResolutionService {
                 "timestamp": Utc::now().to_rfc3339()
             })
         ).await.ok();
+        
         println!(" [MPI] get_snapshot_data - STEP 6");
+        
         // ═════════════════════════════════════════════════════════════════════════
         // PHASE 6: PAYLOAD ASSEMBLY (Aligned to models/src/evolution.rs MpiSnapshot)
         // ═════════════════════════════════════════════════════════════════════════
@@ -3174,6 +3293,7 @@ impl MpiIdentityResolutionService {
     /// Ensures the given Patient vertex is linked to a Golden Record.
     /// If no link exists, it creates a new Golden Record (identity) and links the Patient to it.
     /// Returns the canonical ID of the associated Golden Record.
+    /// In a ROLLBACK scenario, this restores/verifies the original link instead of creating a new one.
     async fn ensure_golden_record_and_link(
         &self, 
         patient_vertex: &Vertex,
@@ -3182,71 +3302,86 @@ impl MpiIdentityResolutionService {
         let gs = &self.graph_service;
         let patient_uuid = patient_vertex.id.0;
         
-        // Use first_name/last_name for logging to match your search context
         let first_name = patient_vertex.properties.get("first_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
         let last_name = patient_vertex.properties.get("last_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
 
         info!("[MPI] Ensuring identity link for Patient: {} {} ({})", first_name, last_name, patient_uuid);
 
         // =========================================================================
-        // STEP 1: IDEMPOTENCY CHECK - Corrected Direction
-        // Direction: Patient (Outbound) -[:HAS_GOLDEN_RECORD]-> GoldenRecord (Inbound)
+        // STEP 1: IDEMPOTENCY & ROLLBACK RECOVERY
         // =========================================================================
         let all_edges = gs.get_all_edges().await
             .map_err(|e| format!("Failed to retrieve edges: {}", e))?;
         
-        // Check if THIS SPECIFIC patient vertex already has a link
         let existing_gr_edge = all_edges.iter().find(|e| {
-            e.outbound_id.0 == patient_uuid && // Fixed: Patient is the source
+            e.outbound_id.0 == patient_uuid && 
             e.edge_type.as_ref() == "HAS_GOLDEN_RECORD"
         });
         
         if let Some(edge) = existing_gr_edge {
-            let gr_uuid = edge.inbound_id.0; // Fixed: Golden Record is the target
+            let gr_uuid = edge.inbound_id.0;
             
-            let gr_vertex = gs.get_vertex(&gr_uuid).await
-                .ok_or_else(|| format!("Dangling edge! GR vertex {} missing", gr_uuid))?;
-            
-            // Use 'canonical_id' or 'id' depending on your GoldenRecord schema
-            let gr_id = gr_vertex.properties.get("id")
-                .and_then(|v| v.as_str())
-                .or_else(|| gr_vertex.properties.get("canonical_id").and_then(|v| v.as_str()))
-                .unwrap_or("UNKNOWN-GR-ID")
-                .to_string();
-            
-            info!("[MPI] Identity link verified: Patient {} -> GR {}", patient_uuid, gr_id);
-            
-            return Ok(gr_id);
+            if let Some(gr_vertex) = gs.get_vertex(&gr_uuid).await {
+                let gr_id = gr_vertex.properties.get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| gr_vertex.properties.get("canonical_id").and_then(|v| v.as_str()))
+                    .unwrap_or("UNKNOWN-GR-ID")
+                    .to_string();
+                
+                info!("[MPI] Identity verified for existing/rolled-back record: Patient {} -> GR {}", patient_uuid, gr_id);
+                return Ok(gr_id);
+            }
+            // If we are here, it's a dangling edge.
+            warn!("[MPI] Dangling edge found. Cleaning up edge {} for re-linking.", edge.id.0);
+            let _ = gs.delete_edge(Identifier::from(edge.id.0.to_string())).await;
         }
-        
-        // =========================================================================
-        // STEP 2: NO LINK FOUND - Create one for THIS patient
-        // =========================================================================
-        // We do NOT look up by MRN here because that would "collapse" two different
-        // patients into one Golden Record prematurely. Each distinct patient 
-        // vertex gets its own Golden Record until they are merged.
-        
-        let event_id = gs.persist_mpi_change_event(
-            patient_uuid,
-            Uuid::nil(),
-            "LINK_ABSENT_INITIATING_CREATION",
-            json!({ 
-                "first_name": first_name, 
-                "last_name": last_name, 
-                "requested_by": requested_by 
-            })
-        ).await.map_err(|e| format!("Audit log failed: {}", e))?;
 
+        // =========================================================================
+        // STEP 2: CHECK IF THIS IS A RECENTLY UNMERGED RECORD
+        // =========================================================================
+        // If the patient was just unmerged, they should already have a Golden Record 
+        // in the database even if the edge was lost.
+        let all_vertices = gs.get_all_vertices().await.map_err(|e| e.to_string())?;
+        let existing_gr = all_vertices.iter().find(|v| {
+            v.label.as_ref() == "GoldenRecord" && 
+            v.properties.get("patient_uuid").and_then(|p| p.as_str()) == Some(&patient_uuid.to_string())
+        });
+
+        if let Some(gr_vertex) = existing_gr {
+            let gr_uuid = gr_vertex.id.0;
+            info!("[MPI] Found orphaned GoldenRecord {} for patient {}. Restoring link.", gr_uuid, patient_uuid);
+            
+            // FIX: Use BTreeMap and correct ModelEdge fields
+            let mut properties = std::collections::BTreeMap::new();
+            
+            // Re-create the edge using the correct struct definition
+            let _ = gs.create_edge(Edge {
+                id: SerializableUuid(Uuid::new_v4()),
+                outbound_id: SerializableUuid(patient_uuid),
+                inbound_id: SerializableUuid(gr_uuid),
+                edge_type: Identifier::from("HAS_GOLDEN_RECORD"),
+                label: "HAS_GOLDEN_RECORD".to_string(), // Added label field
+                properties, // Now using BTreeMap
+                // Removed created_at/updated_at as they are not in ModelEdge
+            }).await;
+
+            return Ok(gr_vertex.properties.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string());
+        }
+
+        // =========================================================================
+        // STEP 3: NEW CREATION (Only if no previous identity exists)
+        // =========================================================================
+        info!("[MPI] No existing identity found. Proceeding with initial creation.");
+        
         let patient_model = Patient::from_vertex(patient_vertex)
             .ok_or_else(|| "Failed to convert Patient vertex to model.".to_string())?;
         
-        // Create a NEW Golden Record specifically for this patient
         let gr_uuid = self.create_golden_record_and_link(&patient_model, patient_uuid, requested_by).await
             .map_err(|e| format!("Failed to create Golden Record: {}", e))?;
         
-        // =========================================================================
-        // STEP 3: FINAL VERIFICATION
-        // =========================================================================
         let gr_vertex = gs.get_vertex(&gr_uuid).await
             .ok_or_else(|| format!("Verification failed: GoldenRecord {} not found", gr_uuid))?;
         
@@ -3256,20 +3391,6 @@ impl MpiIdentityResolutionService {
             .ok_or_else(|| "GoldenRecord missing id property".to_string())?
             .to_string();
 
-        // Log in the Graph of Changes (Golden Record Created/Linked)
-        gs.log_mpi_transaction(
-            patient_uuid,
-            gr_uuid,
-            "GOLDEN_RECORD_LINKED",
-            "Initial creation of master identity",
-            requested_by
-        ).await.ok();
-
-        let mut props = HashMap::new();
-        props.insert("status".to_string(), PropertyValue::String("COMPLETED".to_string()));
-        props.insert("final_golden_record_id".to_string(), PropertyValue::String(final_id.clone()));
-        let _ = gs.update_vertex_properties(event_id, props).await;
-        
         Ok(final_id)
     }
 

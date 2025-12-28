@@ -968,43 +968,39 @@ impl MPIHandlers {
         depth: Option<u32>,
         include_flags: Option<String>,
     ) -> Result<(), GraphError> {
+        let _id_type = id_type; // Silence unused warning
         let requested_by = "whoami";
 
         println!("\n=== MPI IDENTITY LINEAGE & TRANSACTION TRACE ===");
         
         let raw_report = self.mpi_service
-            .get_lineage_data(id, id_type, from, to, head, tail, depth, requested_by)
+            .get_lineage_data(id, _id_type, from, to, head, tail, depth, requested_by)
             .await
             .map_err(|e| GraphError::InternalError(format!("Trace failed: {}", e)))?;
 
-        // Deserialize into the struct updated in evolution.rs
         let report: LineageReportTrace = serde_json::from_value(raw_report)
             .map_err(|e| GraphError::InternalError(format!("Lineage data mapping failed: {}", e)))?;
 
-        println!("Canonical Identity: {} {}", 
-            report.first_name.as_deref().unwrap_or("Unknown"), 
-            report.last_name.as_deref().unwrap_or("Unknown")
-        );
+        let first_name = report.first_name.as_deref().unwrap_or("Unknown");
+        let last_name = report.last_name.as_deref().unwrap_or("Unknown");
+
+        println!("Canonical Identity: {} {}", first_name, last_name);
         
         println!("Trace Depth: {:<5} | Active Red Flags: {}", 
-            depth.unwrap_or(1), 
+            depth.unwrap_or(3), 
             report.red_flag_count.unwrap_or(0)
         );
         println!("{:=<100}", "");
 
-        // Comprehensive History Loop - handle Option<Vec<HistoryEntry>>
         if let Some(chain) = report.history_chain {
             for (i, entry) in chain.iter().enumerate() {
-                // Handle optional timestamp formatting
                 let ts_str = entry.timestamp
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| "0000-00-00 00:00:00".to_string());
 
-                println!("#{:02} [{}] TRANSACTION: {}", 
-                    i + 1, 
-                    ts_str, 
-                    entry.action_type.as_deref().unwrap_or("UNKNOWN_ACTION")
-                );
+                let action_type = entry.action_type.as_deref().unwrap_or("UNKNOWN");
+
+                println!("#{:03} [{}] TRANSACTION: {}", i + 1, ts_str, action_type);
 
                 println!("    Actor:  {:<15} | Source: {}", 
                     entry.user_id.as_deref().unwrap_or("system"), 
@@ -1015,28 +1011,44 @@ impl MPIHandlers {
                     println!("    Reason: {}", reason);
                 }
 
-                // Handle Option<Vec<FieldMutation>>
                 if let Some(muts) = &entry.mutations {
                     if !muts.is_empty() {
                         println!("    Changes:");
                         for mutation in muts {
-                            println!("      Δ {}: '{}' ➔ '{}'", 
-                                mutation.field.as_deref().unwrap_or("unknown_field"), 
-                                mutation.old_val.as_deref().unwrap_or("null"), 
-                                mutation.new_val.as_deref().unwrap_or("null")
-                            );
+                            let field = mutation.field.as_deref().unwrap_or("unknown_field");
+                            let old = mutation.old_val.as_deref().unwrap_or("null");
+                            let new = mutation.new_val.as_deref().unwrap_or("null");
+                            println!("      Δ {}: '{}' ➔ '{}'", field, old, new);
                         }
                     }
                 }
 
-                // Handle Option<bool>
                 if entry.is_structural.unwrap_or(false) {
-                    let action = entry.action_type.as_deref().unwrap_or("");
+                    // Build a String for the fallback name (owned)
+                    let fallback_name = format!("{} {}", first_name, last_name).trim().to_string();
+                    let fallback_name = if fallback_name == "Unknown Unknown" {
+                        "Unknown".to_string()
+                    } else {
+                        fallback_name
+                    };
+
+                    let identity_name = entry.involved_identity_alias
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty() && *s != "Unknown")
+                        .unwrap_or(&fallback_name);
+
+                    let verb = if action_type.contains("MERGE") || action_type.contains("MANUAL_MERGE") {
+                        "merged"
+                    } else if action_type.contains("SPLIT") {
+                        "split"
+                    } else {
+                        "extracted"
+                    };
+
                     println!("    ⚠️  STRUCTURAL EVOLUTION: Identity '{}' was {} into this record.", 
-                        entry.involved_identity_alias.as_deref().unwrap_or("Unknown"), 
-                        if action == "MERGE" { "absorbed" } else { "extracted" }
-                    );
+                        identity_name, verb);
                 }
+
                 println!("{:-<60}", "");
             }
         } else {
