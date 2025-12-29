@@ -1491,19 +1491,34 @@ pub fn evaluate_expression(
         },
 
         Expression::PropertyComparison { variable, property, operator, value } => {
-            // FIX: If property is empty, 'variable' is a direct alias (like 'dist')
-            if property.is_empty() {
+            // FIX: Handle IN operator explicitly
+            if operator.to_uppercase() == "IN" {
                 let left_val = context.variables.get(variable)
-                    .cloned()
                     .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
                 
-                // RHS value from JSON literal
-                let rhs_val = CypherValue::from_json(value.clone());
-                
-                // Direct scalar comparison
-                evaluate_comparison(&left_val, operator, &rhs_val)
+                let prop_val = match left_val {
+                    CypherValue::Vertex(v) => {
+                        if property.is_empty() {
+                            return Err(GraphError::QueryExecutionError("Empty property in IN comparison".into()));
+                        }
+                        v.properties.get(property)
+                            .map(property_value_to_cypher)
+                            .unwrap_or(CypherValue::Null)
+                    },
+                    _ => return Err(GraphError::QueryExecutionError(format!("Variable '{}' is not a vertex", variable))),
+                };
+
+                // RHS is a JSON Value from the parser — convert to CypherValue
+                let right_val = CypherValue::from_json(value.clone());
+
+                // Reuse BinaryOp::In logic
+                match right_val {
+                    CypherValue::List(list) => Ok(CypherValue::Bool(list.contains(&prop_val))),
+                    CypherValue::Null => Ok(CypherValue::Null),
+                    _ => Err(GraphError::QueryExecutionError("The 'IN' operator requires a list on the right side".into())),
+                }
             } else {
-                // Standard logic: find vertex/edge then look up property
+                // Original logic for =, <, etc.
                 evaluate_property_comparison(context, variable, property, operator, value)
             }
         },
@@ -3324,6 +3339,7 @@ fn parse_single_set_assignment(input: &str) -> IResult<&str, (String, String, Ex
 }
 
 /// Evaluates a comparison between two CypherValues using the given operator.
+/// Evaluates a comparison between two CypherValues using the given operator.
 pub fn evaluate_comparison(
     left: &CypherValue,
     operator: &str,
@@ -3335,8 +3351,25 @@ pub fn evaluate_comparison(
     }
 
     let op_upper = operator.to_uppercase();
+
+    // ✅ Handle IN operator first
+    if op_upper == "IN" {
+        match right {
+            CypherValue::List(list) => {
+                return Ok(CypherValue::Bool(list.contains(left)));
+            },
+            _ => {
+                return Err(GraphError::QueryExecutionError(
+                    "The 'IN' operator requires a list on the right side".to_string()
+                ));
+            }
+        }
+    }
+
+    // Existing comparison logic for =, <, >, etc.
     let result = match (&left, &right) {
-        // CRITICAL FIX: Mixed numeric promotion (Integer vs Float)
+        // ... (rest of your existing code unchanged) ...
+        // Keep all your existing type-specific matches here
         (CypherValue::Integer(a), CypherValue::Float(b)) => {
             let a_f = *a as f64;
             match op_upper.as_str() {
@@ -3345,7 +3378,10 @@ pub fn evaluate_comparison(
                 "<=" => a_f <= *b,
                 ">" => a_f > *b,
                 ">=" => a_f >= *b,
-                _ => a_f != *b,
+                "<>" | "!=" => a_f != *b,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Unsupported operator '{}' for numeric types", operator)
+                )),
             }
         },
         (CypherValue::Float(a), CypherValue::Integer(b)) => {
@@ -3356,10 +3392,12 @@ pub fn evaluate_comparison(
                 "<=" => *a <= b_f,
                 ">" => *a > b_f,
                 ">=" => *a >= b_f,
-                _ => *a != b_f,
+                "<>" | "!=" => *a != b_f,
+                _ => return Err(GraphError::QueryExecutionError(
+                    format!("Unsupported operator '{}' for numeric types", operator)
+                )),
             }
         },
-        // Integer vs Integer
         (CypherValue::Integer(a), CypherValue::Integer(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -3372,8 +3410,7 @@ pub fn evaluate_comparison(
                     format!("Unsupported operator '{}' for integers", operator)
                 )),
             }
-        }
-        // Float vs Float
+        },
         (CypherValue::Float(a), CypherValue::Float(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -3386,8 +3423,7 @@ pub fn evaluate_comparison(
                     format!("Unsupported operator '{}' for floats", operator)
                 )),
             }
-        }
-        // String vs String
+        },
         (CypherValue::String(a), CypherValue::String(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -3400,8 +3436,7 @@ pub fn evaluate_comparison(
                     format!("Unsupported operator '{}' for strings", operator)
                 )),
             }
-        }
-        // Boolean vs Boolean
+        },
         (CypherValue::Bool(a), CypherValue::Bool(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -3410,8 +3445,7 @@ pub fn evaluate_comparison(
                     format!("Operator '{}' not supported for booleans", operator)
                 )),
             }
-        }
-        // UUID vs String (common case: ID(p) = "uuid")
+        },
         (CypherValue::Uuid(a), CypherValue::String(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a.to_string() == *b,
@@ -3420,8 +3454,7 @@ pub fn evaluate_comparison(
                     format!("Operator '{}' not supported for UUID comparison", operator)
                 )),
             }
-        }
-        // String vs UUID (reverse)
+        },
         (CypherValue::String(a), CypherValue::Uuid(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => *a == b.to_string(),
@@ -3430,49 +3463,17 @@ pub fn evaluate_comparison(
                     format!("Operator '{}' not supported for UUID comparison", operator)
                 )),
             }
-        }
-        // Vertex vs anything — not comparable
+        },
         (CypherValue::Vertex(_), _) | (_, CypherValue::Vertex(_)) => {
             return Err(GraphError::QueryExecutionError(
                 "Cannot compare vertex values".to_string()
             ));
-        }
-        // Edge vs anything — not comparable
+        },
         (CypherValue::Edge(_), _) | (_, CypherValue::Edge(_)) => {
             return Err(GraphError::QueryExecutionError(
                 "Cannot compare edge values".to_string()
             ));
-        }
-        // Mixed numeric: promote integer to float (redundant but kept for structure)
-        (CypherValue::Integer(a), CypherValue::Float(b)) => {
-            let a_f = *a as f64;
-            match op_upper.as_str() {
-                "=" | "==" => a_f == *b,
-                "<>" | "!=" => a_f != *b,
-                "<" => a_f < *b,
-                "<=" => a_f <= *b,
-                ">" => a_f > *b,
-                ">=" => a_f >= *b,
-                _ => return Err(GraphError::QueryExecutionError(
-                    format!("Unsupported operator '{}' for numeric types", operator)
-                )),
-            }
-        }
-        (CypherValue::Float(a), CypherValue::Integer(b)) => {
-            let b_f = *b as f64;
-            match op_upper.as_str() {
-                "=" | "==" => *a == b_f,
-                "<>" | "!=" => *a != b_f,
-                "<" => *a < b_f,
-                "<=" => *a <= b_f,
-                ">" => *a > b_f,
-                ">=" => *a >= b_f,
-                _ => return Err(GraphError::QueryExecutionError(
-                    format!("Unsupported operator '{}' for numeric types", operator)
-                )),
-            }
-        }
-        // Default: incompatible types
+        },
         _ => {
             return Err(GraphError::QueryExecutionError(
                 format!("Cannot compare {:?} and {:?}", left, right)

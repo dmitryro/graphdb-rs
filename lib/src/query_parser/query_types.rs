@@ -1157,6 +1157,19 @@ impl Expression {
 
                 let right_hand_side = CypherValue::from_json(value.clone());
 
+                // ✅ Handle IN operator explicitly
+                if operator.to_uppercase() == "IN" {
+                    match right_hand_side {
+                        CypherValue::List(list) => {
+                            return Ok(CypherValue::Bool(list.contains(&left_hand_side)));
+                        },
+                        _ => {
+                            return Err(GraphError::QueryError("The 'IN' operator requires a list on the right side".into()));
+                        }
+                    }
+                }
+
+                // Handle other operators (=, <, >, etc.)
                 let result = match (left_hand_side, right_hand_side) {
                     (CypherValue::Integer(a), CypherValue::Integer(b)) => match operator.as_str() {
                         ">" => a > b, "<" => a < b, ">=" => a >= b, "<=" => a <= b, "=" | "==" => a == b, "!=" | "<>" => a != b,
@@ -1168,10 +1181,14 @@ impl Expression {
                     },
                     (CypherValue::Integer(a), CypherValue::Float(b)) => match operator.as_str() {
                         ">" => (a as f64) > b, "<" => (a as f64) < b, ">=" => (a as f64) >= b, "<=" => (a as f64) <= b,
+                        "=" | "==" => (a as f64) == b,
+                        "!=" | "<>" => (a as f64) != b,
                         _ => false,
                     },
                     (CypherValue::Float(a), CypherValue::Integer(b)) => match operator.as_str() {
                         ">" => a > (b as f64), "<" => a < (b as f64), ">=" => a >= (b as f64), "<=" => a <= (b as f64),
+                        "=" | "==" => a == (b as f64),
+                        "!=" | "<>" => a != (b as f64),
                         _ => false,
                     },
                     (CypherValue::String(a), CypherValue::String(b)) => match operator.as_str() {
@@ -1182,6 +1199,10 @@ impl Expression {
                         "=" | "==" => a == b, "!=" | "<>" => a != b,
                         _ => false,
                     },
+                    (CypherValue::Null, _) | (_, CypherValue::Null) => {
+                        // Null comparisons should return false for =, !=, etc.
+                        false
+                    },
                     (l, r) => {
                         if operator == "=" || operator == "==" { l == r }
                         else if operator == "!=" || operator == "<>" { l != r }
@@ -1190,6 +1211,7 @@ impl Expression {
                 };
                 Ok(CypherValue::Bool(result))
             }
+
 
             Expression::StartsWith { variable, property, prefix } => {
                 let target = ctx.variables.get(variable)
