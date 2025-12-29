@@ -1258,11 +1258,8 @@ pub fn evaluate_expression(
                     
                     if let CypherValue::Vertex(v) = val {
                         match v.properties.get(prop_name) {
-                            Some(prop_val) => {
-                                let json_value = serde_json::to_value(prop_val)
-                                    .map_err(|e| GraphError::QueryExecutionError(format!("Property conversion failed: {}", e)))?;
-                                Ok(CypherValue::from_json(json_value))
-                            },
+                            // FIX: Use your conversion helper directly to avoid double-quoting strings
+                            Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
                             None => Ok(CypherValue::Null), 
                         }
                     } else {
@@ -1293,6 +1290,43 @@ pub fn evaluate_expression(
                 _ => Ok(CypherValue::Bool(false)),
             }
         },
+        Expression::Predicate { name, variable, list, condition } => {
+            let list_val = evaluate_expression(list, context)?;
+            
+            if let CypherValue::List(elements) = list_val {
+                let name_upper = name.to_uppercase();
+                match name_upper.as_str() {
+                    "ANY" => {
+                        for item in elements {
+                            let mut nested_ctx = context.clone();
+                            nested_ctx.variables.insert(variable.clone(), item);
+                            
+                            // FIX: Explicitly match Bool(true)
+                            if let Ok(CypherValue::Bool(true)) = evaluate_expression(condition, &nested_ctx) {
+                                return Ok(CypherValue::Bool(true));
+                            }
+                        }
+                        Ok(CypherValue::Bool(false))
+                    },
+                    "ALL" => {
+                        for item in elements {
+                            let mut nested_ctx = context.clone();
+                            nested_ctx.variables.insert(variable.clone(), item);
+                            
+                            // FIX: If it's NOT true (either False or Null), ALL fails
+                            match evaluate_expression(condition, &nested_ctx)? {
+                                CypherValue::Bool(true) => continue,
+                                _ => return Ok(CypherValue::Bool(false)),
+                            }
+                        }
+                        Ok(CypherValue::Bool(true))
+                    },
+                    _ => Err(GraphError::QueryExecutionError(format!("Unsupported predicate: {name}")))
+                }
+            } else {
+                Ok(CypherValue::Null)
+            }
+        },
         Expression::FunctionCall { name, args } => {
             let func_name = name.to_uppercase();
             match func_name.as_str() {
@@ -1308,25 +1342,56 @@ pub fn evaluate_expression(
                     }
                 },
                 "TYPE" => {
-                    let val = args.get(0)
-                        .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 arg".into()))?
-                        .evaluate(context)?; // Ensure you use 'ctx' or 'context' consistently
+                    let arg = args.get(0)
+                        .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 arg".into()))?;
+                    // Use the native method you provided
+                    let val = arg.evaluate(context)?; 
                     match val {
-                        // Convert Identifier to String
                         CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
                         _ => Ok(CypherValue::Null),
                     }
                 },
                 "LABELS" => {
-                    let val = args.get(0)
-                        .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 arg".into()))?
-                        .evaluate(context)?;
+                    let arg = args.get(0)
+                        .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 arg".into()))?;
+                    let val = arg.evaluate(context)?;
                     match val {
-                        // Convert Identifier to String here as well
                         CypherValue::Vertex(v) => Ok(CypherValue::List(vec![
                             CypherValue::String(v.label.to_string())
                         ])),
                         _ => Ok(CypherValue::Null),
+                    }
+                },
+                "PROPERTIES" => {
+                    let val = evaluate_expression(
+                        args.get(0).ok_or_else(|| GraphError::QueryExecutionError("PROPERTIES() requires 1 arg".into()))?,
+                        context
+                    )?;
+                    match val {
+                        CypherValue::Vertex(v) => {
+                            let map = v.properties.iter()
+                                .map(|(k, v)| (k.clone(), property_value_to_cypher(v)))
+                                .collect();
+                            Ok(CypherValue::Map(map))
+                        },
+                        CypherValue::Edge(e) => {
+                            let map = e.properties.iter()
+                                .map(|(k, v)| (k.clone(), property_value_to_cypher(v)))
+                                .collect();
+                            Ok(CypherValue::Map(map))
+                        },
+                        _ => Ok(CypherValue::Null),
+                    }
+                },
+                "COUNT" => {
+                    let val = evaluate_expression(
+                        args.get(0).ok_or_else(|| GraphError::QueryExecutionError("COUNT() requires 1 arg".into()))?,
+                        context
+                    )?;
+                    match val {
+                        CypherValue::List(l) => Ok(CypherValue::Integer(l.len() as i64)),
+                        CypherValue::Null => Ok(CypherValue::Integer(0)),
+                        _ => Ok(CypherValue::Integer(1)),
                     }
                 },
                 "LEVENSHTEIN" => {
@@ -1393,9 +1458,16 @@ pub fn evaluate_expression(
                 // --- ADDED: IN Operator Support ---
                 BinaryOp::In => {
                     match right_val {
-                        CypherValue::List(list) => Ok(CypherValue::Bool(list.contains(&left_val))),
+                        CypherValue::List(list) => {
+                            // FIX: Ensure it returns false if left_val is Null
+                            if matches!(left_val, CypherValue::Null) {
+                                Ok(CypherValue::Bool(false))
+                            } else {
+                                Ok(CypherValue::Bool(list.contains(&left_val)))
+                            }
+                        },
                         CypherValue::Null => Ok(CypherValue::Null),
-                        _ => Err(GraphError::QueryExecutionError("The 'IN' operator requires a list on the right side".into())),
+                        _ => Err(GraphError::QueryExecutionError("The 'IN' operator requires a list".into())),
                     }
                 },
                 BinaryOp::Plus => add_values(left_val, right_val),
@@ -1887,6 +1959,99 @@ fn parse_set_list(input: &str) -> IResult<&str, HashMap<String, Value>> {
         all_props.extend(props);
     }
     Ok((input, all_props))
+}
+
+fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
+    // 1. Match "any" or "all"
+    let (input, name) = alt((
+        tag_no_case("any"), 
+        tag_no_case("all")
+    )).parse(input)?;
+    
+    let (input, _) = multispace0.parse(input)?;
+    let (input, _) = char('(').parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    
+    // 2. Match the variable (e.g., "label")
+    let (input, var_name) = parse_identifier(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    
+    // 3. Match "IN"
+    let (input, _) = tag_no_case("IN").parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    
+    // 4. Match the list expression — allow expression lists, function calls, literals, etc.
+    let (input, list_expr) = alt((
+        parse_expression_list, // ← Handles [p.first_name]
+        parse_function_call_full,
+        parse_list_literal,    // ← Handles ['Alice', 'Bob']
+        // Property access like p.names (MUST come before plain identifier)
+        map(
+            tuple((parse_identifier, char('.'), parse_identifier)),
+            |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+        ),
+        map(parse_identifier, |v| Expression::Variable(v.to_string())),
+    )).parse(input)?;
+    
+    let (input, _) = multispace1.parse(input)?;
+    
+    // 5. Match "WHERE"
+    let (input, _) = tag_no_case("WHERE").parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    
+    // 6. Parse the condition
+    let (input, condition_expr) = parse_condition_internal(input)?;
+    
+    let (input, _) = multispace0.parse(input)?;
+    let (input, _) = char(')').parse(input)?;
+    
+    Ok((input, Expression::Predicate {
+        name: name.to_uppercase(),
+        variable: var_name.to_string(),
+        list: Box::new(list_expr),
+        condition: Box::new(condition_expr),
+    }))
+}
+
+/// Helper to parse the inner condition (label IN [...]) without infinite recursion
+fn parse_condition_internal(input: &str) -> IResult<&str, Expression> {
+    let (input, left_var) = parse_identifier(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    
+    let (input, op_str) = alt((
+        tag_no_case("IN"),
+        tag("="),
+        tag("<>"),
+        tag("!="),
+    )).parse(input)?;
+    
+    let (input, _) = multispace1.parse(input)?;
+    
+    // Allow property access (e.g., p.names) on the RHS of IN
+    let (input, right) = alt((
+        parse_list_literal,
+        parse_function_call_full,
+        // Property access like p.names
+        map(
+            tuple((parse_identifier, char('.'), parse_identifier)),
+            |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+        ),
+        map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+        map(parse_identifier, |v| Expression::Variable(v.to_string())),
+    )).parse(input)?;
+
+    let op = match op_str.to_uppercase().as_str() {
+        "IN" => BinaryOp::In,
+        "=" => BinaryOp::Eq,
+        "<>" | "!=" => BinaryOp::Neq,
+        _ => BinaryOp::Eq,
+    };
+
+    Ok((input, Expression::Binary {
+        op,
+        left: Box::new(Expression::Variable(left_var.to_string())),
+        right: Box::new(right),
+    }))
 }
 
 fn parse_set_query(input: &str) -> IResult<&str, CypherQuery> {
@@ -3387,6 +3552,20 @@ fn evaluate_function_comparison(
     evaluate_comparison(&func_result, operator, &rhs_val)
 }
 
+fn parse_expression_list(input: &str) -> IResult<&str, Expression> {
+    delimited(
+        char('['),
+        map(
+            separated_list0(
+                delimited(multispace0, char(','), multispace0),
+                parse_expression, // Parse full expressions like p.first_name
+            ),
+            Expression::List,
+        ),
+        char(']')
+    ).parse(input)
+}
+
 /// Parse a list literal like ['A', 'B', 'C'] or [1, 2, 3]
 pub fn parse_list_literal(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_list_literal START, input length: {}, preview: '{}'", 
@@ -3463,18 +3642,27 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
         alt((
             // Parenthesized expressions for grouping
             delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
+            
+            // Predicate functions with special syntax (any, all, exists, etc.)
+            // Placed before standard function calls to capture specialized WHERE logic
+            parse_predicate_expression,
+
             // Function calls like labels(e) or id(e)
             parse_function_call_full,
+            
             // List literals like ['A', 'B']
             parse_list_literal, 
+            
             // Property access like e.source_uuid (Must come before plain identifier)
             map(
                 tuple((parse_identifier, char('.'), parse_identifier)),
                 |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
             ),
-            // Literal values (strings, numbers, etc.)
+            
+            // Literal values (strings, numbers, etc.) — MUST COME BEFORE IDENTIFIER
             map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-            // Plain variables/identifiers
+            
+            // Plain variables/identifiers (only if not a literal)
             map(parse_identifier, |v| Expression::Variable(v.to_string())),
         ))
     }.parse(input)?;
@@ -3499,12 +3687,17 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
                 // Parse the Right-Hand Side (RHS) atom
                 let rhs_result = alt((
                     delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
+                    
+                    // Allow predicates on the RHS (e.g., WHERE x = any(...))
+                    parse_predicate_expression,
+                    
                     parse_function_call_full,
                     parse_list_literal, 
                     map(
                         tuple((parse_identifier, char('.'), parse_identifier)),
                         |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
                     ),
+                    // Literal values — MUST COME BEFORE IDENTIFIER
                     map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
                     map(parse_identifier, |v| Expression::Variable(v.to_string())),
                 )).parse(after_op);
@@ -4500,6 +4693,7 @@ fn extract_alias_identifier(text: &str) -> &str {
 }
 
 /// Parse projection items from a string like "p, levenshtein(...) AS dist"
+/// Parse projection items from a string like "p, levenshtein(...) AS dist"
 fn parse_projection_items(input: &str) -> Result<Vec<QueryReturnItem>, String> {
     let mut items = Vec::new();
     let mut current = input;
@@ -4509,8 +4703,9 @@ fn parse_projection_items(input: &str) -> Result<Vec<QueryReturnItem>, String> {
         let mut in_string = false;
         let mut quote_char = ' ';
         let mut found_comma = None;
+        let mut found_clause = None;
         
-        // Find the next comma at depth 0 (outside parentheses/strings)
+        // Find the next comma OR clause keyword at depth 0
         for (i, c) in current.char_indices() {
             match c {
                 '"' | '\'' => {
@@ -4527,18 +4722,33 @@ fn parse_projection_items(input: &str) -> Result<Vec<QueryReturnItem>, String> {
                 ')' => {
                     if !in_string { depth -= 1; }
                 }
-                ',' => {
-                    if !in_string && depth == 0 {
-                        found_comma = Some(i);
-                        break;
-                    }
-                }
                 _ => {}
+            }
+
+            if !in_string && depth == 0 {
+                let remaining = &current[i..];
+                let upper = remaining.to_uppercase();
+                // Stop at clause keywords (not inside expressions)
+                if upper.starts_with(" WHERE") ||
+                   upper.starts_with(" RETURN") ||
+                   upper.starts_with(" ORDER") ||
+                   upper.starts_with(" SKIP") ||
+                   upper.starts_with(" LIMIT") {
+                    found_clause = Some(i);
+                    break;
+                }
+            }
+
+            if !in_string && depth == 0 && c == ',' {
+                found_comma = Some(i);
+                break;
             }
         }
         
-        // Split at comma or take everything
-        let (item_str, rest) = if let Some(pos) = found_comma {
+        // Split at clause boundary first, then comma
+        let (item_str, rest) = if let Some(pos) = found_clause {
+            (&current[..pos], &current[pos..]) // Stop BEFORE clause
+        } else if let Some(pos) = found_comma {
             (&current[..pos], &current[pos+1..])
         } else {
             (current, "")
@@ -4546,13 +4756,16 @@ fn parse_projection_items(input: &str) -> Result<Vec<QueryReturnItem>, String> {
         
         let trimmed_item = item_str.trim();
         if !trimmed_item.is_empty() {
-            // Parse "expression AS alias"
             let (expr, alias) = parse_single_projection_item(trimmed_item)?;
-            
             items.push(QueryReturnItem {
                 expression: expr.to_string(),
                 alias: alias.map(|s| s.to_string()),
             });
+        }
+
+        // If we stopped at a clause, don't continue parsing
+        if found_clause.is_some() {
+            break;
         }
         
         current = rest.trim();
@@ -4966,12 +5179,85 @@ pub fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
 pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_where_expression START");
     
-    // 1. Parenthesized expressions (Recursion handles complex OR/AND inside)
+    // 1. Try to parse as a predicate expression with enhanced list_expr support
+    if let Ok((remaining, expr)) = parse_predicate_expression(input) {
+        return Ok((remaining, expr));
+    }
+
+    // 1b. If that fails, try a manual predicate parse that allows property access in list_expr
+    if input.trim_start().to_uppercase().starts_with("ANY(") || input.trim_start().to_uppercase().starts_with("ALL(") {
+        let (input, name) = alt((tag_no_case("any"), tag_no_case("all"))).parse(input)?;
+        let (input, _) = multispace0.parse(input)?;
+        let (input, _) = char('(').parse(input)?;
+        let (input, _) = multispace0.parse(input)?;
+        
+        let (input, var_name) = parse_identifier(input)?;
+        let (input, _) = multispace1.parse(input)?;
+        let (input, _) = tag_no_case("IN").parse(input)?;
+        let (input, _) = multispace1.parse(input)?;
+        
+        // Enhanced list_expr parsing: allow property access
+        let (input, list_expr) = alt((
+            parse_function_call_full,
+            parse_list_literal,
+            map(
+                tuple((parse_identifier, char('.'), parse_identifier)),
+                |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+            ),
+            map(parse_identifier, |v| Expression::Variable(v.to_string())),
+        )).parse(input)?;
+        
+        let (input, _) = multispace1.parse(input)?;
+        let (input, _) = tag_no_case("WHERE").parse(input)?;
+        let (input, _) = multispace1.parse(input)?;
+        
+        // Enhanced condition parsing: allow property access on RHS
+        let (input, left_var) = parse_identifier(input)?;
+        let (input, _) = multispace1.parse(input)?;
+        let (input, op_str) = alt((tag_no_case("IN"), tag("="), tag("<>"), tag("!="))).parse(input)?;
+        let (input, _) = multispace1.parse(input)?;
+        
+        let (input, right) = alt((
+            parse_list_literal,
+            parse_function_call_full,
+            map(
+                tuple((parse_identifier, char('.'), parse_identifier)),
+                |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+            ),
+            map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+            map(parse_identifier, |v| Expression::Variable(v.to_string())),
+        )).parse(input)?;
+
+        let op = match op_str.to_uppercase().as_str() {
+            "IN" => BinaryOp::In,
+            "=" => BinaryOp::Eq,
+            "<>" | "!=" => BinaryOp::Neq,
+            _ => BinaryOp::Eq,
+        };
+
+        let condition = Expression::Binary {
+            op,
+            left: Box::new(Expression::Variable(left_var.to_string())),
+            right: Box::new(right),
+        };
+        
+        let (input, _) = multispace0.parse(input)?;
+        let (input, _) = char(')').parse(input)?;
+        
+        return Ok((input, Expression::Predicate {
+            name: name.to_uppercase(),
+            variable: var_name.to_string(),
+            list: Box::new(list_expr),
+            condition: Box::new(condition),
+        }));
+    }
+
+    // 2. Parenthesized expressions (Recursion handles complex OR/AND inside)
     if let Ok((remaining, expr)) = parse_parenthesized_expression(input) {
         return Ok((remaining, expr));
     }
 
-    // 2. Label Predicate check: (e:IdentityEvent)
+    // 3. Label Predicate check: (e:IdentityEvent)
     if let Ok((remaining, _)) = char::<&str, nom::error::Error<&str>>('(').parse(input) {
         if let Ok((remaining2, (var, _, label, _))) = tuple((
             parse_identifier,
@@ -4986,7 +5272,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 3. Function calls (e.g., labels(e) IN ['A', 'B'])
+    // 4. Function calls (e.g., labels(e) IN ['A', 'B'])
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
@@ -4998,7 +5284,6 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         } else if op_upper == "IN" {
             // Parse list literal for IN operator
             let (rem, list_expr) = parse_list_literal(remaining)?;
-            // Convert Expression::List to JSON Value for storage
             let json_val = match list_expr {
                 Expression::List(elements) => {
                     let mut arr = Vec::new();
@@ -5024,11 +5309,11 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }));
     }
     
-    // 4. Property access (e.g., n.name = "Alice" or e.source_uuid IN ['a', 'b'])
+    // 5. Property access (e.g., n.name = "Alice" or e.source_uuid IN ['a', 'b'])
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    // 5. Parse operator (handle multi-word operators first)
+    // 6. Parse operator (handle multi-word operators first)
     let (input, op_str) = {
         let trimmed = input.trim_start();
         let upper = trimmed.to_uppercase();
@@ -5054,14 +5339,12 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
 
     let (input, _) = multispace0.parse(input)?;
     
-    // 6. Parse value (handle IN operator with lists)
+    // 7. Parse value (handle IN operator with lists)
     let op_upper = op_str.to_uppercase();
     let (input, val) = if op_upper.contains("NULL") {
         (input, Value::Null)
     } else if op_upper == "IN" {
-        // Parse list literal for IN operator
         let (rem, list_expr) = parse_list_literal(input)?;
-        // Convert Expression::List to JSON Value
         let json_val = match list_expr {
             Expression::List(elements) => {
                 let mut arr = Vec::new();
@@ -5079,12 +5362,12 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         parse_value(input)?
     };
     
-    // 7. Split property path
+    // 8. Split property path
     let (var, prop) = full_path.split_once('.')
         .map(|(v, p)| (v.to_string(), p.to_string()))
         .unwrap_or_else(|| (full_path.clone(), String::new()));
 
-    // 8. Handle special operators
+    // 9. Handle special operators
     if op_str == "STARTS WITH" {
         if let Value::String(prefix) = val {
             return Ok((input, Expression::StartsWith {
@@ -5095,7 +5378,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 9. Standard property comparison
+    // 10. Standard property comparison
     Ok((input, Expression::PropertyComparison {
         variable: var,
         property: prop,
