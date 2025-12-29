@@ -986,7 +986,7 @@ fn parse_property_pattern(input: &str) -> IResult<&str, Vec<String>> {
 
 
 /// Updated to return a single String "var.prop"
-fn parse_property_access(input: &str) -> IResult<&str, String> {
+pub fn parse_property_access(input: &str) -> IResult<&str, String> {
     println!("===> parse_property_access START");
     let (input, _) = multispace0.parse(input)?;
     let (input, var) = parse_identifier.parse(input)?;
@@ -1491,35 +1491,45 @@ pub fn evaluate_expression(
         },
 
         Expression::PropertyComparison { variable, property, operator, value } => {
-            // FIX: Handle IN operator explicitly
+            // Handle IN operator
             if operator.to_uppercase() == "IN" {
                 let left_val = context.variables.get(variable)
                     .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
-                
-                let prop_val = match left_val {
-                    CypherValue::Vertex(v) => {
-                        if property.is_empty() {
-                            return Err(GraphError::QueryExecutionError("Empty property in IN comparison".into()));
-                        }
-                        v.properties.get(property)
-                            .map(property_value_to_cypher)
-                            .unwrap_or(CypherValue::Null)
-                    },
-                    _ => return Err(GraphError::QueryExecutionError(format!("Variable '{}' is not a vertex", variable))),
+
+                let prop_val = if property.is_empty() {
+                    // Scalar variable (e.g., 'dist' from WITH projection)
+                    left_val.clone()
+                } else {
+                    // Vertex property (e.g., 'p.first_name')
+                    match left_val {
+                        CypherValue::Vertex(v) => {
+                            v.properties.get(property)
+                                .map(property_value_to_cypher)
+                                .unwrap_or(CypherValue::Null)
+                        },
+                        _ => return Err(GraphError::QueryExecutionError(format!("Variable '{}' is not a vertex", variable))),
+                    }
                 };
 
-                // RHS is a JSON Value from the parser — convert to CypherValue
                 let right_val = CypherValue::from_json(value.clone());
 
-                // Reuse BinaryOp::In logic
                 match right_val {
                     CypherValue::List(list) => Ok(CypherValue::Bool(list.contains(&prop_val))),
                     CypherValue::Null => Ok(CypherValue::Null),
                     _ => Err(GraphError::QueryExecutionError("The 'IN' operator requires a list on the right side".into())),
                 }
             } else {
-                // Original logic for =, <, etc.
-                evaluate_property_comparison(context, variable, property, operator, value)
+                // Handle other operators (=, <, etc.)
+                if property.is_empty() {
+                    // Scalar comparison
+                    let left_val = context.variables.get(variable)
+                        .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
+                    let right_val = CypherValue::from_json(value.clone());
+                    evaluate_comparison(left_val, &operator, &right_val)
+                } else {
+                    // Vertex property comparison
+                    evaluate_property_comparison(context, variable, property, operator, value)
+                }
             }
         },
         
