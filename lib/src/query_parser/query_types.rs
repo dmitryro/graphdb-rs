@@ -79,6 +79,8 @@ pub enum CypherExpression {
         name: String,
         args: Vec<CypherExpression>,
     },
+    // Added to support [element1, element2, ...]
+    List(Vec<CypherExpression>),
 }
 
 /// Represents the possible outcomes of executing a Cypher query.
@@ -454,6 +456,7 @@ pub enum Expression {
     Literal(CypherValue),
     Property(PropertyAccess),
     Variable(String),
+    List(Vec<Expression>),
     Binary {
         op: BinaryOp,
         left: Box<Expression>,
@@ -901,7 +904,13 @@ impl Expression {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{name}' not found"))),
-            
+            Expression::List(elements) => {
+                let mut evaluated_elements = Vec::with_capacity(elements.len());
+                for expr in elements {
+                    evaluated_elements.push(expr.evaluate(ctx)?);
+                }
+                Ok(CypherValue::List(evaluated_elements))
+            },
             Expression::Property(access) => match access {
                 PropertyAccess::Vertex(var, prop) => {
                     if let Some(CypherValue::Vertex(v)) = ctx.variables.get(var) {
@@ -1483,7 +1492,11 @@ impl From<CypherExpression> for Expression {
                     args: args.into_iter().map(Expression::from).collect(),
                 }
             },
-
+            CypherExpression::List(elements) => {
+                Expression::List(
+                    elements.into_iter().map(Expression::from).collect()
+                )
+            },
             CypherExpression::BinaryOp { left, op, right } => {
                 let op_upper = op.to_uppercase();
                 match op_upper.as_str() {

@@ -1272,6 +1272,14 @@ pub fn evaluate_expression(
                 _ => Err(GraphError::QueryExecutionError("Unsupported property access".to_string())),
             }
         },
+        // --- ADDED: List Evaluation ---
+        Expression::List(elements) => {
+            let mut evaluated_elements = Vec::with_capacity(elements.len());
+            for element_expr in elements {
+                evaluated_elements.push(evaluate_expression(element_expr, context)?);
+            }
+            Ok(CypherValue::List(evaluated_elements))
+        },
         Expression::LabelPredicate { variable, label } => {
             let val = context.variables.get(variable)
                 .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
@@ -1381,6 +1389,14 @@ pub fn evaluate_expression(
                         _ => unreachable!(),
                     };
                     evaluate_comparison(&left_val, op_str, &right_val)
+                },
+                // --- ADDED: IN Operator Support ---
+                BinaryOp::In => {
+                    match right_val {
+                        CypherValue::List(list) => Ok(CypherValue::Bool(list.contains(&left_val))),
+                        CypherValue::Null => Ok(CypherValue::Null),
+                        _ => Err(GraphError::QueryExecutionError("The 'IN' operator requires a list on the right side".into())),
+                    }
                 },
                 BinaryOp::Plus => add_values(left_val, right_val),
                 BinaryOp::Minus => subtract_values(left_val, right_val),
@@ -2235,8 +2251,8 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     let (input_after_clause, clause_type_str) = preceded(
         multispace0,
         alt((
-            tag_no_case::<_, _, NomErrorType<&str>>("MERGE"),
             tag_no_case::<_, _, NomErrorType<&str>>("OPTIONAL MATCH"),
+            tag_no_case::<_, _, NomErrorType<&str>>("MERGE"),
             tag_no_case::<_, _, NomErrorType<&str>>("MATCH"),
         ))
     ).parse(input_current)?;
@@ -2257,7 +2273,19 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     if !is_merge {
         loop {
             let (input_ws, _) = multispace0.parse(input_current)?;
-            if is_at_keyword_boundary(input_ws) {
+            
+            // FIXED: Early termination check for WHERE and other keywords
+            let trimmed = input_ws.trim_start().to_uppercase();
+            if trimmed.starts_with("WHERE") || 
+               trimmed.starts_with("WITH") || 
+               trimmed.starts_with("RETURN") ||
+               trimmed.starts_with("ORDER") ||
+               trimmed.starts_with("LIMIT") ||
+               trimmed.starts_with("SET") ||
+               trimmed.starts_with("CREATE") ||
+               trimmed.starts_with("REMOVE") ||
+               trimmed.starts_with("DELETE") ||
+               trimmed.is_empty() {
                 input_current = input_ws;
                 break;
             }
@@ -2336,7 +2364,7 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         }
     }
 
-    // --- 6. FIXED CREATE CLAUSE PARSING ---
+    // --- 6. PARSE CREATE CLAUSE ---
     let (input_after_create, create_patterns_raw) = opt(preceded(
         tuple((multispace0, tag_no_case("CREATE"), multispace1)),
         separated_list1(
@@ -3068,39 +3096,44 @@ fn parse_pattern_with_stop_guard(input: &str) -> IResult<&str, Pattern> {
 
 /// Parse a value (string, number, boolean, null)
 /// FIX: Re-ordered to prioritize Strings and handle UUID hyphens
-fn parse_value(input: &str) -> IResult<&str, Value> {
+pub fn parse_value(input: &str) -> IResult<&str, serde_json::Value> {
     println!("===> parse_value START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
-
+    
     alt((
-        // 1. Quoted Strings - Always String
+        // String literals (single quotes)
         map(
-            alt((
-                delimited(char('"'), take_while(|c| c != '"'), char('"')),
-                delimited(char('\''), take_while(|c| c != '\''), char('\'')),
-            )),
-            |s: &str| Value::String(s.to_string())
+            delimited(char('\''), take_while(|c| c != '\''), char('\'')),
+            |s: &str| serde_json::Value::String(s.to_string())
         ),
-        
-        // 2. Booleans & Null
-        map(tag_no_case("true"), |_| Value::Bool(true)),
-        map(tag_no_case("false"), |_| Value::Bool(false)),
-        map(tag_no_case("null"), |_| Value::Null),
-
-        // 3. Numbers - Prioritize if it starts with a digit or minus followed by digit
+        // String literals (double quotes)
+        map(
+            delimited(char('"'), take_while(|c| c != '"'), char('"')),
+            |s: &str| serde_json::Value::String(s.to_string())
+        ),
+        // Booleans
+        map(tag_no_case("true"), |_| serde_json::Value::Bool(true)),
+        map(tag_no_case("false"), |_| serde_json::Value::Bool(false)),
+        // Null
+        map(tag_no_case("null"), |_| serde_json::Value::Null),
+        // Numbers (float with decimal point)
         map(
             recognize(tuple((
                 opt(char('-')),
                 digit1,
-                opt(tuple((char('.'), digit1)))
+                char('.'),
+                digit1
             ))),
-            |s: &str| {
-                if s.contains('.') {
-                    Value::Number(serde_json::Number::from_f64(s.parse().unwrap()).unwrap())
-                } else {
-                    Value::Number(serde_json::Number::from(s.parse::<i64>().unwrap()))
-                }
-            }
+            |s: &str| serde_json::Value::Number(
+                serde_json::Number::from_f64(s.parse().unwrap_or(0.0)).unwrap()
+            )
+        ),
+        // Numbers (integers)
+        map(
+            recognize(tuple((opt(char('-')), digit1))),
+            |s: &str| serde_json::Value::Number(
+                serde_json::Number::from(s.parse::<i64>().unwrap_or(0))
+            )
         ),
     )).parse(input)
 }
@@ -3354,6 +3387,72 @@ fn evaluate_function_comparison(
     evaluate_comparison(&func_result, operator, &rhs_val)
 }
 
+/// Parse a list literal like ['A', 'B', 'C'] or [1, 2, 3]
+pub fn parse_list_literal(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_list_literal START, input length: {}, preview: '{}'", 
+             input.len(), &input[..input.len().min(50)]);
+    
+    let (input, _) = char('[').parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Parse comma-separated list of literal values (NOT full expressions to avoid recursion)
+    let (input, elements) = separated_list0(
+        tuple((multispace0, char(','), multispace0)),
+        alt((
+            // String literals with single quotes (most common in Cypher)
+            map(
+                delimited(
+                    char('\''),
+                    take_while(|c| c != '\''),
+                    char('\'')
+                ),
+                |s: &str| Expression::Literal(CypherValue::String(s.to_string()))
+            ),
+            // String literals with double quotes
+            map(
+                delimited(
+                    char('"'),
+                    take_while(|c| c != '"'),
+                    char('"')
+                ),
+                |s: &str| Expression::Literal(CypherValue::String(s.to_string()))
+            ),
+            // Numbers (integers and floats)
+            map(
+                recognize(tuple((
+                    opt(char('-')),
+                    digit1,
+                    opt(tuple((char('.'), digit1)))
+                ))),
+                |s: &str| {
+                    if s.contains('.') {
+                        Expression::Literal(CypherValue::Float(s.parse().unwrap_or(0.0)))
+                    } else {
+                        Expression::Literal(CypherValue::Integer(s.parse().unwrap_or(0)))
+                    }
+                }
+            ),
+            // Booleans
+            map(
+                alt((tag_no_case("true"), tag_no_case("false"))),
+                |s: &str| Expression::Literal(CypherValue::Bool(s.to_lowercase() == "true"))
+            ),
+            // Null
+            map(
+                tag_no_case("null"),
+                |_| Expression::Literal(CypherValue::Null)
+            ),
+        ))
+    ).parse(input)?;
+    
+    let (input, _) = multispace0.parse(input)?;
+    let (input, _) = char(']').parse(input)?;
+    
+    println!("===> parse_list_literal END, found {} elements", elements.len());
+    
+    Ok((input, Expression::List(elements)))
+}
+
 /// Recursive descent parser for expressions (handles precedence and function calls)
 pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_expression START, input length: {}, preview: '{}'", 
@@ -3362,13 +3461,20 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     // --- STEP 1: Parse the "Atom" (The left-most part of an expression) ---
     let (mut current_input, mut left) = {
         alt((
+            // Parenthesized expressions for grouping
             delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
+            // Function calls like labels(e) or id(e)
             parse_function_call_full,
+            // List literals like ['A', 'B']
+            parse_list_literal, 
+            // Property access like e.source_uuid (Must come before plain identifier)
             map(
                 tuple((parse_identifier, char('.'), parse_identifier)),
                 |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
             ),
+            // Literal values (strings, numbers, etc.)
             map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+            // Plain variables/identifiers
             map(parse_identifier, |v| Expression::Variable(v.to_string())),
         ))
     }.parse(input)?;
@@ -3382,16 +3488,19 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
         current_input = after_null;
     }
 
-    // --- STEP 3: Handle Binary Operators (AND, OR, =, etc.) ---
+    // --- STEP 3: Handle Binary Operators (AND, OR, =, IN, etc.) ---
     loop {
+        // Parse the operator (delimited by optional whitespace)
         let op_result: IResult<&str, BinaryOp> = delimited(multispace0, parse_binary_op, multispace0)
             .parse(current_input);
 
         match op_result {
             Ok((after_op, op)) => {
+                // Parse the Right-Hand Side (RHS) atom
                 let rhs_result = alt((
                     delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
                     parse_function_call_full,
+                    parse_list_literal, 
                     map(
                         tuple((parse_identifier, char('.'), parse_identifier)),
                         |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
@@ -3413,6 +3522,7 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
                             after_rhs
                         };
 
+                        // Build the binary expression tree (left-associative)
                         left = Expression::Binary {
                             op,
                             left: Box::new(left),
@@ -3420,9 +3530,11 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
                         };
                         current_input = final_after_rhs;
                     }
+                    // If we found an operator but no valid RHS, we stop parsing the expression chain
                     Err(_) => break,
                 }
             }
+            // No more binary operators found, exit loop
             Err(_) => break,
         }
     }
@@ -3465,11 +3577,11 @@ fn parse_expression_string(input: &str) -> IResult<&str, String> {
 
 fn parse_binary_op(input: &str) -> IResult<&str, BinaryOp> {
     println!("===> parse_binary_op START");
-    
-    // Order: comparisons first (higher precedence), then math
     preceded(
         multispace0,
         alt((
+            // Add IN here (case-insensitive)
+            map(tag_no_case("IN"), |_| BinaryOp::In),
             // Comparisons
             map(tag("="), |_| BinaryOp::Eq),
             map(tag("<>"), |_| BinaryOp::Neq),
@@ -3478,7 +3590,6 @@ fn parse_binary_op(input: &str) -> IResult<&str, BinaryOp> {
             map(tag(">="), |_| BinaryOp::Gte),
             map(tag("<"), |_| BinaryOp::Lt),
             map(tag(">"), |_| BinaryOp::Gt),
-            
             // Math
             map(tag("+"), |_| BinaryOp::Plus),
             map(tag("-"), |_| BinaryOp::Minus),
@@ -4544,16 +4655,20 @@ fn extract_identifier_before_keyword<'a>(text: &'a str, keywords: &[&str]) -> &'
 /// Level 3: Comparisons (=, <>, etc.)
 fn parse_comparison_expression(input: &str) -> IResult<&str, CypherExpression> {
     println!("===> parse_comparison_expression START");
-    // We must use a parser that understands both "n" and "n.name"
     let (input, left) = parse_property_or_terminal(input)?;
     
     let (input, op_match) = opt(pair(
         delimited(
             multispace0, 
-            alt((tag("="), tag("!="), tag("<>"), tag("<="), tag(">="), tag("<"), tag(">"))), 
+            alt((
+                tag_no_case("IN"), // <--- Add IN here
+                tag("="), tag("!="), tag("<>"), 
+                tag("<="), tag(">="), tag("<"), tag(">")
+            )), 
             multispace0
         ),
-        parse_property_or_terminal
+        // Allow the right side to be a list literal OR a terminal
+        alt((parse_list_literal, parse_property_or_terminal))
     )).parse(input)?;
 
     if let Some((op, right)) = op_match {
@@ -4648,16 +4763,42 @@ fn cypher_value_to_value(cv: CypherValue) -> Value {
     }
 }
 
-fn parse_comparison_expr(input: &str) -> IResult<&str, Expression> {
+pub fn expression_to_json_value(expr: Expression) -> Result<serde_json::Value, String> {
+    match expr {
+        Expression::List(elements) => {
+            let mut arr = Vec::new();
+            for e in elements {
+                // Ensure the list only contains literals for the comparison
+                if let Expression::Literal(cv) = e {
+                    arr.push(cv.to_json());
+                } else {
+                    return Err("List in comparison must contain literals".to_string());
+                }
+            }
+            Ok(serde_json::Value::Array(arr))
+        },
+        Expression::Literal(cv) => Ok(cv.to_json()),
+        _ => Err("Expected literal or list for comparison value".to_string()),
+    }
+}
+
+pub fn parse_comparison_expr(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_comparison_expr START");
-    // Try function call first (e.g., ID(n) = "uuid")
+    
+    // --- BRANCH A: Function Calls (e.g., labels(e) IN [...]) ---
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
         let (remaining, _) = multispace0.parse(remaining)?;
         
-        let (remaining, val) = if op.to_uppercase().contains("NULL") {
-            (remaining, Value::Null)
+        let op_upper = op.to_uppercase();
+        let (remaining, val) = if op_upper.contains("NULL") {
+            (remaining, serde_json::Value::Null)
+        } else if op_upper == "IN" {
+            let (rem, list_expr) = parse_list_literal(remaining)?;
+            let json_val = expression_to_json_value(list_expr)
+                .map_err(|_| nom::Err::Failure(nom::error::Error::new(remaining, nom::error::ErrorKind::Tag)))?;
+            (rem, json_val)
         } else {
             parse_value(remaining)?
         };
@@ -4670,14 +4811,20 @@ fn parse_comparison_expr(input: &str) -> IResult<&str, Expression> {
         }));
     }
 
-    // Try property access (e.g., n.id = "123")
+    // --- BRANCH B: Property Access (e.g., e.source_uuid = "...") ---
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     let (input, op) = parse_comparison_op(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    let (input, val) = if op.to_uppercase().contains("NULL") {
-        (input, Value::Null)
+    let op_upper = op.to_uppercase();
+    let (input, val) = if op_upper.contains("NULL") {
+        (input, serde_json::Value::Null)
+    } else if op_upper == "IN" {
+        let (rem, list_expr) = parse_list_literal(input)?;
+        let json_val = expression_to_json_value(list_expr)
+            .map_err(|_| nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))?;
+        (rem, json_val)
     } else {
         parse_value(input)?
     };
@@ -4694,7 +4841,6 @@ fn parse_comparison_expr(input: &str) -> IResult<&str, Expression> {
     }))
 }
 
-// ✅ RENAME: parse_property_or_terminal → parse_property_or_terminal_expr
 // Return Expression, not CypherExpression
 pub fn parse_property_or_terminal(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_property_or_terminal START");
@@ -4796,25 +4942,26 @@ fn parse_function_call(input: &str) -> IResult<&str, (String, String)> {
 }
 
 /// Parse a comparison operator
-fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
+/// Parse comparison operators including IN
+pub fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
     println!("===> parse_comparison_op START");
     alt((
-        tag_no_case("STARTS WITH"), 
-        tag_no_case("ENDS WITH"),
-        tag_no_case("CONTAINS"),
+        tag_no_case("IN"),           // Must come before other operators
         tag_no_case("IS NOT NULL"),
         tag_no_case("IS NULL"),
-        tag("="),
-        tag("!="),
-        tag("<>"),
-        tag("<="),
+        tag_no_case("STARTS WITH"),
+        tag_no_case("ENDS WITH"),
+        tag_no_case("CONTAINS"),
         tag(">="),
-        tag("<"),
+        tag("<="),
+        tag("<>"),
+        tag("!="),
+        tag("="),
         tag(">"),
+        tag("<"),
     )).parse(input)
 }
 
-/// Parse a single WHERE condition/expression (property, function, or parenthesized)
 /// Parse a single WHERE condition/expression (label check, property, function, or parenthesized)
 pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_where_expression START");
@@ -4825,7 +4972,6 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     }
 
     // 2. Label Predicate check: (e:IdentityEvent)
-    // We check for the ':' which distinguishes a Label check from a Property access.
     if let Ok((remaining, _)) = char::<&str, nom::error::Error<&str>>('(').parse(input) {
         if let Ok((remaining2, (var, _, label, _))) = tuple((
             parse_identifier,
@@ -4834,21 +4980,38 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
             char(')'),
         )).parse(remaining) {
             return Ok((remaining2, Expression::LabelPredicate {
-                // Convert &str to owned String
                 variable: var.to_string(),
                 label: label.to_string(),
             }));
         }
     }
 
-    // 3. Function calls (e.g., ID(n) = "uuid")
+    // 3. Function calls (e.g., labels(e) IN ['A', 'B'])
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
         let (remaining, _) = multispace0.parse(remaining)?;
         
-        let (remaining, val) = if op.to_uppercase().contains("NULL") {
+        let op_upper = op.to_uppercase();
+        let (remaining, val) = if op_upper.contains("NULL") {
             (remaining, Value::Null)
+        } else if op_upper == "IN" {
+            // Parse list literal for IN operator
+            let (rem, list_expr) = parse_list_literal(remaining)?;
+            // Convert Expression::List to JSON Value for storage
+            let json_val = match list_expr {
+                Expression::List(elements) => {
+                    let mut arr = Vec::new();
+                    for elem in elements {
+                        if let Expression::Literal(cv) = elem {
+                            arr.push(cv.to_json());
+                        }
+                    }
+                    Value::Array(arr)
+                }
+                _ => Value::Null,
+            };
+            (rem, json_val)
         } else {
             parse_value(remaining)?
         };
@@ -4861,7 +5024,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }));
     }
     
-    // 4. Property access (e.g., n.name = "Alice")
+    // 4. Property access (e.g., n.name = "Alice" or e.source_uuid IN ['a', 'b'])
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     
@@ -4891,9 +5054,27 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
 
     let (input, _) = multispace0.parse(input)?;
     
-    // 6. Parse value
-    let (input, val) = if op_str.to_uppercase().contains("NULL") {
+    // 6. Parse value (handle IN operator with lists)
+    let op_upper = op_str.to_uppercase();
+    let (input, val) = if op_upper.contains("NULL") {
         (input, Value::Null)
+    } else if op_upper == "IN" {
+        // Parse list literal for IN operator
+        let (rem, list_expr) = parse_list_literal(input)?;
+        // Convert Expression::List to JSON Value
+        let json_val = match list_expr {
+            Expression::List(elements) => {
+                let mut arr = Vec::new();
+                for elem in elements {
+                    if let Expression::Literal(cv) = elem {
+                        arr.push(cv.to_json());
+                    }
+                }
+                Value::Array(arr)
+            }
+            _ => Value::Null,
+        };
+        (rem, json_val)
     } else {
         parse_value(input)?
     };
@@ -4922,6 +5103,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         value: val,
     }))
 }
+
 /// The WHERE clause parser itself - updated for legacy compatibility with AND support
 fn parse_where_clause_content(input: &str) -> IResult<&str, String> {
     println!("===> parse_where_clause_content START");
@@ -5145,12 +5327,15 @@ fn parse_create_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
     .parse(input)
 }
 
-fn parse_where_clause(input: &str) -> IResult<&str, String> {
+fn parse_where_clause(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_where_clause START"); 
-    let (input, _) = tag("WHERE").parse(input)?;
+    let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
-    let (input, condition) = take_while1(|c| c != '\n' && c != '\r' && c != 'R').parse(input)?;
-    Ok((input, condition.to_string()))
+    
+    // Instead of take_while1, use the expression parser
+    let (input, expression) = parse_expression(input)?;
+    
+    Ok((input, expression))
 }
 
 fn parse_return_clause_as_struct(input: &str) -> IResult<&str, ReturnClause> {
