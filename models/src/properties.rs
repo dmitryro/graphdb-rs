@@ -1,12 +1,14 @@
 // models/src/properties.rs
-use crate::{edges::Edge, identifiers::Identifier, json::Json, vertices::Vertex};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use bincode::{Encode, Decode};
+use bincode::{Encode, Decode };
+use bincode::error::{EncodeError, DecodeError};
 use std::hash::{Hash, Hasher};
 use std::cmp::Ordering;
 use serde_json::{json, Value };
+use crate::{edges::Edge, identifiers::Identifier, json::Json, vertices::Vertex};
 
 /// --- NEW STRUCT FOR F64 WRAPPER ---
 /// f64 does not implement `Eq` or `Hash` directly.
@@ -14,6 +16,59 @@ use serde_json::{json, Value };
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Encode, Decode)]
 #[serde(transparent)]
 pub struct SerializableFloat(pub f64);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SerializableDateTime(pub DateTime<Utc>);
+
+impl bincode::Encode for SerializableDateTime {
+    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        self.0.timestamp().encode(encoder)?;
+        (self.0.timestamp_nanos() % 1_000_000_000i64).encode(encoder)?;
+        Ok(())
+    }
+}
+
+impl<C> bincode::Decode<C> for SerializableDateTime {
+    fn decode<D>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::Decoder<Context = C>,
+    {
+        let secs: i64 = bincode::Decode::decode(decoder)?;
+        let nanos: i64 = bincode::Decode::decode(decoder)?;
+        let nanos_u32 = (nanos as u32).min(999_999_999);
+
+        let naive = NaiveDateTime::from_timestamp_opt(secs, nanos_u32)
+            .ok_or_else(|| bincode::error::DecodeError::OtherString("Invalid timestamp".to_string()))?;
+
+        let dt = DateTime::from_utc(naive, Utc);
+        Ok(SerializableDateTime(dt))
+    }
+}
+
+impl<'de, C> bincode::BorrowDecode<'de, C> for SerializableDateTime {
+    fn borrow_decode<D>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError>
+    where
+        D: bincode::de::BorrowDecoder<'de, Context = C>,
+    {
+        Self::decode(decoder)
+    }
+}
+
+// Assuming SerializableDateTime is defined as: 
+// pub struct SerializableDateTime(pub DateTime<Utc>);
+
+impl From<DateTime<Utc>> for SerializableDateTime {
+    fn from(dt: DateTime<Utc>) -> Self {
+        SerializableDateTime(dt)
+    }
+}
+
+// Optional but recommended: Implement the reverse for easy extraction
+impl From<SerializableDateTime> for DateTime<Utc> {
+    fn from(sdt: SerializableDateTime) -> Self {
+        sdt.0
+    }
+}
 
 impl PartialEq for SerializableFloat {
     fn eq(&self, other: &Self) -> bool {
@@ -144,6 +199,10 @@ pub enum PropertyValue {
     Integer(i64),
     I32(i32),
     Float(SerializableFloat),
+   /// DateTime is placed above String so ISO-8601 strings 
+    /// are correctly typed for temporal graph queries.
+    /// Use the wrapper to satisfy Encode/Decode trait bounds for Sled storage
+    DateTime(SerializableDateTime),
     String(String),
     Uuid(crate::identifiers::SerializableUuid),
     Byte(u8),
@@ -186,35 +245,39 @@ impl PropertyValue {
         use serde_json::Value;
         match self {
             PropertyValue::Null => Value::Null,
-            
+
             PropertyValue::Boolean(b) => Value::Bool(*b),
             PropertyValue::Integer(i) => Value::Number((*i).into()),
             PropertyValue::I32(i) => Value::Number((*i).into()),
-            
-            // Fix: Since f.0 is a primitive f64, use it directly.
-            PropertyValue::Float(f) => Value::from(f.0), 
-            
+
+            PropertyValue::Float(f) => Value::from(f.0),
+
             PropertyValue::String(s) => Value::String(s.clone()),
             PropertyValue::Byte(b) => Value::Number((*b as i64).into()),
             PropertyValue::Uuid(u) => Value::String(u.0.to_string()),
-            
+
+            PropertyValue::DateTime(dt) => Value::String(dt.0.to_rfc3339()),
+
             PropertyValue::List(items) => {
-                let vec = items.iter()
+                let vec = items
+                    .iter()
                     .map(|item| item.to_serde_value())
                     .collect::<Vec<Value>>();
                 Value::Array(vec)
-            },
+            }
 
             PropertyValue::Map(m) => {
-                let map = m.0.iter()
+                let map = m
+                    .0
+                    .iter()
                     .map(|(k, v)| (k.to_string(), v.to_serde_value()))
                     .collect::<serde_json::Map<String, Value>>();
                 Value::Object(map)
-            },
-            
+            }
+
             PropertyValue::Vertex(v) => {
                 serde_json::to_value(&v.0).unwrap_or(Value::Null)
-            },
+            }
         }
     }
 }

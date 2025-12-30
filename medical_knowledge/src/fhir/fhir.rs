@@ -507,7 +507,10 @@ impl FhirService {
             .unwrap_or(AdministrativeGender::Unknown); // If None or invalid, default to Unknown
 
         // 4. Birth date (only supply if we parsed successfully)
-        let birth_date_str = patient.date_of_birth.format("%Y-%m-%d").to_string();
+        let birth_date_str = patient.date_of_birth
+                                .as_ref() // Get &SerializableDateTime
+                                .map(|dt| dt.0.format("%Y-%m-%d").to_string()) // Access inner .0 and format
+                                .unwrap_or_default(); // Return "" if None
         // Assuming Date is a FHIR date type that implements FromStr
         let birth_date = birth_date_str.parse::<Date>().ok(); 
 
