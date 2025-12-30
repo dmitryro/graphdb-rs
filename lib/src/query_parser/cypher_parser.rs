@@ -1277,6 +1277,42 @@ pub fn evaluate_expression(
             }
             Ok(CypherValue::List(evaluated_elements))
         },
+        Expression::DynamicPropertyAccess { variable, property_expr } => {
+            // Get the target object (vertex/edge)
+            let target_val = context.variables.get(variable)
+                .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
+            
+            // Evaluate the property name expression
+            let prop_name_val = evaluate_expression(property_expr, context)?;
+            let prop_name = match prop_name_val {
+                CypherValue::String(s) => s,
+                CypherValue::Null => return Ok(CypherValue::Null),
+                _ => return Err(GraphError::QueryExecutionError("Property name must be a string".into())),
+            };
+            
+            // Extract property value based on target type
+            match target_val {
+                CypherValue::Vertex(v) => {
+                    match v.properties.get(&prop_name) {
+                        Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                        None => Ok(CypherValue::Null),
+                    }
+                },
+                CypherValue::Edge(e) => {
+                    match e.properties.get(&prop_name) {
+                        Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                        None => Ok(CypherValue::Null),
+                    }
+                },
+                CypherValue::Map(map) => {
+                    match map.get(&prop_name) {
+                        Some(val) => Ok(val.clone()),
+                        None => Ok(CypherValue::Null),
+                    }
+                },
+                _ => Err(GraphError::QueryExecutionError(format!("Cannot access properties on variable '{}'", variable))),
+            }
+        },
         Expression::LabelPredicate { variable, label } => {
             let val = context.variables.get(variable)
                 .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
@@ -1381,6 +1417,33 @@ pub fn evaluate_expression(
                             Ok(CypherValue::Map(map))
                         },
                         _ => Ok(CypherValue::Null),
+                    }
+                },
+                "KEYS" => {
+                    let val = evaluate_expression(
+                        args.get(0).ok_or_else(|| GraphError::QueryExecutionError("KEYS() requires 1 arg".into()))?,
+                        context
+                    )?;
+                    match val {
+                        CypherValue::Vertex(v) => {
+                            let key_list: Vec<CypherValue> = v.properties.keys()
+                                .map(|k| CypherValue::String(k.clone()))
+                                .collect();
+                            Ok(CypherValue::List(key_list))
+                        },
+                        CypherValue::Edge(e) => {
+                            let key_list: Vec<CypherValue> = e.properties.keys()
+                                .map(|k| CypherValue::String(k.clone()))
+                                .collect();
+                            Ok(CypherValue::List(key_list))
+                        },
+                        CypherValue::Map(map) => {
+                            let key_list: Vec<CypherValue> = map.keys()
+                                .map(|k| CypherValue::String(k.clone()))
+                                .collect();
+                            Ok(CypherValue::List(key_list))
+                        },
+                        _ => Ok(CypherValue::List(vec![])),
                     }
                 },
                 "COUNT" => {
@@ -1577,6 +1640,35 @@ pub fn evaluate_expression(
                 UnaryOp::IsNotNull => Ok(CypherValue::Bool(!matches!(val, CypherValue::Null))),
                 UnaryOp::IsNull => Ok(CypherValue::Bool(matches!(val, CypherValue::Null))),
                 _ => Err(GraphError::QueryExecutionError("Unary op not implemented".into())),
+            }
+        },
+        Expression::ArrayIndex { expr, index } => {
+            let array_val = evaluate_expression(expr, context)?;
+            let index_val = evaluate_expression(index, context)?;
+            
+            let idx = match index_val {
+                CypherValue::Integer(i) => i as usize,
+                CypherValue::Float(f) => f as usize,
+                CypherValue::String(s) => {
+                    // Try to parse string as integer
+                    if let Ok(i) = s.parse::<i64>() {
+                        i as usize
+                    } else {
+                        return Err(GraphError::QueryExecutionError("Array index must be a number".into()));
+                    }
+                }
+                _ => return Err(GraphError::QueryExecutionError("Array index must be a number".into())),
+            };
+            
+            match array_val {
+                CypherValue::List(items) => {
+                    if idx < items.len() {
+                        Ok(items[idx].clone())
+                    } else {
+                        Ok(CypherValue::Null)
+                    }
+                }
+                _ => Err(GraphError::QueryExecutionError("Cannot index non-list value".into())),
             }
         },
         _ => Err(GraphError::QueryExecutionError("Expression type not implemented".to_string())),
@@ -2040,6 +2132,53 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
 
 /// Helper to parse the inner condition (label IN [...]) without infinite recursion
 fn parse_condition_internal(input: &str) -> IResult<&str, Expression> {
+    // Try dynamic property access first: n[prop]
+    let dynamic_result = map(
+        tuple((parse_identifier, char('['), parse_expression, char(']'))),
+        |(var, _, prop_expr, _)| Expression::DynamicPropertyAccess {
+            variable: var.to_string(),
+            property_expr: Box::new(prop_expr),
+        }
+    ).parse(input);
+
+    if let Ok((remaining, dynamic_expr)) = dynamic_result {
+        // If we successfully parsed dynamic property access, continue with operator
+        let (remaining, _) = multispace1.parse(remaining)?;
+        let (remaining, op_str) = alt((
+            tag_no_case("IN"),
+            tag("="),
+            tag("<>"),
+            tag("!="),
+        )).parse(remaining)?;
+        let (remaining, _) = multispace1.parse(remaining)?;
+        
+        let (remaining, right) = alt((
+            parse_list_literal,
+            parse_function_call_full,
+            // Property access like p.names
+            map(
+                tuple((parse_identifier, char('.'), parse_identifier)),
+                |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+            ),
+            map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+            map(parse_identifier, |v| Expression::Variable(v.to_string())),
+        )).parse(remaining)?;
+
+        let op = match op_str.to_uppercase().as_str() {
+            "IN" => BinaryOp::In,
+            "=" => BinaryOp::Eq,
+            "<>" | "!=" => BinaryOp::Neq,
+            _ => BinaryOp::Eq,
+        };
+
+        return Ok((remaining, Expression::Binary {
+            op,
+            left: Box::new(dynamic_expr),
+            right: Box::new(right),
+        }));
+    }
+
+    // Fallback to original parsing (variable-based conditions)
     let (input, left_var) = parse_identifier(input)?;
     let (input, _) = multispace1.parse(input)?;
     
@@ -2189,20 +2328,42 @@ fn parse_signed_number_value(input: &str) -> IResult<&str, Value> {
 }
 
 fn parse_simple_query_type(input: &str) -> IResult<&str, CypherQuery> {
-    println!("===> parse_simple_query_type START, input length: {}, preview: '{}'", 
-             input.len(), &input[..input.len().min(100)]);
+    println!("===> parse_simple_query_type START");
     
+    // ONLY add parse_sequential_statements HERE (as first option)
     alt((
-        // parse_match_remove_relationship,
-        parse_merge_statement, // <--- ADDED MERGE HERE
+        parse_sequential_statements,  // ← handles UNION
+        parse_merge_statement,
         parse_match_detach_delete, 
         parse_create_statement, 
         parse_delete_edges_simple,
-        
-        // *** FIX: Added MatchSet, prioritized over MatchCreate ***
-        //parse_match_set_relationship, // <--- NEW FIX: Handle MATCH...SET
-        //parse_match_create_relationship, 
-        parse_unwind_clause, // ← ADD THIS LINE (new parser for UNWIND)
+        parse_unwind_clause,
+        full_statement_parser,
+        parse_detach_delete,
+        parse_delete_edges,
+        parse_create_index,
+        parse_create_edge_between_existing,
+        parse_create_complex_pattern,
+        parse_create_nodes,
+        parse_create_node,
+        parse_create_edge,
+        parse_match_multiple_nodes, 
+        parse_set_query,
+        parse_set_node,
+        parse_delete_node,
+        parse_kv_operations,
+    ))
+    .parse(input)
+}
+
+/// Parses a single clause WITHOUT recursion (used by parse_sequential_statements)
+fn parse_clause_non_recursive(input: &str) -> IResult<&str, CypherQuery> {
+    alt((
+        parse_merge_statement,
+        parse_match_detach_delete, 
+        parse_create_statement, 
+        parse_delete_edges_simple,
+        parse_unwind_clause,
         full_statement_parser,
         parse_detach_delete,
         parse_delete_edges,
@@ -2228,21 +2389,71 @@ fn parse_simple_query_type(input: &str) -> IResult<&str, CypherQuery> {
 /// Parses a sequence of independent, simple statements concatenated without semicolons.
 /// This is the key fix for inputs like "CREATE (a) CREATE (b) MATCH (c) RETURN c".
 fn parse_sequential_statements(input: &str) -> IResult<&str, CypherQuery> {
-    println!("===> parse_sequential_statements START, input length: {}, preview: '{}'", 
-             input.len(), &input[..input.len().min(100)]);
+    println!("===> parse_sequential_statements START");
     
-    let (input, statements) = many1(preceded(
-        multispace0,
-        parse_simple_query_type,
-    )).parse(input)?;
+    let mut remaining = input;
+    let mut clauses = Vec::new();
     
-    let result = if statements.len() == 1 {
-        statements.into_iter().next().unwrap()
+    loop {
+        let (rest, _) = multispace0(remaining)?;
+        if rest.is_empty() {
+            break;
+        }
+        
+        // Check for UNION
+        if rest.trim_start().to_uppercase().starts_with("UNION") {
+            // Parse UNION keyword
+            let (after_union, _) = tag_no_case::<_, _, nom::error::Error<&str>>("UNION")(rest)?;
+            let (after_union, _) = multispace1(after_union)?;
+            
+            // Check for ALL with explicit error type
+            let (after_union, is_all) = if let Ok((i, _)) = tag_no_case::<_, _, nom::error::Error<&str>>("ALL")(after_union) {
+                let (i, _) = multispace1(i)?;
+                (i, true)
+            } else {
+                (after_union, false)
+            };
+            
+            // Parse RHS clause (non-recursive)
+            let (final_remaining, rhs_clause) = parse_clause_non_recursive(after_union)?;
+            
+            // Construct UNION
+            let left_query = if clauses.len() == 1 {
+                Box::new(clauses.pop().unwrap())
+            } else if clauses.is_empty() {
+                // Should not happen, but fallback
+                return parse_clause_non_recursive(input);
+            } else {
+                // Wrap multiple left clauses in Chain
+                Box::new(CypherQuery::Chain(clauses.drain(..).collect()))
+            };
+            
+            return Ok((final_remaining, CypherQuery::Union(
+                left_query,
+                is_all,
+                Box::new(rhs_clause)
+            )));
+        }
+        
+        // Parse next clause (non-recursive)
+        match parse_clause_non_recursive(rest) {
+            Ok((new_remaining, next_clause)) => {
+                clauses.push(next_clause);
+                remaining = new_remaining;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    // Handle non-UNION results
+    if clauses.len() == 1 {
+        Ok((remaining, clauses.into_iter().next().unwrap()))
+    } else if clauses.is_empty() {
+        // Fallback to single clause parsing (should not happen)
+        parse_clause_non_recursive(input)
     } else {
-        CypherQuery::Batch(statements)
-    };
-    
-    Ok((input, result))
+        Ok((remaining, CypherQuery::Chain(clauses)))
+    }
 }
 
 // NOTE: This assumes 'all_vertices' and 'all_edges' are available/passed in, 
@@ -3693,37 +3904,63 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_expression START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
 
-    // --- STEP 1: Parse the "Atom" (The left-most part of an expression) ---
+    // --- STEP 1: Parse the "Atom" (The left-most part eh of an expression) ---
     let (mut current_input, mut left) = {
         alt((
             // Parenthesized expressions for grouping
             delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
             
             // Predicate functions with special syntax (any, all, exists, etc.)
-            // Placed before standard function calls to capture specialized WHERE logic
             parse_predicate_expression,
 
+            // Function calls with array indexing: labels(e)[0]  ← ADD THIS
+            parse_function_call_with_index,
+            
             // Function calls like labels(e) or id(e)
             parse_function_call_full,
+            
+            // Dynamic property access like n[prop]
+            parse_dynamic_property_access,
             
             // List literals like ['A', 'B']
             parse_list_literal, 
             
-            // Property access like e.source_uuid (Must come before plain identifier)
+            // Property access like e.source_uuid
             map(
                 tuple((parse_identifier, char('.'), parse_identifier)),
                 |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
             ),
             
-            // Literal values (strings, numbers, etc.) — MUST COME BEFORE IDENTIFIER
+            // Literal values
             map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
             
-            // Plain variables/identifiers (only if not a literal)
+            // Plain variables/identifiers
             map(parse_identifier, |v| Expression::Variable(v.to_string())),
         ))
     }.parse(input)?;
 
-    // --- STEP 2: Check for Postfix Unary Operators (IS NULL / IS NOT NULL) ---
+    // --- STEP 2: Handle Postfix Operations (Array Indexing and Null Checks) ---
+    
+    // Handle array indexing: expr[index]
+    loop {
+        let index_result = delimited(multispace0, 
+            tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
+            multispace0
+        ).parse(current_input);
+        
+        match index_result {
+            Ok((after_index, (_, index_expr, _))) => {
+                left = Expression::ArrayIndex {
+                    expr: Box::new(left),
+                    index: Box::new(index_expr),
+                };
+                current_input = after_index;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Check for Postfix Unary Operators (IS NULL / IS NOT NULL)
     if let Ok((after_null, op)) = parse_null_operator(current_input) {
         left = Expression::Unary {
             op,
@@ -3734,61 +3971,111 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
 
     // --- STEP 3: Handle Binary Operators (AND, OR, =, IN, etc.) ---
     loop {
-        // Parse the operator (delimited by optional whitespace)
         let op_result: IResult<&str, BinaryOp> = delimited(multispace0, parse_binary_op, multispace0)
             .parse(current_input);
 
         match op_result {
             Ok((after_op, op)) => {
-                // Parse the Right-Hand Side (RHS) atom
                 let rhs_result = alt((
                     delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
-                    
-                    // Allow predicates on the RHS (e.g., WHERE x = any(...))
                     parse_predicate_expression,
-                    
+                    // Also add function call with index to RHS
+                    parse_function_call_with_index,
                     parse_function_call_full,
+                    parse_dynamic_property_access,
                     parse_list_literal, 
                     map(
                         tuple((parse_identifier, char('.'), parse_identifier)),
                         |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
                     ),
-                    // Literal values — MUST COME BEFORE IDENTIFIER
                     map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
                     map(parse_identifier, |v| Expression::Variable(v.to_string())),
                 )).parse(after_op);
 
                 match rhs_result {
                     Ok((after_rhs, mut right_atom)) => {
-                        // Check if the RHS itself has a postfix null operator (e.g., "a = b IS NULL")
-                        let final_after_rhs = if let Ok((after_rhs_null, rhs_op)) = parse_null_operator(after_rhs) {
-                            right_atom = Expression::Unary {
+                        // Handle array indexing on RHS
+                        let mut temp_input = after_rhs;
+                        let mut temp_right = right_atom;
+                        loop {
+                            let index_result = delimited(multispace0,
+                                tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
+                                multispace0
+                            ).parse(temp_input);
+                            
+                            match index_result {
+                                Ok((after_idx, (_, idx_expr, _))) => {
+                                    temp_right = Expression::ArrayIndex {
+                                        expr: Box::new(temp_right),
+                                        index: Box::new(idx_expr),
+                                    };
+                                    temp_input = after_idx;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        
+                        // Check for postfix null operator on RHS
+                        let final_after_rhs = if let Ok((after_rhs_null, rhs_op)) = parse_null_operator(temp_input) {
+                            temp_right = Expression::Unary {
                                 op: rhs_op,
-                                expr: Box::new(right_atom),
+                                expr: Box::new(temp_right),
                             };
                             after_rhs_null
                         } else {
-                            after_rhs
+                            temp_input
                         };
 
-                        // Build the binary expression tree (left-associative)
                         left = Expression::Binary {
                             op,
                             left: Box::new(left),
-                            right: Box::new(right_atom),
+                            right: Box::new(temp_right),
                         };
                         current_input = final_after_rhs;
                     }
-                    // If we found an operator but no valid RHS, we stop parsing the expression chain
                     Err(_) => break,
                 }
             }
-            // No more binary operators found, exit loop
             Err(_) => break,
         }
     }
 
     Ok((current_input, left))
+}
+
+/// Parses function calls with optional array indexing: func(args)[index]
+fn parse_function_call_with_index(input: &str) -> IResult<&str, Expression> {
+    let (input, func_call) = parse_function_call_full(input)?;
+    
+    // Check for array indexing immediately after the function call
+    let (input, indexed_expr) = parse_array_indexing_chain(input, func_call)?;
+    
+    Ok((input, indexed_expr))
+}
+
+/// Parses a chain of array indexing operations: expr[index1][index2]...
+fn parse_array_indexing_chain(input: &str, mut expr: Expression) -> IResult<&str, Expression> {
+    let mut current_input = input;
+    
+    loop {
+        let index_result = delimited(multispace0,
+            tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
+            multispace0
+        ).parse(current_input);
+        
+        match index_result {
+            Ok((remaining, (_, index_expr, _))) => {
+                expr = Expression::ArrayIndex {
+                    expr: Box::new(expr),
+                    index: Box::new(index_expr),
+                };
+                current_input = remaining;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    Ok((current_input, expr))
 }
 
 /// Parses a full function call with multiple arguments and nested expressions
@@ -5401,7 +5688,51 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 4. Function calls (e.g., labels(e) IN ['A', 'B'])
+    // 4. Function calls with array indexing like labels(e)[0] = 'Value'
+    if let Ok((remaining, expr)) = parse_function_call_with_index(input) {
+        let (remaining, _) = multispace0.parse(remaining)?;
+        let (remaining, op) = parse_comparison_op(remaining)?;
+        let (remaining, _) = multispace0.parse(remaining)?;
+        
+        let op_upper = op.to_uppercase();
+        let (remaining, val) = if op_upper.contains("NULL") {
+            (remaining, Value::Null)
+        } else if op_upper == "IN" {
+            let (rem, list_expr) = parse_list_literal(remaining)?;
+            let json_val = match list_expr {
+                Expression::List(elements) => {
+                    let mut arr = Vec::new();
+                    for elem in elements {
+                        if let Expression::Literal(cv) = elem {
+                            arr.push(cv.to_json());
+                        }
+                    }
+                    Value::Array(arr)
+                }
+                _ => Value::Null,
+            };
+            (rem, json_val)
+        } else {
+            parse_value(remaining)?
+        };
+        
+        return Ok((remaining, Expression::Binary {
+            op: match op_upper.as_str() {
+                "=" => BinaryOp::Eq,
+                "!=" | "<>" => BinaryOp::Neq,
+                ">" => BinaryOp::Gt,
+                "<" => BinaryOp::Lt,
+                ">=" => BinaryOp::Gte,
+                "<=" => BinaryOp::Lte,
+                "IN" => BinaryOp::In,
+                _ => BinaryOp::Eq,
+            },
+            left: Box::new(expr),
+            right: Box::new(Expression::Literal(CypherValue::from_json(val))),
+        }));
+    }
+
+    // 5. Function calls (e.g., labels(e) IN ['A', 'B'])
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
@@ -5438,11 +5769,11 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }));
     }
     
-    // 5. Property access (e.g., n.name = "Alice" or e.source_uuid IN ['a', 'b'])
+    // 6. Property access (e.g., n.name = "Alice" or e.source_uuid IN ['a', 'b'])
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    // 6. Parse operator (handle multi-word operators first)
+    // 7. Parse operator (handle multi-word operators first)
     let (input, op_str) = {
         let trimmed = input.trim_start();
         let upper = trimmed.to_uppercase();
@@ -5468,7 +5799,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
 
     let (input, _) = multispace0.parse(input)?;
     
-    // 7. Parse value (handle IN operator with lists)
+    // 8. Parse value (handle IN operator with lists)
     let op_upper = op_str.to_uppercase();
     let (input, val) = if op_upper.contains("NULL") {
         (input, Value::Null)
@@ -5491,12 +5822,12 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         parse_value(input)?
     };
     
-    // 8. Split property path
+    // 9. Split property path
     let (var, prop) = full_path.split_once('.')
         .map(|(v, p)| (v.to_string(), p.to_string()))
         .unwrap_or_else(|| (full_path.clone(), String::new()));
 
-    // 9. Handle special operators
+    // 10. Handle special operators
     if op_str == "STARTS WITH" {
         if let Value::String(prefix) = val {
             return Ok((input, Expression::StartsWith {
@@ -5507,7 +5838,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 10. Standard property comparison
+    // 11. Standard property comparison
     Ok((input, Expression::PropertyComparison {
         variable: var,
         property: prop,
@@ -5737,6 +6068,41 @@ fn parse_create_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
         parse_create_pattern, // ✅ Use CREATE-specific parser
     )
     .parse(input)
+}
+
+// In your expression parsing logic
+/// Parses dynamic property access like n[prop] where prop is an expression
+fn parse_dynamic_property_access(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_dynamic_property_access START");
+    
+    let (input, var_name) = parse_identifier(input)?;
+    let (input, _) = char('[')(input)?;
+    let (input, prop_expr) = parse_expression(input)?; // Recursively parse the property expression
+    let (input, _) = char(']')(input)?;
+    
+    Ok((input, Expression::DynamicPropertyAccess {
+        variable: var_name.to_string(),
+        property_expr: Box::new(prop_expr),
+    }))
+}
+
+/// Parses a UNION [ALL] clause and returns the right-hand side query
+fn parse_union_clause(input: &str) -> IResult<&str, (bool, Box<CypherQuery>)> {
+    let (input, _) = tag_no_case("UNION")(input)?;
+    let (input, _) = multispace1(input)?;
+    
+    // Check for ALL keyword - specify error type explicitly
+    let (input, is_all) = if let Ok((i, _)) = tag_no_case::<_, _, nom::error::Error<&str>>("ALL")(input) {
+        let (i, _) = multispace1(i)?;
+        (i, true)
+    } else {
+        (input, false)
+    };
+    
+    // Parse the RHS as a single query clause (not sequential)
+    let (input, rhs_query) = parse_simple_query_type(input)?;
+    
+    Ok((input, (is_all, Box::new(rhs_query))))
 }
 
 /// Parses an UNWIND clause: UNWIND expression AS variable
@@ -6640,19 +7006,23 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                 // Return the collected results wrapped as a single JSON object.
                 Ok(json!({ "results": results }))
             },
-            CypherQuery::Unwind {
-                expression,
-                variable,
-            } => {
+            // ============================================================================
+            // UNWIND - Return flat structure
+            // ============================================================================
+            CypherQuery::Unwind { expression, variable } => {
                 info!("===> EXECUTING Unwind with variable '{}'", variable);
-
+                
+                // 1. Setup context (In a full implementation, this should include 
+                // variables matched in previous clauses like 'e' from MATCH)
                 let ctx = EvaluationContext {
-                    variables: HashMap::new(),
+                    variables: HashMap::new(), 
                     parameters: HashMap::new(),
                 };
 
+                // 2. Evaluate the expression (e.g., keys(e))
                 let result = expression.evaluate(&ctx)?;
                 
+                // 3. Ensure we have a list to unwind
                 let list = if let CypherValue::List(items) = result {
                     items
                 } else {
@@ -6660,26 +7030,40 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         "UNWIND requires a list expression".to_string()
                     ));
                 };
-
-                // For standalone UNWIND, return empty vertices/edges
-                // (Real usage is always in Chain with MATCH)
+                
+                // 4. Transform the list items into a flat 'rows' structure
+                let rows: Vec<serde_json::Value> = list
+                    .into_iter()
+                    .map(|item| {
+                        // Each row is an object where the key is the 'AS' variable
+                        json!({
+                            variable.clone(): item
+                        })
+                    })
+                    .collect();
+                
+                // 5. Return the flat structure with the populated rows
                 Ok(json!({
+                    "rows": rows,
                     "vertices": [],
                     "edges": [],
                     "stats": {
                         "vertices_matched": 0,
-                        "edges_matched": 0
+                        "edges_matched": 0,
+                        "rows_generated": rows.len()
                     }
                 }))
-            },
+            }
             // --- UPDATED MATCH PATTERN ---
             // Handles pure MATCH ... RETURN, relying on a full pattern matcher.
             // --- UPDATED MATCH PATTERN BRANCH ---
             // --- FIXED: MatchPattern with variable binding and WHERE evaluation ---
+            // ============================================================================
+            // MATCH PATTERN - Return UNWRAPPED (something else wraps it)
+            // ============================================================================
             CypherQuery::MatchPattern { patterns, where_clause, with_clause, return_clause } => {
                 info!("===> EXECUTING MatchPattern with {} patterns", patterns.len());
 
-                // 1. Restore exact label transformation logic
                 let transformed_patterns: Vec<_> = patterns.iter().map(|(id, nodes, edges)| {
                     let transformed_nodes: Vec<_> = nodes.iter().map(|(var, labels, props)| {
                         (var.clone(), labels.first().cloned(), props.clone())
@@ -6701,7 +7085,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     .map(|s| s.as_str())
                     .unwrap_or("r");
 
-                // 2. Restore exact MATCH WHERE filtering with manual PropertyComparison fallback
+                // WHERE clause filtering
                 if let Some(wc) = where_clause {
                     let original_count = final_vertices.len();
                     let mut filtered = Vec::new();
@@ -6717,7 +7101,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             Ok(CypherValue::Bool(true)) => true,
                             Ok(CypherValue::Bool(false)) | Ok(CypherValue::Null) => false,
                             _ => {
-                                // Manual PropertyComparison fallback preserved from your repo
                                 if let Expression::PropertyComparison { variable, property, operator, value } = &wc.condition {
                                     let left_val_opt = if variable == var_name {
                                         if property.is_empty() { Some(CypherValue::Vertex(v.clone())) }
@@ -6741,7 +7124,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     println!("===> After initial MATCH WHERE: {} -> {} vertices", original_count, final_vertices.len());
                 }
 
-                // 3. Restore exact WITH clause logic (including WHERE dist < 2 support)
+                // WITH clause logic
                 if let Some(with) = with_clause {
                     let original_count = final_vertices.len();
                     let mut filtered = Vec::new();
@@ -6769,12 +7152,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
 
                         if !projection_success { continue; }
 
-                        // Restore the WITH WHERE condition evaluation
                         let passes = if let Some(wwc) = &with.where_clause {
                             match wwc.condition.evaluate(&ctx) {
                                 Ok(CypherValue::Bool(result)) => result,
                                 _ => {
-                                    // Manual check for aliases like 'dist'
                                     if let Expression::PropertyComparison { variable, property, operator, value } = &wwc.condition {
                                         if property.is_empty() {
                                             if let Some(var_val) = ctx.variables.get(variable) {
@@ -6792,7 +7173,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     println!("===> After WITH WHERE: {} -> {} vertices", original_count, final_vertices.len());
                 }
 
-                // 4. Restore Comprehensive Output while respecting RETURN LIMIT/SKIP
+                // Apply RETURN LIMIT/SKIP
                 let mut final_v = final_vertices;
                 let mut final_e = final_edges.clone();
 
@@ -6807,7 +7188,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     }
                 }
 
-                // Return the raw result object, NOT wrapped in {"results": ...}
+                // ❌ DO NOT WRAP - Return flat structure
                 Ok(json!({
                     "vertices": final_v,
                     "edges": final_e,
@@ -7873,22 +8254,21 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     "message": format!("Successfully deleted {deleted} edge(s) following MPI logical verification")
                 }))
             }
-            // 1. Handle Query Chains (Multiple clauses like MATCH...CREATE...RETURN)
+            // ============================================================================
+            // CHAIN - Check if results are already wrapped before wrapping
+            // ============================================================================
             CypherQuery::Chain(clauses) => {
                 info!("===> EXECUTING Chain with aggregation support");
 
                 let mut all_bindings = Vec::new();
                 let mut has_aggregation = false;
                 let mut return_items = Vec::new();
-
-                // Phase 1: Execute MATCH and UNWIND to collect flat bindings
                 let mut current_vertices = Vec::new();
                 let mut var_name = "n".to_string();
 
                 for query in clauses.iter() {
                     match query {
                         CypherQuery::MatchPattern { patterns, where_clause, .. } => {
-                            // Transform patterns for execution
                             let transformed_patterns: Vec<_> = patterns.iter().map(|(id, nodes, edges)| {
                                 let transformed_nodes: Vec<_> = nodes.iter().map(|(var, labels, props)| {
                                     (var.clone(), labels.first().cloned(), props.clone())
@@ -7898,7 +8278,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
 
                             (current_vertices, _) = exec_cypher_pattern(transformed_patterns, &graph_service).await?;
 
-                            // Apply WHERE clause filtering
                             if let Some(wc) = where_clause {
                                 current_vertices.retain(|v| {
                                     let var_ref = patterns.get(0)
@@ -7912,7 +8291,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                 });
                             }
 
-                            // Extract variable name for UNWIND context
                             if let Some(var) = patterns.get(0).and_then(|p| p.1.get(0)).and_then(|n| n.0.clone()) {
                                 var_name = var;
                             }
@@ -7933,12 +8311,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         }
 
                         CypherQuery::ReturnStatement { projection_string, .. } => {
-                            // Parse projection to detect aggregation
                             if projection_string.contains("count(") {
                                 has_aggregation = true;
                             }
                             
-                            // Try to parse return items, use empty vec as fallback
                             return_items = serde_json::from_str::<ReturnClause>(projection_string)
                                 .ok()
                                 .map(|rc| rc.items)
@@ -7949,13 +8325,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     }
                 }
 
-                // Phase 2: Project and aggregate
                 if has_aggregation {
-                    // Build grouping key: e.g., "label"
                     let mut groups: HashMap<String, Vec<HashMap<String, CypherValue>>> = HashMap::new();
 
                     for binding in all_bindings {
-                        // Extract grouping key (assume first non-aggregate item is group key)
                         let group_key = binding.get("label")
                             .and_then(|v| match v {
                                 CypherValue::String(s) => Some(s.clone()),
@@ -7966,7 +8339,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         groups.entry(group_key).or_default().push(binding);
                     }
 
-                    // Build result vertices
                     let mut result_vertices = Vec::new();
                     for (label, group) in groups {
                         let count = group.len() as i64;
@@ -7989,6 +8361,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         });
                     }
 
+                    // Return flat structure (will be wrapped by caller if needed)
                     return Ok(json!({
                         "vertices": result_vertices,
                         "edges": Vec::<Edge>::new(),
@@ -7999,7 +8372,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     }));
                 }
 
-                // Fallback: no aggregation
+                // Return flat structure (will be wrapped by caller if needed)
                 Ok(json!({
                     "vertices": current_vertices,
                     "edges": Vec::<Edge>::new(),
@@ -8008,37 +8381,113 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         "edges_matched": 0
                     }
                 }))
-            },
-            // 3. Handle Union Queries
-            // Assuming the original structure: CypherQuery::Union(q1, q2, is_all)
-            CypherQuery::Union(q1, q2, is_all) => {
-                // q1 and q2 are already Box<CypherQuery> as bound in the match pattern.
-                // We pass them directly to the service method without dereferencing (*q1, *q2)
-                // which was causing the type mismatch (expected Box, found raw enum).
-                let union_qr_result = graph_service.union_results(q1, q2, is_all)
-                    .await;
-
-                // Convert the QueryResult returned by the service into the final Value.
-                graph_service.query_result_to_value(union_qr_result)
             }
-            // 3. Handle RETURN Statements (The final step in a query chain)
+            // ============================================================================
+            // UNION - Return flat or check if already wrapped
+            // ============================================================================
+            CypherQuery::Union(left_query, is_all, right_query) => {
+                let union_qr_result = graph_service.union_results(
+                    left_query.clone(),
+                    is_all,
+                    right_query.clone(),
+                ).await;
+                
+                let raw_value = graph_service.query_result_to_value(union_qr_result)?;
+                
+                // If raw_value is already a flat graph structure, return as-is
+                if raw_value.is_object() 
+                    && raw_value.get("vertices").is_some() 
+                    && raw_value.get("edges").is_some() {
+                    Ok(raw_value)
+                }
+                // If wrapped in {"results": [...]}, extract the first result
+                else if let Some(results_array) = raw_value.get("results").and_then(|r| r.as_array()) {
+                    if let Some(first_result) = results_array.first() {
+                        // If first_result is flat graph structure, return it
+                        if first_result.is_object() 
+                            && first_result.get("vertices").is_some() 
+                            && first_result.get("edges").is_some() {
+                            Ok(first_result.clone())
+                        } else {
+                            // Unexpected format - return empty flat structure
+                            Ok(json!({
+                                "vertices": [],
+                                "edges": [],
+                                "stats": { "vertices_matched": 0, "edges_matched": 0 }
+                            }))
+                        }
+                    } else {
+                        // Empty results - return empty flat structure
+                        Ok(json!({
+                            "vertices": [],
+                            "edges": [],
+                            "stats": { "vertices_matched": 0, "edges_matched": 0 }
+                        }))
+                    }
+                }
+                // Unexpected format - return empty flat structure
+                else {
+                    Ok(json!({
+                        "vertices": [],
+                        "edges": [],
+                        "stats": { "vertices_matched": 0, "edges_matched": 0 }
+                    }))
+                }
+            }
+            // ============================================================================
+            // RETURN STATEMENT - Return flat or check if already wrapped
+            // ============================================================================
             CypherQuery::ReturnStatement { 
                 projection_string,
                 order_by,
                 skip,
                 limit,
             } => {
-                // Serialize Vec<OrderByItem> → Option<String>
                 let order_by_str = graph_service.serialize_order_by_to_string(&order_by);
 
                 let return_qr_result = graph_service.execute_return_statement(
                     projection_string,
-                    order_by_str, // ✅ now Option<String>
+                    order_by_str,
                     skip,
                     limit,
                 ).await;
 
-                graph_service.query_result_to_value(return_qr_result)
+                let raw_value = graph_service.query_result_to_value(return_qr_result)?;
+                
+                // Same logic as Union
+                if raw_value.is_object() 
+                    && raw_value.get("vertices").is_some() 
+                    && raw_value.get("edges").is_some() {
+                    Ok(raw_value)
+                }
+                else if let Some(results_array) = raw_value.get("results").and_then(|r| r.as_array()) {
+                    if let Some(first_result) = results_array.first() {
+                        if first_result.is_object() 
+                            && first_result.get("vertices").is_some() 
+                            && first_result.get("edges").is_some() {
+                            Ok(first_result.clone())
+                        } else {
+                            Ok(json!({
+                                "vertices": [],
+                                "edges": [],
+                                "stats": { "vertices_matched": 0, "edges_matched": 0 }
+                            }))
+                        }
+                    } else {
+                        Ok(json!({
+                            "vertices": [],
+                            "edges": [],
+                            "stats": { "vertices_matched": 0, "edges_matched": 0 }
+                        }))
+                    }
+                }
+                else {
+                    Ok(json!({
+                        "vertices": [],
+                        "edges": [],
+                        "stats": { "vertices_matched": 0, "edges_matched": 0 }
+                    }))
+                }
             }
             // NEW: Handles the standalone SET clause for chaining (e.g., `MATCH (n) SET n.prop = 'new'`)
             CypherQuery::SetStatement { assignments } => {
