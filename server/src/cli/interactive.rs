@@ -3269,11 +3269,14 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut depth: Option<u32> = None;
             let mut include_flags = false;
 
+            // Rollback variables
+            let mut event_uuid: Option<String> = None;
+
             // Transaction/Audit context
             let mut requested_by: Option<String> = None; // For the "whoami" context
             if !remaining_args.is_empty() {
                 match remaining_args[0].to_lowercase().as_str() {
-                    "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" | "index" | "resolve" | "search" | "fetch-identity" => { // NEW: fetch-identity
+                    "match" | "link" | "merge" | "audit" | "split" | "getgoldenrecord" | "index" | "resolve" | "search" | "fetch-identity" | "rollback" => { // NEW: fetch-identity
                         explicit_subcommand = Some(remaining_args[0].to_lowercase());
                         current_subcommand_index = 1;
                     }
@@ -3665,6 +3668,24 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 1;
                         }
                     }
+                    "--event-uuid" => {
+                        if i + 1 < remaining_args.len() {
+                            event_uuid = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--requested-by" => {
+                        if i + 1 < remaining_args.len() {
+                            requested_by = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
                     _ => {
                         eprintln!("Warning: Unknown argument for 'mpi': {}", remaining_args[i]);
                         i += 1;
@@ -3915,6 +3936,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         dob,
                         address,
                         phone,
+                    })
+                }
+                Some("rollback") => {
+                    CommandType::Mpi(MPICommand::Rollback {
+                        event_uuid,
+                        id,   // Reusing existing 'id' variable
+                        mrn,  // Reusing existing 'mrn' variable
+                        requested_by: requested_by.unwrap_or_else(|| "unknown_system".into()),
+                        reason, // Reusing existing 'reason' variable
                     })
                 }
                 None => {
@@ -9501,7 +9531,36 @@ pub async fn handle_interactive_command(
                     .await
                     .map_err(|e| anyhow::anyhow!("MPI split/unmerge failed: {}", e))
                 }
+                MPICommand::Rollback {
+                    event_uuid,
+                    id,
+                    mrn,
+                    requested_by,
+                    reason,
+                } => {
+                    // Validation: Ensure at least one discovery mechanism is provided
+                    if event_uuid.is_none() && id.is_none() && mrn.is_none() {
+                        anyhow::bail!("Rollback requires discovery data: provide --event-uuid, --id, or --mrn.");
+                    }
 
+                    println!(
+                        "[AUDIT] Rollback initiated by: {} | Reason: {}",
+                        requested_by,
+                        reason.as_deref().unwrap_or("No reason provided")
+                    );
+
+                    // Call the interactive handler with the specific discovery fields
+                    handlers_mpi::handle_mpi_rollback_interactive(
+                        event_uuid,
+                        id,
+                        mrn,
+                        requested_by,
+                        reason,
+                        mpi_handlers_state,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI Rollback failed: {}", e))
+                }
                 // --- Golden Record Retrieval (UNCHANGED) ---
                 MPICommand::GetGoldenRecord { patient_id } => {
                     handlers_mpi::handle_get_golden_record_interactive(

@@ -1564,6 +1564,31 @@ pub enum MPICommand {
         #[arg(long)]
         system: Option<String>,
     },
+    /// Reverses an erroneous merge operation by discovering the merge event via Patient ID, MRN, or Event UUID.
+    /// This restores clinical edges to the source and re-establishes an independent Golden Record.
+    Rollback {
+        /// Discovery: The UUID of the specific MANUAL_MERGE_INITIATED event to roll back.
+        #[arg(long, group = "discovery")]
+        event_uuid: Option<String>,
+
+        /// Discovery: The UUID of the patient who was the SOURCE of a merge. 
+        /// The system will find the latest merge event for this patient.
+        #[arg(long, group = "discovery")]
+        id: Option<String>,
+
+        /// Discovery: The MRN of the patient who was the SOURCE of a merge.
+        /// The system will find the patient and then their latest merge event.
+        #[arg(long, group = "discovery")]
+        mrn: Option<String>,
+
+        /// Mandatory: The user or system requesting the rollback (required for 2025-12-20 audit compliance).
+        #[arg(long)]
+        requested_by: String,
+
+        /// Optional: A detailed reason for the rollback to be logged in the graph of changes.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 // =========================================================================

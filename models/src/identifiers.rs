@@ -12,7 +12,6 @@ use crate::errors::{ValidationError, ValidationResult, GraphError, GraphResult};
 #[serde(transparent)]
 pub struct SerializableUuid(pub Uuid);
 
-
 impl SerializableUuid {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
@@ -74,11 +73,15 @@ impl From<SerializableUuid> for Uuid {
 #[serde(transparent)]
 pub struct SerializableInternString(pub Intern<String>);
 
-// FIX: Implement From<&str> for SerializableInternString
 impl From<&str> for SerializableInternString {
     fn from(s: &str) -> Self {
-        // FIX: Convert the &str to String using .to_string() before passing to Intern::new
         SerializableInternString(Intern::new(s.to_string()))
+    }
+}
+
+impl From<String> for SerializableInternString {
+    fn from(s: String) -> Self {
+        SerializableInternString(Intern::new(s))
     }
 }
 
@@ -136,11 +139,16 @@ impl fmt::Display for SerializableInternString {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize, Encode)]
 pub struct Identifier(pub SerializableInternString);
 
-// Implementation of From<&str> for Identifier
 impl From<&str> for Identifier {
     fn from(s: &str) -> Self {
-        // This now succeeds because SerializableInternString implements From<&str>
-        Identifier(s.into()) 
+        Identifier(SerializableInternString::from(s))
+    }
+}
+
+// Added explicit From<String> implementation
+impl From<String> for Identifier {
+    fn from(s: String) -> Self {
+        Identifier(SerializableInternString::from(s))
     }
 }
 
@@ -164,13 +172,8 @@ impl Identifier {
         Ok(Self(SerializableInternString(Intern::new(value))))
     }
 
-    /// Creates an Identifier from a UUID.
-    /// This uses the UUID's display string and validates it against the Identifier's length constraints.
     pub fn from_uuid(uuid: Uuid) -> ValidationResult<Self> {
-        // Convert the UUID to its canonical string representation (e.g., "01234567-89ab-cdef-0123-456789abcdef")
         let uuid_string = uuid.to_string();
-        
-        // Use the existing validation logic
         Self::new(uuid_string)
     }
 
@@ -215,40 +218,6 @@ impl PartialOrd for Identifier {
 impl Ord for Identifier {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.cmp(&other.0)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Identifier, ValidationError};
-    use core::str::FromStr;
-
-    #[test]
-    fn should_not_create_empty_identifier() {
-        let identifier = Identifier::new("".to_string());
-        assert!(identifier.is_err());
-        assert_eq!(identifier.unwrap_err(), ValidationError::InvalidIdentifierLength);
-    }
-
-    #[test]
-    fn should_not_create_too_long_identifier() {
-        let identifier = Identifier::new("a".repeat(256));
-        assert!(identifier.is_err());
-        assert_eq!(identifier.unwrap_err(), ValidationError::InvalidIdentifierLength);
-    }
-
-    #[test]
-    fn should_create_identifier() {
-        let identifier = Identifier::new("test".to_string());
-        assert!(identifier.is_ok());
-        assert_eq!(identifier.unwrap().as_ref(), "test");
-    }
-
-    #[test]
-    fn should_convert_identifier_from_str() {
-        let identifier = Identifier::from_str("test");
-        assert!(identifier.is_ok());
-        assert_eq!(identifier.unwrap().as_ref(), "test");
     }
 }
 

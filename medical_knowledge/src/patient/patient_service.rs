@@ -11,7 +11,8 @@ use log::{info, error, warn, debug};
 use std::collections::{ HashMap };
 use models::medical::{Patient, Problem, Prescription, Allergy, Referral};
 use models::{Vertex};
-use models::identifiers::{Identifier, VertexId};
+use models::identifiers::{Identifier, VertexId, };
+use models::properties::{ SerializableDateTime };
 use models::errors::{GraphError, GraphResult};
 use lib::commands::{PatientCommand, JourneyFormat, AlertFormat, AlertSeverity};
 use lib::graph_engine::graph_service::{GraphService}; 
@@ -25,12 +26,12 @@ pub static PATIENT_SERVICE: OnceCell<Arc<PatientService>> = OnceCell::const_new(
 pub struct PatientService {
     // Patient cache (retained for fast local lookups, but graph is the source of truth)
     patients: Arc<RwLock<HashMap<Uuid, Patient>>>,
-    // ✅ DEPENDENCY INJECTION: Store the required GraphService
+    // DEPENDENCY INJECTION: Store the required GraphService
     graph_service: Arc<GraphService>, 
 }
 
 impl PatientService {
-    /// ✅ CONSTRUCTOR: Requires the GraphService instance, guaranteeing a valid state.
+    /// CONSTRUCTOR: Requires the GraphService instance, guaranteeing a valid state.
     pub fn new(graph_service: Arc<GraphService>) -> Self {
         let service = Self {
             patients: Arc::new(RwLock::new(HashMap::new())),
@@ -137,12 +138,16 @@ impl PatientService {
     pub async fn create_patient(&self, mut new_patient: Patient) -> Result<String, GraphError> {
         // Ensure IDs are generated and synced
         let patient_uuid = Uuid::new_v4();
+        let now = Utc::now();
+        
         new_patient.vertex_id = Some(patient_uuid);
         
         // Match the legacy i32 ID logic used for internal integer-based references
         new_patient.id = Some(patient_uuid.as_u128() as i32);
-        new_patient.created_at = Utc::now();
-        new_patient.updated_at = Utc::now();
+        
+        // Wrap raw DateTime into Option<SerializableDateTime>
+        new_patient.created_at = Some(SerializableDateTime(now));
+        new_patient.updated_at = Some(SerializableDateTime(now));
         
         // 1. Sanitize REQUIRED string fields
         let first_name = sanitize_cypher_string(new_patient.first_name.as_deref().unwrap_or(""));
@@ -153,15 +158,26 @@ impl PatientService {
         let ssn = format_optional_string(&new_patient.ssn);
         let mrn = format_optional_string(&new_patient.mrn);
         
-        // 3. Format Timestamps to ISO 8601
-        let dob = new_patient.date_of_birth.to_rfc3339();
-        let created_at = new_patient.created_at.to_rfc3339();
-        let updated_at = new_patient.updated_at.to_rfc3339();
+        // 3. Format Timestamps to ISO 8601 (handling Option and the SerializableDateTime wrapper)
+        let dob = new_patient.date_of_birth.as_ref()
+            .map(|d| d.0.to_rfc3339())
+            .unwrap_or_else(|| "null".to_string());
+            
+        let created_at_str = new_patient.created_at.as_ref()
+            .map(|d| d.0.to_rfc3339())
+            .unwrap_or_else(|| now.to_rfc3339());
+            
+        let updated_at_str = new_patient.updated_at.as_ref()
+            .map(|d| d.0.to_rfc3339())
+            .unwrap_or_else(|| now.to_rfc3339());
         
         let id_val = new_patient.id.map(|i| i.to_string()).unwrap_or_else(|| "null".to_string());
         let vertex_uuid_str = patient_uuid.to_string();
 
         // The query explicitly sets the vertex_id to ensure merge/lookup reliability
+        // Note: If dob is null, we handle it without quotes in the Cypher query via a helper or conditional
+        let dob_query_val = if dob == "null" { "null".to_string() } else { format!("\"{}\"", dob) };
+
         let query = format!(
             "CREATE (p:Patient {{
                 id: {}, 
@@ -171,7 +187,7 @@ impl PatientService {
                 gender: {}, 
                 ssn: {}, 
                 mrn: {}, 
-                date_of_birth: \"{}\", 
+                date_of_birth: {}, 
                 created_at: \"{}\", 
                 updated_at: \"{}\"
             }});",
@@ -182,14 +198,15 @@ impl PatientService {
             gender,
             ssn, 
             mrn,
-            dob,
-            created_at,
-            updated_at
+            dob_query_val,
+            created_at_str,
+            updated_at_str
         );
         
         // Passing the full json properties ensures all 40+ clinical fields from the Patient struct
         // are stored on the node, making them available for 'MASTER_WINS' merge policies.
-        let properties = json!(new_patient);
+        let properties = serde_json::to_value(&new_patient)
+            .map_err(|e| GraphError::InternalError(format!("Serialization failed: {}", e)))?;
         
         self.graph_service
             .execute_cypher_write(&query, properties)

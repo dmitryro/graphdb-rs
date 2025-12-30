@@ -16,6 +16,7 @@ pub mod errors;
 pub mod util;
 pub mod timestamp;
 pub mod evolution;
+pub mod dashboard;
 
 // Declare the 'medical' sub-module
 pub mod medical;
@@ -30,6 +31,7 @@ pub mod medical;
 pub use vertices::Vertex; // Changed from `pub use vertices::{Node, Vertex};`
 // ---------------------------------
 pub use timestamp::*;
+pub use dashboard::*;
 pub use evolution::*;
 pub use edges::Edge;
 pub use properties::{PropertyValue, PropertyMap};
