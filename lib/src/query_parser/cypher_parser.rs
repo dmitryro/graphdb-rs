@@ -1642,6 +1642,35 @@ pub fn evaluate_expression(
                 _ => Err(GraphError::QueryExecutionError("Unary op not implemented".into())),
             }
         },
+        Expression::ArrayIndex { expr, index } => {
+            let array_val = evaluate_expression(expr, context)?;
+            let index_val = evaluate_expression(index, context)?;
+            
+            let idx = match index_val {
+                CypherValue::Integer(i) => i as usize,
+                CypherValue::Float(f) => f as usize,
+                CypherValue::String(s) => {
+                    // Try to parse string as integer
+                    if let Ok(i) = s.parse::<i64>() {
+                        i as usize
+                    } else {
+                        return Err(GraphError::QueryExecutionError("Array index must be a number".into()));
+                    }
+                }
+                _ => return Err(GraphError::QueryExecutionError("Array index must be a number".into())),
+            };
+            
+            match array_val {
+                CypherValue::List(items) => {
+                    if idx < items.len() {
+                        Ok(items[idx].clone())
+                    } else {
+                        Ok(CypherValue::Null)
+                    }
+                }
+                _ => Err(GraphError::QueryExecutionError("Cannot index non-list value".into())),
+            }
+        },
         _ => Err(GraphError::QueryExecutionError("Expression type not implemented".to_string())),
     }
 }
@@ -3871,45 +3900,67 @@ pub fn parse_list_literal(input: &str) -> IResult<&str, Expression> {
 }
 
 /// Recursive descent parser for expressions (handles precedence and function calls)
-/// Recursive descent parser for expressions (handles precedence and function calls)
 pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_expression START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
 
-    // --- STEP 1: Parse the "Atom" (The left-most part of an expression) ---
+    // --- STEP 1: Parse the "Atom" (The left-most part eh of an expression) ---
     let (mut current_input, mut left) = {
         alt((
             // Parenthesized expressions for grouping
             delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
             
             // Predicate functions with special syntax (any, all, exists, etc.)
-            // Placed before standard function calls to capture specialized WHERE logic
             parse_predicate_expression,
 
+            // Function calls with array indexing: labels(e)[0]  ← ADD THIS
+            parse_function_call_with_index,
+            
             // Function calls like labels(e) or id(e)
             parse_function_call_full,
             
-            // Dynamic property access like n[prop] - MUST COME BEFORE list literals
+            // Dynamic property access like n[prop]
             parse_dynamic_property_access,
             
             // List literals like ['A', 'B']
             parse_list_literal, 
             
-            // Property access like e.source_uuid (Must come before plain identifier)
+            // Property access like e.source_uuid
             map(
                 tuple((parse_identifier, char('.'), parse_identifier)),
                 |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
             ),
             
-            // Literal values (strings, numbers, etc.) — MUST COME BEFORE IDENTIFIER
+            // Literal values
             map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
             
-            // Plain variables/identifiers (only if not a literal)
+            // Plain variables/identifiers
             map(parse_identifier, |v| Expression::Variable(v.to_string())),
         ))
     }.parse(input)?;
 
-    // --- STEP 2: Check for Postfix Unary Operators (IS NULL / IS NOT NULL) ---
+    // --- STEP 2: Handle Postfix Operations (Array Indexing and Null Checks) ---
+    
+    // Handle array indexing: expr[index]
+    loop {
+        let index_result = delimited(multispace0, 
+            tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
+            multispace0
+        ).parse(current_input);
+        
+        match index_result {
+            Ok((after_index, (_, index_expr, _))) => {
+                left = Expression::ArrayIndex {
+                    expr: Box::new(left),
+                    index: Box::new(index_expr),
+                };
+                current_input = after_index;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Check for Postfix Unary Operators (IS NULL / IS NOT NULL)
     if let Ok((after_null, op)) = parse_null_operator(current_input) {
         left = Expression::Unary {
             op,
@@ -3920,65 +3971,111 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
 
     // --- STEP 3: Handle Binary Operators (AND, OR, =, IN, etc.) ---
     loop {
-        // Parse the operator (delimited by optional whitespace)
         let op_result: IResult<&str, BinaryOp> = delimited(multispace0, parse_binary_op, multispace0)
             .parse(current_input);
 
         match op_result {
             Ok((after_op, op)) => {
-                // Parse the Right-Hand Side (RHS) atom
                 let rhs_result = alt((
                     delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
-                    
-                    // Allow predicates on the RHS (e.g., WHERE x = any(...))
                     parse_predicate_expression,
-                    
+                    // Also add function call with index to RHS
+                    parse_function_call_with_index,
                     parse_function_call_full,
-                    
-                    // Dynamic property access on RHS too
                     parse_dynamic_property_access,
-                    
                     parse_list_literal, 
                     map(
                         tuple((parse_identifier, char('.'), parse_identifier)),
                         |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
                     ),
-                    // Literal values — MUST COME BEFORE IDENTIFIER
                     map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
                     map(parse_identifier, |v| Expression::Variable(v.to_string())),
                 )).parse(after_op);
 
                 match rhs_result {
                     Ok((after_rhs, mut right_atom)) => {
-                        // Check if the RHS itself has a postfix null operator (e.g., "a = b IS NULL")
-                        let final_after_rhs = if let Ok((after_rhs_null, rhs_op)) = parse_null_operator(after_rhs) {
-                            right_atom = Expression::Unary {
+                        // Handle array indexing on RHS
+                        let mut temp_input = after_rhs;
+                        let mut temp_right = right_atom;
+                        loop {
+                            let index_result = delimited(multispace0,
+                                tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
+                                multispace0
+                            ).parse(temp_input);
+                            
+                            match index_result {
+                                Ok((after_idx, (_, idx_expr, _))) => {
+                                    temp_right = Expression::ArrayIndex {
+                                        expr: Box::new(temp_right),
+                                        index: Box::new(idx_expr),
+                                    };
+                                    temp_input = after_idx;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        
+                        // Check for postfix null operator on RHS
+                        let final_after_rhs = if let Ok((after_rhs_null, rhs_op)) = parse_null_operator(temp_input) {
+                            temp_right = Expression::Unary {
                                 op: rhs_op,
-                                expr: Box::new(right_atom),
+                                expr: Box::new(temp_right),
                             };
                             after_rhs_null
                         } else {
-                            after_rhs
+                            temp_input
                         };
 
-                        // Build the binary expression tree (left-associative)
                         left = Expression::Binary {
                             op,
                             left: Box::new(left),
-                            right: Box::new(right_atom),
+                            right: Box::new(temp_right),
                         };
                         current_input = final_after_rhs;
                     }
-                    // If we found an operator but no valid RHS, we stop parsing the expression chain
                     Err(_) => break,
                 }
             }
-            // No more binary operators found, exit loop
             Err(_) => break,
         }
     }
 
     Ok((current_input, left))
+}
+
+/// Parses function calls with optional array indexing: func(args)[index]
+fn parse_function_call_with_index(input: &str) -> IResult<&str, Expression> {
+    let (input, func_call) = parse_function_call_full(input)?;
+    
+    // Check for array indexing immediately after the function call
+    let (input, indexed_expr) = parse_array_indexing_chain(input, func_call)?;
+    
+    Ok((input, indexed_expr))
+}
+
+/// Parses a chain of array indexing operations: expr[index1][index2]...
+fn parse_array_indexing_chain(input: &str, mut expr: Expression) -> IResult<&str, Expression> {
+    let mut current_input = input;
+    
+    loop {
+        let index_result = delimited(multispace0,
+            tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
+            multispace0
+        ).parse(current_input);
+        
+        match index_result {
+            Ok((remaining, (_, index_expr, _))) => {
+                expr = Expression::ArrayIndex {
+                    expr: Box::new(expr),
+                    index: Box::new(index_expr),
+                };
+                current_input = remaining;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    Ok((current_input, expr))
 }
 
 /// Parses a full function call with multiple arguments and nested expressions
@@ -5591,7 +5688,51 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 4. Function calls (e.g., labels(e) IN ['A', 'B'])
+    // 4. Function calls with array indexing like labels(e)[0] = 'Value'
+    if let Ok((remaining, expr)) = parse_function_call_with_index(input) {
+        let (remaining, _) = multispace0.parse(remaining)?;
+        let (remaining, op) = parse_comparison_op(remaining)?;
+        let (remaining, _) = multispace0.parse(remaining)?;
+        
+        let op_upper = op.to_uppercase();
+        let (remaining, val) = if op_upper.contains("NULL") {
+            (remaining, Value::Null)
+        } else if op_upper == "IN" {
+            let (rem, list_expr) = parse_list_literal(remaining)?;
+            let json_val = match list_expr {
+                Expression::List(elements) => {
+                    let mut arr = Vec::new();
+                    for elem in elements {
+                        if let Expression::Literal(cv) = elem {
+                            arr.push(cv.to_json());
+                        }
+                    }
+                    Value::Array(arr)
+                }
+                _ => Value::Null,
+            };
+            (rem, json_val)
+        } else {
+            parse_value(remaining)?
+        };
+        
+        return Ok((remaining, Expression::Binary {
+            op: match op_upper.as_str() {
+                "=" => BinaryOp::Eq,
+                "!=" | "<>" => BinaryOp::Neq,
+                ">" => BinaryOp::Gt,
+                "<" => BinaryOp::Lt,
+                ">=" => BinaryOp::Gte,
+                "<=" => BinaryOp::Lte,
+                "IN" => BinaryOp::In,
+                _ => BinaryOp::Eq,
+            },
+            left: Box::new(expr),
+            right: Box::new(Expression::Literal(CypherValue::from_json(val))),
+        }));
+    }
+
+    // 5. Function calls (e.g., labels(e) IN ['A', 'B'])
     if let Ok((remaining, (func_name, arg))) = parse_function_call(input) {
         let (remaining, _) = multispace0.parse(remaining)?;
         let (remaining, op) = parse_comparison_op(remaining)?;
@@ -5628,11 +5769,11 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }));
     }
     
-    // 5. Property access (e.g., n.name = "Alice" or e.source_uuid IN ['a', 'b'])
+    // 6. Property access (e.g., n.name = "Alice" or e.source_uuid IN ['a', 'b'])
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    // 6. Parse operator (handle multi-word operators first)
+    // 7. Parse operator (handle multi-word operators first)
     let (input, op_str) = {
         let trimmed = input.trim_start();
         let upper = trimmed.to_uppercase();
@@ -5658,7 +5799,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
 
     let (input, _) = multispace0.parse(input)?;
     
-    // 7. Parse value (handle IN operator with lists)
+    // 8. Parse value (handle IN operator with lists)
     let op_upper = op_str.to_uppercase();
     let (input, val) = if op_upper.contains("NULL") {
         (input, Value::Null)
@@ -5681,12 +5822,12 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         parse_value(input)?
     };
     
-    // 8. Split property path
+    // 9. Split property path
     let (var, prop) = full_path.split_once('.')
         .map(|(v, p)| (v.to_string(), p.to_string()))
         .unwrap_or_else(|| (full_path.clone(), String::new()));
 
-    // 9. Handle special operators
+    // 10. Handle special operators
     if op_str == "STARTS WITH" {
         if let Value::String(prefix) = val {
             return Ok((input, Expression::StartsWith {
@@ -5697,7 +5838,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 10. Standard property comparison
+    // 11. Standard property comparison
     Ok((input, Expression::PropertyComparison {
         variable: var,
         property: prop,

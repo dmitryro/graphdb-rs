@@ -98,6 +98,10 @@ pub enum CypherExpression {
         variable: String,
         property_expr: Box<CypherExpression>,
     },
+    ArrayIndex {
+        expr: Box<CypherExpression>,
+        index: Box<CypherExpression>,
+    },
 }
 
 /// Represents the possible outcomes of executing a Cypher query.
@@ -523,7 +527,10 @@ pub enum Expression {
         variable: String,
         property_expr: Box<Expression>, // Expression that evaluates to property name
     },
-
+    ArrayIndex {
+        expr: Box<Expression>,
+        index: Box<Expression>,
+    },
     And { left: Box<Expression>, right: Box<Expression> },
     Or { left: Box<Expression>, right: Box<Expression> },
 }
@@ -1051,6 +1058,27 @@ impl Expression {
                     _ => Err(GraphError::EvaluationError(format!("Cannot access properties on variable '{}'", variable))),
                 }
             },
+            Expression::ArrayIndex { expr, index } => {
+                let array_val = expr.evaluate(ctx)?;
+                let index_val = index.evaluate(ctx)?;
+                
+                let idx = match index_val {
+                    CypherValue::Integer(i) => i as usize,
+                    CypherValue::Float(f) => f as usize,
+                    _ => return Err(GraphError::EvaluationError("Array index must be a number".into())),
+                };
+                
+                match array_val {
+                    CypherValue::List(items) => {
+                        if idx < items.len() {
+                            Ok(items[idx].clone())
+                        } else {
+                            Ok(CypherValue::Null)
+                        }
+                    }
+                    _ => Err(GraphError::EvaluationError("Cannot index non-list value".into())),
+                }
+            },
             Expression::LabelPredicate { variable, label } => {
                 if let Some(val) = ctx.variables.get(variable) {
                     match val {
@@ -1564,7 +1592,11 @@ pub fn expression_to_cypher(expr: &Expression) -> String {
             let prop_str = expression_to_cypher(property_expr);
             format!("{}[{}]", variable, prop_str)
         },
-        
+        Expression::ArrayIndex { expr, index } => {
+            let expr_str = expression_to_cypher(expr);
+            let index_str = expression_to_cypher(index);
+            format!("{}[{}]", expr_str, index_str)
+        },
         Expression::Binary { op, left, right } => {
             let left_str = expression_to_cypher(left);
             let right_str = expression_to_cypher(right);
@@ -1924,7 +1956,12 @@ impl From<CypherExpression> for Expression {
                     property_expr: Box::new(Expression::from(*property_expr)),
                 }
             },
-
+            CypherExpression::ArrayIndex { expr, index } => {
+                Expression::ArrayIndex {
+                    expr: Box::new(Expression::from(*expr)),
+                    index: Box::new(Expression::from(*index)),
+                }
+            },
             // --- Specialized Predicate Conversion ---
             // This maps the structural any/all/exists to our evaluator logic
             CypherExpression::Predicate { name, variable, list, condition } => {
