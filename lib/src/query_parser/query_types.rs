@@ -10,7 +10,8 @@ use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
 use models::properties::{ PropertyValue, SerializableFloat, HashablePropertyMap} ;
 use models::identifiers::SerializableUuid;
-use std::result::Result;
+use std::result::Result; 
+use strum_macros::{Display, AsRefStr};
 
 // This definition allows you to specify both T and E when using StdResult.
 pub type StdResult<T, E> = Result<T, E>;
@@ -92,6 +93,14 @@ pub enum CypherExpression {
         list: Box<CypherExpression>,
         /// The boolean condition to evaluate for each element
         condition: Box<CypherExpression>,
+    },
+    DynamicPropertyAccess {
+        variable: String,
+        property_expr: Box<CypherExpression>,
+    },
+    ArrayIndex {
+        expr: Box<CypherExpression>,
+        index: Box<CypherExpression>,
     },
 }
 
@@ -514,6 +523,14 @@ pub enum Expression {
         property: String,
         prefix: String,
     },
+    DynamicPropertyAccess {
+        variable: String,
+        property_expr: Box<Expression>, // Expression that evaluates to property name
+    },
+    ArrayIndex {
+        expr: Box<Expression>,
+        index: Box<Expression>,
+    },
     And { left: Box<Expression>, right: Box<Expression> },
     Or { left: Box<Expression>, right: Box<Expression> },
 }
@@ -529,16 +546,59 @@ pub enum ProjectionItem {
     Expression(Expression),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Display, AsRefStr)]
 pub enum BinaryOp {
-    Eq, Neq, Lt, Lte, Gt, Gte, And, Or, Xor, Plus, Minus, Mul, Div, Mod, Contains, StartsWith, EndsWith, Regex, In, NotIn, 
+    #[strum(serialize = "=")]
+    Eq,
+    #[strum(serialize = "<>")]
+    Neq,
+    #[strum(serialize = "<")]
+    Lt,
+    #[strum(serialize = "<=")]
+    Lte,
+    #[strum(serialize = ">")]
+    Gt,
+    #[strum(serialize = ">=")]
+    Gte,
+    #[strum(serialize = "AND")]
+    And,
+    #[strum(serialize = "OR")]
+    Or,
+    #[strum(serialize = "XOR")]
+    Xor,
+    #[strum(serialize = "+")]
+    Plus,
+    #[strum(serialize = "-")]
+    Minus,
+    #[strum(serialize = "*")]
+    Mul,
+    #[strum(serialize = "/")]
+    Div,
+    #[strum(serialize = "%")]
+    Mod,
+    #[strum(serialize = "CONTAINS")]
+    Contains,
+    #[strum(serialize = "STARTS WITH")]
+    StartsWith,
+    #[strum(serialize = "ENDS WITH")]
+    EndsWith,
+    #[strum(serialize = "=~")]
+    Regex,
+    #[strum(serialize = "IN")]
+    In,
+    #[strum(serialize = "NOT IN")]
+    NotIn, 
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Display, AsRefStr)]
 pub enum UnaryOp {
+    #[strum(serialize = "NOT")]
     Not, 
+    #[strum(serialize = "-")]
     Neg,
+    #[strum(serialize = "IS NOT NULL")]
     IsNotNull, 
+    #[strum(serialize = "IS NULL")]
     IsNull,   
 }
 
@@ -961,7 +1021,64 @@ impl Expression {
                     .cloned()
                     .ok_or_else(|| GraphError::EvaluationError(format!("Parameter '${name}' not provided"))),
             },
-
+            // --- ADD DYNAMIC PROPERTY ACCESS HERE ---
+            Expression::DynamicPropertyAccess { variable, property_expr } => {
+                // Get the target object (vertex/edge/map) from context
+                let target_val = ctx.variables.get(variable)
+                    .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{}' not found", variable)))?;
+                
+                // Evaluate the property name expression
+                let prop_name_val = property_expr.evaluate(ctx)?;
+                let prop_name = match prop_name_val {
+                    CypherValue::String(s) => s,
+                    CypherValue::Null => return Ok(CypherValue::Null),
+                    _ => return Err(GraphError::EvaluationError("Property name must be a string".into())),
+                };
+                
+                // Extract property value based on target type
+                match target_val {
+                    CypherValue::Vertex(v) => {
+                        match v.properties.get(&prop_name) {
+                            Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                            None => Ok(CypherValue::Null),
+                        }
+                    },
+                    CypherValue::Edge(e) => {
+                        match e.properties.get(&prop_name) {
+                            Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                            None => Ok(CypherValue::Null),
+                        }
+                    },
+                    CypherValue::Map(map) => {
+                        match map.get(&prop_name) {
+                            Some(val) => Ok(val.clone()),
+                            None => Ok(CypherValue::Null),
+                        }
+                    },
+                    _ => Err(GraphError::EvaluationError(format!("Cannot access properties on variable '{}'", variable))),
+                }
+            },
+            Expression::ArrayIndex { expr, index } => {
+                let array_val = expr.evaluate(ctx)?;
+                let index_val = index.evaluate(ctx)?;
+                
+                let idx = match index_val {
+                    CypherValue::Integer(i) => i as usize,
+                    CypherValue::Float(f) => f as usize,
+                    _ => return Err(GraphError::EvaluationError("Array index must be a number".into())),
+                };
+                
+                match array_val {
+                    CypherValue::List(items) => {
+                        if idx < items.len() {
+                            Ok(items[idx].clone())
+                        } else {
+                            Ok(CypherValue::Null)
+                        }
+                    }
+                    _ => Err(GraphError::EvaluationError("Cannot index non-list value".into())),
+                }
+            },
             Expression::LabelPredicate { variable, label } => {
                 if let Some(val) = ctx.variables.get(variable) {
                     match val {
@@ -1061,6 +1178,32 @@ impl Expression {
                             }
                         } else {
                             Err(GraphError::EvaluationError("ID() requires a variable".into()))
+                        }
+                    },
+                    "KEYS" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("keys() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::Vertex(v) => {
+                                let key_list: Vec<CypherValue> = v.properties.keys()
+                                    .map(|k| CypherValue::String(k.clone()))
+                                    .collect();
+                                Ok(CypherValue::List(key_list))
+                            },
+                            CypherValue::Edge(e) => {
+                                let key_list: Vec<CypherValue> = e.properties.keys()
+                                    .map(|k| CypherValue::String(k.clone()))
+                                    .collect();
+                                Ok(CypherValue::List(key_list))
+                            },
+                            CypherValue::Map(map) => {
+                                let key_list: Vec<CypherValue> = map.keys()
+                                    .map(|k| CypherValue::String(k.clone()))
+                                    .collect();
+                                Ok(CypherValue::List(key_list))
+                            },
+                            _ => Ok(CypherValue::List(vec![])), // Return empty list for non-entities
                         }
                     },
                     "TYPE" => {
@@ -1425,6 +1568,115 @@ impl PartialEq for CypherValue {
     }
 }
 
+pub fn expression_to_cypher(expr: &Expression) -> String {
+    match expr {
+        Expression::Literal(value) => literal_to_cypher(value),
+        
+        // Handling all PropertyAccess variants
+        Expression::Property(prop) => match prop {
+            PropertyAccess::Vertex(var, p) | PropertyAccess::Edge(var, p) => format!("{}.{}", var, p),
+            PropertyAccess::Parameter(name) => format!("${}", name),
+        },
+            
+        Expression::Variable(name) => name.clone(),
+        
+        Expression::List(items) => {
+            let item_strs: Vec<String> = items.iter()
+                .map(|i| expression_to_cypher(i))
+                .collect();
+            format!("[{}]", item_strs.join(", "))
+        },
+        
+        // --- ADD DYNAMIC PROPERTY ACCESS ---
+        Expression::DynamicPropertyAccess { variable, property_expr } => {
+            let prop_str = expression_to_cypher(property_expr);
+            format!("{}[{}]", variable, prop_str)
+        },
+        Expression::ArrayIndex { expr, index } => {
+            let expr_str = expression_to_cypher(expr);
+            let index_str = expression_to_cypher(index);
+            format!("{}[{}]", expr_str, index_str)
+        },
+        Expression::Binary { op, left, right } => {
+            let left_str = expression_to_cypher(left);
+            let right_str = expression_to_cypher(right);
+            format!("({} {} {})", left_str, op, right_str)
+        },
+        
+        Expression::Unary { op, expr } => {
+            let expr_str = expression_to_cypher(expr);
+            match op {
+                UnaryOp::Not => format!("NOT {}", expr_str),
+                UnaryOp::Neg => format!("-{}", expr_str),
+                UnaryOp::IsNull => format!("{} IS NULL", expr_str),
+                UnaryOp::IsNotNull => format!("{} IS NOT NULL", expr_str),
+            }
+        },
+        
+        Expression::LabelPredicate { variable, label } => {
+            format!("{}:{}", variable, label)
+        },
+        
+        Expression::Predicate { name, variable, list, condition } => {
+            let list_str = expression_to_cypher(list);
+            let cond_str = expression_to_cypher(condition);
+            format!("{}({} IN {} WHERE {})", name.to_uppercase(), variable, list_str, cond_str)
+        },
+        
+        Expression::FunctionCall { name, args } => {
+            let arg_strs: Vec<String> = args.iter()
+                .map(|arg| expression_to_cypher(arg))
+                .collect();
+            format!("{}({})", name, arg_strs.join(", "))
+        },
+        
+        Expression::PropertyComparison { variable, property, operator, value } => {
+            let val_str = serde_json::to_string(value).unwrap_or_default();
+            format!("{}.{} {} {}", variable, property, operator, val_str)
+        },
+        
+        Expression::FunctionComparison { function, argument, operator, value } => {
+            let val_str = serde_json::to_string(value).unwrap_or_default();
+            format!("{}({}) {} {}", function, argument, operator, val_str)
+        },
+        
+        Expression::StartsWith { variable, property, prefix } => {
+            format!("{}.{} STARTS WITH '{}'", variable, property, prefix)
+        },
+        
+        Expression::And { left, right } => {
+            let left_str = expression_to_cypher(left);
+            let right_str = expression_to_cypher(right);
+            format!("({} AND {})", left_str, right_str)
+        },
+        
+        Expression::Or { left, right } => {
+            let left_str = expression_to_cypher(left);
+            let right_str = expression_to_cypher(right);
+            format!("({} OR {})", left_str, right_str)
+        },
+    }
+}
+
+pub fn literal_to_cypher(value: &CypherValue) -> String {
+    match value {
+        CypherValue::Null => "null".to_string(),
+        CypherValue::Bool(b) => b.to_string(),
+        CypherValue::Integer(i) => i.to_string(),
+        CypherValue::Float(f) => f.to_string(),
+        CypherValue::String(s) => format!("'{}'", s.replace("'", "''")),
+        CypherValue::Uuid(uuid) => format!("'{}'", uuid.0.to_string()),
+        CypherValue::List(items) => {
+            let item_strs: Vec<String> = items.iter()
+                .map(|item| literal_to_cypher(item))
+                .collect();
+            format!("[{}]", item_strs.join(", "))
+        },
+        // For Vertex/Edge, return a placeholder (shouldn't occur in WHERE clauses)
+        _ => "/* UNSUPPORTED LITERAL */".to_string(),
+    }
+}
+
 pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
     match pv {
         PropertyValue::Null => CypherValue::Null,
@@ -1455,6 +1707,103 @@ pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
         }
 
         PropertyValue::Vertex(_) => CypherValue::Null,
+    }
+}
+
+pub fn cypher_serialize(query: CypherQuery) -> String {
+    match query {
+        CypherQuery::MatchPattern { patterns, where_clause, with_clause, return_clause } => {
+            let mut parts = Vec::new();
+            
+            // Build MATCH patterns
+            let pattern_strs: Vec<String> = patterns.iter()
+                .map(|(var, nodes, rels)| {
+                    // Serialize nodes
+                    let node_strs: Vec<String> = nodes.iter()
+                        .map(|(v, labels, props)| {
+                            let var_part = v.as_ref().map(|s| s.clone()).unwrap_or_else(|| "_".to_string());
+                            let label_part = if !labels.is_empty() {
+                                format!(":{}", labels.join(":"))
+                            } else { "".to_string() };
+                            
+                            let prop_part = if !props.is_empty() {
+                                let props_str: Vec<String> = props.iter()
+                                    .map(|(k, v)| {
+                                        format!("{}: {}", k, serde_json::to_string(v).unwrap_or_default())
+                                    })
+                                    .collect();
+                                format!(" {{{}}}", props_str.join(", "))
+                            } else { "".to_string() };
+                            
+                            format!("({}{})", var_part, label_part) + &prop_part
+                        })
+                        .collect();
+                    
+                    // Serialize relationships (simplified)
+                    let mut full_pattern = node_strs.join("-");
+                    if !rels.is_empty() {
+                        // Add relationship patterns if needed
+                    }
+                    
+                    full_pattern
+                })
+                .collect();
+            
+            parts.push(format!("MATCH {}", pattern_strs.join(", ")));
+            
+            // Add WHERE clause
+            if let Some(wc) = where_clause {
+                parts.push(format!("WHERE {}", expression_to_cypher(&wc.condition)));
+            }
+            
+            // Add WITH clause
+            if let Some(with) = with_clause {
+                let items: Vec<String> = with.items.iter()
+                    .map(|item| {
+                        if let Some(alias) = &item.alias {
+                            format!("{} AS {}", item.expression, alias)
+                        } else {
+                            item.expression.clone()
+                        }
+                    })
+                    .collect();
+                parts.push(format!("WITH {}", items.join(", ")));
+                if let Some(wc) = &with.where_clause {
+                    parts.push(format!("WHERE {}", expression_to_cypher(&wc.condition)));
+                }
+            }
+            
+            // Add RETURN clause
+            if let Some(ret) = return_clause {
+                let items: Vec<String> = ret.items.iter()
+                    .map(|item| {
+                        if let Some(alias) = &item.alias {
+                            format!("{} AS {}", item.expression, alias)
+                        } else {
+                            item.expression.clone()
+                        }
+                    })
+                    .collect();
+                parts.push(format!("RETURN {}", items.join(", ")));
+                
+                if let Some(skip) = ret.skip {
+                    parts.push(format!("SKIP {}", skip));
+                }
+                if let Some(limit) = ret.limit {
+                    parts.push(format!("LIMIT {}", limit));
+                }
+            }
+            
+            parts.join(" ")
+        }
+        
+        // Handle UNWIND
+        CypherQuery::Unwind { expression, variable } => {
+            format!("UNWIND {} AS {}", expression_to_cypher(&expression), variable)
+        }
+        
+        // Add other query types as needed
+        _ => format!("/* UNSUPPORTED: {:?} */", query),
     }
 }
 
@@ -1600,6 +1949,19 @@ impl From<CypherExpression> for Expression {
                 Expression::Property(PropertyAccess::Vertex(var, prop))
             },
 
+            // --- ADD DYNAMIC PROPERTY ACCESS ---
+            CypherExpression::DynamicPropertyAccess { variable, property_expr } => {
+                Expression::DynamicPropertyAccess {
+                    variable,
+                    property_expr: Box::new(Expression::from(*property_expr)),
+                }
+            },
+            CypherExpression::ArrayIndex { expr, index } => {
+                Expression::ArrayIndex {
+                    expr: Box::new(Expression::from(*expr)),
+                    index: Box::new(Expression::from(*index)),
+                }
+            },
             // --- Specialized Predicate Conversion ---
             // This maps the structural any/all/exists to our evaluator logic
             CypherExpression::Predicate { name, variable, list, condition } => {
@@ -1652,6 +2014,7 @@ impl From<CypherExpression> for Expression {
                             } else { None }
                         } else { None }
                     }
+                    // ADD DYNAMIC PROPERTY ACCESS OPTIMIZATION IF NEEDED
                     _ => None,
                 };
 
