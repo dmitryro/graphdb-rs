@@ -243,7 +243,7 @@ pub struct WithItem {
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] // ← Add Serialize
 pub struct ReturnClause {
     pub items: Vec<ReturnItem>,
     pub distinct: bool,
@@ -252,7 +252,7 @@ pub struct ReturnClause {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReturnItem {
     pub expression: String,
     pub alias: Option<String>,
@@ -430,6 +430,11 @@ pub enum CypherQuery {
         skip: Option<i64>,        // Parsed value for SKIP
         limit: Option<i64>,       // Parsed value for LIMIT
     },
+    // NEW: UNWIND clause support
+    Unwind {
+        expression: Expression, // The list expression to unwind
+        variable: String,       // The variable name to bind each element
+    },
     Chain(Vec<CypherQuery>),
     Batch(Vec<CypherQuery>),
     Union(Box<CypherQuery>, bool, Box<CypherQuery>),
@@ -542,7 +547,7 @@ pub struct WhereClause {
     pub condition: Expression,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EvaluationContext {
     pub variables: HashMap<String, CypherValue>,
     pub parameters: HashMap<String, CypherValue>,

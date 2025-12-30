@@ -2202,7 +2202,7 @@ fn parse_simple_query_type(input: &str) -> IResult<&str, CypherQuery> {
         // *** FIX: Added MatchSet, prioritized over MatchCreate ***
         //parse_match_set_relationship, // <--- NEW FIX: Handle MATCH...SET
         //parse_match_create_relationship, 
-        
+        parse_unwind_clause, // ← ADD THIS LINE (new parser for UNWIND)
         full_statement_parser,
         parse_detach_delete,
         parse_delete_edges,
@@ -2441,11 +2441,17 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     let (input_after_clause, clause_type_str) = preceded(
         multispace0,
         alt((
+            tag_no_case::<_, _, NomErrorType<&str>>("UNWIND"),
             tag_no_case::<_, _, NomErrorType<&str>>("OPTIONAL MATCH"),
             tag_no_case::<_, _, NomErrorType<&str>>("MERGE"),
             tag_no_case::<_, _, NomErrorType<&str>>("MATCH"),
         ))
     ).parse(input_current)?;
+
+    // Handle UNWIND separately
+    if clause_type_str.to_uppercase() == "UNWIND" {
+        return parse_unwind_clause(input_current);
+    }
 
     let is_merge = clause_type_str.to_uppercase() == "MERGE";
     input_current = input_after_clause;
@@ -2468,6 +2474,7 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
             let trimmed = input_ws.trim_start().to_uppercase();
             if trimmed.starts_with("WHERE") || 
                trimmed.starts_with("WITH") || 
+               trimmed.starts_with("UNWIND") || 
                trimmed.starts_with("RETURN") ||
                trimmed.starts_with("ORDER") ||
                trimmed.starts_with("LIMIT") ||
@@ -2499,6 +2506,15 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
             }
         }
     }
+
+    // --- 2b. PARSE OPTIONAL UNWIND CLAUSE ---
+    let (input_after_unwind, unwind_clause_opt) = opt(preceded(
+        multispace0,
+        parse_unwind_clause,
+    )).parse(input_current)?;
+
+    let captured_unwind = unwind_clause_opt;
+    input_current = input_after_unwind;
 
     // --- 3. PARSE OPTIONAL WHERE CLAUSE ---
     let (input_after_where, where_opt) = opt(preceded(
@@ -2627,6 +2643,35 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
             on_create_set, 
             on_match_set 
         }))
+    } else if captured_unwind.is_some() {
+        // Handle MATCH ... UNWIND ... [RETURN]
+        let mut chain_clauses = vec![
+            CypherQuery::MatchPattern {
+                patterns: all_patterns,
+                where_clause: captured_where,
+                with_clause: captured_with,
+                return_clause: None, // UNWIND handles the transformation
+            },
+            captured_unwind.unwrap(),
+        ];
+        
+        // If there's a RETURN, add it as a final clause
+        if let Some(ret) = captured_return {
+            chain_clauses.push(CypherQuery::ReturnStatement {
+                projection_string: serde_json::to_string(&ret).unwrap_or_default(),
+                order_by: ret.order_by.clone().unwrap_or_default()
+                    .into_iter()
+                    .map(|(expr, asc)| OrderByItem { 
+                        expression: expr, 
+                        ascending: asc 
+                    })
+                    .collect(),
+                skip: ret.skip.map(|s| s as i64),
+                limit: ret.limit.map(|l| l as i64),
+            });
+        }
+        
+        Ok((input_final, CypherQuery::Chain(chain_clauses)))
     } else if !create_patterns_mut.is_empty() {
         Ok((input_final, CypherQuery::MatchCreate { 
             match_patterns: all_patterns, 
@@ -3844,21 +3889,106 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
     println!("===> parse_single_query_clause START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
 
+    let (input, _) = multispace0(input)?;
+    if input.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Eof)));
+    }
+
     let trimmed = input.trim_start();
     let upper = trimmed.to_uppercase();
 
-    // 1. Prioritize full_statement_parser for MATCH/MERGE to capture WITH, WHERE, and RETURN correctly.
-    // This avoids the manual conversion logic that was stripping details from ParsedWithClause.
+    // 1. Parse sequence of clauses (MATCH -> UNWIND -> RETURN)
     if upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH") || upper.starts_with("MERGE") {
-        return full_statement_parser(input);
+        let mut clauses = Vec::new();
+        let mut current_input = input;
+
+        // Parse first clause
+        let (remaining, first_clause) = full_statement_parser(current_input)?;
+        clauses.push(first_clause);
+        current_input = remaining;
+
+        // Parse subsequent clauses
+        loop {
+            let (rest, _) = multispace0(current_input)?;
+            if rest.is_empty() {
+                break;
+            }
+
+            let rest_trimmed = rest.trim_start();
+            let rest_upper = rest_trimmed.to_uppercase();
+
+            if rest_upper.starts_with("UNWIND") {
+                let (new_remaining, unwind_clause) = parse_unwind_clause(rest)?;
+                clauses.push(unwind_clause);
+                current_input = new_remaining;
+            } else if rest_upper.starts_with("RETURN") {
+                let (new_remaining, return_struct) = parse_return_clause_as_struct(rest)?;
+                
+                // FIXED: Don't try to serialize ReturnClause, just extract the fields
+                let order_by_items = return_struct.order_by.clone().unwrap_or_default()
+                    .into_iter()
+                    .map(|(expr, asc)| OrderByItem { 
+                        expression: expr, 
+                        ascending: asc 
+                    })
+                    .collect();
+                
+                clauses.push(CypherQuery::ReturnStatement {
+                    projection_string: format!("RETURN {:?}", return_struct.items),
+                    order_by: order_by_items,
+                    skip: return_struct.skip.map(|s| s as i64),
+                    limit: return_struct.limit.map(|l| l as i64),
+                });
+                current_input = new_remaining;
+                break;
+            } else if rest_upper.starts_with("WITH") {
+                let (new_remaining, with_clause) = parse_with_full(rest)?;
+                
+                // FIXED: Extract where_clause first, then use with_clause
+                let where_clause_opt = with_clause.where_clause.as_ref().map(|wc| WhereClause { 
+                    condition: wc.condition.clone() 
+                });
+                
+                clauses.push(CypherQuery::MatchPattern {
+                    patterns: vec![],
+                    where_clause: where_clause_opt,
+                    with_clause: Some(with_clause),
+                    return_clause: None,
+                });
+                current_input = new_remaining;
+            } else {
+                break;
+            }
+        }
+
+        if clauses.len() == 1 {
+            return Ok((current_input, clauses.into_iter().next().unwrap()));
+        } else {
+            return Ok((current_input, CypherQuery::Chain(clauses)));
+        }
+    }
+    // 2. Handle standalone UNWIND
+    else if upper.starts_with("UNWIND") {
+        return parse_unwind_clause(input);
+    }
+    // 3. Handle standalone RETURN
+    else if upper.starts_with("RETURN") {
+        if let Ok((remaining, ret_struct)) = parse_return_clause_as_struct(input) {
+            return Ok((remaining, CypherQuery::MatchPattern {
+                patterns: vec![],
+                where_clause: None,
+                with_clause: None,
+                return_clause: Some(ret_struct),
+            }));
+        }
     }
 
-    // 2. Fallback for standalone WITH (used in chainable queries)
+    // 4. Fallback for standalone WITH (used in chainable queries)
     if let Ok(result) = parse_with_clause(input) {
         return Ok(result);
     }
 
-    // 3. Fallback for standalone CREATE
+    // 5. Fallback for standalone CREATE
     if let Ok((remaining, patterns)) = parse_create_clause(input) {
         return Ok((remaining, CypherQuery::CreateStatement {
             patterns,
@@ -3866,21 +3996,9 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
         }));
     }
 
-    // 4. Fallback for specialized mutation clauses (SET, DELETE, REMOVE)
+    // 6. Fallback for specialized mutation clauses (SET, DELETE, REMOVE)
     if let Ok(result) = parse_modifying_clause(input) {
         return Ok(result);
-    }
-
-    // 5. Explicitly handle standalone RETURN if not caught by full_statement_parser
-    if upper.starts_with("RETURN") {
-        if let Ok((remaining, ret_struct)) = parse_return_clause_as_struct(input) {
-             return Ok((remaining, CypherQuery::MatchPattern {
-                patterns: vec![],
-                where_clause: None,
-                with_clause: None,
-                return_clause: Some(ret_struct),
-            }));
-        }
     }
 
     Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Alt)))
@@ -5621,6 +5739,29 @@ fn parse_create_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
     .parse(input)
 }
 
+/// Parses an UNWIND clause: UNWIND expression AS variable
+fn parse_unwind_clause(input: &str) -> IResult<&str, CypherQuery> {
+    println!("===> parse_unwind_clause START");
+    
+    let (input, _) = tag_no_case("UNWIND").parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    
+    // Parse the expression to unwind (e.g., [1,2,3] or p.names)
+    let (input, expression) = parse_expression(input)?;
+    
+    let (input, _) = multispace1.parse(input)?;
+    let (input, _) = tag_no_case("AS").parse(input)?;
+    let (input, _) = multispace1.parse(input)?;
+    
+    // Parse the variable name to bind each element to
+    let (input, variable) = parse_identifier(input)?;
+    
+    Ok((input, CypherQuery::Unwind {
+        expression,
+        variable: variable.to_string(),
+    }))
+}
+
 fn parse_where_clause(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_where_clause START"); 
     let (input, _) = tag_no_case("WHERE").parse(input)?;
@@ -6498,7 +6639,39 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                 
                 // Return the collected results wrapped as a single JSON object.
                 Ok(json!({ "results": results }))
-            }
+            },
+            CypherQuery::Unwind {
+                expression,
+                variable,
+            } => {
+                info!("===> EXECUTING Unwind with variable '{}'", variable);
+
+                let ctx = EvaluationContext {
+                    variables: HashMap::new(),
+                    parameters: HashMap::new(),
+                };
+
+                let result = expression.evaluate(&ctx)?;
+                
+                let list = if let CypherValue::List(items) = result {
+                    items
+                } else {
+                    return Err(GraphError::QueryExecutionError(
+                        "UNWIND requires a list expression".to_string()
+                    ));
+                };
+
+                // For standalone UNWIND, return empty vertices/edges
+                // (Real usage is always in Chain with MATCH)
+                Ok(json!({
+                    "vertices": [],
+                    "edges": [],
+                    "stats": {
+                        "vertices_matched": 0,
+                        "edges_matched": 0
+                    }
+                }))
+            },
             // --- UPDATED MATCH PATTERN ---
             // Handles pure MATCH ... RETURN, relying on a full pattern matcher.
             // --- UPDATED MATCH PATTERN BRANCH ---
@@ -6634,15 +6807,14 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     }
                 }
 
+                // Return the raw result object, NOT wrapped in {"results": ...}
                 Ok(json!({
-                    "results": [{
-                        "vertices": final_v,
-                        "edges": final_e,
-                        "stats": {
-                            "vertices_matched": final_v.len(),
-                            "edges_matched": final_e.len()
-                        }
-                    }]
+                    "vertices": final_v,
+                    "edges": final_e,
+                    "stats": {
+                        "vertices_matched": final_v.len(),
+                        "edges_matched": final_e.len()
+                    }
                 }))
             }
             CypherQuery::MatchSet { match_patterns, where_clause, with_clause, set_clauses } => {
@@ -7703,18 +7875,140 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
             }
             // 1. Handle Query Chains (Multiple clauses like MATCH...CREATE...RETURN)
             CypherQuery::Chain(clauses) => {
-                // FIX: Restore the required logic to box clauses and call the high-level service method.
-                // This service method is assumed to handle the state/context of sequential execution,
-                // internally relying on the logic provided by `execute_chain_internal`.
-                let boxed_clauses = clauses.into_iter().map(Box::new).collect();
-                
-                let chain_qr_result = graph_service.execute_chain(boxed_clauses)
-                    .await;
+                info!("===> EXECUTING Chain with aggregation support");
 
-                // The service method returns GraphResult<QueryResult>, so convert the result 
-                // to the final required type, Value.
-                graph_service.query_result_to_value(chain_qr_result)
-            }
+                let mut all_bindings = Vec::new();
+                let mut has_aggregation = false;
+                let mut return_items = Vec::new();
+
+                // Phase 1: Execute MATCH and UNWIND to collect flat bindings
+                let mut current_vertices = Vec::new();
+                let mut var_name = "n".to_string();
+
+                for query in clauses.iter() {
+                    match query {
+                        CypherQuery::MatchPattern { patterns, where_clause, .. } => {
+                            // Transform patterns for execution
+                            let transformed_patterns: Vec<_> = patterns.iter().map(|(id, nodes, edges)| {
+                                let transformed_nodes: Vec<_> = nodes.iter().map(|(var, labels, props)| {
+                                    (var.clone(), labels.first().cloned(), props.clone())
+                                }).collect();
+                                (id.clone(), transformed_nodes, edges.clone())
+                            }).collect();
+
+                            (current_vertices, _) = exec_cypher_pattern(transformed_patterns, &graph_service).await?;
+
+                            // Apply WHERE clause filtering
+                            if let Some(wc) = where_clause {
+                                current_vertices.retain(|v| {
+                                    let var_ref = patterns.get(0)
+                                        .and_then(|p| p.1.get(0))
+                                        .and_then(|n| n.0.as_ref())
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("n");
+                                    
+                                    let ctx = EvaluationContext::from_vertex(var_ref, v);
+                                    matches!(wc.condition.evaluate(&ctx), Ok(CypherValue::Bool(true)))
+                                });
+                            }
+
+                            // Extract variable name for UNWIND context
+                            if let Some(var) = patterns.get(0).and_then(|p| p.1.get(0)).and_then(|n| n.0.clone()) {
+                                var_name = var;
+                            }
+                        }
+
+                        CypherQuery::Unwind { expression, variable } => {
+                            for vertex in &current_vertices {
+                                let ctx = EvaluationContext::from_vertex(&var_name, vertex);
+                                let result = expression.evaluate(&ctx)?;
+                                if let CypherValue::List(items) = result {
+                                    for item in items {
+                                        let mut binding = HashMap::new();
+                                        binding.insert(variable.clone(), item);
+                                        all_bindings.push(binding);
+                                    }
+                                }
+                            }
+                        }
+
+                        CypherQuery::ReturnStatement { projection_string, .. } => {
+                            // Parse projection to detect aggregation
+                            if projection_string.contains("count(") {
+                                has_aggregation = true;
+                            }
+                            
+                            // Try to parse return items, use empty vec as fallback
+                            return_items = serde_json::from_str::<ReturnClause>(projection_string)
+                                .ok()
+                                .map(|rc| rc.items)
+                                .unwrap_or_else(Vec::new);
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                // Phase 2: Project and aggregate
+                if has_aggregation {
+                    // Build grouping key: e.g., "label"
+                    let mut groups: HashMap<String, Vec<HashMap<String, CypherValue>>> = HashMap::new();
+
+                    for binding in all_bindings {
+                        // Extract grouping key (assume first non-aggregate item is group key)
+                        let group_key = binding.get("label")
+                            .and_then(|v| match v {
+                                CypherValue::String(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        groups.entry(group_key).or_default().push(binding);
+                    }
+
+                    // Build result vertices
+                    let mut result_vertices = Vec::new();
+                    for (label, group) in groups {
+                        let count = group.len() as i64;
+                        let mut props = HashMap::new();
+                        props.insert(
+                            "label".to_string(), 
+                            to_property_value(CypherValue::String(label.clone()).to_json())?
+                        );
+                        props.insert(
+                            "count".to_string(), 
+                            to_property_value(CypherValue::Integer(count).to_json())?
+                        );
+
+                        result_vertices.push(Vertex {
+                            id: SerializableUuid::default(),
+                            label: Identifier::new("AggregationResult".to_string())?,
+                            properties: props,
+                            created_at: Utc::now().into(),
+                            updated_at: Utc::now().into(),
+                        });
+                    }
+
+                    return Ok(json!({
+                        "vertices": result_vertices,
+                        "edges": Vec::<Edge>::new(),
+                        "stats": {
+                            "vertices_matched": result_vertices.len(),
+                            "edges_matched": 0
+                        }
+                    }));
+                }
+
+                // Fallback: no aggregation
+                Ok(json!({
+                    "vertices": current_vertices,
+                    "edges": Vec::<Edge>::new(),
+                    "stats": {
+                        "vertices_matched": current_vertices.len(),
+                        "edges_matched": 0
+                    }
+                }))
+            },
             // 3. Handle Union Queries
             // Assuming the original structure: CypherQuery::Union(q1, q2, is_all)
             CypherQuery::Union(q1, q2, is_all) => {
