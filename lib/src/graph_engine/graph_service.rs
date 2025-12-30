@@ -917,7 +917,6 @@ impl GraphService {
                     } else if key == "last_name" {
                         with_exprs.push(format!("levenshtein(p.last_name, '{}') AS dist", title_case));
                     } else if key == "name" {
-                        // For "name", assume it's full name — split or use as-is for both
                         with_exprs.push(format!(
                             "(levenshtein(p.first_name, '{}') + levenshtein(p.last_name, '{}')) / 2.0 AS dist",
                             title_case, title_case
@@ -962,40 +961,30 @@ impl GraphService {
         
         let mut patients = Vec::new();
         
-        // FIXED: Properly traverse the response structure
-        // raw_results is Vec<Value>, each element has structure: {"results": [{"vertices": [...], "edges": [], "stats": {}}]}
-        for result_wrapper in &raw_results {
-            println!("===> Processing result wrapper: {}", serde_json::to_string_pretty(&result_wrapper).unwrap_or_default());
+        // ✅ FIXED: Directly access "vertices" — NO "results" wrapper
+        for result_obj in &raw_results {
+            println!("===> Processing result object: {}", serde_json::to_string_pretty(&result_obj).unwrap_or_default());
             
-            // Get the "results" array from the wrapper
-            if let Some(results_array) = result_wrapper.get("results").and_then(|v| v.as_array()) {
-                println!("===> Found results array with {} items", results_array.len());
+            // Directly access "vertices" from the flat result object
+            if let Some(vertices) = result_obj.get("vertices").and_then(|v| v.as_array()) {
+                println!("===> Found {} vertices in result", vertices.len());
                 
-                // Each item in results has vertices, edges, and stats
-                for result_item in results_array {
-                    if let Some(vertices) = result_item.get("vertices").and_then(|v| v.as_array()) {
-                        println!("===> Found {} vertices in result_item", vertices.len());
-                        
-                        for vertex in vertices {
-                            println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
-                            
-                            match parse_patient_from_cypher_result(vertex.clone()) {
-                                Ok(patient) => {
-                                    println!("===> Successfully parsed patient: {:?}", patient);
-                                    patients.push(patient);
-                                }
-                                Err(e) => {
-                                    println!("===> Failed to parse patient: {}", e);
-                                    // Continue with next vertex instead of failing entire search
-                                }
-                            }
+                for vertex in vertices {
+                    println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
+                    
+                    match parse_patient_from_cypher_result(vertex.clone()) {
+                        Ok(patient) => {
+                            println!("===> Successfully parsed patient: {:?}", patient);
+                            patients.push(patient);
                         }
-                    } else {
-                        println!("===> No vertices found in result_item");
+                        Err(e) => {
+                            println!("===> Failed to parse patient: {}", e);
+                            // Continue with next vertex instead of failing entire search
+                        }
                     }
                 }
             } else {
-                println!("===> No results array found in wrapper");
+                println!("===> No vertices found in result object");
             }
         }
         
@@ -2056,15 +2045,12 @@ impl GraphService {
             .await
             .map_err(|e| format!("Graph read failed: {}", e))?;
 
-        // 2. Extract the nested vertex from the structure:
-        // results[0]["results"][0]["vertices"][0]
+        // 2. Extract the vertex from the CORRECT flat structure:
+        // results[0]["vertices"][0]  (NO "results" wrapper)
         let vertex_json = results.first()
-            .and_then(|r| r.get("results"))
-            .and_then(|r_inner| r_inner.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|first_res| first_res.get("vertices"))
-            .and_then(|v_arr| v_arr.as_array())
-            .and_then(|v_list| v_list.first())
+            .and_then(|result_obj| result_obj.get("vertices"))
+            .and_then(|vertices| vertices.as_array())
+            .and_then(|vertices| vertices.first())
             .ok_or_else(|| format!("Vertex {} not found in graph results", uuid))?;
 
         // 3. Deserialize into the Vertex struct
@@ -2134,40 +2120,53 @@ impl GraphService {
     /// Combines the results of two independently executed queries using UNION or UNION ALL logic.
     pub async fn union_results(
         &self,
-        // FIX 3: Swap query2 and is_all to match the argument order implied by the compiler error
         query1: Box<CypherQuery>,
-        is_all: bool, // true for UNION ALL, false for UNION DISTINCT
+        is_all: bool,
         query2: Box<CypherQuery>,
     ) -> GraphResult<QueryResult> {
+        // Dereference the Box to get CypherQuery
+        let query1_str = cypher_serialize(*query1);
+        let query2_str = cypher_serialize(*query2);
         
-        let engine = QueryExecEngine::get()
-            .await
-            .map_err(|e| GraphError::InternalError(format!("QueryExecEngine not initialized: {}", e)))?;
+        let result1 = self.execute_cypher_read(&query1_str, serde_json::Value::Null).await?;
+        let result2 = self.execute_cypher_read(&query2_str, serde_json::Value::Null).await?;
         
-        // Convert *query1 to &str
-        let query1_string = query_to_string(*query1);
+        // Extract vertices from results
+        let mut all_vertices = Vec::new(); // This `mut` is needed and correct
         
-        // FIX 1: Execute the first query via the engine. Returns Value.
-        let result_value_1 = engine.execute_cypher(&query1_string)
-            .await
-            .map_err(|e| GraphError::QueryExecutionError(format!("Union query 1 failed: {}", e)))?;
+        for result in result1 {
+            if let Some(vertices) = result.get("vertices").and_then(|v| v.as_array()) {
+                all_vertices.extend(vertices.iter().cloned());
+            }
+        }
         
-        // Convert *query2 to &str
-        let query2_string = query_to_string(*query2);
-
-        // FIX 1: Execute the second query via the engine. Returns Value.
-        let result_value_2 = engine.execute_cypher(&query2_string)
-            .await
-            .map_err(|e| GraphError::QueryExecutionError(format!("Union query 2 failed: {}", e)))?;
-
-        // FIX 2: Convert Value results back to QueryResult before combining
-        let result_qr_1 = self.value_to_query_result(result_value_1)?;
-        let result_qr_2 = self.value_to_query_result(result_value_2)?;
-
-        // 4. Combine and serialize the results using the helper.
-        self.combine_json_results(result_qr_1, result_qr_2, is_all)
+        for result in result2 {
+            if let Some(vertices) = result.get("vertices").and_then(|v| v.as_array()) {
+                all_vertices.extend(vertices.iter().cloned());
+            }
+        }
+        
+        // Apply DISTINCT if needed
+        if !is_all {
+            let mut seen = std::collections::HashSet::new();
+            all_vertices.retain(|vertex| {
+                let id_str = vertex.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                seen.insert(id_str)
+            });
+        }
+        
+        let result_value = json!({
+            "vertices": all_vertices,
+            "edges": [],
+            "stats": {
+                "vertices_matched": all_vertices.len(),
+                "edges_matched": 0
+            }
+        });
+        
+        let result_string = serde_json::to_string(&result_value)?;
+        Ok(QueryResult::Success(result_string))
     }
-
 
     /// Helper to combine the raw JSON string results from two sub-queries for UNION/UNION ALL.
     /// This function relies on serializing JSON values to strings for deduplication (for UNION DISTINCT).
@@ -2177,54 +2176,76 @@ impl GraphService {
         result2: QueryResult, 
         is_all: bool
     ) -> GraphResult<QueryResult> {
-        
-        // Function to safely parse QueryResult into a JSON array, treating Null as []
-        let parse_result = |qr: QueryResult| -> GraphResult<Value> {
+        // Parse both results as graph objects
+        let parse_result = |qr: QueryResult| -> GraphResult<serde_json::Value> {
             match qr {
-                // Assumes QueryResult::Success contains a string of a JSON array
-                QueryResult::Success(s) => from_str(&s)
-                    .map_err(|e| GraphError::DeserializationError(format!("Result parsing failed: {}", e))),
-                QueryResult::Null => Ok(Value::Array(vec![])),
-                _ => Err(GraphError::DeserializationError("Unsupported QueryResult type for UNION".into())),
+                QueryResult::Success(s) => {
+                    let val: serde_json::Value = serde_json::from_str(&s)
+                        .map_err(|e| GraphError::DeserializationError(format!("Failed to parse result: {}", e)))?;
+                    
+                    // If it's a graph object, extract vertices as rows
+                    if val.is_object() {
+                        if let Some(vertices) = val.get("vertices").and_then(|v| v.as_array()) {
+                            // Convert vertices to row format for union
+                            let rows: Vec<serde_json::Value> = vertices.iter().map(|v| {
+                                // Extract just the properties you need (id, timestamp)
+                                let mut row = serde_json::Map::new();
+                                if let Some(id) = v.get("id") {
+                                    row.insert("id".to_string(), id.clone());
+                                }
+                                if let Some(ts) = v.get("properties").and_then(|p| p.get("timestamp")) {
+                                    row.insert("timestamp".to_string(), ts.clone());
+                                }
+                                serde_json::Value::Object(row)
+                            }).collect();
+                            Ok(serde_json::Value::Array(rows))
+                        } else {
+                            Ok(serde_json::Value::Array(vec![]))
+                        }
+                    } else if val.is_array() {
+                        Ok(val)
+                    } else {
+                        Ok(serde_json::Value::Array(vec![]))
+                    }
+                }
+                QueryResult::Null => Ok(serde_json::Value::Array(vec![])),
+                _ => Err(GraphError::DeserializationError("Unsupported QueryResult type".into())),
             }
         };
         
         let json_val_1 = parse_result(result1)?;
         let json_val_2 = parse_result(result2)?;
         
-        // Ensure both results are treated as arrays for concatenation
         let mut arr_1 = json_val_1.as_array().cloned().unwrap_or_default();
         let arr_2 = json_val_2.as_array().cloned().unwrap_or_default();
 
-        if !json_val_1.is_array() && !json_val_1.is_null() || !json_val_2.is_array() && !json_val_2.is_null() {
-            return Err(GraphError::QueryExecutionError(
-                "UNION operands produced incompatible or unstructured data (expected JSON array or Null).".to_string()
-            ));
-        }
-
         if is_all {
-            // UNION ALL: Simply combine arrays
             arr_1.extend(arr_2);
         } else {
-            // UNION (DISTINCT): Combine and deduplicate
-            // Use the string representation of the JSON value for hashing/deduplication
-            let mut distinct_set: HashSet<String> = arr_1.iter().filter_map(|v| to_string(v).ok()).collect();
+            // UNION DISTINCT - deduplicate using serialized values
+            let mut seen = std::collections::HashSet::new();
+            arr_1.retain(|item| {
+                let serialized = serde_json::to_string(item).unwrap_or_default();
+                seen.insert(serialized)
+            });
             
             for item in arr_2 {
-                if let Ok(s) = to_string(&item) {
-                    // Only keep the item if its serialized form is new
-                    if distinct_set.insert(s) {
-                        arr_1.push(item);
-                    }
+                let serialized = serde_json::to_string(&item).unwrap_or_default();
+                if seen.insert(serialized) {
+                    arr_1.push(item);
                 }
             }
         }
 
-        // Serialize back to QueryResult
+        // Sort by timestamp DESC if needed (your original query has ORDER BY)
+        // For now, just return combined results
         if arr_1.is_empty() {
             Ok(QueryResult::Null)
         } else {
-            let combined_string = to_string(&arr_1).map_err(|e| GraphError::SerializationError(format!("{}", e)))?;
+            // Apply ORDER BY and LIMIT from the original query
+            // This requires parsing the ORDER BY clause, but for now return raw union
+            let combined_string = serde_json::to_string(&arr_1)
+                .map_err(|e| GraphError::SerializationError(format!("{}", e)))?;
             Ok(QueryResult::Success(combined_string))
         }
     }
@@ -2285,33 +2306,29 @@ impl GraphService {
         
         let mut found_vertices = Vec::new();
         
-        // 3. Unpack the nested structure
-        // Log shows structure: Vec -> [ { "results": [ { "vertices": [...] } ] } ]
-        for result_envelope in results_vec {
-            // Access the inner 'results' array
-            if let Some(inner_results) = result_envelope.get("results").and_then(|r| r.as_array()) {
-                for result_item in inner_results {
-                    // Extract vertices from each inner result item
-                    if let Some(vertices_array) = result_item.get("vertices").and_then(|v| v.as_array()) {
-                        for vertex_value in vertices_array {
-                            match serde_json::from_value::<Vertex>(vertex_value.clone()) {
-                                Ok(vertex) => {
-                                    // Robust label check: Strip quotes that may come from Enum serialization
-                                    let label_str = vertex.label.to_string().replace('"', "");
-                                    
-                                    if label_str == "Patient" {
-                                        if let Some(PropertyValue::String(vertex_mrn)) = vertex.properties.get("mrn") {
-                                            if vertex_mrn == mrn {
-                                                found_vertices.push(vertex);
-                                            }
-                                        }
+        // 3. Unpack the CORRECT structure:
+        // results_vec is Vec<Value> where each Value is:
+        // { "vertices": [...], "edges": [...], "stats": {...} }
+        for result_obj in results_vec {
+            // Directly access "vertices" — NO "results" wrapper
+            if let Some(vertices_array) = result_obj.get("vertices").and_then(|v| v.as_array()) {
+                for vertex_value in vertices_array {
+                    match serde_json::from_value::<Vertex>(vertex_value.clone()) {
+                        Ok(vertex) => {
+                            // Robust label check: Strip quotes that may come from Enum serialization
+                            let label_str = vertex.label.to_string().replace('"', "");
+                            
+                            if label_str == "Patient" {
+                                if let Some(PropertyValue::String(vertex_mrn)) = vertex.properties.get("mrn") {
+                                    if vertex_mrn == mrn {
+                                        found_vertices.push(vertex);
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Failed to deserialize vertex JSON for MRN '{}': {}", mrn, e);
-                                    return Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)));
-                                }
                             }
+                        }
+                        Err(e) => {
+                            error!("Failed to deserialize vertex JSON for MRN '{}': {}", mrn, e);
+                            return Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)));
                         }
                     }
                 }
