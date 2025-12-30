@@ -74,10 +74,24 @@ pub enum CypherExpression {
         right: Box<CypherExpression>,
     },
     Variable(String),
-    // --- ADD THIS VARIANT ---
     FunctionCall {
         name: String,
         args: Vec<CypherExpression>,
+    },
+    List(Vec<CypherExpression>),
+    
+    /// Represents predicates like: any(var IN list WHERE condition)
+    /// This is distinct from FunctionCall because it introduces a new 
+    /// scope variable used within the condition expression.
+    Predicate {
+        /// The predicate name (ANY, ALL, NONE, SINGLE)
+        name: String,
+        /// The iteration variable name (e.g., 'x' in 'any(x IN ...)')
+        variable: String,
+        /// The list expression being iterated over
+        list: Box<CypherExpression>,
+        /// The boolean condition to evaluate for each element
+        condition: Box<CypherExpression>,
     },
 }
 
@@ -229,6 +243,21 @@ pub struct WithItem {
     pub alias: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] // ← Add Serialize
+pub struct ReturnClause {
+    pub items: Vec<ReturnItem>,
+    pub distinct: bool,
+    pub order_by: Option<Vec<(String, bool)>>,
+    pub skip: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReturnItem {
+    pub expression: String,
+    pub alias: Option<String>,
+}
+
 // 2. crate::query::OrderByItem
 // Represents a field and its sort order in ORDER BY clause
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize )]
@@ -303,8 +332,9 @@ pub enum CypherQuery {
     },
     MatchPattern {
         patterns: Vec<Pattern>,
-        where_clause: Option<WhereClause>, // Added
+        where_clause: Option<WhereClause>, 
         with_clause: Option<ParsedWithClause>,
+        return_clause: Option<ReturnClause>, 
     },
     MatchSet {
         match_patterns: Vec<Pattern>, // Adjust type name to match your codebase
@@ -400,6 +430,11 @@ pub enum CypherQuery {
         skip: Option<i64>,        // Parsed value for SKIP
         limit: Option<i64>,       // Parsed value for LIMIT
     },
+    // NEW: UNWIND clause support
+    Unwind {
+        expression: Expression, // The list expression to unwind
+        variable: String,       // The variable name to bind each element
+    },
     Chain(Vec<CypherQuery>),
     Batch(Vec<CypherQuery>),
     Union(Box<CypherQuery>, bool, Box<CypherQuery>),
@@ -438,6 +473,7 @@ pub enum Expression {
     Literal(CypherValue),
     Property(PropertyAccess),
     Variable(String),
+    List(Vec<Expression>),
     Binary {
         op: BinaryOp,
         left: Box<Expression>,
@@ -447,7 +483,16 @@ pub enum Expression {
         op: UnaryOp,
         expr: Box<Expression>,
     },
-    // --- ADD THIS VARIANT ---
+    LabelPredicate {
+        variable: String,
+        label: String,
+    },
+    Predicate {
+        name: String,            // "any", "all", etc.
+        variable: String,        // "label"
+        list: Box<Expression>,   // "labels(e)"
+        condition: Box<Expression>, // "label IN ['...']"
+    },
     FunctionCall {
         name: String,
         args: Vec<Expression>,
@@ -502,7 +547,7 @@ pub struct WhereClause {
     pub condition: Expression,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EvaluationContext {
     pub variables: HashMap<String, CypherValue>,
     pub parameters: HashMap<String, CypherValue>,
@@ -614,24 +659,28 @@ impl From<PropertyValue> for CypherValue {
             PropertyValue::String(s) => CypherValue::String(s),
             PropertyValue::Uuid(u) => CypherValue::String(u.0.to_string()),
             PropertyValue::Byte(b) => CypherValue::Integer(b as i64),
+
+            PropertyValue::DateTime(dt) => {
+                // Convert DateTime<Utc> to ISO 8601 / RFC 3339 string
+                // This is the standard way Cypher represents datetime values as strings
+                CypherValue::String(dt.0.to_rfc3339())
+            }
+
             PropertyValue::List(list) => {
-                // map consumes the list; no mut required
                 CypherValue::List(list.into_iter().map(CypherValue::from).collect())
             }
+
             PropertyValue::Map(map) => {
                 let mut cypher_map = std::collections::HashMap::new();
-                // map.0 accesses the inner HashMap<Identifier, PropertyValue>
                 for (k, v) in map.0 {
-                    // Convert Identifier k to String for CypherValue::Map
                     cypher_map.insert(k.to_string(), CypherValue::from(v));
                 }
                 CypherValue::Map(cypher_map)
             }
+
             PropertyValue::Vertex(v) => {
                 let mut vertex_map = std::collections::HashMap::new();
-                // v is UnhashableVertex(Vertex), so we use v.0.properties
                 for (k, val) in v.0.properties {
-                    // Convert Identifier k to String
                     vertex_map.insert(k.to_string(), CypherValue::from(val));
                 }
                 CypherValue::Map(vertex_map)
@@ -878,6 +927,13 @@ impl Expression {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{name}' not found"))),
+            Expression::List(elements) => {
+                let mut evaluated_elements = Vec::with_capacity(elements.len());
+                for expr in elements {
+                    evaluated_elements.push(expr.evaluate(ctx)?);
+                }
+                Ok(CypherValue::List(evaluated_elements))
+            },
             Expression::Property(access) => match access {
                 PropertyAccess::Vertex(var, prop) => {
                     if let Some(CypherValue::Vertex(v)) = ctx.variables.get(var) {
@@ -905,11 +961,30 @@ impl Expression {
                     .cloned()
                     .ok_or_else(|| GraphError::EvaluationError(format!("Parameter '${name}' not provided"))),
             },
+
+            Expression::LabelPredicate { variable, label } => {
+                if let Some(val) = ctx.variables.get(variable) {
+                    match val {
+                        CypherValue::Vertex(v) => {
+                            // Since v.label is an 'Identifier' and label is a 'String',
+                            // we convert the Identifier to a string for the comparison.
+                            Ok(CypherValue::Bool(v.label.to_string() == *label))
+                        }
+                        _ => Ok(CypherValue::Bool(false)),
+                    }
+                } else {
+                    Err(GraphError::EvaluationError(format!(
+                        "Variable '{variable}' not found for label check"
+                    )))
+                }
+            },
+
             Expression::Binary { op, left, right } => {
                 let l = left.evaluate(ctx)?;
                 let r = right.evaluate(ctx)?;
                 op.apply(&l, &r)
             },
+
             Expression::Unary { op, expr } => {
                 let val = expr.evaluate(ctx)?;
                 match op {
@@ -931,6 +1006,46 @@ impl Expression {
                     UnaryOp::IsNull => Ok(CypherValue::Bool(matches!(val, CypherValue::Null))),
                 }
             },  
+            // --- Specialized Predicate Arm (Replaces ANY in FunctionCall) ---
+            Expression::Predicate { name, variable, list, condition } => {
+                let list_val = list.evaluate(ctx)?;
+                if let CypherValue::List(elements) = list_val {
+                    match name.to_uppercase().as_str() {
+                        "ANY" => {
+                            for item in elements {
+                                let mut nested_vars = ctx.variables.clone();
+                                nested_vars.insert(variable.clone(), item);
+                                let nested_ctx = EvaluationContext { 
+                                    variables: nested_vars, 
+                                    parameters: ctx.parameters.clone() 
+                                };
+                                if let CypherValue::Bool(true) = condition.evaluate(&nested_ctx)? {
+                                    return Ok(CypherValue::Bool(true));
+                                }
+                            }
+                            Ok(CypherValue::Bool(false))
+                        },
+                        "ALL" => {
+                            for item in elements {
+                                let mut nested_vars = ctx.variables.clone();
+                                nested_vars.insert(variable.clone(), item);
+                                let nested_ctx = EvaluationContext { 
+                                    variables: nested_vars, 
+                                    parameters: ctx.parameters.clone() 
+                                };
+                                // If ANY element is NOT true, ALL fails
+                                if !matches!(condition.evaluate(&nested_ctx)?, CypherValue::Bool(true)) {
+                                    return Ok(CypherValue::Bool(false));
+                                }
+                            }
+                            Ok(CypherValue::Bool(true))
+                        },
+                        _ => Err(GraphError::EvaluationError(format!("Unsupported predicate: {name}")))
+                    }
+                } else {
+                    Ok(CypherValue::Null)
+                }
+            },
             Expression::FunctionCall { name, args } => {
                 match name.to_uppercase().as_str() {
                     "ID" => {
@@ -948,39 +1063,81 @@ impl Expression {
                             Err(GraphError::EvaluationError("ID() requires a variable".into()))
                         }
                     },
+                    "TYPE" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
+                            _ => Ok(CypherValue::Null),
+                        }
+                    },
+                    "LABELS" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::Vertex(v) => Ok(CypherValue::List(vec![
+                                CypherValue::String(v.label.to_string())
+                            ])),
+                            _ => Ok(CypherValue::Null),
+                        }
+                    },
+                    "PROPERTIES" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("properties() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::Vertex(v) => {
+                                let map = v.properties.iter()
+                                    .map(|(k, v)| (k.clone(), property_value_to_cypher(v)))
+                                    .collect();
+                                Ok(CypherValue::Map(map))
+                            },
+                            CypherValue::Edge(e) => {
+                                let map = e.properties.iter()
+                                    .map(|(k, v)| (k.clone(), property_value_to_cypher(v)))
+                                    .collect();
+                                Ok(CypherValue::Map(map))
+                            },
+                            _ => Ok(CypherValue::Null),
+                        }
+                    },
+                    "COUNT" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("count() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::List(l) => Ok(CypherValue::Integer(l.len() as i64)),
+                            CypherValue::Null => Ok(CypherValue::Integer(0)),
+                            _ => Ok(CypherValue::Integer(1)), // Count of a non-list non-null is 1
+                        }
+                    },
                     "LEVENSHTEIN" => {
                         if args.len() != 2 {
                             return Err(GraphError::EvaluationError(
                                 "levenshtein() requires exactly 2 string arguments".into()
                             ));
                         }
-
                         let left = args[0].evaluate(ctx)?;
                         let right = args[1].evaluate(ctx)?;
-
                         let s1 = match left {
                             CypherValue::String(s) => s,
                             CypherValue::Null => return Ok(CypherValue::Null),
-                            _ => return Err(GraphError::EvaluationError(
-                                "levenshtein(): first argument must be string".into()
-                            )),
+                            _ => return Err(GraphError::EvaluationError("levenshtein(): first argument must be string".into())),
                         };
-
                         let s2 = match right {
                             CypherValue::String(s) => s,
                             CypherValue::Null => return Ok(CypherValue::Null),
-                            _ => return Err(GraphError::EvaluationError(
-                                "levenshtein(): second argument must be string".into()
-                            )),
+                            _ => return Err(GraphError::EvaluationError("levenshtein(): second argument must be string".into())),
                         };
-
                         let distance = strsim::levenshtein(&s1, &s2) as i64;
                         Ok(CypherValue::Integer(distance))
                     },
                     _ => Err(GraphError::EvaluationError(format!("Unknown function: {}", name)))
                 }
             }
-            // Inside your Expression::evaluate implementation:
+
             Expression::PropertyComparison { variable, property, operator, value } => {
                 let var_value = ctx.variables.get(variable)
                     .ok_or_else(|| GraphError::QueryError(format!("Variable '{}' not found", variable)))?;
@@ -1005,8 +1162,19 @@ impl Expression {
 
                 let right_hand_side = CypherValue::from_json(value.clone());
 
-                // MANUAL COMPARISON BLOCK
-                // This bypasses the need for CypherValue to implement PartialOrd
+                // ✅ Handle IN operator explicitly
+                if operator.to_uppercase() == "IN" {
+                    match right_hand_side {
+                        CypherValue::List(list) => {
+                            return Ok(CypherValue::Bool(list.contains(&left_hand_side)));
+                        },
+                        _ => {
+                            return Err(GraphError::QueryError("The 'IN' operator requires a list on the right side".into()));
+                        }
+                    }
+                }
+
+                // Handle other operators (=, <, >, etc.)
                 let result = match (left_hand_side, right_hand_side) {
                     (CypherValue::Integer(a), CypherValue::Integer(b)) => match operator.as_str() {
                         ">" => a > b, "<" => a < b, ">=" => a >= b, "<=" => a <= b, "=" | "==" => a == b, "!=" | "<>" => a != b,
@@ -1018,10 +1186,14 @@ impl Expression {
                     },
                     (CypherValue::Integer(a), CypherValue::Float(b)) => match operator.as_str() {
                         ">" => (a as f64) > b, "<" => (a as f64) < b, ">=" => (a as f64) >= b, "<=" => (a as f64) <= b,
+                        "=" | "==" => (a as f64) == b,
+                        "!=" | "<>" => (a as f64) != b,
                         _ => false,
                     },
                     (CypherValue::Float(a), CypherValue::Integer(b)) => match operator.as_str() {
                         ">" => a > (b as f64), "<" => a < (b as f64), ">=" => a >= (b as f64), "<=" => a <= (b as f64),
+                        "=" | "==" => a == (b as f64),
+                        "!=" | "<>" => a != (b as f64),
                         _ => false,
                     },
                     (CypherValue::String(a), CypherValue::String(b)) => match operator.as_str() {
@@ -1032,18 +1204,20 @@ impl Expression {
                         "=" | "==" => a == b, "!=" | "<>" => a != b,
                         _ => false,
                     },
+                    (CypherValue::Null, _) | (_, CypherValue::Null) => {
+                        // Null comparisons should return false for =, !=, etc.
+                        false
+                    },
                     (l, r) => {
                         if operator == "=" || operator == "==" { l == r }
                         else if operator == "!=" || operator == "<>" { l != r }
-                        else {
-                            println!("===> Cannot compare {:?} and {:?} with {}", l, r, operator);
-                            false
-                        }
+                        else { false }
                     }
                 };
-
                 Ok(CypherValue::Bool(result))
             }
+
+
             Expression::StartsWith { variable, property, prefix } => {
                 let target = ctx.variables.get(variable)
                     .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{variable}' not found")))?;
@@ -1060,16 +1234,15 @@ impl Expression {
 
                 match prop_val {
                     CypherValue::String(s) => Ok(CypherValue::Bool(s.starts_with(prefix))),
-                    CypherValue::Null => Ok(CypherValue::Bool(false)),
-                    _ => Ok(CypherValue::Bool(false)), // Non-string properties don't match STARTS WITH
+                    _ => Ok(CypherValue::Bool(false)),
                 }
             }
+
             Expression::FunctionComparison { function, argument, operator, value } => {
                 let left_val = match function.to_uppercase().as_str() {
                     "ID" => {
                         let target = ctx.variables.get(argument)
                             .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{argument}' not found")))?;
-                        
                         match target {
                             CypherValue::Vertex(v) => CypherValue::String(v.id.to_string()),
                             CypherValue::Edge(e) => CypherValue::String(e.id.to_string()),
@@ -1095,10 +1268,10 @@ impl Expression {
 
                 evaluate_comparison(&left_val, operator, &right_val)
             }
+
             Expression::And { left, right } => {
                 let l_val = left.evaluate(ctx)?;
                 let r_val = right.evaluate(ctx)?;
-
                 match (l_val, r_val) {
                     (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l && r)),
                     (CypherValue::Bool(false), _) | (_, CypherValue::Bool(false)) => Ok(CypherValue::Bool(false)),
@@ -1106,10 +1279,10 @@ impl Expression {
                     _ => Err(GraphError::EvaluationError("Logical AND requires boolean operands".into())),
                 }
             }
+
             Expression::Or { left, right } => {
                 let l_val = left.evaluate(ctx)?;
                 let r_val = right.evaluate(ctx)?;
-
                 match (l_val, r_val) {
                     (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l || r)),
                     (CypherValue::Bool(true), _) | (_, CypherValue::Bool(true)) => Ok(CypherValue::Bool(true)),
@@ -1262,11 +1435,17 @@ pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
         PropertyValue::String(s) => CypherValue::String(s.clone()),
         PropertyValue::Uuid(u) => CypherValue::Uuid(u.clone()),
         PropertyValue::Byte(b) => CypherValue::Integer(*b as i64),
+
+        PropertyValue::DateTime(dt) => {
+            // Convert to RFC 3339 / ISO 8601 string – standard for Cypher datetime parameters
+            CypherValue::String(dt.0.to_rfc3339())
+        }
+
         PropertyValue::List(list) => {
             CypherValue::List(list.iter().map(property_value_to_cypher).collect())
         }
+
         PropertyValue::Map(map) => {
-            // FIX: Convert Identifier keys to String keys
             let new_map: HashMap<String, CypherValue> = map
                 .0
                 .iter()
@@ -1274,7 +1453,41 @@ pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
                 .collect();
             CypherValue::Map(new_map)
         }
+
         PropertyValue::Vertex(_) => CypherValue::Null,
+    }
+}
+
+// Helper function to convert PropertyValue to serde_json::Value
+fn property_value_to_json(prop_val: PropertyValue) -> Value {
+    println!("===> property_value_to_json START");
+    match prop_val {
+        PropertyValue::String(s) => Value::String(s),
+        PropertyValue::Integer(i) => Value::Number(i.into()),
+        PropertyValue::I32(i) => Value::Number(i.into()),
+        PropertyValue::Float(f) => Value::Number(serde_json::Number::from_f64(f.0).unwrap_or(serde_json::Number::from(0))),
+        PropertyValue::Boolean(b) => Value::Bool(b),
+        PropertyValue::Uuid(uuid) => Value::String(uuid.to_string()),
+        PropertyValue::Byte(b) => Value::Number(b.into()),
+        PropertyValue::Vertex(v) => {
+            Value::String(format!("Vertex({:?})", v.0))
+        },
+        PropertyValue::DateTime(dt) => {
+            // Convert to RFC 3339 / ISO 8601 string (standard JSON timestamp format)
+            Value::String(dt.0.to_rfc3339())
+        },
+        PropertyValue::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (key, val) in map.0.into_iter() {
+                obj.insert(key.0.to_string(), property_value_to_json(val));
+            }
+            Value::Object(obj)
+        },
+        // Fix: Added missing arms to satisfy exhaustiveness check
+        PropertyValue::Null => Value::Null,
+        PropertyValue::List(list) => {
+            Value::Array(list.into_iter().map(property_value_to_json).collect())
+        }
     }
 }
 
@@ -1387,15 +1600,67 @@ impl From<CypherExpression> for Expression {
                 Expression::Property(PropertyAccess::Vertex(var, prop))
             },
 
+            // --- Specialized Predicate Conversion ---
+            // This maps the structural any/all/exists to our evaluator logic
+            CypherExpression::Predicate { name, variable, list, condition } => {
+                Expression::Predicate {
+                    name,
+                    variable,
+                    list: Box::new(Expression::from(*list)),
+                    condition: Box::new(Expression::from(*condition)),
+                }
+            },
+
             CypherExpression::FunctionCall { name, args } => {
                 Expression::FunctionCall {
                     name,
                     args: args.into_iter().map(Expression::from).collect(),
                 }
             },
+            
+            CypherExpression::List(elements) => {
+                Expression::List(
+                    elements.into_iter().map(Expression::from).collect()
+                )
+            },
 
             CypherExpression::BinaryOp { left, op, right } => {
                 let op_upper = op.to_uppercase();
+
+                // 1. Peek at 'left' and 'right' using references to decide on optimization.
+                let optimized = match (&*left, &*right) {
+                    (CypherExpression::PropertyLookup { var, prop }, CypherExpression::Literal(val)) => {
+                        Some(Expression::PropertyComparison {
+                            variable: var.clone(),
+                            property: prop.clone(),
+                            operator: op.clone(),
+                            value: val.clone(),
+                        })
+                    }
+                    (CypherExpression::FunctionCall { name, args }, _) if args.len() == 1 => {
+                        if let Some(CypherExpression::Variable(arg_var)) = args.get(0) {
+                            if is_literal_or_literal_list(&*right) {
+                                let json_val = expression_to_json_value_owned(Expression::from(*right.clone()));
+                                if let Ok(v) = json_val {
+                                    Some(Expression::FunctionComparison {
+                                        function: name.clone(),
+                                        argument: arg_var.clone(),
+                                        operator: op.clone(),
+                                        value: v,
+                                    })
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    }
+                    _ => None,
+                };
+
+                // 2. If we found an optimized path, return it immediately.
+                if let Some(expr) = optimized {
+                    return expr;
+                }
+
+                // 3. Fallback: Ownership of 'left' and 'right' is taken ONLY here.
                 match op_upper.as_str() {
                     "AND" => Expression::And {
                         left: Box::new(Expression::from(*left)),
@@ -1405,19 +1670,25 @@ impl From<CypherExpression> for Expression {
                         left: Box::new(Expression::from(*left)),
                         right: Box::new(Expression::from(*right)),
                     },
+                    ":" => {
+                        if let (CypherExpression::Variable(var), CypherExpression::Variable(label)) = (&*left, &*right) {
+                            return Expression::LabelPredicate {
+                                variable: var.clone(),
+                                label: label.clone(),
+                            };
+                        }
+                        panic!("Label predicate ':' requires variable on left and label on right");
+                    },
                     "STARTS WITH" => {
-                        // Convert BinaryOp "STARTS WITH" into StartsWith expression
-                        // Assumes left is PropertyLookup { var, prop }, right is Literal(String)
-                        if let CypherExpression::PropertyLookup { var, prop } = *left {
-                            if let CypherExpression::Literal(serde_json::Value::String(prefix)) = *right {
+                        if let CypherExpression::PropertyLookup { var, prop } = &*left {
+                            if let CypherExpression::Literal(serde_json::Value::String(prefix)) = &*right {
                                 return Expression::StartsWith {
-                                    variable: var,
-                                    property: prop,
-                                    prefix,
+                                    variable: var.clone(),
+                                    property: prop.clone(),
+                                    prefix: prefix.clone(),
                                 };
                             }
                         }
-                        // Fallback if structure doesn't match
                         panic!("STARTS WITH requires left=property, right=string literal");
                     },
                     _ => {
@@ -1428,8 +1699,14 @@ impl From<CypherExpression> for Expression {
                             "<" => BinaryOp::Lt,
                             ">=" => BinaryOp::Gte,
                             "<=" => BinaryOp::Lte,
-                            _ => panic!("Unsupported operator for MPI resolution: {}", op),
+                            "+" => BinaryOp::Plus,
+                            "-" => BinaryOp::Minus,
+                            "*" => BinaryOp::Mul,
+                            "/" => BinaryOp::Div,
+                            "IN" => BinaryOp::In,
+                            _ => panic!("Unsupported operator: {}", op),
                         };
+
                         Expression::Binary {
                             op: binary_op,
                             left: Box::new(Expression::from(*left)),
@@ -1439,5 +1716,32 @@ impl From<CypherExpression> for Expression {
                 }
             }
         }
+    }
+}
+
+fn is_literal_or_literal_list(ce: &CypherExpression) -> bool {
+    match ce {
+        CypherExpression::Literal(_) => true,
+        CypherExpression::List(elements) => elements.iter().all(is_literal_or_literal_list),
+        _ => false,
+    }
+}
+
+// Helper to bridge the gap between Expression and JSON for optimized structs
+fn expression_to_json_value_owned(expr: Expression) -> Result<serde_json::Value, String> {
+    match expr {
+        Expression::Literal(cv) => Ok(cv.to_json()),
+        Expression::List(elements) => {
+            let mut arr = Vec::new();
+            for e in elements {
+                if let Expression::Literal(cv) = e {
+                    arr.push(cv.to_json());
+                } else {
+                    return Err("Lists in comparisons must be literals".into());
+                }
+            }
+            Ok(serde_json::Value::Array(arr))
+        }
+        _ => Err("Not a literal or literal list".into()),
     }
 }

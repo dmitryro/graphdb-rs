@@ -1581,7 +1581,40 @@ pub async fn run_single_command(
                         system,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("MPI status retrieval failed: {}", e))?;
+                    .map_err(|e| anyhow!("MPI status retrieval failed: {}", e))?;
+                }
+                // --- Reversal & Audit Compliance: Rollback ---
+                // Reverses a specific merge event and ensures traceability in the graph of events.
+                MPICommand::Rollback { 
+                    event_uuid, 
+                    id, 
+                    mrn, 
+                    requested_by, 
+                    reason 
+                } => {
+                    // Validation: At least one discovery key must be present to locate the event.
+                    if event_uuid.is_none() && id.is_none() && mrn.is_none() {
+                        return Err(anyhow!(
+                            "Rollback discovery failed: You must provide --event-uuid, --id, or --mrn."
+                        ));
+                    }
+
+                    info!(
+                        "Initiating MPI Rollback. Requested by: {} | Reason: {}", 
+                        requested_by, 
+                        reason.as_deref().unwrap_or("None provided")
+                    );
+
+                    handlers_mpi::handle_mpi_rollback(
+                        storage.clone(),
+                        event_uuid,
+                        id,
+                        mrn,
+                        Some(requested_by),
+                        reason,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("MPI rollback operation failed: {}", e))?;
                 }
             }
 
