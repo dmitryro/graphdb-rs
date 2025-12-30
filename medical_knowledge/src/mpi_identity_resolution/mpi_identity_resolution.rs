@@ -1439,7 +1439,7 @@ impl MpiIdentityResolutionService {
             updated_at: Utc::now(),
         })
     }
-
+    
     pub async fn rollback_merge(
         &self,
         identifier: String,
@@ -1480,35 +1480,96 @@ impl MpiIdentityResolutionService {
 
                 println!("[MPI] Resolved patient vertex with MRN/ID: {}", mrn);
 
-                // BROADENED SEARCH: Look for any merge-related event
+                // CORRECTED QUERY: Move MRN filter to WHERE clause and return edge
                 let query = format!(
-                    "MATCH (p:Patient {{mrn: '{}'}})<-[:LOGGED_FOR]-(e) \
-                     WHERE e.action IN ['MANUAL_MERGE_EXECUTION', 'MERGE_COMPLETED'] \
-                        OR e.event_type IN ['MANUAL_MERGE_INITIATED', 'MANUAL_MERGE_EXECUTION'] \
-                     RETURN e ORDER BY e.timestamp DESC LIMIT 1",
+                    "MATCH (p:Patient)<-[r:LOGGED_FOR]-(e:IdentityEvent) \
+                     WHERE p.mrn = '{}' \
+                       AND (e.action IN ['MANUAL_MERGE_EXECUTION', 'MERGE_COMPLETED'] \
+                            OR e.event_type IN ['MANUAL_MERGE_INITIATED', 'MANUAL_MERGE_EXECUTION']) \
+                     RETURN r ORDER BY e.timestamp DESC LIMIT 1",
                     mrn
                 );
-
                 println!("[MPI] Executing discovery query: {}", query);
 
                 let results = gs.execute_cypher_read(&query, serde_json::json!({})).await
                     .map_err(|e| format!("Merge event discovery failed: {}", e))?;
 
-                let event_vertex_json = results.iter()
-                    .find_map(|wrapper| {
-                        wrapper.get("results")?.as_array()?
-                            .get(0)?
-                            .get("vertices")?.as_array()?
-                            .get(0)
-                            .cloned()
-                    })
-                    .ok_or_else(|| format!("No merge-related event found for patient {}", clean_id))?;
+                // DEBUG: Print actual result structure and event properties
+                println!("[DEBUG] Raw discovery query results ({} total result objects):", results.len());
+                let mut found_events = 0;
+                let mut event_uuid_from_edge: Option<String> = None;
+                
+                for (idx, result_obj) in results.iter().enumerate() {
+                    println!("[DEBUG] Result object {}: {}", idx, serde_json::to_string_pretty(result_obj).unwrap_or_default());
+                    
+                    // Check for edges (this is what we expect now)
+                    if let Some(edges) = result_obj.get("edges").and_then(|e| e.as_array()) {
+                        println!("[DEBUG] Found {} edges in result object {}", edges.len(), idx);
+                        if let Some(first_edge) = edges.get(0) {
+                            if let Some(outbound_id) = first_edge.get("outbound_id").and_then(|id| id.as_str()) {
+                                println!("[DEBUG] Extracted event UUID from edge outbound_id: {}", outbound_id);
+                                event_uuid_from_edge = Some(outbound_id.to_string());
+                            }
+                        }
+                        found_events = edges.len();
+                    }
+                    
+                    // Also check for vertices (fallback)
+                    if let Some(vertices) = result_obj.get("vertices").and_then(|v| v.as_array()) {
+                        println!("[DEBUG] Found {} vertices in result object {}", vertices.len(), idx);
+                        found_events += vertices.len();
+                        
+                        for (v_idx, vertex) in vertices.iter().enumerate() {
+                            if let Some(id) = vertex.get("id").and_then(|v| v.as_str()) {
+                                println!("[DEBUG] Vertex {} ID: {}", v_idx, id);
+                            }
+                            
+                            if let Some(props) = vertex.get("properties").and_then(|p| p.as_object()) {
+                                println!("[DEBUG] Vertex {} properties keys: {:?}", v_idx, props.keys().collect::<Vec<_>>());
+                                println!("[DEBUG] Vertex {} full properties: {}", v_idx, serde_json::to_string_pretty(props).unwrap_or_default());
+                                
+                                // Check what action/event_type values actually exist
+                                if let Some(action) = props.get("action").and_then(|v| v.as_str()) {
+                                    println!("[DEBUG] Vertex {} has action: '{}'", v_idx, action);
+                                }
+                                if let Some(event_type) = props.get("event_type").and_then(|v| v.as_str()) {
+                                    println!("[DEBUG] Vertex {} has event_type: '{}'", v_idx, event_type);
+                                }
+                                if let Some(evt_type) = props.get("type").and_then(|v| v.as_str()) {
+                                    println!("[DEBUG] Vertex {} has type: '{}'", v_idx, evt_type);
+                                }
+                                if let Some(merge_action) = props.get("merge_action").and_then(|v| v.as_str()) {
+                                    println!("[DEBUG] Vertex {} has merge_action: '{}'", v_idx, merge_action);
+                                }
+                            }
+                        }
+                    } else {
+                        println!("[DEBUG] Result object {} has no 'vertices' or 'edges' key", idx);
+                    }
+                }
+                println!("[DEBUG] Total events/edges found in results: {}", found_events);
 
-                let uuid_str = event_vertex_json.get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or("Missing id on event vertex")?;
+                // Extract event UUID from edge's outbound_id (primary method)
+                let event_uuid_str = if let Some(uuid_from_edge) = event_uuid_from_edge {
+                    uuid_from_edge
+                } else {
+                    // Fallback: Try to get from vertices (original method)
+                    let event_vertex_json = results.iter()
+                        .find_map(|result_obj| {
+                            result_obj.get("vertices")
+                                ?.as_array()?
+                                .get(0)
+                                .cloned()
+                        })
+                        .ok_or_else(|| format!("No merge-related event found for patient {}", clean_id))?;
 
-                let parsed = Uuid::parse_str(uuid_str)
+                    event_vertex_json.get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing id on event vertex")?
+                        .to_string()
+                };
+
+                let parsed = Uuid::parse_str(&event_uuid_str)
                     .map_err(|e| format!("Invalid event UUID: {}", e))?;
 
                 println!("[MPI] Discovered merge event UUID: {}", parsed);

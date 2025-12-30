@@ -917,7 +917,6 @@ impl GraphService {
                     } else if key == "last_name" {
                         with_exprs.push(format!("levenshtein(p.last_name, '{}') AS dist", title_case));
                     } else if key == "name" {
-                        // For "name", assume it's full name — split or use as-is for both
                         with_exprs.push(format!(
                             "(levenshtein(p.first_name, '{}') + levenshtein(p.last_name, '{}')) / 2.0 AS dist",
                             title_case, title_case
@@ -962,40 +961,30 @@ impl GraphService {
         
         let mut patients = Vec::new();
         
-        // FIXED: Properly traverse the response structure
-        // raw_results is Vec<Value>, each element has structure: {"results": [{"vertices": [...], "edges": [], "stats": {}}]}
-        for result_wrapper in &raw_results {
-            println!("===> Processing result wrapper: {}", serde_json::to_string_pretty(&result_wrapper).unwrap_or_default());
+        // ✅ FIXED: Directly access "vertices" — NO "results" wrapper
+        for result_obj in &raw_results {
+            println!("===> Processing result object: {}", serde_json::to_string_pretty(&result_obj).unwrap_or_default());
             
-            // Get the "results" array from the wrapper
-            if let Some(results_array) = result_wrapper.get("results").and_then(|v| v.as_array()) {
-                println!("===> Found results array with {} items", results_array.len());
+            // Directly access "vertices" from the flat result object
+            if let Some(vertices) = result_obj.get("vertices").and_then(|v| v.as_array()) {
+                println!("===> Found {} vertices in result", vertices.len());
                 
-                // Each item in results has vertices, edges, and stats
-                for result_item in results_array {
-                    if let Some(vertices) = result_item.get("vertices").and_then(|v| v.as_array()) {
-                        println!("===> Found {} vertices in result_item", vertices.len());
-                        
-                        for vertex in vertices {
-                            println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
-                            
-                            match parse_patient_from_cypher_result(vertex.clone()) {
-                                Ok(patient) => {
-                                    println!("===> Successfully parsed patient: {:?}", patient);
-                                    patients.push(patient);
-                                }
-                                Err(e) => {
-                                    println!("===> Failed to parse patient: {}", e);
-                                    // Continue with next vertex instead of failing entire search
-                                }
-                            }
+                for vertex in vertices {
+                    println!("===> Parsing vertex: {}", serde_json::to_string_pretty(vertex).unwrap_or_default());
+                    
+                    match parse_patient_from_cypher_result(vertex.clone()) {
+                        Ok(patient) => {
+                            println!("===> Successfully parsed patient: {:?}", patient);
+                            patients.push(patient);
                         }
-                    } else {
-                        println!("===> No vertices found in result_item");
+                        Err(e) => {
+                            println!("===> Failed to parse patient: {}", e);
+                            // Continue with next vertex instead of failing entire search
+                        }
                     }
                 }
             } else {
-                println!("===> No results array found in wrapper");
+                println!("===> No vertices found in result object");
             }
         }
         
@@ -2056,15 +2045,12 @@ impl GraphService {
             .await
             .map_err(|e| format!("Graph read failed: {}", e))?;
 
-        // 2. Extract the nested vertex from the structure:
-        // results[0]["results"][0]["vertices"][0]
+        // 2. Extract the vertex from the CORRECT flat structure:
+        // results[0]["vertices"][0]  (NO "results" wrapper)
         let vertex_json = results.first()
-            .and_then(|r| r.get("results"))
-            .and_then(|r_inner| r_inner.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|first_res| first_res.get("vertices"))
-            .and_then(|v_arr| v_arr.as_array())
-            .and_then(|v_list| v_list.first())
+            .and_then(|result_obj| result_obj.get("vertices"))
+            .and_then(|vertices| vertices.as_array())
+            .and_then(|vertices| vertices.first())
             .ok_or_else(|| format!("Vertex {} not found in graph results", uuid))?;
 
         // 3. Deserialize into the Vertex struct
@@ -2300,33 +2286,29 @@ impl GraphService {
         
         let mut found_vertices = Vec::new();
         
-        // 3. Unpack the nested structure
-        // Log shows structure: Vec -> [ { "results": [ { "vertices": [...] } ] } ]
-        for result_envelope in results_vec {
-            // Access the inner 'results' array
-            if let Some(inner_results) = result_envelope.get("results").and_then(|r| r.as_array()) {
-                for result_item in inner_results {
-                    // Extract vertices from each inner result item
-                    if let Some(vertices_array) = result_item.get("vertices").and_then(|v| v.as_array()) {
-                        for vertex_value in vertices_array {
-                            match serde_json::from_value::<Vertex>(vertex_value.clone()) {
-                                Ok(vertex) => {
-                                    // Robust label check: Strip quotes that may come from Enum serialization
-                                    let label_str = vertex.label.to_string().replace('"', "");
-                                    
-                                    if label_str == "Patient" {
-                                        if let Some(PropertyValue::String(vertex_mrn)) = vertex.properties.get("mrn") {
-                                            if vertex_mrn == mrn {
-                                                found_vertices.push(vertex);
-                                            }
-                                        }
+        // 3. Unpack the CORRECT structure:
+        // results_vec is Vec<Value> where each Value is:
+        // { "vertices": [...], "edges": [...], "stats": {...} }
+        for result_obj in results_vec {
+            // Directly access "vertices" — NO "results" wrapper
+            if let Some(vertices_array) = result_obj.get("vertices").and_then(|v| v.as_array()) {
+                for vertex_value in vertices_array {
+                    match serde_json::from_value::<Vertex>(vertex_value.clone()) {
+                        Ok(vertex) => {
+                            // Robust label check: Strip quotes that may come from Enum serialization
+                            let label_str = vertex.label.to_string().replace('"', "");
+                            
+                            if label_str == "Patient" {
+                                if let Some(PropertyValue::String(vertex_mrn)) = vertex.properties.get("mrn") {
+                                    if vertex_mrn == mrn {
+                                        found_vertices.push(vertex);
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Failed to deserialize vertex JSON for MRN '{}': {}", mrn, e);
-                                    return Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)));
-                                }
                             }
+                        }
+                        Err(e) => {
+                            error!("Failed to deserialize vertex JSON for MRN '{}': {}", mrn, e);
+                            return Err(GraphError::DeserializationError(format!("Failed to parse vertex JSON: {}", e)));
                         }
                     }
                 }
