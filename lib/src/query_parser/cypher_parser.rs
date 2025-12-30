@@ -1277,6 +1277,42 @@ pub fn evaluate_expression(
             }
             Ok(CypherValue::List(evaluated_elements))
         },
+        Expression::DynamicPropertyAccess { variable, property_expr } => {
+            // Get the target object (vertex/edge)
+            let target_val = context.variables.get(variable)
+                .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
+            
+            // Evaluate the property name expression
+            let prop_name_val = evaluate_expression(property_expr, context)?;
+            let prop_name = match prop_name_val {
+                CypherValue::String(s) => s,
+                CypherValue::Null => return Ok(CypherValue::Null),
+                _ => return Err(GraphError::QueryExecutionError("Property name must be a string".into())),
+            };
+            
+            // Extract property value based on target type
+            match target_val {
+                CypherValue::Vertex(v) => {
+                    match v.properties.get(&prop_name) {
+                        Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                        None => Ok(CypherValue::Null),
+                    }
+                },
+                CypherValue::Edge(e) => {
+                    match e.properties.get(&prop_name) {
+                        Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                        None => Ok(CypherValue::Null),
+                    }
+                },
+                CypherValue::Map(map) => {
+                    match map.get(&prop_name) {
+                        Some(val) => Ok(val.clone()),
+                        None => Ok(CypherValue::Null),
+                    }
+                },
+                _ => Err(GraphError::QueryExecutionError(format!("Cannot access properties on variable '{}'", variable))),
+            }
+        },
         Expression::LabelPredicate { variable, label } => {
             let val = context.variables.get(variable)
                 .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
@@ -1381,6 +1417,33 @@ pub fn evaluate_expression(
                             Ok(CypherValue::Map(map))
                         },
                         _ => Ok(CypherValue::Null),
+                    }
+                },
+                "KEYS" => {
+                    let val = evaluate_expression(
+                        args.get(0).ok_or_else(|| GraphError::QueryExecutionError("KEYS() requires 1 arg".into()))?,
+                        context
+                    )?;
+                    match val {
+                        CypherValue::Vertex(v) => {
+                            let key_list: Vec<CypherValue> = v.properties.keys()
+                                .map(|k| CypherValue::String(k.clone()))
+                                .collect();
+                            Ok(CypherValue::List(key_list))
+                        },
+                        CypherValue::Edge(e) => {
+                            let key_list: Vec<CypherValue> = e.properties.keys()
+                                .map(|k| CypherValue::String(k.clone()))
+                                .collect();
+                            Ok(CypherValue::List(key_list))
+                        },
+                        CypherValue::Map(map) => {
+                            let key_list: Vec<CypherValue> = map.keys()
+                                .map(|k| CypherValue::String(k.clone()))
+                                .collect();
+                            Ok(CypherValue::List(key_list))
+                        },
+                        _ => Ok(CypherValue::List(vec![])),
                     }
                 },
                 "COUNT" => {
@@ -2040,6 +2103,53 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
 
 /// Helper to parse the inner condition (label IN [...]) without infinite recursion
 fn parse_condition_internal(input: &str) -> IResult<&str, Expression> {
+    // Try dynamic property access first: n[prop]
+    let dynamic_result = map(
+        tuple((parse_identifier, char('['), parse_expression, char(']'))),
+        |(var, _, prop_expr, _)| Expression::DynamicPropertyAccess {
+            variable: var.to_string(),
+            property_expr: Box::new(prop_expr),
+        }
+    ).parse(input);
+
+    if let Ok((remaining, dynamic_expr)) = dynamic_result {
+        // If we successfully parsed dynamic property access, continue with operator
+        let (remaining, _) = multispace1.parse(remaining)?;
+        let (remaining, op_str) = alt((
+            tag_no_case("IN"),
+            tag("="),
+            tag("<>"),
+            tag("!="),
+        )).parse(remaining)?;
+        let (remaining, _) = multispace1.parse(remaining)?;
+        
+        let (remaining, right) = alt((
+            parse_list_literal,
+            parse_function_call_full,
+            // Property access like p.names
+            map(
+                tuple((parse_identifier, char('.'), parse_identifier)),
+                |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+            ),
+            map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+            map(parse_identifier, |v| Expression::Variable(v.to_string())),
+        )).parse(remaining)?;
+
+        let op = match op_str.to_uppercase().as_str() {
+            "IN" => BinaryOp::In,
+            "=" => BinaryOp::Eq,
+            "<>" | "!=" => BinaryOp::Neq,
+            _ => BinaryOp::Eq,
+        };
+
+        return Ok((remaining, Expression::Binary {
+            op,
+            left: Box::new(dynamic_expr),
+            right: Box::new(right),
+        }));
+    }
+
+    // Fallback to original parsing (variable-based conditions)
     let (input, left_var) = parse_identifier(input)?;
     let (input, _) = multispace1.parse(input)?;
     
@@ -3761,6 +3871,7 @@ pub fn parse_list_literal(input: &str) -> IResult<&str, Expression> {
 }
 
 /// Recursive descent parser for expressions (handles precedence and function calls)
+/// Recursive descent parser for expressions (handles precedence and function calls)
 pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_expression START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
@@ -3777,6 +3888,9 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
 
             // Function calls like labels(e) or id(e)
             parse_function_call_full,
+            
+            // Dynamic property access like n[prop] - MUST COME BEFORE list literals
+            parse_dynamic_property_access,
             
             // List literals like ['A', 'B']
             parse_list_literal, 
@@ -3820,6 +3934,10 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
                     parse_predicate_expression,
                     
                     parse_function_call_full,
+                    
+                    // Dynamic property access on RHS too
+                    parse_dynamic_property_access,
+                    
                     parse_list_literal, 
                     map(
                         tuple((parse_identifier, char('.'), parse_identifier)),
@@ -5811,6 +5929,22 @@ fn parse_create_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
     .parse(input)
 }
 
+// In your expression parsing logic
+/// Parses dynamic property access like n[prop] where prop is an expression
+fn parse_dynamic_property_access(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_dynamic_property_access START");
+    
+    let (input, var_name) = parse_identifier(input)?;
+    let (input, _) = char('[')(input)?;
+    let (input, prop_expr) = parse_expression(input)?; // Recursively parse the property expression
+    let (input, _) = char(']')(input)?;
+    
+    Ok((input, Expression::DynamicPropertyAccess {
+        variable: var_name.to_string(),
+        property_expr: Box::new(prop_expr),
+    }))
+}
+
 /// Parses a UNION [ALL] clause and returns the right-hand side query
 fn parse_union_clause(input: &str) -> IResult<&str, (bool, Box<CypherQuery>)> {
     let (input, _) = tag_no_case("UNION")(input)?;
@@ -6736,12 +6870,18 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
             // ============================================================================
             CypherQuery::Unwind { expression, variable } => {
                 info!("===> EXECUTING Unwind with variable '{}'", variable);
+                
+                // 1. Setup context (In a full implementation, this should include 
+                // variables matched in previous clauses like 'e' from MATCH)
                 let ctx = EvaluationContext {
-                    variables: HashMap::new(),
+                    variables: HashMap::new(), 
                     parameters: HashMap::new(),
                 };
+
+                // 2. Evaluate the expression (e.g., keys(e))
                 let result = expression.evaluate(&ctx)?;
                 
+                // 3. Ensure we have a list to unwind
                 let list = if let CypherValue::List(items) = result {
                     items
                 } else {
@@ -6750,13 +6890,26 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     ));
                 };
                 
-                // Return flat structure
+                // 4. Transform the list items into a flat 'rows' structure
+                let rows: Vec<serde_json::Value> = list
+                    .into_iter()
+                    .map(|item| {
+                        // Each row is an object where the key is the 'AS' variable
+                        json!({
+                            variable.clone(): item
+                        })
+                    })
+                    .collect();
+                
+                // 5. Return the flat structure with the populated rows
                 Ok(json!({
+                    "rows": rows,
                     "vertices": [],
                     "edges": [],
                     "stats": {
                         "vertices_matched": 0,
-                        "edges_matched": 0
+                        "edges_matched": 0,
+                        "rows_generated": rows.len()
                     }
                 }))
             }

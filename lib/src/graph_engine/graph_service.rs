@@ -2124,28 +2124,48 @@ impl GraphService {
         is_all: bool,
         query2: Box<CypherQuery>,
     ) -> GraphResult<QueryResult> {
-        let engine = QueryExecEngine::get()
-            .await
-            .map_err(|e| GraphError::InternalError(format!("QueryExecEngine not initialized: {}", e)))?;
+        // Dereference the Box to get CypherQuery
+        let query1_str = cypher_serialize(*query1);
+        let query2_str = cypher_serialize(*query2);
         
-        // Serialize AST to VALID Cypher (not debug output)
-        let query1_string = cypher_serialize(*query1);
-        let query2_string = cypher_serialize(*query2);
+        let result1 = self.execute_cypher_read(&query1_str, serde_json::Value::Null).await?;
+        let result2 = self.execute_cypher_read(&query2_str, serde_json::Value::Null).await?;
         
-        // Execute queries
-        let result_value_1 = engine.execute_cypher(&query1_string)
-            .await
-            .map_err(|e| GraphError::QueryExecutionError(format!("Union query 1 failed: {}", e)))?;
+        // Extract vertices from results
+        let mut all_vertices = Vec::new(); // This `mut` is needed and correct
         
-        let result_value_2 = engine.execute_cypher(&query2_string)
-            .await
-            .map_err(|e| GraphError::QueryExecutionError(format!("Union query 2 failed: {}", e)))?;
-
-        // Convert and combine results
-        let result_qr_1 = self.value_to_query_result(result_value_1)?;
-        let result_qr_2 = self.value_to_query_result(result_value_2)?;
+        for result in result1 {
+            if let Some(vertices) = result.get("vertices").and_then(|v| v.as_array()) {
+                all_vertices.extend(vertices.iter().cloned());
+            }
+        }
         
-        self.combine_json_results(result_qr_1, result_qr_2, is_all)
+        for result in result2 {
+            if let Some(vertices) = result.get("vertices").and_then(|v| v.as_array()) {
+                all_vertices.extend(vertices.iter().cloned());
+            }
+        }
+        
+        // Apply DISTINCT if needed
+        if !is_all {
+            let mut seen = std::collections::HashSet::new();
+            all_vertices.retain(|vertex| {
+                let id_str = vertex.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                seen.insert(id_str)
+            });
+        }
+        
+        let result_value = json!({
+            "vertices": all_vertices,
+            "edges": [],
+            "stats": {
+                "vertices_matched": all_vertices.len(),
+                "edges_matched": 0
+            }
+        });
+        
+        let result_string = serde_json::to_string(&result_value)?;
+        Ok(QueryResult::Success(result_string))
     }
 
     /// Helper to combine the raw JSON string results from two sub-queries for UNION/UNION ALL.

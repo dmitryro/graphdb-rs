@@ -94,6 +94,10 @@ pub enum CypherExpression {
         /// The boolean condition to evaluate for each element
         condition: Box<CypherExpression>,
     },
+    DynamicPropertyAccess {
+        variable: String,
+        property_expr: Box<CypherExpression>,
+    },
 }
 
 /// Represents the possible outcomes of executing a Cypher query.
@@ -515,6 +519,11 @@ pub enum Expression {
         property: String,
         prefix: String,
     },
+    DynamicPropertyAccess {
+        variable: String,
+        property_expr: Box<Expression>, // Expression that evaluates to property name
+    },
+
     And { left: Box<Expression>, right: Box<Expression> },
     Or { left: Box<Expression>, right: Box<Expression> },
 }
@@ -1005,7 +1014,43 @@ impl Expression {
                     .cloned()
                     .ok_or_else(|| GraphError::EvaluationError(format!("Parameter '${name}' not provided"))),
             },
-
+            // --- ADD DYNAMIC PROPERTY ACCESS HERE ---
+            Expression::DynamicPropertyAccess { variable, property_expr } => {
+                // Get the target object (vertex/edge/map) from context
+                let target_val = ctx.variables.get(variable)
+                    .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{}' not found", variable)))?;
+                
+                // Evaluate the property name expression
+                let prop_name_val = property_expr.evaluate(ctx)?;
+                let prop_name = match prop_name_val {
+                    CypherValue::String(s) => s,
+                    CypherValue::Null => return Ok(CypherValue::Null),
+                    _ => return Err(GraphError::EvaluationError("Property name must be a string".into())),
+                };
+                
+                // Extract property value based on target type
+                match target_val {
+                    CypherValue::Vertex(v) => {
+                        match v.properties.get(&prop_name) {
+                            Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                            None => Ok(CypherValue::Null),
+                        }
+                    },
+                    CypherValue::Edge(e) => {
+                        match e.properties.get(&prop_name) {
+                            Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
+                            None => Ok(CypherValue::Null),
+                        }
+                    },
+                    CypherValue::Map(map) => {
+                        match map.get(&prop_name) {
+                            Some(val) => Ok(val.clone()),
+                            None => Ok(CypherValue::Null),
+                        }
+                    },
+                    _ => Err(GraphError::EvaluationError(format!("Cannot access properties on variable '{}'", variable))),
+                }
+            },
             Expression::LabelPredicate { variable, label } => {
                 if let Some(val) = ctx.variables.get(variable) {
                     match val {
@@ -1105,6 +1150,32 @@ impl Expression {
                             }
                         } else {
                             Err(GraphError::EvaluationError("ID() requires a variable".into()))
+                        }
+                    },
+                    "KEYS" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("keys() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::Vertex(v) => {
+                                let key_list: Vec<CypherValue> = v.properties.keys()
+                                    .map(|k| CypherValue::String(k.clone()))
+                                    .collect();
+                                Ok(CypherValue::List(key_list))
+                            },
+                            CypherValue::Edge(e) => {
+                                let key_list: Vec<CypherValue> = e.properties.keys()
+                                    .map(|k| CypherValue::String(k.clone()))
+                                    .collect();
+                                Ok(CypherValue::List(key_list))
+                            },
+                            CypherValue::Map(map) => {
+                                let key_list: Vec<CypherValue> = map.keys()
+                                    .map(|k| CypherValue::String(k.clone()))
+                                    .collect();
+                                Ok(CypherValue::List(key_list))
+                            },
+                            _ => Ok(CypherValue::List(vec![])), // Return empty list for non-entities
                         }
                     },
                     "TYPE" => {
@@ -1488,6 +1559,12 @@ pub fn expression_to_cypher(expr: &Expression) -> String {
             format!("[{}]", item_strs.join(", "))
         },
         
+        // --- ADD DYNAMIC PROPERTY ACCESS ---
+        Expression::DynamicPropertyAccess { variable, property_expr } => {
+            let prop_str = expression_to_cypher(property_expr);
+            format!("{}[{}]", variable, prop_str)
+        },
+        
         Expression::Binary { op, left, right } => {
             let left_str = expression_to_cypher(left);
             let right_str = expression_to_cypher(right);
@@ -1840,6 +1917,14 @@ impl From<CypherExpression> for Expression {
                 Expression::Property(PropertyAccess::Vertex(var, prop))
             },
 
+            // --- ADD DYNAMIC PROPERTY ACCESS ---
+            CypherExpression::DynamicPropertyAccess { variable, property_expr } => {
+                Expression::DynamicPropertyAccess {
+                    variable,
+                    property_expr: Box::new(Expression::from(*property_expr)),
+                }
+            },
+
             // --- Specialized Predicate Conversion ---
             // This maps the structural any/all/exists to our evaluator logic
             CypherExpression::Predicate { name, variable, list, condition } => {
@@ -1892,6 +1977,7 @@ impl From<CypherExpression> for Expression {
                             } else { None }
                         } else { None }
                     }
+                    // ADD DYNAMIC PROPERTY ACCESS OPTIMIZATION IF NEEDED
                     _ => None,
                 };
 
