@@ -1992,6 +1992,246 @@ impl GraphService {
         Ok(execution_result)
     }
 
+    /// Executes MERGE patterns, creating nodes and edges if they don't exist
+    pub async fn execute_merge_patterns(
+        &self,
+        mut initial_bindings: HashMap<String, Value>,
+        merge_patterns: Vec<(Option<String>, Vec<NodePattern>, Vec<RelPattern>)>,
+        where_clause: Option<WhereClause>,
+        on_create_set: Vec<(String, String, Expression)>,
+        on_match_set: Vec<(String, String, Expression)>,
+    ) -> GraphResult<ExecutionResult> {
+        let mut execution_result = ExecutionResult::new();
+        let mut mutations = Vec::new();
+        
+        // Helper to extract a bound UUID string from the HashMap<String, Value> bindings.
+        let get_uuid = |bindings: &HashMap<String, Value>, var: &str| -> GraphResult<Uuid> {
+            let binding_value = bindings.get(var)
+                .ok_or_else(|| GraphError::ValidationError(format!(
+                    "Source/Target node variable '{}' not found in bindings: {:?}", 
+                    var, 
+                    bindings.keys().collect::<Vec<_>>()
+                )))?;
+
+            let id_str = binding_value.as_str().ok_or_else(|| 
+                GraphError::InternalError(format!(
+                    "Bound variable '{}' does not contain a string UUID. Found: {:?}", 
+                    var, 
+                    binding_value
+                )))?;
+                
+            uuid::Uuid::parse_str(id_str)
+                .map_err(|e| GraphError::InternalError(format!(
+                    "Invalid UUID string '{}' in bindings: {}", 
+                    id_str, 
+                    e
+                )))
+        };
+        
+        // For each pattern, check if it exists, if not create it
+        for (_, node_patterns, rel_patterns) in merge_patterns {
+            let node_var_names: Vec<Option<String>> = node_patterns.iter()
+                .map(|(var, _, _)| var.clone())
+                .collect();
+                
+            // --- 1. Process Node Instructions (Vertices) ---
+            let mut node_uuids = Vec::new();
+            let mut nodes_created = false;
+            
+            for (idx, node_pattern) in node_patterns.iter().enumerate() {
+                let (var_name_opt, labels, properties) = node_pattern;
+                let var_name = var_name_opt.clone().unwrap_or_default();
+                
+                // Check if node already exists with these properties
+                let mut found_vertex = None;
+                if !properties.is_empty() {
+                    // Try to find existing vertex with matching properties (label optional)
+                    if let Ok(all_vertices) = self.storage.get_all_vertices().await {
+                        for vertex in all_vertices {
+                            // If labels are specified, they must match
+                            let label_matches = if !labels.is_empty() {
+                                vertex.label.to_string() == labels[0]
+                            } else {
+                                true // No label requirement
+                            };
+                            
+                            if label_matches {
+                                let mut matches = true;
+                                for (prop_key, prop_val) in properties {
+                                    let expected_val = to_property_value(prop_val.clone().into())?;
+                                    if vertex.properties.get(prop_key) != Some(&expected_val) {
+                                        matches = false;
+                                        break;
+                                    }
+                                }
+                                if matches {
+                                    found_vertex = Some(vertex);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if let Some(existing_vertex) = found_vertex {
+                    // Node exists - use existing
+                    node_uuids.push(existing_vertex.id.0);
+                    if let Some(var_name) = var_name_opt {
+                        initial_bindings.insert(var_name.clone(), json!(existing_vertex.id.0.to_string()));
+                    }
+                    
+                    // Apply ON MATCH SET if any
+                    if !on_match_set.is_empty() {
+                        let mut updated_vertex = existing_vertex.clone();
+                        let mut has_updates = false;
+                        
+                        for (target_var, prop_name, expr) in &on_match_set {
+                            if Some(target_var) == var_name_opt.as_ref() {
+                                let ctx = EvaluationContext {
+                                    variables: initial_bindings.iter()
+                                        .map(|(k, v)| (k.clone(), CypherValue::from_json(v.clone())))
+                                        .collect(),
+                                    parameters: HashMap::new(),
+                                };
+                                
+                                if let Ok(value) = expr.evaluate(&ctx) {
+                                    updated_vertex.properties.insert(prop_name.clone(), to_property_value(value.to_json())?);
+                                    has_updates = true;
+                                }
+                            }
+                        }
+                        
+                        // Update vertex in storage if there are changes
+                        if has_updates {
+                            updated_vertex.updated_at = Utc::now().into();
+                            self.storage.update_vertex(updated_vertex).await?;
+                        }
+                    }
+                } else {
+                    // Node doesn't exist - create new
+                    nodes_created = true;
+                    let node_uuid = Uuid::new_v4();
+                    
+                    // Handle unlabeled nodes - use a default label or extract from properties
+                    let primary_label = if !labels.is_empty() {
+                        labels[0].clone()
+                    } else if let Some(id_val) = properties.get("id") {
+                        // Use the UUID as label or default to "GenericNode"
+                        "GenericNode".to_string()
+                    } else {
+                        "GenericNode".to_string()
+                    };
+                    
+                    let now: BincodeDateTime = Utc::now().into();
+                    
+                    let mut new_vertex = Vertex {
+                        id: SerializableUuid(node_uuid),
+                        label: Identifier::new(primary_label)
+                            .map_err(|e| GraphError::InternalError(format!(
+                                "Invalid Identifier from node label: {}", e
+                            )))?,
+                        properties: HashMap::new(),
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    
+                    // Apply properties from MERGE pattern
+                    for (key, val) in properties {
+                        let property_value = to_property_value(val.clone().into())?;
+                        new_vertex.properties.insert(key.clone(), property_value);
+                    }
+                    
+                    // Apply ON CREATE SET if any
+                    if !on_create_set.is_empty() {
+                        let ctx = EvaluationContext {
+                            variables: initial_bindings.iter()
+                                .map(|(k, v)| (k.clone(), CypherValue::from_json(v.clone())))
+                                .collect(),
+                            parameters: HashMap::new(),
+                        };
+                        
+                        for (target_var, prop_name, expr) in &on_create_set {
+                            if Some(target_var) == var_name_opt.as_ref() {
+                                if let Ok(value) = expr.evaluate(&ctx) {
+                                    new_vertex.properties.insert(prop_name.clone(), to_property_value(value.to_json())?);
+                                }
+                            }
+                        }
+                        new_vertex.updated_at = Utc::now().into();
+                    }
+                    
+                    mutations.push(GraphOp::InsertVertex(new_vertex.clone()));
+                    execution_result.add_created_node(node_uuid);
+                    node_uuids.push(node_uuid);
+                    
+                    if let Some(var_name) = var_name_opt {
+                        initial_bindings.insert(var_name.clone(), json!(node_uuid.to_string()));
+                    }
+                }
+            }
+            
+            // --- 2. Process Relationship Instructions (Edges) ---
+            if nodes_created && !rel_patterns.is_empty() {
+                for (idx, rel_pattern) in rel_patterns.iter().enumerate() {
+                    let (var_name_opt, rel_type_opt, _length_range, properties, _direction) = rel_pattern;
+                    
+                    let source_var_name = node_var_names.get(idx)
+                        .and_then(|v| v.as_ref())
+                        .ok_or_else(|| GraphError::ValidationError(format!(
+                            "Source node at index {} must have a variable in a path pattern.", idx
+                        ).into()))?;
+                    
+                    let target_var_name = node_var_names.get(idx + 1)
+                        .and_then(|v| v.as_ref())
+                        .ok_or_else(|| GraphError::ValidationError(format!(
+                            "Target node at index {} must have a variable in a path pattern.", idx + 1
+                        ).into()))?;
+                    
+                    let source_id = get_uuid(&initial_bindings, source_var_name)?.to_owned();
+                    let target_id = get_uuid(&initial_bindings, target_var_name)?.to_owned();
+                    
+                    let rel_type = rel_type_opt.clone()
+                        .ok_or_else(|| GraphError::ValidationError(
+                            "Relationship type must be specified in MERGE path.".into()
+                        ))?;
+                    
+                    let edge_uuid = Uuid::new_v4();
+                    
+                    let mut new_edge = Edge {
+                        id: SerializableUuid(edge_uuid),
+                        outbound_id: SerializableUuid(source_id),
+                        edge_type: Identifier::new(rel_type.clone())
+                            .map_err(|e| GraphError::InternalError(format!(
+                                "Invalid Identifier from relationship type: {}", e
+                            )))?,
+                        inbound_id: SerializableUuid(target_id),
+                        label: rel_type.clone(),
+                        properties: BTreeMap::new(),
+                    };
+                    
+                    for (key, val) in properties {
+                        let property_value = to_property_value(val.clone().into())?;
+                        new_edge.properties.insert(key.clone(), property_value);
+                    }
+                    
+                    mutations.push(GraphOp::InsertEdge(new_edge.clone()));
+                    execution_result.add_created_edge(edge_uuid);
+                    
+                    if let Some(var_name) = var_name_opt {
+                        initial_bindings.insert(var_name.clone(), json!(edge_uuid.to_string()));
+                    }
+                }
+            }
+        }
+        
+        // Apply all collected mutations
+        for op in mutations {
+            self.storage.append(op).await?;
+        }
+        
+        Ok(execution_result)
+    }
+
     /// Executes the RETURN statement: evaluates projection, applies ORDER BY, SKIP, and LIMIT.
     ///
     /// NOTE: This placeholder implementation assumes that the `GraphService` manages the 
@@ -2037,23 +2277,35 @@ impl GraphService {
         Ok(current_results)
     }
 
+    /// Retrieves a list of Vertices by their Uuids from the persistent storage.
+    pub async fn get_vertices_by_ids(&self, ids: &[Uuid]) -> GraphResult<Vec<Vertex>> {
+        let mut results = Vec::new();
+
+        for id in ids {
+            // Fetch directly from storage using the pattern from filter_results_by_where
+            if let Some(vertex) = self.storage.get_vertex(id).await? {
+                results.push(vertex);
+            } else {
+                warn!("Vertex with ID {} not found in persistent store", id);
+            }
+        }
+
+        Ok(results)
+    }
+
     pub async fn get_vertex_by_uuid_cypher(&self, uuid: &Uuid) -> Result<Vertex, String> {
-        let query = format!("MATCH (v) WHERE v.id = '{}' RETURN v LIMIT 1", uuid);
+        let query = format!("MATCH (v) WHERE id(v) = '{}' RETURN v LIMIT 1", uuid);
         
-        // 1. Execute the read (returns Vec<serde_json::Value>)
         let results = self.execute_cypher_read(&query, serde_json::Value::Null)
             .await
             .map_err(|e| format!("Graph read failed: {}", e))?;
 
-        // 2. Extract the vertex from the CORRECT flat structure:
-        // results[0]["vertices"][0]  (NO "results" wrapper)
         let vertex_json = results.first()
             .and_then(|result_obj| result_obj.get("vertices"))
             .and_then(|vertices| vertices.as_array())
             .and_then(|vertices| vertices.first())
             .ok_or_else(|| format!("Vertex {} not found in graph results", uuid))?;
 
-        // 3. Deserialize into the Vertex struct
         let vertex: Vertex = serde_json::from_value(vertex_json.clone())
             .map_err(|e| format!("Failed to parse vertex JSON: {}", e))?;
 
@@ -2675,6 +2927,516 @@ impl GraphService {
 
             self.storage.create_edge(new_e.clone()).await?;
             execution_result.add_created_edge(new_e.id.0);
+        }
+
+        Ok(execution_result)
+    }
+
+    /// Executes MERGE patterns with additional context to ensure transactions are 
+    /// logged into the graph of events and related to specific patient golden records.
+pub async fn execute_merge_query_with_context(
+        &self,
+        patterns: Vec<(Option<String>, Vec<NodePattern>, Vec<RelPattern>)>,
+        where_clause: Option<WhereClause>,
+        with_clause: Option<ParsedWithClause>,
+        on_create_set: Vec<(String, String, Expression)>,
+        on_match_set: Vec<(String, String, Expression)>,
+        context_bindings: Option<HashMap<String, HashSet<Uuid>>>,
+    ) -> GraphResult<ExecutionResult> {
+        if patterns.is_empty() {
+            return Ok(ExecutionResult::new());
+        }
+
+        let mut execution_result = ExecutionResult::new();
+        let mut bindings: HashMap<String, Uuid> = HashMap::new();
+
+        // 1. Process Path Nodes
+        let (_, node_patterns, rel_patterns) = &patterns[0];
+        
+        for node_pat in node_patterns {
+            let (var_name_opt, labels, props) = node_pat;
+            let var_name = var_name_opt.clone().unwrap_or_else(|| "node".to_string());
+            
+            // Extract the 'id' for physical lookup
+            let provided_id = if let Some(id_val) = props.get("id") {
+                id_val.as_str().and_then(|s| Uuid::parse_str(s).ok())
+            } else {
+                None
+            };
+
+            let node_id = if let Some(var_name) = var_name_opt.clone() {
+                // Check if already bound in context
+                if let Some(bind_set) = context_bindings.as_ref().and_then(|cb| cb.get(&var_name)) {
+                    if let Some(&bound_id) = bind_set.iter().next() {
+                        println!("===> Using existing bound ID {} for variable {}", bound_id, var_name);
+                        bound_id
+                    } else {
+                        // Not bound - proceed with lookup or create
+                        let existing_vertex_opt = if let Some(ref uuid) = provided_id {
+                            self.storage.get_vertex(uuid).await?
+                        } else {
+                            None
+                        };
+
+                        match existing_vertex_opt {
+                            Some(vertex) => {
+                                let current_id = vertex.id.0;
+                                
+                                let mut variables = HashMap::new();
+                                variables.insert(
+                                    var_name.clone(), 
+                                    CypherValue::Vertex(vertex.clone())
+                                );
+                                
+                                if let Some(ref ctx_map) = context_bindings {
+                                    for (k, v_set) in ctx_map {
+                                        if let Some(first_uuid) = v_set.iter().next() {
+                                            variables.insert(
+                                                format!("context_{}", k), 
+                                                CypherValue::Uuid(SerializableUuid(*first_uuid))
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let ctx = EvaluationContext {
+                                    variables,
+                                    parameters: HashMap::new(),
+                                };
+
+                                let where_passed = match where_clause.as_ref() {
+                                    Some(wc) => wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false),
+                                    None => true,
+                                };
+
+                                let with_passed = match with_clause.as_ref() {
+                                    Some(pw) => pw.where_clause.as_ref().map_or(true, |wc| {
+                                        wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false)
+                                    }),
+                                    None => true,
+                                };
+
+                                if where_passed && with_passed {
+                                    let eval_ctx = EvaluationContext::from_vertex(&var_name, &vertex);
+                                    let mut updated_vertex = vertex.clone();
+                                    let mut changed = false;
+
+                                    for (var, key, expr) in &on_match_set {
+                                        if var_name_opt.as_ref() == Some(var) {
+                                            let val = expr.evaluate(&eval_ctx)?;
+                                            updated_vertex.properties.insert(key.clone(), PropertyValue::from(val));
+                                            changed = true;
+                                        }
+                                    }
+                                    
+                                    if changed {
+                                        updated_vertex.updated_at = chrono::Utc::now().into();
+                                        self.storage.update_vertex(updated_vertex).await?;
+                                        execution_result.add_updated_node(current_id);
+                                        
+                                        if let Some(ref ctx_info) = context_bindings {
+                                             execution_result.add_metadata("mpi_transaction_type", "update".to_string());
+                                             execution_result.add_metadata("mpi_context", serde_json::to_string(ctx_info).unwrap_or_default());
+                                        }
+                                    }
+                                    current_id
+                                } else {
+                                    self.create_new_merge_vertex(
+                                        provided_id, 
+                                        labels, 
+                                        props, 
+                                        var_name_opt, 
+                                        &on_create_set, 
+                                        &mut execution_result
+                                    ).await?
+                                }
+                            }
+                            None => {
+                                let new_id = self.create_new_merge_vertex(
+                                    provided_id, 
+                                    labels, 
+                                    props, 
+                                    var_name_opt, 
+                                    &on_create_set, 
+                                    &mut execution_result
+                                ).await?;
+                                
+                                if let Some(ref ctx_info) = context_bindings {
+                                    execution_result.add_metadata("mpi_transaction_type", "create".to_string());
+                                    execution_result.add_metadata("mpi_event_origin", serde_json::to_string(ctx_info).unwrap_or_default());
+                                }
+                                new_id
+                            }
+                        }
+                    }
+                } else {
+                    // No context binding - proceed with normal lookup/create
+                    let existing_vertex_opt = if let Some(ref uuid) = provided_id {
+                        self.storage.get_vertex(uuid).await?
+                    } else {
+                        None
+                    };
+
+                    match existing_vertex_opt {
+                        Some(vertex) => {
+                            let current_id = vertex.id.0;
+                            
+                            let mut variables = HashMap::new();
+                            variables.insert(
+                                var_name.clone(), 
+                                CypherValue::Vertex(vertex.clone())
+                            );
+                            
+                            if let Some(ref ctx_map) = context_bindings {
+                                for (k, v_set) in ctx_map {
+                                    if let Some(first_uuid) = v_set.iter().next() {
+                                        variables.insert(
+                                            format!("context_{}", k), 
+                                            CypherValue::Uuid(SerializableUuid(*first_uuid))
+                                        );
+                                    }
+                                }
+                            }
+
+                            let ctx = EvaluationContext {
+                                variables,
+                                parameters: HashMap::new(),
+                            };
+
+                            let where_passed = match where_clause.as_ref() {
+                                Some(wc) => wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false),
+                                None => true,
+                            };
+
+                            let with_passed = match with_clause.as_ref() {
+                                Some(pw) => pw.where_clause.as_ref().map_or(true, |wc| {
+                                    wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false)
+                                }),
+                                None => true,
+                            };
+
+                            if where_passed && with_passed {
+                                let eval_ctx = EvaluationContext::from_vertex(&var_name, &vertex);
+                                let mut updated_vertex = vertex.clone();
+                                let mut changed = false;
+
+                                for (var, key, expr) in &on_match_set {
+                                    if var_name_opt.as_ref() == Some(var) {
+                                        let val = expr.evaluate(&eval_ctx)?;
+                                        updated_vertex.properties.insert(key.clone(), PropertyValue::from(val));
+                                        changed = true;
+                                    }
+                                }
+                                
+                                if changed {
+                                    updated_vertex.updated_at = chrono::Utc::now().into();
+                                    self.storage.update_vertex(updated_vertex).await?;
+                                    execution_result.add_updated_node(current_id);
+                                    
+                                    if let Some(ref ctx_info) = context_bindings {
+                                         execution_result.add_metadata("mpi_transaction_type", "update".to_string());
+                                         execution_result.add_metadata("mpi_context", serde_json::to_string(ctx_info).unwrap_or_default());
+                                    }
+                                }
+                                current_id
+                            } else {
+                                self.create_new_merge_vertex(
+                                    provided_id, 
+                                    labels, 
+                                    props, 
+                                    var_name_opt, 
+                                    &on_create_set, 
+                                    &mut execution_result
+                                ).await?
+                            }
+                        }
+                        None => {
+                            let new_id = self.create_new_merge_vertex(
+                                provided_id, 
+                                labels, 
+                                props, 
+                                var_name_opt, 
+                                &on_create_set, 
+                                &mut execution_result
+                            ).await?;
+                            
+                            if let Some(ref ctx_info) = context_bindings {
+                                execution_result.add_metadata("mpi_transaction_type", "create".to_string());
+                                execution_result.add_metadata("mpi_event_origin", serde_json::to_string(ctx_info).unwrap_or_default());
+                            }
+                            new_id
+                        }
+                    }
+                }
+            } else {
+                // Anonymous node - create new
+                self.create_new_merge_vertex(
+                    provided_id, 
+                    labels, 
+                    props, 
+                    var_name_opt, 
+                    &on_create_set, 
+                    &mut execution_result
+                ).await?
+            };
+
+            if let Some(var) = var_name_opt {
+                bindings.insert(var.clone(), node_id);
+            }
+        }
+
+        // 2. Process Path Relationships 
+        for (idx, rel_pat) in rel_patterns.iter().enumerate() {
+            let (_, r_type_opt, _, props, _) = rel_pat;
+            let (s_var_opt, _, _) = &node_patterns[idx];
+            let (t_var_opt, _, _) = &node_patterns[idx+1];
+            
+            let s_id = bindings.get(s_var_opt.as_ref().unwrap()).ok_or_else(|| GraphError::InternalError("Source ID unbound".into()))?;
+            let t_id = bindings.get(t_var_opt.as_ref().unwrap()).ok_or_else(|| GraphError::InternalError("Target ID unbound".into()))?;
+            let r_type = r_type_opt.clone().unwrap_or_else(|| "RELATED".to_string());
+
+            let new_e = Edge {
+                id: SerializableUuid(Uuid::new_v4()),
+                outbound_id: SerializableUuid(*s_id),
+                inbound_id: SerializableUuid(*t_id),
+                edge_type: Identifier::new(r_type.clone()).map_err(|e| GraphError::InternalError(e.to_string()))?,
+                label: r_type,
+                properties: props.iter()
+                    .map(|(k, v)| {
+                        let cv = CypherValue::from(v); 
+                        (k.clone(), PropertyValue::from(cv))
+                    })
+                    .collect(),
+            };
+
+            self.storage.create_edge(new_e.clone()).await?;
+            execution_result.add_created_edge(new_e.id.0);
+        }
+
+        Ok(execution_result)
+    }
+
+    /// Executes CREATE patterns with additional context to ensure transactions are 
+    /// logged into the graph of events and related to specific patient golden records.
+    pub async fn execute_create_query_with_context(
+        &self,
+        patterns: Vec<(Option<String>, Vec<NodePattern>, Vec<RelPattern>)>,
+        context_bindings: Option<HashMap<String, HashSet<Uuid>>>,
+    ) -> GraphResult<ExecutionResult> {
+        let mut execution_result = ExecutionResult::new();
+        let mut bindings: HashMap<String, Uuid> = HashMap::new();
+
+        for (_path_var, node_patterns, rel_patterns) in patterns {
+            // 1. Process Path Nodes
+            // FIX: Use &node_patterns to avoid moving ownership
+            for node_pat in &node_patterns {
+                let (var_name_opt, labels, props) = node_pat;
+                
+                let new_id = if let Some(id_val) = props.get("id") {
+                    id_val.as_str()
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .unwrap_or_else(Uuid::new_v4)
+                } else {
+                    Uuid::new_v4()
+                };
+
+                let primary_label = labels.first()
+                    .cloned()
+                    .unwrap_or_else(|| "Node".to_string());
+
+                let new_vertex = Vertex {
+                    id: SerializableUuid(new_id),
+                    label: Identifier::new(primary_label)
+                        .map_err(|e| GraphError::InternalError(e.to_string()))?,
+                    properties: props.iter()
+                        .map(|(k, v)| {
+                            let val_str = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                _ => v.to_string().replace('"', ""),
+                            };
+                            (k.clone(), PropertyValue::from(val_str))
+                        })
+                        .collect(),
+                    created_at: chrono::Utc::now().into(),
+                    updated_at: chrono::Utc::now().into(),
+                };
+
+                self.storage.create_vertex(new_vertex).await?;
+                execution_result.add_created_node(new_id);
+
+                // MPI Logging: Requirement check - log transaction to event graph
+                if let Some(ref ctx_info) = context_bindings {
+                    execution_result.add_metadata("mpi_transaction_type", "create_explicit".to_string());
+                    execution_result.add_metadata("mpi_event_origin", serde_json::to_string(ctx_info).unwrap_or_default());
+                }
+
+                if let Some(var) = var_name_opt {
+                    bindings.insert(var.clone(), new_id);
+                }
+            }
+
+            // 2. Process Path Relationships
+            for (idx, rel_pat) in rel_patterns.iter().enumerate() {
+                let (rel_var_opt, r_type_opt, _, props, _) = rel_pat;
+                
+                // Now we can safely borrow by index because we didn't consume node_patterns above
+                let (s_var_opt, _, _) = &node_patterns[idx];
+                let (t_var_opt, _, _) = &node_patterns[idx+1];
+                
+                let s_id = s_var_opt.as_ref()
+                    .and_then(|var| bindings.get(var))
+                    .ok_or_else(|| GraphError::InternalError(format!("Source variable {:?} unbound", s_var_opt)))?;
+                
+                let t_id = t_var_opt.as_ref()
+                    .and_then(|var| bindings.get(var))
+                    .ok_or_else(|| GraphError::InternalError(format!("Target variable {:?} unbound", t_var_opt)))?;
+                
+                let r_type = r_type_opt.clone().unwrap_or_else(|| "RELATED".to_string());
+                let rel_id = Uuid::new_v4();
+
+                let new_edge = Edge {
+                    id: SerializableUuid(rel_id),
+                    outbound_id: SerializableUuid(*s_id),
+                    inbound_id: SerializableUuid(*t_id),
+                    edge_type: Identifier::new(r_type.clone())
+                        .map_err(|e| GraphError::InternalError(e.to_string()))?,
+                    label: r_type,
+                    properties: props.iter()
+                        .map(|(k, v)| {
+                            let val_str = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                _ => v.to_string().replace('"', ""),
+                            };
+                            (k.clone(), PropertyValue::from(val_str))
+                        })
+                        .collect(),
+                };
+
+                self.storage.create_edge(new_edge).await?;
+                execution_result.add_created_edge(rel_id);
+                
+                if let Some(var) = rel_var_opt {
+                    bindings.insert(var.clone(), rel_id);
+                }
+            }
+        }
+
+        Ok(execution_result)
+    }
+
+    /// Executes SET operations with context to ensure property changes are logged 
+    /// into the graph of changes for specific patient golden records.
+    pub async fn execute_set_query_with_context(
+        &self,
+        updates: Vec<(String, String, Expression)>, // (Variable, PropertyKey, NewValueExpression)
+        context_bindings: Option<HashMap<String, HashSet<Uuid>>>,
+    ) -> GraphResult<ExecutionResult> {
+        let mut execution_result = ExecutionResult::new();
+
+        // Group updates by variable to minimize storage lookups
+        let mut grouped_updates: HashMap<String, Vec<(String, Expression)>> = HashMap::new();
+        for (var, key, expr) in updates {
+            grouped_updates.entry(var).or_default().push((key, expr));
+        }
+
+        for (var_name, property_updates) in grouped_updates {
+            // Retrieve IDs for this variable from context_bindings
+            let target_ids = context_bindings.as_ref()
+                .and_then(|cb| cb.get(&var_name))
+                .ok_or_else(|| GraphError::InternalError(format!("No context binding found for variable: {}", var_name)))?;
+
+            for &uuid in target_ids {
+                let mut vertex = self.storage.get_vertex(&uuid).await?
+                    .ok_or_else(|| GraphError::InternalError(format!("Vertex {} not found for update", uuid)))?;
+
+                let mut changed = false;
+                let eval_ctx = EvaluationContext::from_vertex(&var_name, &vertex);
+
+                for (key, expr) in &property_updates {
+                    let new_val = expr.evaluate(&eval_ctx)?;
+                    vertex.properties.insert(key.clone(), PropertyValue::from(new_val));
+                    changed = true;
+                }
+
+                if changed {
+                    vertex.updated_at = chrono::Utc::now().into();
+                    self.storage.update_vertex(vertex).await?;
+                    execution_result.add_updated_node(uuid);
+
+                    // MPI Logging: Add metadata to relate this SET operation to the event graph
+                    if let Some(ref ctx_info) = context_bindings {
+                        execution_result.add_metadata("mpi_transaction_type", "set_property".to_string());
+                        execution_result.add_metadata("mpi_change_context", serde_json::to_string(ctx_info).unwrap_or_default());
+                        execution_result.add_metadata("mpi_updated_variable", var_name.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(execution_result)
+    }
+
+    /// Executes DELETE operations with context to ensure removals are 
+    /// logged into the graph of events and traceable to the patient golden record.
+    pub async fn execute_delete_query_with_context(
+        &self,
+        variable_names: Vec<String>,
+        context_bindings: Option<HashMap<String, HashSet<Uuid>>>,
+    ) -> GraphResult<ExecutionResult> {
+        let mut execution_result = ExecutionResult::new();
+
+        for var_name in variable_names {
+            // Retrieve the specific IDs associated with this variable from the context
+            let target_ids = context_bindings.as_ref()
+                .and_then(|cb| cb.get(&var_name))
+                .ok_or_else(|| GraphError::InternalError(format!("No context binding found for DELETE variable: {}", var_name)))?;
+
+            for &uuid in target_ids {
+                // 1. Check if the ID refers to a Vertex
+                if let Some(vertex) = self.storage.get_vertex(&uuid).await? {
+                    if context_bindings.is_some() {
+                        let meta_key = format!("deleted_node_{}", uuid);
+                        let meta_val = serde_json::to_string(&vertex).unwrap_or_default();
+                        // Fix: Pass as &str using .as_str()
+                        execution_result.add_metadata(meta_key.as_str(), meta_val);
+                    }
+
+                    self.storage.delete_vertex(&uuid).await?;
+                    execution_result.add_deleted_node(uuid);
+                } 
+                else {
+                    // 2. Check if the ID refers to an Edge
+                    // Since storage.get_edge requires (src, type, dst), we find the edge by ID from the global list
+                    let all_edges = self.storage.get_all_edges().await?;
+                    if let Some(edge) = all_edges.into_iter().find(|e| e.id.0 == uuid) {
+                        
+                        if context_bindings.is_some() {
+                            let meta_key = format!("deleted_edge_{}", uuid);
+                            let meta_val = serde_json::to_string(&edge).unwrap_or_default();
+                            // Fix: Pass as &str
+                            execution_result.add_metadata(meta_key.as_str(), meta_val);
+                        }
+
+                        // Fix: Use the triple required by your storage engine
+                        self.storage.delete_edge(
+                            &edge.outbound_id.0, 
+                            &edge.edge_type, 
+                            &edge.inbound_id.0
+                        ).await?;
+                        
+                        execution_result.add_deleted_edge(uuid);
+                    } else {
+                        return Err(GraphError::InternalError(format!("Entity {} not found for deletion", uuid)));
+                    }
+                }
+
+                // 3. MPI Event Logging - Traceability requirement
+                if let Some(ref ctx_info) = context_bindings {
+                    let origin_json = serde_json::to_string(ctx_info).unwrap_or_default();
+                    execution_result.add_metadata("mpi_transaction_type", "delete_explicit".to_string());
+                    execution_result.add_metadata("mpi_event_origin", origin_json);
+                }
+            }
         }
 
         Ok(execution_result)

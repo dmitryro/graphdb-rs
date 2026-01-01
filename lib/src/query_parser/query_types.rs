@@ -3,6 +3,8 @@
 
 use serde_json::{json, Value};
 use std::collections::{HashSet, HashMap};
+use tokio::sync::RwLock;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use crate::config::QueryResult;
@@ -11,7 +13,55 @@ use models::errors::{GraphError, GraphResult};
 use models::properties::{ PropertyValue, SerializableFloat, HashablePropertyMap} ;
 use models::identifiers::SerializableUuid;
 use std::result::Result; 
+use std::sync::{Arc};
 use strum_macros::{Display, AsRefStr};
+
+#[derive(Debug, Default)]
+pub struct GlobalPersistenceContext {
+    // Maps variable names to DB UUIDs (e.g., "e" -> UUID)
+    pub bindings: RwLock<HashMap<String, Uuid>>,
+}
+
+impl GlobalPersistenceContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SymbolTable {
+    pub variables: HashMap<String, SerializableUuid>,
+    pub relationships: HashMap<String, SerializableUuid>,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            relationships: HashMap::new(),
+        }
+    }
+    
+    pub fn bind_variable(&mut self, var_name: String, vertex_id: SerializableUuid) {
+        if !var_name.is_empty() {
+            self.variables.insert(var_name, vertex_id);
+        }
+    }
+    
+    pub fn bind_relationship(&mut self, var_name: String, edge_id: SerializableUuid) {
+        if !var_name.is_empty() {
+            self.relationships.insert(var_name, edge_id);
+        }
+    }
+    
+    pub fn get_variable(&self, var_name: &str) -> Option<&SerializableUuid> {
+        self.variables.get(var_name)
+    }
+    
+    pub fn get_relationship(&self, var_name: &str) -> Option<&SerializableUuid> {
+        self.relationships.get(var_name)
+    }
+}
 
 // This definition allows you to specify both T and E when using StdResult.
 pub type StdResult<T, E> = Result<T, E>;
@@ -418,6 +468,7 @@ pub enum CypherQuery {
         with_clause: Option<ParsedWithClause>,
         on_create_set: Vec<(String, String, Expression)>, 
         on_match_set: Vec<(String, String, Expression)>,
+        return_clause: Option<ReturnClause>,
     },
     // NEW: Standalone SET clause for chaining
     SetStatement { 
@@ -611,6 +662,31 @@ pub struct WhereClause {
 pub struct EvaluationContext {
     pub variables: HashMap<String, CypherValue>,
     pub parameters: HashMap<String, CypherValue>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionContext {
+    // Variable name -> Set of Vertex UUIDs (multiple possible bindings)
+    pub vertex_bindings: HashMap<String, HashSet<uuid::Uuid>>,
+    // Relationship variable -> Set of Edge UUIDs  
+    pub edge_bindings: HashMap<String, HashSet<uuid::Uuid>>,
+    // Current working set of vertices (for filtering/matching)
+    pub current_vertices: Vec<Vertex>,
+    // Current working set of edges
+    pub current_edges: Vec<Edge>,
+}
+
+/// Global query context manager for tracking MPI state across sequential statements
+pub static GLOBAL_QUERY_CONTEXT: OnceCell<Arc<RwLock<ExecutionContext>>> = OnceCell::const_new();
+
+/// Helper to initialize or retrieve the global context
+pub async fn get_global_context() -> Arc<RwLock<ExecutionContext>> {
+    GLOBAL_QUERY_CONTEXT
+        .get_or_init(|| async {
+            Arc::new(RwLock::new(ExecutionContext::default()))
+        })
+        .await
+        .clone()
 }
 
 // =================================================================
@@ -873,6 +949,7 @@ pub struct ExecutionResult {
     pub updated_kv_keys: HashSet<String>,
     // ADDED: Track number of properties modified (e.g., u.count + 1)
     pub properties_set_count: usize,
+    pub metadata: HashMap<String, String>,
 }
 
 impl ExecutionResult {
@@ -932,6 +1009,10 @@ impl ExecutionResult {
         self.updated_nodes.len() + self.updated_edges.len()
     }
 
+    pub fn add_metadata(&mut self, key: &str, value: String) {
+        self.metadata.insert(key.to_string(), value);
+    }
+
     pub fn extend(&mut self, other: ExecutionResult) {
         self.created_nodes.extend(other.created_nodes);
         self.updated_nodes.extend(other.updated_nodes);
@@ -940,8 +1021,9 @@ impl ExecutionResult {
         self.updated_edges.extend(other.updated_edges);
         self.deleted_edges.extend(other.deleted_edges);
         self.updated_kv_keys.extend(other.updated_kv_keys);
-        // ADDED: Accumulate property counts
         self.properties_set_count += other.properties_set_count;
+        // ADDED: Merge metadata
+        self.metadata.extend(other.metadata);
     }
 }
 
