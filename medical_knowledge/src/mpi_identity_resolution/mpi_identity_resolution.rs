@@ -2144,9 +2144,8 @@ impl MpiIdentityResolutionService {
 
         Ok(serde_json::to_value(dashboard)?)
     }
-
-    /// LINEAGE: Fetches filtered lineage report from the Graph of Events.
-     pub async fn get_lineage_data(
+/// LINEAGE: Fetches filtered lineage report from the Graph of Events.
+    pub async fn get_lineage_data(
         &self,
         mpi_id: String,
         _id_type: Option<String>,
@@ -2221,9 +2220,7 @@ impl MpiIdentityResolutionService {
             trace_path.push(canonical_vertex.id.0);
         }
 
-        let target_uuid = canonical_vertex.id.0.to_string();
         let log_uid = canonical_vertex.id.0;
-
         println!("[MPI] Canonical (survivor) vertex resolved: {} (after {} hops)", canonical_vertex.id.0, merge_hops);
 
         // 3. EXTRACT DEMOGRAPHICS & RED FLAGS
@@ -2240,20 +2237,33 @@ impl MpiIdentityResolutionService {
             .map(|s| s.split(',').filter(|f| !f.is_empty()).count());
 
         // 4. LINEAGE TRAVERSAL
+        let internal_id = canonical_vertex.properties.get("id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(&-1i64); 
+
         let mut query = format!(
-            "MATCH (g {{id: '{target_uuid}'}})-[*1..{search_depth}]-(e:IdentityEvent) "
+            "MATCH (p {{id: {}}})-[:PARTICIPATED_IN]->(e:IdentityEvent) ",
+            internal_id
         );
 
+     
+
         let mut filters = Vec::new();
-        if let Some(f) = &from { filters.push(format!("e.timestamp >= '{}'", f)); }
-        if let Some(t) = &to { filters.push(format!("e.timestamp <= '{}'", t)); }
+        if let Some(f) = &from { 
+            filters.push(format!("e.timestamp >= '{}'", f)); 
+        }
+        if let Some(t) = &to { 
+            filters.push(format!("e.timestamp <= '{}'", t)); 
+        }
+        
         if !filters.is_empty() {
             query.push_str(&format!("WHERE {} ", filters.join(" AND ")));
         }
 
         query.push_str("RETURN DISTINCT e ORDER BY e.timestamp ASC ");
-        if let Some(h) = head { query.push_str(&format!("LIMIT {} ", h)); }
-
+        if let Some(h) = head { 
+            query.push_str(&format!("LIMIT {} ", h)); 
+        }
         println!("===> Lineage query: {}", query);
 
         let events_results = gs.execute_cypher_read(&query, serde_json::json!({})).await
@@ -2262,6 +2272,7 @@ impl MpiIdentityResolutionService {
         println!("===> Lineage query returned {} result wrappers", events_results.len());
 
         // 5. 2-LAYER LOGGING (Compliance 2025-12-20)
+        // All transactions must be logged into the graph of events/changes
         gs.log_mpi_transaction(start_vertex.id.0, log_uid, "IDENTITY_LINEAGE_REVEAL", 
             &format!("Resolved via {} hops. MRN: {}", merge_hops, clean_id), requested_by).await.ok();
 
@@ -2275,64 +2286,57 @@ impl MpiIdentityResolutionService {
 
         // 6. MAP HISTORY CHAIN
         let default_ts = chrono::Utc::now().to_rfc3339();
-        let empty_map = serde_json::Map::new(); // Long-lived fallback
-
-        let structural_events = ["MERGE", "SPLIT", "MANUAL_MERGE_INITIATED", "MANUAL_MERGE_EXECUTION"];
+        let structural_events = ["MERGE", "SPLIT", "MANUAL_MERGE_INITIATED", "MANUAL_MERGE_EXECUTION", "MERGE_ROLLBACK_EXECUTED"];
 
         let history_entries: Vec<serde_json::Value> = events_results.iter()
-            .flat_map(|result_wrapper| {
-                result_wrapper.get("results")
-                    .and_then(|r| r.as_array())
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|result_item| {
-                        result_item.get("vertices")
-                            .and_then(|v| v.as_array())
-                            .into_iter()
-                            .flatten()
+            .flat_map(|wrapper| {
+                wrapper.get("vertices")
+                    .and_then(|v| v.as_array())
+                    .unwrap_or(&Vec::new())
+                    .iter()
+                    .filter(|vertex| {
+                        vertex.get("label").and_then(|l| l.as_str()) == Some("IdentityEvent")
                     })
+                    .cloned()
+                    .collect::<Vec<serde_json::Value>>()
             })
             .map(|event_vertex| {
+                // FIX: Get the object reference without creating a temporary fallback
+                // If "properties" doesn't exist or isn't an object, we use an empty map
+                let empty_map = serde_json::Map::new();
                 let props = event_vertex.get("properties")
                     .and_then(|p| p.as_object())
                     .unwrap_or(&empty_map);
-
+                
                 let event_type = props.get("event_type")
-                    .or_else(|| props.get("action"))
+                    .or(props.get("action"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("UNKNOWN");
 
                 let timestamp = props.get("timestamp")
                     .and_then(|v| v.as_str())
                     .unwrap_or(&default_ts);
-
-                let user_id = props.get("user_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("system");
-
-                let source_system = props.get("source_system")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("MPI");
-
-                let reason = props.get("reason")
-                    .and_then(|v| v.as_str());
-
-                let metadata = props.get("metadata")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                    
+                let metadata_raw = props.get("metadata").and_then(|v| v.as_str());
+                
+                let meta: serde_json::Value = metadata_raw
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::json!({}));
 
                 serde_json::json!({
                     "timestamp": timestamp,
                     "action_type": event_type,
-                    "user_id": user_id,
-                    "source_system": source_system,
-                    "change_reason": reason,
-                    "involved_identity_alias": metadata.as_ref().and_then(|m| m.get("input_id")).and_then(|v| v.as_str()),
-                    "mutations": metadata.as_ref().and_then(|m| m.get("mutations")).unwrap_or(&serde_json::json!([])),
+                    "user_id": props.get("user_id").and_then(|v| v.as_str()).unwrap_or("system"),
+                    "source_system": props.get("source_system").and_then(|v| v.as_str()).unwrap_or("MPI"),
+                    "change_reason": props.get("reason").and_then(|v| v.as_str()),
+                    "involved_identity_alias": meta.get("input_id").and_then(|v| v.as_str()),
+                    "mutations": meta.get("mutations").unwrap_or(&serde_json::json!([])),
                     "is_structural": structural_events.contains(&event_type)
                 })
             })
             .collect();
+
+        println!("[MPI] Parsed {} history entries from lineage results", history_entries.len());
 
         let final_history = if let Some(t) = tail {
             let start = history_entries.len().saturating_sub(t);
