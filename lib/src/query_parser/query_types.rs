@@ -674,6 +674,8 @@ pub struct ExecutionContext {
     pub current_vertices: Vec<Vertex>,
     // Current working set of edges
     pub current_edges: Vec<Edge>,
+    // NEW: Variable name -> Value (for scalars, strings, numbers from UNWIND)
+    pub scalar_rows: Vec<HashMap<String, CypherValue>>,
 }
 
 /// Global query context manager for tracking MPI state across sequential statements

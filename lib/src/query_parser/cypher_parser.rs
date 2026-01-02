@@ -16,6 +16,7 @@ use nom::{
     error as NomError,
     error::Error as NomErrorType, 
 };
+use regex::Regex;
 use std::pin::Pin;
 use std::future::Future;
 use serde_json::{json, Value, Number, Map};
@@ -6429,6 +6430,38 @@ fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
     Ok((input, return_query))
 }
 
+fn apply_projection_aliases(projection_string: &str, obj: &mut serde_json::Map<String, serde_json::Value>) {
+    // 1. Clean the RETURN prefix
+    let clean_projection = projection_string.trim_start_matches("RETURN ").trim();
+    
+    // 2. Regex to split commas only if NOT inside parentheses
+    // This handles: RETURN coalesce(p.name, 'N/A') AS name, p.id
+    let split_re = Regex::new(r",\s*(?![^()]*\))").unwrap();
+    let items: Vec<&str> = split_re.split(clean_projection).map(|s| s.trim()).collect();
+
+    // 3. Regex for the " AS " alias pattern (case-insensitive)
+    let alias_re = Regex::new(r"(?i)\s+AS\s+").unwrap();
+
+    for item in items {
+        if let Some(mat) = alias_re.find(item) {
+            let expr = item[..mat.start()].trim();
+            let alias = item[mat.end()..].trim();
+            
+            // If the object has the raw expression key, move it to the alias key
+            if let Some(val) = obj.remove(expr) {
+                obj.insert(alias.to_string(), val);
+            }
+        } 
+        // AUTO-FLATTEN: If "p.mrn" exists but no alias was provided, move to "mrn"
+        else if item.contains('.') {
+            if let Some(val) = obj.remove(item) {
+                let flat_key = item.split('.').last().unwrap_or(item);
+                obj.insert(flat_key.to_string(), val);
+            }
+        }
+    }
+}
+
 // Conceptual Helper method on NodePattern, Vertex (or similar)
 // You must implement this in an appropriate file.
 
@@ -8337,9 +8370,9 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             }
                         }
 
-                        // ================================================================
-                        // RETURN Statement in Chain - Evaluation
-                        // ================================================================
+                        // ============================================================================
+                        // INTERNAL RETURN HANDLER (Inside Chain match arm)
+                        // ============================================================================
                         CypherQuery::ReturnStatement { projection_string, .. } => {
                             println!("===> Processing RETURN in Chain using global context");
                             
@@ -8351,61 +8384,136 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                     ctx.vertex_bindings.clone(),
                                     ctx.edge_bindings.clone()
                                 )
-                            }; 
+                            };
                             
+                            println!("===> Context: {} vertices, {} edges, {} vertex_bindings, {} edge_bindings",
+                                     current_vertices.len(), current_edges.len(), vertex_bindings.len(), edge_bindings.len());
+                            
+                            // Build evaluation bindings
                             let mut eval_bindings = HashMap::new();
                             for (var_name, vertex_id_set) in &vertex_bindings {
                                 if let Some(vertex) = current_vertices.iter().find(|v| vertex_id_set.contains(&v.id.0)) {
                                     eval_bindings.insert(var_name.clone(), CypherValue::Vertex(vertex.clone()));
+                                    println!("===> Bound variable '{}' to vertex with {} properties", 
+                                             var_name, vertex.properties.len());
                                 }
                             }
                             
                             for (var_name, edge_id_set) in &edge_bindings {
                                 if let Some(edge) = current_edges.iter().find(|e| edge_id_set.contains(&e.id.0)) {
                                     eval_bindings.insert(var_name.clone(), CypherValue::Edge(edge.clone()));
+                                    println!("===> Bound variable '{}' to edge '{}'", var_name, edge.label);
                                 }
                             }
                             
-                            if let Ok(ret_clause) = serde_json::from_str::<ReturnClause>(projection_string) {
-                                let mut result_row = serde_json::Map::new();
+                            // Parse projection items from the string
+                            let items: Vec<&str> = projection_string
+                                .trim_start_matches("RETURN ")
+                                .split(',')
+                                .map(|s| s.trim())
+                                .collect();
+                            
+                            let mut result_row = serde_json::Map::new();
+                            
+                            for item in items {
+                                println!("===> Processing projection item: '{}'", item);
                                 
-                                for item in &ret_clause.items {
-                                    let expr_str = &item.expression;
-                                    
-                                    if expr_str.starts_with("type(") && expr_str.ends_with(')') {
-                                        let edge_var = expr_str[5..expr_str.len()-1].trim();
-                                        if let Some(CypherValue::Edge(edge)) = eval_bindings.get(edge_var) {
-                                            let key = item.alias.clone().unwrap_or_else(|| expr_str.to_string());
-                                            result_row.insert(key, json!(edge.label.as_str()));
-                                        }
-                                    } else if let Some(dot_pos) = expr_str.find('.') {
-                                        let var = &expr_str[..dot_pos];
-                                        let prop = &expr_str[dot_pos + 1..];
-                                        if let Some(CypherValue::Vertex(vertex)) = eval_bindings.get(var) {
-                                            if let Some(pv) = vertex.properties.get(prop) {
-                                                let key = item.alias.clone().unwrap_or_else(|| expr_str.to_string());
-                                                result_row.insert(key, serde_json::to_value(pv).unwrap_or(json!(null)));
-                                            }
-                                        }
+                                // Parse alias if present (e.g., "expr AS alias")
+                                let (expr_raw, alias_opt) = if let Some(as_pos) = item.to_uppercase().find(" AS ") {
+                                    (item[..as_pos].trim(), Some(item[as_pos + 4..].trim()))
+                                } else {
+                                    (item.trim(), None)
+                                };
+                                
+                                // Determine the output key
+                                let key = if let Some(alias) = alias_opt {
+                                    alias.to_string()
+                                } else {
+                                    expr_raw.to_string()
+                                };
+                                
+                                println!("===> Expression: '{}', Key: '{}'", expr_raw, key);
+                                
+                                // 1. Handle type() function for edges
+                                if expr_raw.to_lowercase().starts_with("type(") && expr_raw.ends_with(')') {
+                                    let edge_var = expr_raw[5..expr_raw.len()-1].trim();
+                                    if let Some(CypherValue::Edge(edge)) = eval_bindings.get(edge_var) {
+                                        result_row.insert(key.clone(), json!(edge.label.as_str()));
+                                        println!("===> ✓ Inserted type({}) = '{}'", edge_var, edge.label.as_str());
+                                        continue;
                                     } else {
-                                        if let Some(val) = eval_bindings.get(expr_str) {
-                                            let key = item.alias.clone().unwrap_or_else(|| expr_str.to_string());
-                                            result_row.insert(key, val.to_json());
-                                        }
+                                        println!("===> ✗ Edge variable '{}' not found", edge_var);
+                                        result_row.insert(key, json!(null));
+                                        continue;
                                     }
                                 }
                                 
-                                return Ok(json!({
-                                    "vertices": vec![result_row],
-                                    "edges": current_edges,
-                                    "stats": {
-                                        "vertices_matched": current_vertices.len(),
-                                        "edges_matched": current_edges.len(),
-                                        "contains_updates": final_execution_result.has_mutations()
+                                // 2. Handle property access (e.g., "target_patient.mrn", "e.id")
+                                if let Some(dot_pos) = expr_raw.find('.') {
+                                    let var_name = expr_raw[..dot_pos].trim();
+                                    let prop_name = expr_raw[dot_pos + 1..].trim();
+                                    
+                                    println!("===> Looking up variable '{}', property '{}'", var_name, prop_name);
+                                    
+                                    if let Some(cypher_val) = eval_bindings.get(var_name) {
+                                        match cypher_val {
+                                            CypherValue::Vertex(vertex) => {
+                                                println!("===> Found vertex, checking properties map...");
+                                                if let Some(property_value) = vertex.properties.get(prop_name) {
+                                                    let json_val = serde_json::to_value(property_value)
+                                                        .unwrap_or(json!(null));
+                                                    println!("===> ✓ Inserted {} = {:?}", key, json_val);
+                                                    result_row.insert(key, json_val);
+                                                } else {
+                                                    println!("===> ✗ Property '{}' not found in vertex", prop_name);
+                                                    result_row.insert(key, json!(null));
+                                                }
+                                            }
+                                            CypherValue::Edge(edge) => {
+                                                if let Some(property_value) = edge.properties.get(prop_name) {
+                                                    let json_val = serde_json::to_value(property_value)
+                                                        .unwrap_or(json!(null));
+                                                    println!("===> ✓ Inserted {} = {:?}", key, json_val);
+                                                    result_row.insert(key, json_val);
+                                                } else {
+                                                    result_row.insert(key, json!(null));
+                                                }
+                                            }
+                                            _ => {
+                                                println!("===> ✗ Variable '{}' is not a Vertex or Edge", var_name);
+                                                result_row.insert(key, json!(null));
+                                            }
+                                        }
+                                    } else {
+                                        println!("===> ✗ Variable '{}' not found in eval_bindings", var_name);
+                                        result_row.insert(key, json!(null));
                                     }
-                                }));
+                                    continue;
+                                }
+                                
+                                // 3. Handle simple variable reference (entire vertex/edge)
+                                if let Some(val) = eval_bindings.get(expr_raw) {
+                                    result_row.insert(key.clone(), val.to_json());
+                                    println!("===> ✓ Inserted entire object for '{}'", expr_raw);
+                                } else {
+                                    println!("===> ✗ Variable '{}' not found", expr_raw);
+                                    result_row.insert(key, json!(null));
+                                }
                             }
+                            
+                            println!("===> Final result_row: {:?}", result_row);
+                            
+                            return Ok(json!({
+                                "vertices": vec![result_row],
+                                "edges": current_edges,
+                                "stats": {
+                                    "vertices_matched": current_vertices.len(),
+                                    "edges_matched": current_edges.len(),
+                                    "contains_updates": final_execution_result.has_mutations()
+                                }
+                            }));
                         }
+
 
                         // ================================================================
                         // MATCH CREATE in Chain
@@ -8504,47 +8612,42 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         }
 
                         // ================================================================
-                        // UNWIND in Chain
+                        // FIXED UNWIND in Chain
                         // ================================================================
                         CypherQuery::Unwind { expression, variable } => {
                             println!("===> Executing UNWIND in Chain (clause {})", idx + 1);
                             
-                            let (current_vertices, current_edges, vertex_bindings, edge_bindings) = {
-                                let ctx = global_context.read().await;
-                                (
-                                    ctx.current_vertices.clone(),
-                                    ctx.current_edges.clone(),
-                                    ctx.vertex_bindings.clone(),
-                                    ctx.edge_bindings.clone()
-                                )
-                            }; 
+                            let mut new_rows = Vec::new();
+                            let ctx_snapshot = global_context.read().await;
                             
-                            for _vertex in &current_vertices {
-                                let mut unwind_bindings = HashMap::new();
-                                
-                                for (var_name, vertex_id_set) in &vertex_bindings {
-                                    if let Some(v) = current_vertices.iter().find(|v| vertex_id_set.contains(&v.id.0)) {
-                                        unwind_bindings.insert(var_name.clone(), CypherValue::Vertex(v.clone()));
-                                    }
-                                }
-                                
-                                for (var_name, edge_id_set) in &edge_bindings {
-                                    if let Some(e) = current_edges.iter().find(|e| edge_id_set.contains(&e.id.0)) {
-                                        unwind_bindings.insert(var_name.clone(), CypherValue::Edge(e.clone()));
-                                    }
-                                }
+                            // We must iterate over the existing vertices to maintain "row" state
+                            for vertex in &ctx_snapshot.current_vertices {
+                                // Build eval context for the expression (e.g., keys(e))
+                                let mut eval_bindings = HashMap::new();
+                                // NOTE: You should ideally loop through ctx_snapshot.vertex_bindings 
+                                // to find which variable name maps to this vertex. 
+                                // For now, assuming "e" as per your snippet:
+                                eval_bindings.insert("e".to_string(), CypherValue::Vertex(vertex.clone()));
                                 
                                 let eval_ctx = EvaluationContext {
-                                    variables: unwind_bindings,
+                                    variables: eval_bindings.clone(),
                                     parameters: HashMap::new(),
                                 };
                                 
-                                let result = expression.evaluate(&eval_ctx)?;
-                                if let CypherValue::List(items) = result {
-                                    println!("===> UNWIND produced {} items for variable '{}'", items.len(), variable);
-                                    // Logic to handle item iteration for subsequent clauses would go here
+                                if let Ok(CypherValue::List(items)) = expression.evaluate(&eval_ctx) {
+                                    for item in items {
+                                        // IMPORTANT: Carry over the existing bindings and add the new variable
+                                        let mut row_with_new_var = eval_bindings.clone();
+                                        row_with_new_var.insert(variable.clone(), item);
+                                        new_rows.push(row_with_new_var);
+                                    }
                                 }
                             }
+                            
+                            drop(ctx_snapshot);
+                            let mut ctx_write = global_context.write().await;
+                            // Store as Vec<HashMap<String, CypherValue>> to match RETURN's expectations
+                            ctx_write.scalar_rows = new_rows; 
                         }
 
                         // ================================================================
@@ -9420,60 +9523,133 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     }))
                 }
             }
-            // ============================================================================
-            // RETURN STATEMENT - Return flat or check if already wrapped
-            // ============================================================================
-            CypherQuery::ReturnStatement { 
-                projection_string,
-                order_by,
-                skip,
-                limit,
-            } => {
-                let order_by_str = graph_service.serialize_order_by_to_string(&order_by);
 
+            // ============================================================================
+            // EXTERNAL RETURN HANDLER (Outside Chain, standalone RETURN)
+            // ============================================================================
+            CypherQuery::ReturnStatement { projection_string, order_by, skip, limit } => {
+                info!("===> EXECUTING External RETURN Statement");
+                
+                let order_by_str = graph_service.serialize_order_by_to_string(&order_by);
                 let return_qr_result = graph_service.execute_return_statement(
-                    projection_string,
+                    projection_string.clone(),
                     order_by_str,
                     skip,
                     limit,
                 ).await;
-
+                
                 let raw_value = graph_service.query_result_to_value(return_qr_result)?;
                 
-                if raw_value.is_object() 
+                // Normalize result structure
+                let mut final_wrapped_result = if raw_value.is_object() 
                     && raw_value.get("vertices").is_some() 
                     && raw_value.get("edges").is_some() {
-                    Ok(raw_value)
-                }
-                else if let Some(results_array) = raw_value.get("results").and_then(|r| r.as_array()) {
+                    raw_value
+                } else if let Some(results_array) = raw_value.get("results").and_then(|r| r.as_array()) {
                     if let Some(first_result) = results_array.first() {
                         if first_result.is_object() 
                             && first_result.get("vertices").is_some() 
                             && first_result.get("edges").is_some() {
-                            Ok(first_result.clone())
+                            first_result.clone()
                         } else {
-                            Ok(json!({
-                                "vertices": [],
+                            json!({
+                                "vertices": results_array.clone(),
                                 "edges": [],
-                                "stats": { "vertices_matched": 0, "edges_matched": 0 }
-                            }))
+                                "stats": { "vertices_matched": results_array.len(), "edges_matched": 0 }
+                            })
                         }
                     } else {
-                        Ok(json!({
-                            "vertices": [],
-                            "edges": [],
-                            "stats": { "vertices_matched": 0, "edges_matched": 0 }
-                        }))
+                        json!({ "vertices": [], "edges": [], "stats": { "vertices_matched": 0, "edges_matched": 0 } })
+                    }
+                } else {
+                    json!({ "vertices": [], "edges": [], "stats": { "vertices_matched": 0, "edges_matched": 0 } })
+                };
+                
+                // CRITICAL FIX: Property extraction and Nonsense Access Prevention
+                if let Some(vertices) = final_wrapped_result.get_mut("vertices").and_then(|v| v.as_array_mut()) {
+                    for row in vertices {
+                        if let Some(obj) = row.as_object_mut() {
+                            
+                            // Parse projection to understand what properties/entities are being requested
+                            let projection_items: Vec<&str> = projection_string
+                                .trim_start_matches("RETURN ")
+                                .split(',')
+                                .map(|s| s.trim())
+                                .collect();
+                            
+                            let projection_items_clone = projection_items.clone();
+                            
+                            // STEP 1: Property Extraction from nested objects
+                            for item in &projection_items {
+                                if item.to_lowercase().starts_with("type(") {
+                                    continue;
+                                }
+                                
+                                if let Some(dot_pos) = item.find('.') {
+                                    let var_name = item[..dot_pos].trim();
+                                    let prop_name = item[dot_pos + 1..].trim();
+                                    let full_key = item.to_string();
+                                    
+                                    // Check if this property key needs population
+                                    let needs_extraction = obj.get(&full_key).map_or(true, |v| v.is_null());
+                                    
+                                    if needs_extraction {
+                                        let entity_value = obj.get(var_name).cloned();
+                                        
+                                        if let Some(entity_val) = entity_value {
+                                            if let Some(entity_obj) = entity_val.as_object() {
+                                                // Try extraction from standard 'properties' map
+                                                if let Some(props) = entity_obj.get("properties").and_then(|p| p.as_object()) {
+                                                    if let Some(prop_val) = props.get(prop_name) {
+                                                        obj.insert(full_key.clone(), prop_val.clone());
+                                                        info!("===> Extracted {}.{} = {:?}", var_name, prop_name, prop_val);
+                                                    }
+                                                }
+                                                // Fallback to direct access on the object
+                                                else if let Some(prop_val) = entity_obj.get(prop_name) {
+                                                    obj.insert(full_key.clone(), prop_val.clone());
+                                                    info!("===> Extracted {}.{} = {:?} (direct)", var_name, prop_name, prop_val);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // STEP 2: Nonsense Cleanup - Remove full objects not explicitly in RETURN
+                            let current_keys: Vec<String> = obj.keys().cloned().collect();
+                            for key in current_keys {
+                                if let Some(val) = obj.get(&key) {
+                                    // Detect if value is a raw Vertex or Edge object
+                                    if val.is_object() 
+                                        && val.get("id").is_some() 
+                                        && val.get("label").is_some() 
+                                        && val.get("properties").is_some() {
+                                        
+                                        // Check if the user actually asked for this whole variable
+                                        let is_requested = projection_items_clone.iter().any(|item| {
+                                            let trimmed = item.trim();
+                                            trimmed == key || trimmed.starts_with(&format!("{} AS", key))
+                                        });
+                                        
+                                        if !is_requested {
+                                            // Variable was only context for a property (e.g., p in p.mrn)
+                                            obj.remove(&key);
+                                            info!("===> Cleaned up top-level nonsense object: '{}'", key);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // STEP 3: Final Alias Application
+                            apply_projection_aliases(&projection_string, obj);
+                        }
                     }
                 }
-                else {
-                    Ok(json!({
-                        "vertices": [],
-                        "edges": [],
-                        "stats": { "vertices_matched": 0, "edges_matched": 0 }
-                    }))
-                }
+                
+                Ok(final_wrapped_result)
             }
+
             // NEW: Handles the standalone SET clause for chaining (e.g., `MATCH (n) SET n.prop = 'new'`)
             CypherQuery::SetStatement { assignments } => {
                 println!("===> EXECUTING Standalone SetStatement");
