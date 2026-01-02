@@ -238,6 +238,20 @@ fn parse_property_map(input: &str) -> IResult<&str, Vec<(String, Literal)>> {
     ).parse(input)
 }
 
+// NEW function to handle both literals and property references
+fn parse_property_or_expression(input: &str) -> IResult<&str, Literal> {
+    // First try to parse as a property reference like "source.mrn"
+    if input.contains('.') {
+        let (remaining, expr_str) = take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '.')(input)?;
+        // For now, treat property references as String literals with special marker
+        // In execution, you'll evaluate these expressions
+        return Ok((remaining, Literal::String(format!("EXPR:{}", expr_str))));
+    }
+    
+    // Otherwise parse as normal literal
+    parse_literal(input)
+}
+
 // ============================================================================
 // MATCH...SET PARSER
 // ============================================================================
@@ -408,9 +422,13 @@ fn parse_match_create_relationship(input: &str) -> IResult<&str, CypherQuery> {
     current_input = input_after_with;
 
     // --- E. Parse the mandatory CREATE keyword ---
-    let (input, _) = preceded(
+    // --- Update to allow MERGE or CREATE ---
+    let (input, keyword) = preceded(
         multispace0,
-        terminated(tag_no_case::<_, _, nom::error::Error<&str>>("CREATE"), multispace0)
+        alt((
+            tag_no_case("CREATE"),
+            tag_no_case("MERGE") // Add support for MERGE transition
+        ))
     ).parse(current_input)?;
     
     // --- F. Parse CREATE patterns and transform ---
@@ -630,6 +648,8 @@ fn parse_property_value(input: &str) -> IResult<&str, Value> {
         map(tag_no_case("false"), |_| Value::Bool(false)),
         map(tag_no_case("null"), |_| Value::Null),
        
+        // ADD THIS: Support for source.mrn
+        map(parse_property_access, |s| Value::String(s)), // Or Value::Reference if you have it
         // 4. IMPROVED: Unquoted UUIDs/Identifiers
         // We allow starting digits, but only if it's NOT a pure number
         map(
@@ -3733,30 +3753,41 @@ fn parse_clause_with_symbol_table<'a>(
 // In cypher_parser.rs
 /// Helper function to parse a single statement string.
 pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
-    println!("===> parse_single_statement START, input length: {}, preview: '{}'", 
-             input.len(), &input[..input.len().min(100)]);
+    println!("===> parse_single_statement START...");
     let trimmed = input.trim();
     let upper = trimmed.to_ascii_uppercase();
-    
-    // 1. DETACH DELETE (highest priority - specific pattern)
+
+    // 1. DETACH DELETE (Specific, keep at top)
     if upper.contains("DETACH DELETE") {
         return parse_match_detach_delete(trimmed)
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-DETACH-DELETE parse error: {:?}", e));
     }
-    
-    // 2. MATCH ... CREATE ... SET (specific multi-clause pattern)
+
+    // --- CRITICAL SWAP: MOVE SEQUENTIAL CHECK HIGHER ---
+    // 2. Sequential/Chained statements (MPI Logic)
+    // We check this BEFORE specialized MATCH-CREATE-SET logic
+    let has_union = upper.contains("UNION");
+    let has_with = upper.contains("WITH"); 
+    let merge_count = upper.matches("MERGE").count();
+    let has_multiple_merge = merge_count > 1;
+    let has_merge = merge_count > 0;
+
+    // If it's a complex chain (MATCH -> WITH -> MERGE), use this:
+    if has_union || has_with || has_multiple_merge || (upper.starts_with("MATCH") && has_merge) { 
+        let initial_symbols = SymbolTable::new();
+        if let Ok((remainder, (query, _))) = parse_sequential_statements_with_context(trimmed, initial_symbols) {
+            if remainder.trim().is_empty() {
+                return Ok(query);
+            }
+        }
+    }
+
+    // 3. MATCH ... CREATE ... SET (Only for simple single-pattern MATCH+CREATE)
     if upper.starts_with("MATCH") && upper.contains("CREATE") && upper.contains("SET") {
         return parse_match_create_relationship(trimmed) 
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-CREATE-SET parse error: {:?}", e));
-    }
-    
-    // 3. MATCH ... SET (specific pattern)
-    if upper.starts_with("MATCH") && upper.contains("SET") {
-        return parse_match_set_relationship(trimmed)
-            .map(|(_, q)| q)
-            .map_err(|e| format!("MATCH-SET parse error: {:?}", e));
     }
     
     // 4. MATCH ... CREATE (specific pattern)
@@ -8092,7 +8123,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     
                     match query {
                         // ================================================================
-                        // MERGE in Chain - Update global context
+                        // MERGE in Chain - Update global context (SINGLE BINDING)
                         // ================================================================
                         CypherQuery::Merge { 
                             patterns, 
@@ -8105,6 +8136,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         } => {
                             println!("===> Executing MERGE in Chain (clause {})", idx + 1);
                             
+                            // Pass existing context to ensure transaction traceability for MPI
                             let current_bindings = {
                                 let ctx = global_context.read().await;
                                 ctx.vertex_bindings.clone()
@@ -8130,6 +8162,8 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             {
                                 let mut ctx = global_context.write().await;
                                 let mut node_count = 0;
+                                
+                                // Handle Vertex Bindings
                                 for pattern in patterns.iter() {
                                     for node in &pattern.1 {
                                         if let Some(node_var) = &node.0 {
@@ -8145,25 +8179,28 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                     }
                                 }
                                 
-                                // Update edge bindings for relationships in the MERGE
+                                // Handle Edge Bindings (Fixes .first() and Display errors)
                                 for pattern in patterns.iter() {
                                     for rel in &pattern.2 {
                                         if let Some(rel_var) = &rel.0 {
+                                            // Iterate through created edges to support multi-binding
                                             for edge_id in &merge_result.created_edges {
                                                 ctx.edge_bindings
                                                     .entry(rel_var.clone())
                                                     .or_default()
                                                     .insert(*edge_id);
-                                                println!("===> BOUND edge variable '{}' to edge {}", rel_var, edge_id);
+                                                // Use :? for HashSet or *edge_id for the specific ID
+                                                println!("===> BOUND edge variable '{}' to edge {:?}", rel_var, edge_id);
                                             }
                                         }
                                     }
                                 }
                             }
 
-                            // 2. REFRESH Context Vertices (The Critical Fix)
+                            // 2. REFRESH Context Vertices (Fixes .copied() on HashSet error)
                             let all_vertex_ids: Vec<uuid::Uuid> = {
                                 let ctx = global_context.read().await;
+                                // Use .flatten() to reach the Uuids inside the HashSets
                                 ctx.vertex_bindings.values().flatten().copied().collect()
                             };
                             
