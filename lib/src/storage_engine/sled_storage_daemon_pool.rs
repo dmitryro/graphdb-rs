@@ -1353,7 +1353,6 @@ impl SledDaemon {
         use tokio::fs as tokio_fs;
         use zmq::{Context as ZmqContext, REP};
 
-        println!("SledDaemon =================> LET US SEE IF THIS WAS EVER CALLED");
         let port = config.port.ok_or_else(|| {
             error!("No port specified in SledConfig");
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
@@ -3894,7 +3893,6 @@ impl SledDaemonPool {
     }
    
     pub fn new() -> Self {
-        println!("SledDaemonPool new =================> LET US SEE IF THIS WAS EVER CALLED");
         Self {
             daemons: HashMap::new(),
             registry: Arc::new(RwLock::new(HashMap::new())),
