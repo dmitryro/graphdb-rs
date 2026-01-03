@@ -129,6 +129,12 @@ pub enum CypherExpression {
         name: String,
         args: Vec<CypherExpression>,
     },
+/// Represents regex matching: var.prop =~ 'pattern'
+    Regex {
+        variable: String,
+        property: String,
+        pattern: String,
+    },
     List(Vec<CypherExpression>),
     
     /// Represents predicates like: any(var IN list WHERE condition)
@@ -552,6 +558,11 @@ pub enum Expression {
         variable: String,        // "label"
         list: Box<Expression>,   // "labels(e)"
         condition: Box<Expression>, // "label IN ['...']"
+    },
+    Regex {
+        variable: String,
+        property: String,
+        pattern: String,
     },
     FunctionCall {
         name: String,
@@ -1364,7 +1375,32 @@ impl Expression {
                     _ => Err(GraphError::EvaluationError(format!("Unknown function: {}", name)))
                 }
             }
+            Expression::Regex { variable, property, pattern } => {
+                let target = ctx.variables.get(variable)
+                    .ok_or_else(|| GraphError::EvaluationError(format!("Variable '{variable}' not found")))?;
+                
+                let prop_val = match target {
+                    CypherValue::Vertex(v) => v.properties.get(property)
+                        .map(property_value_to_cypher)
+                        .unwrap_or(CypherValue::Null),
+                    CypherValue::Edge(e) => e.properties.get(property)
+                        .map(property_value_to_cypher)
+                        .unwrap_or(CypherValue::Null),
+                    _ => return Err(GraphError::EvaluationError(format!("Variable '{variable}' is not a Vertex or Edge"))),
+                };
 
+                match prop_val {
+                    CypherValue::String(s) => {
+                        // Compile the regex. In a production environment, you might want to 
+                        // cache compiled regexes if this is called frequently.
+                        let re = regex::Regex::new(pattern)
+                            .map_err(|e| GraphError::EvaluationError(format!("Invalid regex pattern: {}", e)))?;
+                        Ok(CypherValue::Bool(re.is_match(&s)))
+                    },
+                    CypherValue::Null => Ok(CypherValue::Bool(false)),
+                    _ => Ok(CypherValue::Bool(false)),
+                }
+            }
             Expression::PropertyComparison { variable, property, operator, value } => {
                 let var_value = ctx.variables.get(variable)
                     .ok_or_else(|| GraphError::QueryError(format!("Variable '{}' not found", variable)))?;
@@ -1723,6 +1759,11 @@ pub fn expression_to_cypher(expr: &Expression) -> String {
             let val_str = serde_json::to_string(value).unwrap_or_default();
             format!("{}({}) {} {}", function, argument, operator, val_str)
         },
+
+        // --- ADDED REGEX MATCH ARM ---
+        Expression::Regex { variable, property, pattern } => {
+            format!("{}.{} =~ '{}'", variable, property, pattern)
+        },
         
         Expression::StartsWith { variable, property, prefix } => {
             format!("{}.{} STARTS WITH '{}'", variable, property, prefix)
@@ -1925,18 +1966,33 @@ fn property_value_to_json(prop_val: PropertyValue) -> Value {
 }
 
 /// Helper to handle the string-based operators from the parser
+/// Helper to handle the string-based operators from the parser
 fn evaluate_comparison(left: &CypherValue, op: &str, right: &CypherValue) -> GraphResult<CypherValue> {
     match op {
         // Equality
         "=" | "==" => Ok(CypherValue::Bool(left == right)),
         "!=" | "<>" => Ok(CypherValue::Bool(left != right)),
 
+        // --- ADDED REGEX OPERATOR ---
+        "=~" => {
+            match (left, right) {
+                (CypherValue::String(text), CypherValue::String(pattern)) => {
+                    let re = regex::Regex::new(pattern)
+                        .map_err(|e| GraphError::EvaluationError(format!("Invalid regex: {}", e)))?;
+                    Ok(CypherValue::Bool(re.is_match(text)))
+                }
+                // Cypher convention: regex against Null is Null (or False in some implementations)
+                (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Bool(false)),
+                _ => Ok(CypherValue::Bool(false)),
+            }
+        }
+
         // Numeric & String Comparisons
         ">" => Ok(CypherValue::Bool(match (left, right) {
             (CypherValue::Float(l), CypherValue::Float(r)) => l > r,
             (CypherValue::Integer(l), CypherValue::Integer(r)) => l > r,
             (CypherValue::String(l), CypherValue::String(r)) => l > r,
-            _ => false, // Cypher usually returns null/false for mismatched types
+            _ => false, 
         })),
 
         "<" => Ok(CypherValue::Bool(match (left, right) {
@@ -2033,7 +2089,11 @@ impl From<CypherExpression> for Expression {
                 Expression::Property(PropertyAccess::Vertex(var, prop))
             },
 
-            // --- ADD DYNAMIC PROPERTY ACCESS ---
+            // --- ADDED REGEX VARIANT ---
+            CypherExpression::Regex { variable, property, pattern } => {
+                Expression::Regex { variable, property, pattern }
+            },
+
             CypherExpression::DynamicPropertyAccess { variable, property_expr } => {
                 Expression::DynamicPropertyAccess {
                     variable,
@@ -2046,8 +2106,6 @@ impl From<CypherExpression> for Expression {
                     index: Box::new(Expression::from(*index)),
                 }
             },
-            // --- Specialized Predicate Conversion ---
-            // This maps the structural any/all/exists to our evaluator logic
             CypherExpression::Predicate { name, variable, list, condition } => {
                 Expression::Predicate {
                     name,
@@ -2073,15 +2131,26 @@ impl From<CypherExpression> for Expression {
             CypherExpression::BinaryOp { left, op, right } => {
                 let op_upper = op.to_uppercase();
 
-                // 1. Peek at 'left' and 'right' using references to decide on optimization.
+                // 1. Peek at 'left' and 'right' for optimization.
                 let optimized = match (&*left, &*right) {
                     (CypherExpression::PropertyLookup { var, prop }, CypherExpression::Literal(val)) => {
-                        Some(Expression::PropertyComparison {
-                            variable: var.clone(),
-                            property: prop.clone(),
-                            operator: op.clone(),
-                            value: val.clone(),
-                        })
+                        // Special handling for Regex operator =~
+                        if op_upper == "=~" {
+                            if let serde_json::Value::String(pattern) = val {
+                                Some(Expression::Regex {
+                                    variable: var.clone(),
+                                    property: prop.clone(),
+                                    pattern: pattern.clone(),
+                                })
+                            } else { None }
+                        } else {
+                            Some(Expression::PropertyComparison {
+                                variable: var.clone(),
+                                property: prop.clone(),
+                                operator: op.clone(),
+                                value: val.clone(),
+                            })
+                        }
                     }
                     (CypherExpression::FunctionCall { name, args }, _) if args.len() == 1 => {
                         if let Some(CypherExpression::Variable(arg_var)) = args.get(0) {
@@ -2098,16 +2167,14 @@ impl From<CypherExpression> for Expression {
                             } else { None }
                         } else { None }
                     }
-                    // ADD DYNAMIC PROPERTY ACCESS OPTIMIZATION IF NEEDED
                     _ => None,
                 };
 
-                // 2. If we found an optimized path, return it immediately.
                 if let Some(expr) = optimized {
                     return expr;
                 }
 
-                // 3. Fallback: Ownership of 'left' and 'right' is taken ONLY here.
+                // 3. Fallback
                 match op_upper.as_str() {
                     "AND" => Expression::And {
                         left: Box::new(Expression::from(*left)),
@@ -2138,6 +2205,19 @@ impl From<CypherExpression> for Expression {
                         }
                         panic!("STARTS WITH requires left=property, right=string literal");
                     },
+                    // Handle the regex operator if it wasn't caught by the optimization peek
+                    "=~" => {
+                        if let (CypherExpression::PropertyLookup { var, prop }, Expression::Literal(CypherValue::String(pat))) = 
+                            (&*left, Expression::from(*right)) {
+                                Expression::Regex {
+                                    variable: var.clone(),
+                                    property: prop.clone(),
+                                    pattern: pat,
+                                }
+                        } else {
+                            panic!("Regex operator =~ requires property lookup on left and string on right");
+                        }
+                    }
                     _ => {
                         let binary_op = match op_upper.as_str() {
                             "=" | "==" => BinaryOp::Eq,

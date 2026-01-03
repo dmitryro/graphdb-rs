@@ -1676,6 +1676,9 @@ pub fn evaluate_expression(
                         _ => Ok(CypherValue::Null),
                     }
                 },
+                BinaryOp::Regex => { // Ensure this variant exists in your BinaryOp enum
+                    evaluate_comparison(&left_val, "=~", &right_val)
+                },
                 _ => Err(GraphError::QueryExecutionError(format!("Operator {:?} not implemented in evaluator", op))),
             }
         },
@@ -2226,7 +2229,10 @@ fn parse_set_list(input: &str) -> IResult<&str, HashMap<String, Value>> {
     Ok((input, all_props))
 }
 
+// Updated parse_predicate_expression to handle keys() function and complex expressions
 fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_predicate_expression START");
+    
     // 1. Match "any" or "all"
     let (input, name) = alt((
         tag_no_case("any"), 
@@ -2237,7 +2243,7 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
     let (input, _) = char('(').parse(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    // 2. Match the variable (e.g., "label")
+    // 2. Match the variable (e.g., "label", "prop")
     let (input, var_name) = parse_identifier(input)?;
     let (input, _) = multispace1.parse(input)?;
     
@@ -2245,16 +2251,20 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
     let (input, _) = tag_no_case("IN").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // 4. Match the list expression — allow expression lists, function calls, literals, etc.
+    // 4. Match the list expression - ENHANCED to support keys() function
     let (input, list_expr) = alt((
-        parse_expression_list, // ← Handles [p.first_name]
+        // Function calls like keys(e) - MUST come before parse_identifier
         parse_function_call_full,
-        parse_list_literal,    // ← Handles ['Alice', 'Bob']
+        // Expression lists like [p.first_name, p.last_name]
+        parse_expression_list,
+        // List literals like ['Alice', 'Bob']
+        parse_list_literal,
         // Property access like p.names (MUST come before plain identifier)
         map(
             tuple((parse_identifier, char('.'), parse_identifier)),
             |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
         ),
+        // Plain identifier
         map(parse_identifier, |v| Expression::Variable(v.to_string())),
     )).parse(input)?;
     
@@ -2264,7 +2274,7 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
     let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // 6. Parse the condition
+    // 6. Parse the condition - ENHANCED to support function calls and dynamic property access
     let (input, condition_expr) = parse_condition_internal(input)?;
     
     let (input, _) = multispace0.parse(input)?;
@@ -2278,91 +2288,131 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
     }))
 }
 
-/// Helper to parse the inner condition (label IN [...]) without infinite recursion
-fn parse_condition_internal(input: &str) -> IResult<&str, Expression> {
-    // Try dynamic property access first: n[prop]
-    let dynamic_result = map(
-        tuple((parse_identifier, char('['), parse_expression, char(']'))),
-        |(var, _, prop_expr, _)| Expression::DynamicPropertyAccess {
-            variable: var.to_string(),
-            property_expr: Box::new(prop_expr),
-        }
-    ).parse(input);
-
-    if let Ok((remaining, dynamic_expr)) = dynamic_result {
-        // If we successfully parsed dynamic property access, continue with operator
-        let (remaining, _) = multispace1.parse(remaining)?;
-        let (remaining, op_str) = alt((
-            tag_no_case("IN"),
-            tag("="),
-            tag("<>"),
-            tag("!="),
-        )).parse(remaining)?;
-        let (remaining, _) = multispace1.parse(remaining)?;
-        
-        let (remaining, right) = alt((
-            parse_list_literal,
-            parse_function_call_full,
-            // Property access like p.names
-            map(
-                tuple((parse_identifier, char('.'), parse_identifier)),
-                |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
-            ),
-            map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-            map(parse_identifier, |v| Expression::Variable(v.to_string())),
-        )).parse(remaining)?;
-
-        let op = match op_str.to_uppercase().as_str() {
-            "IN" => BinaryOp::In,
-            "=" => BinaryOp::Eq,
-            "<>" | "!=" => BinaryOp::Neq,
-            _ => BinaryOp::Eq,
-        };
-
-        return Ok((remaining, Expression::Binary {
-            op,
-            left: Box::new(dynamic_expr),
-            right: Box::new(right),
-        }));
-    }
-
-    // Fallback to original parsing (variable-based conditions)
-    let (input, left_var) = parse_identifier(input)?;
-    let (input, _) = multispace1.parse(input)?;
+// New helper function to parse conditions inside predicates
+fn parse_predicate_condition(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_predicate_condition START");
     
+    // 1. Parse Left Side (Handles string(e[prop]), e[prop], etc.)
+    let (input, left_expr) = alt((
+        parse_function_call_full,
+        parse_dynamic_property_access,
+        map(
+            tuple((parse_identifier, char('.'), parse_identifier)),
+            |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+        ),
+        map(parse_identifier, |v| Expression::Variable(v.to_string())),
+    )).parse(input)?; // Fixed: added .parse(input)
+    
+    let (input, _) = multispace1(input)?;
+    
+    // 2. Parse Operator (Handles regex and binary ops)
     let (input, op_str) = alt((
         tag_no_case("IN"),
+        tag("=~"),
         tag("="),
-        tag("<>"),
         tag("!="),
-    )).parse(input)?;
+        tag("<>"),
+        tag("<="),
+        tag(">="),
+        tag("<"),
+        tag(">"),
+    )).parse(input)?; // Fixed: added .parse(input)
     
-    let (input, _) = multispace1.parse(input)?;
+    let (input, _) = multispace1(input)?;
     
-    // Allow property access (e.g., p.names) on the RHS of IN
-    let (input, right) = alt((
+    // 3. Parse Right Side
+    let (input, right_expr) = alt((
         parse_list_literal,
         parse_function_call_full,
-        // Property access like p.names
         map(
             tuple((parse_identifier, char('.'), parse_identifier)),
             |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
         ),
         map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
         map(parse_identifier, |v| Expression::Variable(v.to_string())),
-    )).parse(input)?;
-
+    )).parse(input)?; // Fixed: added .parse(input)
+    
     let op = match op_str.to_uppercase().as_str() {
         "IN" => BinaryOp::In,
+        "=~" => BinaryOp::Regex,
         "=" => BinaryOp::Eq,
-        "<>" | "!=" => BinaryOp::Neq,
+        "!=" | "<>" => BinaryOp::Neq,
+        "<=" => BinaryOp::Lte,
+        ">=" => BinaryOp::Gte,
+        "<" => BinaryOp::Lt,
+        ">" => BinaryOp::Gt,
         _ => BinaryOp::Eq,
     };
-
+    
     Ok((input, Expression::Binary {
         op,
-        left: Box::new(Expression::Variable(left_var.to_string())),
-        right: Box::new(right),
+        left: Box::new(left_expr),
+        right: Box::new(right_expr),
+    }))
+}
+
+/// Helper to parse the inner condition (label IN [...]) without infinite recursion
+// Updated parse_condition_internal to handle complex expressions in predicates
+fn parse_condition_internal(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_condition_internal START");
+    
+    // 1. Parse left side - ENHANCED to support function calls and dynamic property access
+    let (input, left_expr) = alt((
+        parse_function_call_full,
+        parse_dynamic_property_access,
+        map(
+            tuple((parse_identifier, char('.'), parse_identifier)),
+            |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+        ),
+        map(parse_identifier, |v| Expression::Variable(v.to_string())),
+    )).parse(input)?; // Fixed: added .parse(input)
+    
+    let (input, _) = multispace1.parse(input)?;
+    
+    // 2. Parse operator - ENHANCED to include =~
+    let (input, op_str) = alt((
+        tag_no_case("IN"),
+        tag("=~"),
+        tag("="),
+        tag("!="),
+        tag("<>"),
+        tag("<="),
+        tag(">="),
+        tag("<"),
+        tag(">"),
+    )).parse(input)?; // Fixed: added .parse(input)
+    
+    let (input, _) = multispace1.parse(input)?;
+    
+    // 3. Parse right side
+    let (input, right_expr) = alt((
+        parse_list_literal,
+        parse_function_call_full,
+        map(
+            tuple((parse_identifier, char('.'), parse_identifier)),
+            |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
+        ),
+        map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+        map(parse_identifier, |v| Expression::Variable(v.to_string())),
+    )).parse(input)?; // Fixed: added .parse(input)
+    
+    // Map operator string to BinaryOp
+    let op = match op_str.to_uppercase().as_str() {
+        "IN" => BinaryOp::In,
+        "=~" => BinaryOp::Regex, // Updated to use Regex for correct MPI filtering
+        "=" => BinaryOp::Eq,
+        "!=" | "<>" => BinaryOp::Neq,
+        "<=" => BinaryOp::Lte,
+        ">=" => BinaryOp::Gte,
+        "<" => BinaryOp::Lt,
+        ">" => BinaryOp::Gt,
+        _ => BinaryOp::Eq,
+    };
+    
+    Ok((input, Expression::Binary {
+        op,
+        left: Box::new(left_expr),
+        right: Box::new(right_expr),
     }))
 }
 
@@ -2948,6 +2998,7 @@ fn convert_parsed_patterns_to_execution_format(
     }).collect()
 }
 
+// Updated full_statement_parser with early RETURN detection
 fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     println!("===> full_statement_parser START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
@@ -2992,7 +3043,6 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         loop {
             let (input_ws, _) = multispace0.parse(input_current)?;
             
-            // FIXED: Early termination check for WHERE and other keywords
             let trimmed = input_ws.trim_start().to_uppercase();
             if trimmed.starts_with("WHERE") || 
                trimmed.starts_with("WITH") || 
@@ -3128,11 +3178,36 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     )).parse(input_current)?;
     input_current = input_after_remove;
 
-    // --- 9. PARSE RETURN CLAUSE ---
-    let (input_after_return, return_opt) = opt(preceded(
-        multispace0,
-        parse_return_clause_as_struct 
-    )).parse(input_current)?;
+    // --- 9. PARSE RETURN CLAUSE (with robust NBSP and Bare RETURN handling) ---
+    println!("===> full_statement_parser: About to parse RETURN, input: '{}'", input_current.trim());
+    
+    // 1. Use your new any_whitespace0 to handle hidden NBSP characters
+    let (input_after_ws, _) = any_whitespace0(input_current)?;
+    
+    // 2. Check for RETURN keyword
+    let (input_after_return, return_opt) = if input_after_ws.to_uppercase().starts_with("RETURN") {
+        // We found RETURN, now let parse_return_clause_as_struct handle the rest
+        // We use opt() so it doesn't crash if it's slightly malformed
+        match parse_return_clause_as_struct(input_after_ws) {
+            Ok((rem, ret)) => (rem, Some(ret)),
+            Err(_) => {
+                // If it fails but we SAW return, we force the bare RETURN "*" default
+                // This ensures MPI transactions are always logged even if the line ends abruptly
+                println!("===> Fallback: Forcing wildcard RETURN for MPI trace");
+                ("", Some(ReturnClause {
+                    items: vec![ReturnItem { expression: "*".to_string(), alias: None }],
+                    distinct: false,
+                    order_by: None,
+                    skip: None,
+                    limit: None,
+                }))
+            }
+        }
+    } else {
+        // No RETURN keyword found at all, skip this section
+        (input_current, None)
+    };
+    
     captured_return = return_opt;
     input_current = input_after_return;
 
@@ -3167,18 +3242,16 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
             return_clause: captured_return,
         }))
     } else if captured_unwind.is_some() {
-        // Handle MATCH ... UNWIND ... [RETURN]
         let mut chain_clauses = vec![
             CypherQuery::MatchPattern {
                 patterns: all_patterns,
                 where_clause: captured_where,
                 with_clause: captured_with,
-                return_clause: None, // UNWIND handles the transformation
+                return_clause: None,
             },
             captured_unwind.unwrap(),
         ];
         
-        // If there's a RETURN, add it as a final clause
         if let Some(ret) = captured_return {
             chain_clauses.push(CypherQuery::ReturnStatement {
                 projection_string: serde_json::to_string(&ret).unwrap_or_default(),
@@ -3764,16 +3837,17 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
             .map_err(|e| format!("MATCH-DETACH-DELETE parse error: {:?}", e));
     }
 
-    // --- CRITICAL SWAP: MOVE SEQUENTIAL CHECK HIGHER ---
+    // --- CRITICAL LOOKAHEAD: Identify RETURN statements early ---
+    let has_return = upper.contains("RETURN");
+    let has_create = upper.contains("CREATE");
+    let has_merge = upper.contains("MERGE");
+
     // 2. Sequential/Chained statements (MPI Logic)
-    // We check this BEFORE specialized MATCH-CREATE-SET logic
     let has_union = upper.contains("UNION");
     let has_with = upper.contains("WITH"); 
     let merge_count = upper.matches("MERGE").count();
     let has_multiple_merge = merge_count > 1;
-    let has_merge = merge_count > 0;
 
-    // If it's a complex chain (MATCH -> WITH -> MERGE), use this:
     if has_union || has_with || has_multiple_merge || (upper.starts_with("MATCH") && has_merge) { 
         let initial_symbols = SymbolTable::new();
         if let Ok((remainder, (query, _))) = parse_sequential_statements_with_context(trimmed, initial_symbols) {
@@ -3783,42 +3857,31 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
     }
 
-    // 3. MATCH ... CREATE ... SET (Only for simple single-pattern MATCH+CREATE)
-    if upper.starts_with("MATCH") && upper.contains("CREATE") && upper.contains("SET") {
+    // 3. EXPLICIT LOOKAHEAD FIX: If query has RETURN, prioritize full_statement_parser
+    // This prevents MATCH...RETURN from being swallowed by parse_match_create_relationship
+    if (upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH")) && has_return {
+        if let Ok((remainder, query)) = full_statement_parser(trimmed) {
+            if remainder.trim().is_empty() {
+                return Ok(query);
+            }
+        }
+    }
+
+    // 4. MATCH ... CREATE ... SET (Only for simple single-pattern MATCH+CREATE)
+    if upper.starts_with("MATCH") && has_create && upper.contains("SET") {
         return parse_match_create_relationship(trimmed) 
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-CREATE-SET parse error: {:?}", e));
     }
     
-    // 4. MATCH ... CREATE (specific pattern)
-    if upper.starts_with("MATCH") && upper.contains("CREATE") {
+    // 5. MATCH ... CREATE (specific pattern)
+    if upper.starts_with("MATCH") && has_create {
         return parse_match_create_relationship(trimmed)
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-CREATE parse error: {:?}", e));
     }
     
-    // 5. Sequential/Chained statements - CHECK THIS BEFORE SINGLE MERGE
-    // This handles: UNION, multiple MERGE statements, MERGE chains
-    let has_union = upper.contains("UNION");
-    let has_with = upper.contains("WITH"); // Added WITH check
-    let merge_count = upper.matches("MERGE").count();
-    let has_multiple_merge = merge_count > 1;
-    
-    // Use sequential parser for multi-clause statements
-    if has_union || has_with || has_multiple_merge { // Updated condition
-        let initial_symbols = SymbolTable::new();
-        if let Ok((remainder, (query, _final_symbols))) = 
-            parse_sequential_statements_with_context(trimmed, initial_symbols) 
-        {
-            let remainder_trimmed = remainder.trim();
-            if remainder_trimmed.is_empty() {
-                return Ok(query);
-            }
-        }
-    }
-    
-    // 6. Single MERGE statement (with optional ON CREATE/MATCH, WHERE, WITH, RETURN)
-    // Only attempt this if we don't have multiple MERGEs
+    // 6. Single MERGE statement
     if upper.starts_with("MERGE") && !has_multiple_merge {
         return parse_merge(trimmed)
             .map(|(remainder, query)| {
@@ -3850,24 +3913,23 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
     }
     
-    // 8. Relationship patterns (patterns with -[...]->, <-[...]-, etc.)
+    // 8. Relationship patterns
     if upper.contains("-[") && (upper.contains("]->") || upper.contains("]-") || upper.contains("<-[")) {
         return parse_simple_query_type(trimmed)
             .map(|(_, q)| q)
             .map_err(|e| format!("Simple-statement parse error: {:?}", e));
     }
     
-    // 9. Full MATCH … RETURN fallback (handles complex MATCH statements)
+    // 9. Fallback MATCH
     if upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH") {
         if let Ok((remainder, query)) = full_statement_parser(trimmed) {
-            let remainder_trimmed = remainder.trim();
-            if remainder_trimmed.is_empty() {
+            if remainder.trim().is_empty() {
                 return Ok(query);
             }
         }
     }
     
-    // 10. Fallback parser list for other statement types
+    // 10. Final Fallback list
     let parsers: Vec<Box<dyn Fn(&str) -> IResult<&str, CypherQuery>>> = vec![
         Box::new(|i| parse_create_statement(i)),
         Box::new(|i| parse_delete_edges_simple(i)),
@@ -3889,7 +3951,6 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
     }
     
-    // 11. Final error - nothing matched
     Err(format!("Unable to parse statement: {}", trimmed))
 }
 
@@ -4056,6 +4117,19 @@ pub fn evaluate_comparison(
                 ));
             }
         }
+    }
+    // ADDED: Regex Operator Support
+    if operator == "=~" {
+        return match (left, right) {
+            (CypherValue::String(text), CypherValue::String(pattern)) => {
+                // Compile and execute the regex
+                match regex::Regex::new(pattern) {
+                    Ok(re) => Ok(CypherValue::Bool(re.is_match(text))),
+                    Err(_) => Err(GraphError::QueryExecutionError(format!("Invalid regex pattern: {}", pattern))),
+                }
+            },
+            _ => Err(GraphError::QueryExecutionError("Regex operator '=~' requires string operands".into())),
+        };
     }
 
     // Existing comparison logic for =, <, >, etc.
@@ -4325,12 +4399,13 @@ pub fn parse_list_literal(input: &str) -> IResult<&str, Expression> {
     Ok((input, Expression::List(elements)))
 }
 
-/// Recursive descent parser for expressions (handles precedence and function calls)
+// Ensure parse_expression handles all the cases we need
+// This should already be in your code, but here's what it needs to support:
 pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_expression START, input length: {}, preview: '{}'", 
              input.len(), &input[..input.len().min(100)]);
 
-    // --- STEP 1: Parse the "Atom" (The left-most part eh of an expression) ---
+    // Parse the "Atom" (The left-most part of an expression)
     let (mut current_input, mut left) = {
         alt((
             // Parenthesized expressions for grouping
@@ -4339,13 +4414,13 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
             // Predicate functions with special syntax (any, all, exists, etc.)
             parse_predicate_expression,
 
-            // Function calls with array indexing: labels(e)[0]  ← ADD THIS
+            // Function calls with array indexing: labels(e)[0]
             parse_function_call_with_index,
             
-            // Function calls like labels(e) or id(e)
+            // Function calls like labels(e) or keys(e) - MUST come before dynamic property
             parse_function_call_full,
             
-            // Dynamic property access like n[prop]
+            // Dynamic property access like n[prop] - MUST come before property access
             parse_dynamic_property_access,
             
             // List literals like ['A', 'B']
@@ -4365,9 +4440,7 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
         ))
     }.parse(input)?;
 
-    // --- STEP 2: Handle Postfix Operations (Array Indexing and Null Checks) ---
-    
-    // Handle array indexing: expr[index]
+    // Handle Postfix Operations (Array Indexing and Null Checks)
     loop {
         let index_result = delimited(multispace0, 
             tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
@@ -4395,7 +4468,7 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
         current_input = after_null;
     }
 
-    // --- STEP 3: Handle Binary Operators (AND, OR, =, IN, etc.) ---
+    // Handle Binary Operators (AND, OR, =, IN, =~, etc.)
     loop {
         let op_result: IResult<&str, BinaryOp> = delimited(multispace0, parse_binary_op, multispace0)
             .parse(current_input);
@@ -4405,7 +4478,6 @@ pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
                 let rhs_result = alt((
                     delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
                     parse_predicate_expression,
-                    // Also add function call with index to RHS
                     parse_function_call_with_index,
                     parse_function_call_full,
                     parse_dynamic_property_access,
@@ -4506,20 +4578,22 @@ fn parse_array_indexing_chain(input: &str, mut expr: Expression) -> IResult<&str
 
 /// Parses a full function call with multiple arguments and nested expressions
 fn parse_function_call_full(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_function_call_full START");
+    
     let (input, _) = multispace0(input)?;
     let (input, name) = parse_identifier(input)?;
     let (input, _) = char('(')(input)?;
     let (input, _) = multispace0(input)?;
-
-    // Use .parse(input) instead of calling the combinator result as a function
+    
+    // Parse arguments - can be empty or multiple expressions
     let (input, args) = separated_list0(
         delimited(multispace0, char(','), multispace0),
-        parse_expression
+        parse_expression  // This now handles dynamic property access too
     ).parse(input)?;
-
+    
     let (input, _) = multispace0(input)?;
     let (input, _) = char(')')(input)?;
-
+    
     Ok((input, Expression::FunctionCall {
         name: name.to_string(),
         args,
@@ -4546,6 +4620,7 @@ fn parse_binary_op(input: &str) -> IResult<&str, BinaryOp> {
             map(tag_no_case("IN"), |_| BinaryOp::In),
             // Comparisons
             map(tag("="), |_| BinaryOp::Eq),
+            map(tag("=~"), |_| BinaryOp::Eq),
             map(tag("<>"), |_| BinaryOp::Neq),
             map(tag("!="), |_| BinaryOp::Neq),
             map(tag("<="), |_| BinaryOp::Lte),
@@ -5192,10 +5267,12 @@ fn parse_cypher_expression(input: &str) -> IResult<&str, Expression> {
 /// Level 1: OR (Lowest Precedence)
 pub fn parse_logical_expression(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_logical_expression START");
-    // Parse sequence of OR-separated terms
+    
+    // OR has the lowest precedence, so we start by splitting by OR
+    // Each term between ORs is an 'AND' term
     let (input, mut terms) = separated_list1(
         delimited(multispace0, tag_no_case("OR"), multispace0),
-        parse_and_term, // Higher precedence: AND
+        parse_and_term, 
     ).parse(input)?;
 
     let condition = if terms.len() == 1 {
@@ -5211,6 +5288,7 @@ pub fn parse_logical_expression(input: &str) -> IResult<&str, Expression> {
         }
         root
     };
+    
     Ok((input, condition))
 }
 
@@ -5462,14 +5540,11 @@ fn parse_and_term(input: &str) -> IResult<&str, Expression> {
         expressions.remove(0)
     } else {
         let mut iter = expressions.into_iter();
-        let mut root = iter.next().unwrap();
-        for next in iter {
-            root = Expression::And {
-                left: Box::new(root),
-                right: Box::new(next),
-            };
-        }
-        root
+        let first = iter.next().unwrap();
+        iter.fold(first, |acc, next| Expression::And {
+            left: Box::new(acc),
+            right: Box::new(next),
+        })
     };
     Ok((input, res))
 }
@@ -5737,6 +5812,7 @@ fn parse_comparison_expression(input: &str) -> IResult<&str, CypherExpression> {
             multispace0, 
             alt((
                 tag_no_case("IN"), // <--- Add IN here
+                tag("=~"), // <--- ADD THIS
                 tag("="), tag("!="), tag("<>"), 
                 tag("<="), tag(">="), tag("<"), tag(">")
             )), 
@@ -6016,8 +6092,7 @@ fn parse_function_call(input: &str) -> IResult<&str, (String, String)> {
     Ok((input, (func_name.to_string(), arg.to_string())))
 }
 
-/// Parse a comparison operator
-/// Parse comparison operators including IN
+/// Parse comparison operators including IN and =~ (regex)
 pub fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
     println!("===> parse_comparison_op START");
     alt((
@@ -6027,6 +6102,7 @@ pub fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
         tag_no_case("STARTS WITH"),
         tag_no_case("ENDS WITH"),
         tag_no_case("CONTAINS"),
+        tag("=~"),                  
         tag(">="),
         tag("<="),
         tag("<>"),
@@ -6039,7 +6115,7 @@ pub fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
 
 /// Parse a single WHERE condition/expression (label check, property, function, or parenthesized)
 pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
-    println!("===> parse_where_expression START");
+    println!("===> parse_where_expression START, input: '{}'", &input[..input.len().min(50)]);
     
     // 1. Try to parse as a predicate expression with enhanced list_expr support
     if let Ok((remaining, expr)) = parse_predicate_expression(input) {
@@ -6076,7 +6152,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         // Enhanced condition parsing: allow property access on RHS
         let (input, left_var) = parse_identifier(input)?;
         let (input, _) = multispace1.parse(input)?;
-        let (input, op_str) = alt((tag_no_case("IN"), tag("="), tag("<>"), tag("!="))).parse(input)?;
+        let (input, op_str) = alt((tag_no_case("IN"), tag("=~"), tag("="), tag("<>"), tag("!="))).parse(input)?;
         let (input, _) = multispace1.parse(input)?;
         
         let (input, right) = alt((
@@ -6093,6 +6169,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         let op = match op_str.to_uppercase().as_str() {
             "IN" => BinaryOp::In,
             "=" => BinaryOp::Eq,
+            "=~" => BinaryOp::Eq, // Note: regex in predicates
             "<>" | "!=" => BinaryOp::Neq,
             _ => BinaryOp::Eq,
         };
@@ -6188,7 +6265,6 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         let (remaining, val) = if op_upper.contains("NULL") {
             (remaining, Value::Null)
         } else if op_upper == "IN" {
-            // Parse list literal for IN operator
             let (rem, list_expr) = parse_list_literal(remaining)?;
             let json_val = match list_expr {
                 Expression::List(elements) => {
@@ -6219,31 +6295,40 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
     let (input, full_path) = parse_property_access(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    // 7. Parse operator (handle multi-word operators first)
+    // 7. Parse operator - CRITICAL: Check for =~ BEFORE calling parse_comparison_op
     let (input, op_str) = {
         let trimmed = input.trim_start();
-        let upper = trimmed.to_uppercase();
-
-        if upper.starts_with("STARTS WITH") {
-            let (i, _) = tag_no_case("STARTS").parse(input)?;
+        
+        // Check =~ FIRST (before other operators)
+        if trimmed.starts_with("=~") {
+            println!("===> Found =~ operator");
+            let (i, _) = tag("=~").parse(trimmed)?;
+            let (i, _) = multispace0.parse(i)?;
+            (i, "=~")
+        } else if trimmed.to_uppercase().starts_with("STARTS WITH") {
+            let (i, _) = tag_no_case("STARTS").parse(trimmed)?;
             let (i, _) = multispace1.parse(i)?;
             let (i, _) = tag_no_case("WITH").parse(i)?;
+            let (i, _) = multispace0.parse(i)?;
             (i, "STARTS WITH")
-        } else if upper.starts_with("ENDS WITH") {
-            let (i, _) = tag_no_case("ENDS").parse(input)?;
+        } else if trimmed.to_uppercase().starts_with("ENDS WITH") {
+            let (i, _) = tag_no_case("ENDS").parse(trimmed)?;
             let (i, _) = multispace1.parse(i)?;
             let (i, _) = tag_no_case("WITH").parse(i)?;
+            let (i, _) = multispace0.parse(i)?;
             (i, "ENDS WITH")
-        } else if upper.starts_with("CONTAINS") {
-            let (i, _) = tag_no_case("CONTAINS").parse(input)?;
+        } else if trimmed.to_uppercase().starts_with("CONTAINS") {
+            let (i, _) = tag_no_case("CONTAINS").parse(trimmed)?;
+            let (i, _) = multispace0.parse(i)?;
             (i, "CONTAINS")
         } else {
-            let (i, op) = parse_comparison_op(input)?;
+            let (i, op) = parse_comparison_op(trimmed)?;
+            let (i, _) = multispace0.parse(i)?;
             (i, op)
         }
     };
-
-    let (input, _) = multispace0.parse(input)?;
+    
+    println!("===> Parsed operator: '{}', remaining: '{}'", op_str, &input[..input.len().min(30)]);
     
     // 8. Parse value (handle IN operator with lists)
     let op_upper = op_str.to_uppercase();
@@ -6265,15 +6350,37 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         };
         (rem, json_val)
     } else {
-        parse_value(input)?
+        let result = parse_value(input)?;
+        println!("===> Parsed value successfully: {:?}", result.1);
+        result
     };
+    
+    println!("===> After value parse, remaining: '{}'", &input[..input.len().min(30)]);
     
     // 9. Split property path
     let (var, prop) = full_path.split_once('.')
         .map(|(v, p)| (v.to_string(), p.to_string()))
         .unwrap_or_else(|| (full_path.clone(), String::new()));
 
-    // 10. Handle special operators
+    // 10. Handle regex operator =~
+    if op_str == "=~" {
+        if let Value::String(pattern) = val {
+            println!("===> Creating Regex expression for pattern: '{}'", pattern);
+            return Ok((input, Expression::Regex {
+                variable: var,
+                property: prop,
+                pattern,
+            }));
+        } else {
+            println!("===> ERROR: =~ operator requires string value");
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag
+            )));
+        }
+    }
+
+    // 11. Handle STARTS WITH
     if op_str == "STARTS WITH" {
         if let Value::String(prefix) = val {
             return Ok((input, Expression::StartsWith {
@@ -6284,7 +6391,7 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         }
     }
 
-    // 11. Standard property comparison
+    // 12. Standard property comparison
     Ok((input, Expression::PropertyComparison {
         variable: var,
         property: prop,
@@ -6415,49 +6522,76 @@ fn parse_node_pattern(input: &str) -> GraphResult<(Option<String>, HashMap<Strin
 
 fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
     println!("===> parse_return_clause START"); 
+    
     // 1. Consume 'RETURN' keyword
     let (input, _) = preceded(
         multispace0::<&str, NomErrorType<&str>>,
         tag_no_case("RETURN"),
     ).parse(input)?;
-
-    // 2. Parse RETURN items (projections)
-    let (input, _) = multispace1.parse(input)?; // RETURN must be followed by space
-    let (input, _) = multispace0.parse(input)?; // optional extra space
-
-    // Capture raw projection string for backward compatibility (as fallback)
+    
+    // 2. Consume whitespace
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Check if RETURN is empty or incomplete
+    let trimmed = input.trim_start();
+    let is_incomplete = trimmed.is_empty() || 
+        trimmed.to_uppercase().starts_with("ORDER") ||
+        trimmed.to_uppercase().starts_with("LIMIT") ||
+        trimmed.to_uppercase().starts_with("SKIP") ||
+        trimmed.starts_with(';');
+    
+    if is_incomplete {
+        println!("===> ERROR: Incomplete RETURN statement in parse_return_clause");
+        // Use Failure to prevent backtracking to other parsers
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge
+        )));
+    }
+    
+    // Capture raw projection string for backward compatibility
     let (input_after_proj, projection_items_str) = take_while1(|c: char| {
         let upper = c.to_ascii_uppercase();
         !(upper == 'O' || upper == 'S' || upper == 'L' || c == ';' || c == '\n' || c == '\r')
     }).parse(input)?;
-
+    
+    // Validate projection string is not empty after trimming
+    let proj_trimmed = projection_items_str.trim();
+    if proj_trimmed.is_empty() {
+        println!("===> ERROR: Empty projection string after RETURN");
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge
+        )));
+    }
+    
     // 3. Parse ORDER BY clause
     let (input, order_by) = opt(preceded(
         tuple((multispace0, tag_no_case::<_, _, NomErrorType<&str>>("ORDER BY"), multispace1)),
         parse_order_by_items,
     )).parse(input_after_proj)?;
     let order_by = order_by.unwrap_or_default();
-
+    
     // 4. Parse SKIP clause
     let (input, skip) = opt(preceded(
         tuple((multispace0, tag_no_case::<_, _, NomErrorType<&str>>("SKIP"), multispace1)),
         map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<i64>())
     )).parse(input)?;
-
+    
     // 5. Parse LIMIT clause
     let (input, limit) = opt(preceded(
         tuple((multispace0, tag_no_case::<_, _, NomErrorType<&str>>("LIMIT"), multispace1)),
         map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<i64>())
     )).parse(input)?;
-
+    
     // 6. Build query
     let return_query = CypherQuery::ReturnStatement { 
-        projection_string: projection_items_str.trim().to_string(),
+        projection_string: proj_trimmed.to_string(),
         order_by,
         skip,
         limit,
     };
-
+    
     Ok((input, return_query))
 }
 
@@ -6555,7 +6689,9 @@ fn parse_dynamic_property_access(input: &str) -> IResult<&str, Expression> {
     
     let (input, var_name) = parse_identifier(input)?;
     let (input, _) = char('[')(input)?;
+    let (input, _) = multispace0(input)?;
     let (input, prop_expr) = parse_expression(input)?; // Recursively parse the property expression
+    let (input, _) = multispace0(input)?;
     let (input, _) = char(']')(input)?;
     
     Ok((input, Expression::DynamicPropertyAccess {
@@ -6617,48 +6753,87 @@ fn parse_where_clause(input: &str) -> IResult<&str, Expression> {
     Ok((input, expression))
 }
 
+// Fix parse_return_clause_as_struct to handle empty/incomplete RETURN
+// A more robust whitespace parser that handles NBSP (0xA0) and other Unicode spaces
+fn any_whitespace0(input: &str) -> IResult<&str, &str> {
+    take_while(|c: char| c.is_whitespace())(input)
+}
 
-fn parse_return_clause_as_struct(input: &str) -> IResult<&str, ReturnClause> {
-    println!("===> parse_return_clause_as_struct START");
-
-    // 1. Consume 'RETURN' and check for 'DISTINCT'
-    let (input, _) = preceded(multispace0, tag_no_case("RETURN")).parse(input)?;
-    let (input, _) = multispace1.parse(input)?;
+// Fixed parse_return_clause_as_struct with proper bare RETURN handling
+pub fn parse_return_clause_as_struct(input: &str) -> IResult<&str, ReturnClause> {
+    println!("=========> parse_return_clause_as_struct START");
+    println!("=========> Input: '{}'", input.trim());
+    
+    // 1. Consume ANY kind of whitespace (including NBSP)
+    let (input, _) = any_whitespace0(input)?;
+    
+    println!("=========> parse_return_clause_as_struct STEP 1");
+    // 2. Consume 'RETURN' keyword
+    let (input, _) = tag_no_case("RETURN")(input)?;
+    
+    println!("=========> parse_return_clause_as_struct STEP 2");
+    // 3. Consume trailing whitespace
+    let (input, _) = any_whitespace0(input)?;
+    
+    println!("=========> parse_return_clause_as_struct STEP 3");
+    let trimmed = input.trim();
+    
+    println!("=========> parse_return_clause_as_struct STEP 4 - checking if bare RETURN");
+    println!("===> Remaining input after RETURN: '{}'", trimmed);
+    
+    let is_bare_return = trimmed.is_empty() || 
+        trimmed == ";" ||
+        trimmed.to_uppercase().starts_with("ORDER") ||
+        trimmed.to_uppercase().starts_with("LIMIT") ||
+        trimmed.to_uppercase().starts_with("SKIP");
+    
+    if is_bare_return {
+        println!("===> ERROR: Bare RETURN detected - this is not allowed!");
+        // Return a Failure error to prevent backtracking
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge
+        )));
+    }
+    
+    println!("=========> parse_return_clause_as_struct STEP 5");
+    // 4. Handle DISTINCT
     let (input, distinct_opt) = opt(terminated(tag_no_case("DISTINCT"), multispace1)).parse(input)?;
     let is_distinct = distinct_opt.is_some();
-
-    // 2. Parse Projection Items
+    
+    println!("=========> parse_return_clause_as_struct STEP 6");
+    // 5. Parse Projection Items
     let (input, items_raw) = separated_list1(
         delimited(multispace0, char(','), multispace0),
         parse_single_return_item
     ).parse(input)?;
-
-    // 3. Parse ORDER BY and map OrderByItem -> (String, bool)
+    
+    println!("=========> parse_return_clause_as_struct STEP 7");
+    // 6. Parse ORDER BY
     let (input, order_by_raw) = opt(preceded(
         tuple((multispace0, tag_no_case("ORDER BY"), multispace1)),
         parse_order_by_items,
     )).parse(input)?;
-
-    // Map Vec<OrderByItem> to Vec<(String, bool)>
-    // NOTE: item.ascending (true) becomes descending (false)
+    
     let order_by = order_by_raw.map(|items| {
         items.into_iter().map(|item| {
             (item.expression, !item.ascending) 
         }).collect::<Vec<(String, bool)>>()
     });
-
-    // 4. Parse SKIP
+    
+    println!("=========> parse_return_clause_as_struct STEP 8");
+    // 7. SKIP & LIMIT
     let (input, skip) = opt(preceded(
         tuple((multispace0, tag_no_case("SKIP"), multispace1)),
         map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<usize>())
     )).parse(input)?;
-
-    // 5. Parse LIMIT
+    
     let (input, limit) = opt(preceded(
         tuple((multispace0, tag_no_case("LIMIT"), multispace1)),
         map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<usize>())
     )).parse(input)?;
-
+    
+    println!("=========> parse_return_clause_as_struct COMPLETE");
     Ok((input, ReturnClause {
         items: items_raw,
         distinct: is_distinct,
