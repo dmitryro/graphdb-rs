@@ -1326,42 +1326,104 @@ fn parse_null_operator(input: &str) -> IResult<&str, UnaryOp> {
     )).parse(input) 
 }
 
-
 pub fn evaluate_expression(
     expr: &Expression,
     context: &EvaluationContext,
 ) -> StdResult<CypherValue, GraphError> {
+    println!("===> evaluate_expression: {:?}", match expr {
+        Expression::LabelPredicate { variable, label } => format!("LabelPredicate({}:{})", variable, label),
+        Expression::Binary { op, .. } => format!("Binary({:?})", op),
+        Expression::PropertyComparison { variable, property, operator, .. } => format!("PropertyComparison({}.{} {} ...)", variable, property, operator),
+        _ => format!("{:?}", expr),
+    });
     match expr {
+        Expression::StartsWith { variable, property, prefix } => {
+            let val = get_property_for_expression(context, variable, property)?;
+            match val {
+                CypherValue::String(s) => Ok(CypherValue::Bool(s.starts_with(prefix))),
+                _ => Ok(CypherValue::Bool(false)),
+            }
+        },
+
+        Expression::EndsWith { variable, property, suffix } => {
+            let val = get_property_for_expression(context, variable, property)?;
+            match val {
+                CypherValue::String(s) => Ok(CypherValue::Bool(s.ends_with(suffix))),
+                _ => Ok(CypherValue::Bool(false)),
+            }
+        },
+
+        Expression::Contains { variable, property, substring } => {
+            let val = get_property_for_expression(context, variable, property)?;
+            match val {
+                CypherValue::String(s) => Ok(CypherValue::Bool(s.contains(substring))),
+                _ => Ok(CypherValue::Bool(false)),
+            }
+        },
+// --- Added Missing NOT Arm ---
+        Expression::Not(inner_expr) => {
+            let val = evaluate_expression(inner_expr, context)?;
+            match val {
+                CypherValue::Bool(b) => Ok(CypherValue::Bool(!b)),
+                CypherValue::Null => Ok(CypherValue::Null), // Three-valued logic: NOT Null is Null
+                _ => Err(GraphError::QueryExecutionError("NOT operator requires a boolean expression".into())),
+            }
+        },
+
+        // --- Added Missing Regex Arm ---
+        Expression::Regex { variable, property, pattern } => {
+            let val = get_property_for_expression(context, variable, property)?;
+            if let CypherValue::String(s) = val {
+                // Assuming you have a regex crate or similar utility
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| GraphError::QueryExecutionError(format!("Invalid regex: {}", e)))?;
+                Ok(CypherValue::Bool(re.is_match(&s)))
+            } else {
+                Ok(CypherValue::Bool(false))
+            }
+        },
+
+        // --- Added Missing FunctionComparison Arm ---
+        // This is used for optimized calls like ID(n) = 'value'
+        Expression::FunctionComparison { function, argument, operator, value } => {
+            let func_expr = Expression::FunctionCall { 
+                name: function.clone(), 
+                args: vec![Expression::Variable(argument.clone())] 
+            };
+            let left_val = evaluate_expression(&func_expr, context)?;
+            let right_val = CypherValue::from_json(value.clone());
+            
+            evaluate_comparison(&left_val, operator, &right_val)
+        },
         Expression::Literal(val) => Ok(val.clone()),
         
         Expression::Variable(name) => context.variables.get(name)
             .cloned()
             .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable not found: {}", name))),
+
         Expression::Property(access) => match access {
             PropertyAccess::Vertex(var, prop) => {
                 if let Some(val) = context.variables.get(var) {
                     match val {
-                        // Handle when variable contains full Vertex object
                         CypherValue::Vertex(v) => {
+                            if prop == "id" {
+                                return Ok(CypherValue::String(v.id.to_string()));
+                            }
+                            if prop == "label" {
+                                return Ok(CypherValue::String(v.label.to_string()));
+                            }
                             match v.properties.get(prop) {
                                 Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
                                 None => Ok(CypherValue::Null),
                             }
                         }
-                        // Handle when variable contains Map (fallback)
                         CypherValue::Map(map) => {
                             match map.get(prop) {
                                 Some(val) => Ok(val.clone()),
                                 None => Ok(CypherValue::Null),
                             }
                         }
-                        // Handle other types - but remove the non-existent as_vertex/as_edge methods
-                        _ => {
-                            // Since we can't call as_vertex() or as_edge(), and the only other
-                            // way to get a vertex/edge is through the CypherValue enum variants,
-                            // we should just return an error for unsupported types
-                            Err(GraphError::EvaluationError(format!("Variable '{}' is not a vertex or edge", var)))
-                        }
+                        _ => Err(GraphError::EvaluationError(format!("Variable '{}' is not a vertex", var)))
                     }
                 } else {
                     Err(GraphError::EvaluationError(format!("Vertex variable '{}' not found", var)))
@@ -1371,6 +1433,12 @@ pub fn evaluate_expression(
                 if let Some(val) = context.variables.get(var) {
                     match val {
                         CypherValue::Edge(e) => {
+                            if prop == "id" {
+                                return Ok(CypherValue::String(e.id.to_string()));
+                            }
+                            if prop == "label" || prop == "type" {
+                                return Ok(CypherValue::String(e.label.to_string()));
+                            }
                             match e.properties.get(prop) {
                                 Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
                                 None => Ok(CypherValue::Null),
@@ -1382,9 +1450,7 @@ pub fn evaluate_expression(
                                 None => Ok(CypherValue::Null),
                             }
                         }
-                        _ => {
-                            Err(GraphError::EvaluationError(format!("Variable '{}' is not an edge", var)))
-                        }
+                        _ => Err(GraphError::EvaluationError(format!("Variable '{}' is not an edge", var)))
                     }
                 } else {
                     Err(GraphError::EvaluationError(format!("Edge variable '{}' not found", var)))
@@ -1396,7 +1462,7 @@ pub fn evaluate_expression(
                 .cloned()
                 .ok_or_else(|| GraphError::EvaluationError(format!("Parameter '${}' not provided", name))),
         },
-        // --- ADDED: List Evaluation ---
+
         Expression::List(elements) => {
             let mut evaluated_elements = Vec::with_capacity(elements.len());
             for element_expr in elements {
@@ -1404,12 +1470,11 @@ pub fn evaluate_expression(
             }
             Ok(CypherValue::List(evaluated_elements))
         },
+
         Expression::DynamicPropertyAccess { variable, property_expr } => {
-            // Get the target object (vertex/edge)
             let target_val = context.variables.get(variable)
                 .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
             
-            // Evaluate the property name expression
             let prop_name_val = evaluate_expression(property_expr, context)?;
             let prop_name = match prop_name_val {
                 CypherValue::String(s) => s,
@@ -1417,15 +1482,18 @@ pub fn evaluate_expression(
                 _ => return Err(GraphError::QueryExecutionError("Property name must be a string".into())),
             };
             
-            // Extract property value based on target type
             match target_val {
                 CypherValue::Vertex(v) => {
+                    if prop_name == "id" { return Ok(CypherValue::String(v.id.to_string())); }
+                    if prop_name == "label" { return Ok(CypherValue::String(v.label.to_string())); }
                     match v.properties.get(&prop_name) {
                         Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
                         None => Ok(CypherValue::Null),
                     }
                 },
                 CypherValue::Edge(e) => {
+                    if prop_name == "id" { return Ok(CypherValue::String(e.id.to_string())); }
+                    if prop_name == "label" || prop_name == "type" { return Ok(CypherValue::String(e.label.to_string())); }
                     match e.properties.get(&prop_name) {
                         Some(prop_val) => Ok(property_value_to_cypher(prop_val)),
                         None => Ok(CypherValue::Null),
@@ -1440,19 +1508,31 @@ pub fn evaluate_expression(
                 _ => Err(GraphError::QueryExecutionError(format!("Cannot access properties on variable '{}'", variable))),
             }
         },
+
         Expression::LabelPredicate { variable, label } => {
+            println!("===> Evaluating LabelPredicate: variable='{}', expected_label='{}'", variable, label);
+            
             let val = context.variables.get(variable)
                 .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
             
             match val {
                 CypherValue::Vertex(v) => {
-                    // Conversion to string for comparison against the String 'label'
-                    // Using .to_string() or accessing the internal field (e.g., v.label.0)
-                    Ok(CypherValue::Bool(v.label.to_string() == *label))
+                    let vertex_label = v.label.to_string();
+                    println!("===> Vertex actual label: '{}'", vertex_label);
+                    
+                    // Compare labels (case-sensitive by default in Neo4j)
+                    let matches = vertex_label == *label;
+                    println!("===> Label match result: {}", matches);
+                    
+                    Ok(CypherValue::Bool(matches))
                 },
-                _ => Ok(CypherValue::Bool(false)),
+                _ => {
+                    println!("===> Variable is not a Vertex, returning false");
+                    Ok(CypherValue::Bool(false))
+                }
             }
         },
+
         Expression::Predicate { name, variable, list, condition } => {
             let list_val = evaluate_expression(list, context)?;
             
@@ -1463,8 +1543,6 @@ pub fn evaluate_expression(
                         for item in elements {
                             let mut nested_ctx = context.clone();
                             nested_ctx.variables.insert(variable.clone(), item);
-                            
-                            // FIX: Explicitly match Bool(true)
                             if let Ok(CypherValue::Bool(true)) = evaluate_expression(condition, &nested_ctx) {
                                 return Ok(CypherValue::Bool(true));
                             }
@@ -1475,8 +1553,6 @@ pub fn evaluate_expression(
                         for item in elements {
                             let mut nested_ctx = context.clone();
                             nested_ctx.variables.insert(variable.clone(), item);
-                            
-                            // FIX: If it's NOT true (either False or Null), ALL fails
                             match evaluate_expression(condition, &nested_ctx)? {
                                 CypherValue::Bool(true) => continue,
                                 _ => return Ok(CypherValue::Bool(false)),
@@ -1490,6 +1566,7 @@ pub fn evaluate_expression(
                 Ok(CypherValue::Null)
             }
         },
+
         Expression::FunctionCall { name, args } => {
             let func_name = name.to_uppercase();
             match func_name.as_str() {
@@ -1507,8 +1584,7 @@ pub fn evaluate_expression(
                 "TYPE" => {
                     let arg = args.get(0)
                         .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 arg".into()))?;
-                    // Use the native method you provided
-                    let val = arg.evaluate(context)?; 
+                    let val = evaluate_expression(arg, context)?;
                     match val {
                         CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
                         _ => Ok(CypherValue::Null),
@@ -1517,7 +1593,7 @@ pub fn evaluate_expression(
                 "LABELS" => {
                     let arg = args.get(0)
                         .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 arg".into()))?;
-                    let val = arg.evaluate(context)?;
+                    let val = evaluate_expression(arg, context)?;
                     match val {
                         CypherValue::Vertex(v) => Ok(CypherValue::List(vec![
                             CypherValue::String(v.label.to_string())
@@ -1553,16 +1629,20 @@ pub fn evaluate_expression(
                     )?;
                     match val {
                         CypherValue::Vertex(v) => {
-                            let key_list: Vec<CypherValue> = v.properties.keys()
+                            let mut keys: Vec<CypherValue> = v.properties.keys()
                                 .map(|k| CypherValue::String(k.clone()))
                                 .collect();
-                            Ok(CypherValue::List(key_list))
+                            keys.push(CypherValue::String("id".to_string()));
+                            keys.push(CypherValue::String("label".to_string()));
+                            Ok(CypherValue::List(keys))
                         },
                         CypherValue::Edge(e) => {
-                            let key_list: Vec<CypherValue> = e.properties.keys()
+                            let mut keys: Vec<CypherValue> = e.properties.keys()
                                 .map(|k| CypherValue::String(k.clone()))
                                 .collect();
-                            Ok(CypherValue::List(key_list))
+                            keys.push(CypherValue::String("id".to_string()));
+                            keys.push(CypherValue::String("label".to_string()));
+                            Ok(CypherValue::List(keys))
                         },
                         CypherValue::Map(map) => {
                             let key_list: Vec<CypherValue> = map.keys()
@@ -1598,41 +1678,59 @@ pub fn evaluate_expression(
                     };
                     Ok(CypherValue::Integer(strsim::levenshtein(&s1, &s2) as i64))
                 },
-                "STARTS WITH" | "STARTSWITH" => {
+                "STARTS WITH" | "STARTSWITH" | "ENDS WITH" | "ENDSWITH" | "CONTAINS" => {
                     if args.len() != 2 {
-                        return Err(GraphError::QueryExecutionError("STARTS WITH requires exactly 2 arguments".into()));
+                        return Err(GraphError::QueryExecutionError(format!("{} requires exactly 2 arguments", func_name)));
                     }
-
                     let haystack_val = evaluate_expression(&args[0], context)?;
                     let needle_val = evaluate_expression(&args[1], context)?;
-
+                    
                     let haystack = match haystack_val {
                         CypherValue::String(s) => s,
+                        CypherValue::Uuid(u) => u.to_string(),
                         CypherValue::Null => return Ok(CypherValue::Bool(false)),
-                        other => {
-                            serde_json::to_string(&other.to_json()).unwrap_or_else(|_| "null".to_string())
-                        }
+                        other => serde_json::to_string(&other.to_json()).unwrap_or_else(|_| "null".to_string())
                     };
-
                     let needle = match needle_val {
                         CypherValue::String(s) => s,
+                        CypherValue::Uuid(u) => u.to_string(),
                         CypherValue::Null => return Ok(CypherValue::Bool(false)),
-                        other => {
-                            serde_json::to_string(&other.to_json()).unwrap_or_else(|_| "null".to_string())
-                        }
+                        other => serde_json::to_string(&other.to_json()).unwrap_or_else(|_| "null".to_string())
                     };
-
-                    Ok(CypherValue::Bool(haystack.starts_with(&needle)))
+                    
+                    let res = match func_name.as_str() {
+                        "STARTS WITH" | "STARTSWITH" => haystack.starts_with(&needle),
+                        "ENDS WITH" | "ENDSWITH" => haystack.ends_with(&needle),
+                        "CONTAINS" => haystack.contains(&needle),
+                        _ => false,
+                    };
+                    Ok(CypherValue::Bool(res))
+                },
+                "STRING" => {
+                    if args.len() != 1 {
+                        return Err(GraphError::QueryExecutionError("string() requires exactly 1 argument".into()));
+                    }
+                    let arg_val = evaluate_expression(&args[0], context)?;
+                    match arg_val {
+                        CypherValue::String(s) => Ok(CypherValue::String(s)),
+                        CypherValue::Integer(i) => Ok(CypherValue::String(i.to_string())),
+                        CypherValue::Float(f) => Ok(CypherValue::String(f.to_string())),
+                        CypherValue::Bool(b) => Ok(CypherValue::String(b.to_string())),
+                        CypherValue::Uuid(u) => Ok(CypherValue::String(u.to_string())),
+                        CypherValue::Vertex(v) => Ok(CypherValue::String(v.id.to_string())),
+                        CypherValue::Edge(e) => Ok(CypherValue::String(e.id.to_string())),
+                        _ => Err(GraphError::QueryExecutionError("string() cannot convert this type".into())),
+                    }
                 },
                 _ => Err(GraphError::QueryExecutionError(format!("Unknown function: {}", name)))
             }
         },
+
         Expression::Binary { op, left, right } => {
             let left_val = evaluate_expression(left, context)?;
             let right_val = evaluate_expression(right, context)?;
 
             match op {
-                // Using your specific Enum variants: Eq, Neq, Lt, Lte, Gt, Gte
                 BinaryOp::Eq | BinaryOp::Neq | BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte => {
                     let op_str = match op {
                         BinaryOp::Eq => "=",
@@ -1645,11 +1743,9 @@ pub fn evaluate_expression(
                     };
                     evaluate_comparison(&left_val, op_str, &right_val)
                 },
-                // --- ADDED: IN Operator Support ---
                 BinaryOp::In => {
                     match right_val {
                         CypherValue::List(list) => {
-                            // FIX: Ensure it returns false if left_val is Null
                             if matches!(left_val, CypherValue::Null) {
                                 Ok(CypherValue::Bool(false))
                             } else {
@@ -1665,62 +1761,78 @@ pub fn evaluate_expression(
                 BinaryOp::Mul => multiply_values(left_val, right_val),
                 BinaryOp::Div => divide_values(left_val, right_val),
                 BinaryOp::And => {
+                    println!("===> Evaluating AND: left={:?}, right={:?}", left_val, right_val);
                     match (left_val, right_val) {
-                        (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l && r)),
-                        _ => Ok(CypherValue::Null),
+                        (CypherValue::Bool(l), CypherValue::Bool(r)) => {
+                            let result = l && r;
+                            println!("===> AND result: {} && {} = {}", l, r, result);
+                            Ok(CypherValue::Bool(result))
+                        },
+                        _ => {
+                            println!("===> AND: non-boolean operands, returning Null");
+                            Ok(CypherValue::Null)
+                        }
                     }
                 },
                 BinaryOp::Or => {
+                    println!("===> Evaluating OR: left={:?}, right={:?}", left_val, right_val);
                     match (left_val, right_val) {
-                        (CypherValue::Bool(l), CypherValue::Bool(r)) => Ok(CypherValue::Bool(l || r)),
-                        _ => Ok(CypherValue::Null),
+                        (CypherValue::Bool(l), CypherValue::Bool(r)) => {
+                            let result = l || r;
+                            println!("===> OR result: {} || {} = {}", l, r, result);
+                            Ok(CypherValue::Bool(result))
+                        },
+                        _ => {
+                            println!("===> OR: non-boolean operands, returning Null");
+                            Ok(CypherValue::Null)
+                        }
                     }
                 },
-                BinaryOp::Regex => { // Ensure this variant exists in your BinaryOp enum
-                    evaluate_comparison(&left_val, "=~", &right_val)
-                },
-                _ => Err(GraphError::QueryExecutionError(format!("Operator {:?} not implemented in evaluator", op))),
+                BinaryOp::Contains => evaluate_comparison(&left_val, "CONTAINS", &right_val),
+                BinaryOp::StartsWith => evaluate_comparison(&left_val, "STARTS WITH", &right_val),
+                BinaryOp::EndsWith => evaluate_comparison(&left_val, "ENDS WITH", &right_val),
+                BinaryOp::Regex => evaluate_comparison(&left_val, "=~", &right_val),
+                _ => Err(GraphError::QueryExecutionError(format!("Operator {:?} not implemented", op))),
             }
         },
 
         Expression::PropertyComparison { variable, property, operator, value } => {
-            // Handle IN operator
-            if operator.to_uppercase() == "IN" {
+            let op_upper = operator.to_uppercase();
+            if op_upper == "IN" {
                 let left_val = context.variables.get(variable)
                     .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
 
                 let prop_val = if property.is_empty() {
-                    // Scalar variable (e.g., 'dist' from WITH projection)
                     left_val.clone()
                 } else {
-                    // Vertex property (e.g., 'p.first_name')
                     match left_val {
                         CypherValue::Vertex(v) => {
-                            v.properties.get(property)
-                                .map(property_value_to_cypher)
-                                .unwrap_or(CypherValue::Null)
+                            if property == "id" { CypherValue::String(v.id.to_string()) }
+                            else if property == "label" { CypherValue::String(v.label.to_string()) }
+                            else { v.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null) }
                         },
-                        _ => return Err(GraphError::QueryExecutionError(format!("Variable '{}' is not a vertex", variable))),
+                        CypherValue::Edge(e) => {
+                            if property == "id" { CypherValue::String(e.id.to_string()) }
+                            else if property == "label" || property == "type" { CypherValue::String(e.label.to_string()) }
+                            else { e.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null) }
+                        },
+                        _ => return Err(GraphError::QueryExecutionError(format!("Variable '{}' is not a graph object", variable))),
                     }
                 };
 
                 let right_val = CypherValue::from_json(value.clone());
-
                 match right_val {
                     CypherValue::List(list) => Ok(CypherValue::Bool(list.contains(&prop_val))),
                     CypherValue::Null => Ok(CypherValue::Null),
-                    _ => Err(GraphError::QueryExecutionError("The 'IN' operator requires a list on the right side".into())),
+                    _ => Err(GraphError::QueryExecutionError("The 'IN' operator requires a list".into())),
                 }
             } else {
-                // Handle other operators (=, <, etc.)
                 if property.is_empty() {
-                    // Scalar comparison
                     let left_val = context.variables.get(variable)
                         .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
                     let right_val = CypherValue::from_json(value.clone());
-                    evaluate_comparison(left_val, &operator, &right_val)
+                    evaluate_comparison(left_val, operator, &right_val)
                 } else {
-                    // Vertex property comparison
                     evaluate_property_comparison(context, variable, property, operator, value)
                 }
             }
@@ -1746,20 +1858,6 @@ pub fn evaluate_expression(
             }
         },
 
-        Expression::StartsWith { variable, property, prefix } => {
-            let target = context.variables.get(variable)
-                .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
-            let prop_val = match target {
-                CypherValue::Vertex(v) => v.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null),
-                CypherValue::Edge(e) => e.properties.get(property).map(property_value_to_cypher).unwrap_or(CypherValue::Null),
-                _ => return Err(GraphError::QueryExecutionError(format!("Variable '{}' is not a Vertex/Edge", variable))),
-            };
-            match prop_val {
-                CypherValue::String(s) => Ok(CypherValue::Bool(s.starts_with(prefix))),
-                _ => Ok(CypherValue::Bool(false)),
-            }
-        },
-        
         Expression::Unary { op, expr } => {
             let val = evaluate_expression(expr, context)?;
             match op {
@@ -1772,6 +1870,7 @@ pub fn evaluate_expression(
                 _ => Err(GraphError::QueryExecutionError("Unary op not implemented".into())),
             }
         },
+
         Expression::ArrayIndex { expr, index } => {
             let array_val = evaluate_expression(expr, context)?;
             let index_val = evaluate_expression(index, context)?;
@@ -1780,29 +1879,22 @@ pub fn evaluate_expression(
                 CypherValue::Integer(i) => i as usize,
                 CypherValue::Float(f) => f as usize,
                 CypherValue::String(s) => {
-                    // Try to parse string as integer
-                    if let Ok(i) = s.parse::<i64>() {
-                        i as usize
-                    } else {
-                        return Err(GraphError::QueryExecutionError("Array index must be a number".into()));
-                    }
+                    if let Ok(i) = s.parse::<i64>() { i as usize } 
+                    else { return Err(GraphError::QueryExecutionError("Array index must be a number".into())); }
                 }
                 _ => return Err(GraphError::QueryExecutionError("Array index must be a number".into())),
             };
             
             match array_val {
                 CypherValue::List(items) => {
-                    if idx < items.len() {
-                        Ok(items[idx].clone())
-                    } else {
-                        Ok(CypherValue::Null)
-                    }
+                    if idx < items.len() { Ok(items[idx].clone()) } 
+                    else { Ok(CypherValue::Null) }
                 }
                 _ => Err(GraphError::QueryExecutionError("Cannot index non-list value".into())),
             }
         },
         _ => Err(GraphError::QueryExecutionError("Expression type not implemented".to_string())),
-    }
+    } 
 }
 
 fn evaluate_expression_string(expr_str: &str, ctx: &EvaluationContext) -> Result<CypherValue, GraphError> {
@@ -2231,19 +2323,17 @@ fn parse_set_list(input: &str) -> IResult<&str, HashMap<String, Value>> {
 
 // Updated parse_predicate_expression to handle keys() function and complex expressions
 fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
-    println!("===> parse_predicate_expression START");
-    
     // 1. Match "any" or "all"
     let (input, name) = alt((
         tag_no_case("any"), 
         tag_no_case("all")
-    )).parse(input)?;
+    )).parse(input)?; // Correct use of the Parser trait
     
     let (input, _) = multispace0.parse(input)?;
     let (input, _) = char('(').parse(input)?;
     let (input, _) = multispace0.parse(input)?;
     
-    // 2. Match the variable (e.g., "label", "prop")
+    // 2. Match the variable
     let (input, var_name) = parse_identifier(input)?;
     let (input, _) = multispace1.parse(input)?;
     
@@ -2251,22 +2341,17 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
     let (input, _) = tag_no_case("IN").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // 4. Match the list expression - ENHANCED to support keys() function
+    // 4. Match the list expression
     let (input, list_expr) = alt((
-        // Function calls like keys(e) - MUST come before parse_identifier
         parse_function_call_full,
-        // Expression lists like [p.first_name, p.last_name]
         parse_expression_list,
-        // List literals like ['Alice', 'Bob']
         parse_list_literal,
-        // Property access like p.names (MUST come before plain identifier)
         map(
             tuple((parse_identifier, char('.'), parse_identifier)),
             |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
         ),
-        // Plain identifier
         map(parse_identifier, |v| Expression::Variable(v.to_string())),
-    )).parse(input)?;
+    )).parse(input)?; // Use .parse(input) here as well
     
     let (input, _) = multispace1.parse(input)?;
     
@@ -2274,7 +2359,7 @@ fn parse_predicate_expression(input: &str) -> IResult<&str, Expression> {
     let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
     
-    // 6. Parse the condition - ENHANCED to support function calls and dynamic property access
+    // 6. Parse the condition
     let (input, condition_expr) = parse_condition_internal(input)?;
     
     let (input, _) = multispace0.parse(input)?;
@@ -2356,7 +2441,7 @@ fn parse_predicate_condition(input: &str) -> IResult<&str, Expression> {
 fn parse_condition_internal(input: &str) -> IResult<&str, Expression> {
     println!("===> parse_condition_internal START");
     
-    // 1. Parse left side - ENHANCED to support function calls and dynamic property access
+    // 1. Parse left side
     let (input, left_expr) = alt((
         parse_function_call_full,
         parse_dynamic_property_access,
@@ -2365,41 +2450,49 @@ fn parse_condition_internal(input: &str) -> IResult<&str, Expression> {
             |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
         ),
         map(parse_identifier, |v| Expression::Variable(v.to_string())),
-    )).parse(input)?; // Fixed: added .parse(input)
+    )).parse(input)?;
     
-    let (input, _) = multispace1.parse(input)?;
+    // Use multispace0 to be safer around parentheses
+    let (input, _) = multispace0.parse(input)?;
     
-    // 2. Parse operator - ENHANCED to include =~
+    // 2. Parse operator
     let (input, op_str) = alt((
         tag_no_case("IN"),
+        tag_no_case("CONTAINS"), // Put CONTAINS higher in priority
+        tag_no_case("STARTS WITH"),
+        tag_no_case("ENDS WITH"),
         tag("=~"),
         tag("="),
         tag("!="),
         tag("<>"),
-        tag("<="),
+        tag("<="),        
         tag(">="),
         tag("<"),
         tag(">"),
-    )).parse(input)?; // Fixed: added .parse(input)
+    )).parse(input)?;
     
-    let (input, _) = multispace1.parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
     
     // 3. Parse right side
     let (input, right_expr) = alt((
         parse_list_literal,
         parse_function_call_full,
+        // Pass a reference here to satisfy the existing trait bound
+        map(parse_value, |v| Expression::Literal(CypherValue::from(&v))), 
         map(
             tuple((parse_identifier, char('.'), parse_identifier)),
             |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
         ),
-        map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
         map(parse_identifier, |v| Expression::Variable(v.to_string())),
-    )).parse(input)?; // Fixed: added .parse(input)
+    )).parse(input)?;
     
     // Map operator string to BinaryOp
-    let op = match op_str.to_uppercase().as_str() {
+    let op = match op_str.to_uppercase().as_ref() {
         "IN" => BinaryOp::In,
-        "=~" => BinaryOp::Regex, // Updated to use Regex for correct MPI filtering
+        "CONTAINS" => BinaryOp::Contains,
+        "STARTS WITH" => BinaryOp::StartsWith,
+        "ENDS WITH" => BinaryOp::EndsWith,
+        "=~" => BinaryOp::Regex,
         "=" => BinaryOp::Eq,
         "!=" | "<>" => BinaryOp::Neq,
         "<=" => BinaryOp::Lte,
@@ -4092,7 +4185,6 @@ fn parse_single_set_assignment(input: &str) -> IResult<&str, (String, String, Ex
 }
 
 /// Evaluates a comparison between two CypherValues using the given operator.
-/// Evaluates a comparison between two CypherValues using the given operator.
 pub fn evaluate_comparison(
     left: &CypherValue,
     operator: &str,
@@ -4105,7 +4197,7 @@ pub fn evaluate_comparison(
 
     let op_upper = operator.to_uppercase();
 
-    // ✅ Handle IN operator first
+    // 1. Handle IN operator
     if op_upper == "IN" {
         match right {
             CypherValue::List(list) => {
@@ -4118,24 +4210,48 @@ pub fn evaluate_comparison(
             }
         }
     }
-    // ADDED: Regex Operator Support
-    if operator == "=~" {
-        return match (left, right) {
-            (CypherValue::String(text), CypherValue::String(pattern)) => {
-                // Compile and execute the regex
-                match regex::Regex::new(pattern) {
-                    Ok(re) => Ok(CypherValue::Bool(re.is_match(text))),
-                    Err(_) => Err(GraphError::QueryExecutionError(format!("Invalid regex pattern: {}", pattern))),
+
+    // 2. Handle String-Specific Operators (CONTAINS, STARTS WITH, ENDS WITH, and Regex)
+    // We consolidate these to ensure they work regardless of whether a UUID has been
+    // pre-converted to a String or remains a Uuid variant.
+    let is_string_op = matches!(op_upper.as_str(), "CONTAINS" | "STARTS WITH" | "ENDS WITH" | "=~");
+    if is_string_op {
+        let left_str = match left {
+            CypherValue::String(s) => s.clone(),
+            CypherValue::Uuid(u) => u.to_string(),
+            _ => return Err(GraphError::QueryExecutionError(
+                format!("Operator '{}' requires string or uuid on the left", operator)
+            )),
+        };
+
+        let right_str = match right {
+            CypherValue::String(s) => s.clone(),
+            CypherValue::Uuid(u) => u.to_string(),
+            _ => return Err(GraphError::QueryExecutionError(
+                format!("Operator '{}' requires string pattern on the right", operator)
+            )),
+        };
+
+        let res = match op_upper.as_str() {
+            "CONTAINS" => left_str.contains(&right_str),
+            "STARTS WITH" => left_str.starts_with(&right_str),
+            "ENDS WITH" => left_str.ends_with(&right_str),
+            "=~" => {
+                match regex::Regex::new(&right_str) {
+                    Ok(re) => re.is_match(&left_str),
+                    Err(_) => return Err(GraphError::QueryExecutionError(
+                        format!("Invalid regex pattern: {}", right_str)
+                    )),
                 }
             },
-            _ => Err(GraphError::QueryExecutionError("Regex operator '=~' requires string operands".into())),
+            _ => false,
         };
+        return Ok(CypherValue::Bool(res));
     }
 
-    // Existing comparison logic for =, <, >, etc.
-    let result = match (&left, &right) {
-        // ... (rest of your existing code unchanged) ...
-        // Keep all your existing type-specific matches here
+    // 3. General Comparison Logic
+    let result = match (left, right) {
+        // Numeric: Integer vs Float
         (CypherValue::Integer(a), CypherValue::Float(b)) => {
             let a_f = *a as f64;
             match op_upper.as_str() {
@@ -4150,6 +4266,7 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // Numeric: Float vs Integer
         (CypherValue::Float(a), CypherValue::Integer(b)) => {
             let b_f = *b as f64;
             match op_upper.as_str() {
@@ -4164,6 +4281,7 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // Numeric: Integer vs Integer
         (CypherValue::Integer(a), CypherValue::Integer(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -4177,6 +4295,7 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // Numeric: Float vs Float
         (CypherValue::Float(a), CypherValue::Float(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -4190,6 +4309,7 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // String vs String
         (CypherValue::String(a), CypherValue::String(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -4203,6 +4323,7 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // Boolean vs Boolean
         (CypherValue::Bool(a), CypherValue::Bool(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a == b,
@@ -4212,6 +4333,7 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // UUID vs String
         (CypherValue::Uuid(a), CypherValue::String(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => a.to_string() == *b,
@@ -4221,6 +4343,7 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // String vs UUID
         (CypherValue::String(a), CypherValue::Uuid(b)) => {
             match op_upper.as_str() {
                 "=" | "==" => *a == b.to_string(),
@@ -4230,14 +4353,15 @@ pub fn evaluate_comparison(
                 )),
             }
         },
+        // Vertex / Edge Constraints
         (CypherValue::Vertex(_), _) | (_, CypherValue::Vertex(_)) => {
             return Err(GraphError::QueryExecutionError(
-                "Cannot compare vertex values".to_string()
+                "Cannot compare vertex values directly".to_string()
             ));
         },
         (CypherValue::Edge(_), _) | (_, CypherValue::Edge(_)) => {
             return Err(GraphError::QueryExecutionError(
-                "Cannot compare edge values".to_string()
+                "Cannot compare edge values directly".to_string()
             ));
         },
         _ => {
@@ -4261,12 +4385,24 @@ fn evaluate_property_comparison(
         .ok_or_else(|| GraphError::QueryExecutionError(format!("Variable '{}' not found", variable)))?;
 
     let left_val = match target {
-        CypherValue::Vertex(v) => v.properties.get(property)
-            .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
-            .unwrap_or(CypherValue::Null),
-        CypherValue::Edge(e) => e.properties.get(property)
-            .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
-            .unwrap_or(CypherValue::Null),
+        CypherValue::Vertex(v) => {
+            match property {
+                "id" => CypherValue::String(v.id.to_string()),
+                "label" => CypherValue::String(v.label.to_string()),
+                _ => v.properties.get(property)
+                    .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
+                    .unwrap_or(CypherValue::Null),
+            }
+        },
+        CypherValue::Edge(e) => {
+            match property {
+                "id" => CypherValue::String(e.id.to_string()),
+                "label" | "type" => CypherValue::String(e.label.to_string()),
+                _ => e.properties.get(property)
+                    .map(|p| CypherValue::from_json(serde_json::to_value(p).unwrap()))
+                    .unwrap_or(CypherValue::Null),
+            }
+        },
         _ => return Err(GraphError::QueryExecutionError(format!("'{}' is not a graph object", variable))),
     };
 
@@ -4399,147 +4535,6 @@ pub fn parse_list_literal(input: &str) -> IResult<&str, Expression> {
     Ok((input, Expression::List(elements)))
 }
 
-// Ensure parse_expression handles all the cases we need
-// This should already be in your code, but here's what it needs to support:
-pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
-    println!("===> parse_expression START, input length: {}, preview: '{}'", 
-             input.len(), &input[..input.len().min(100)]);
-
-    // Parse the "Atom" (The left-most part of an expression)
-    let (mut current_input, mut left) = {
-        alt((
-            // Parenthesized expressions for grouping
-            delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
-            
-            // Predicate functions with special syntax (any, all, exists, etc.)
-            parse_predicate_expression,
-
-            // Function calls with array indexing: labels(e)[0]
-            parse_function_call_with_index,
-            
-            // Function calls like labels(e) or keys(e) - MUST come before dynamic property
-            parse_function_call_full,
-            
-            // Dynamic property access like n[prop] - MUST come before property access
-            parse_dynamic_property_access,
-            
-            // List literals like ['A', 'B']
-            parse_list_literal, 
-            
-            // Property access like e.source_uuid
-            map(
-                tuple((parse_identifier, char('.'), parse_identifier)),
-                |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
-            ),
-            
-            // Literal values
-            map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-            
-            // Plain variables/identifiers
-            map(parse_identifier, |v| Expression::Variable(v.to_string())),
-        ))
-    }.parse(input)?;
-
-    // Handle Postfix Operations (Array Indexing and Null Checks)
-    loop {
-        let index_result = delimited(multispace0, 
-            tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
-            multispace0
-        ).parse(current_input);
-        
-        match index_result {
-            Ok((after_index, (_, index_expr, _))) => {
-                left = Expression::ArrayIndex {
-                    expr: Box::new(left),
-                    index: Box::new(index_expr),
-                };
-                current_input = after_index;
-            }
-            Err(_) => break,
-        }
-    }
-
-    // Check for Postfix Unary Operators (IS NULL / IS NOT NULL)
-    if let Ok((after_null, op)) = parse_null_operator(current_input) {
-        left = Expression::Unary {
-            op,
-            expr: Box::new(left),
-        };
-        current_input = after_null;
-    }
-
-    // Handle Binary Operators (AND, OR, =, IN, =~, etc.)
-    loop {
-        let op_result: IResult<&str, BinaryOp> = delimited(multispace0, parse_binary_op, multispace0)
-            .parse(current_input);
-
-        match op_result {
-            Ok((after_op, op)) => {
-                let rhs_result = alt((
-                    delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
-                    parse_predicate_expression,
-                    parse_function_call_with_index,
-                    parse_function_call_full,
-                    parse_dynamic_property_access,
-                    parse_list_literal, 
-                    map(
-                        tuple((parse_identifier, char('.'), parse_identifier)),
-                        |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
-                    ),
-                    map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-                    map(parse_identifier, |v| Expression::Variable(v.to_string())),
-                )).parse(after_op);
-
-                match rhs_result {
-                    Ok((after_rhs, mut right_atom)) => {
-                        // Handle array indexing on RHS
-                        let mut temp_input = after_rhs;
-                        let mut temp_right = right_atom;
-                        loop {
-                            let index_result = delimited(multispace0,
-                                tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
-                                multispace0
-                            ).parse(temp_input);
-                            
-                            match index_result {
-                                Ok((after_idx, (_, idx_expr, _))) => {
-                                    temp_right = Expression::ArrayIndex {
-                                        expr: Box::new(temp_right),
-                                        index: Box::new(idx_expr),
-                                    };
-                                    temp_input = after_idx;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        
-                        // Check for postfix null operator on RHS
-                        let final_after_rhs = if let Ok((after_rhs_null, rhs_op)) = parse_null_operator(temp_input) {
-                            temp_right = Expression::Unary {
-                                op: rhs_op,
-                                expr: Box::new(temp_right),
-                            };
-                            after_rhs_null
-                        } else {
-                            temp_input
-                        };
-
-                        left = Expression::Binary {
-                            op,
-                            left: Box::new(left),
-                            right: Box::new(temp_right),
-                        };
-                        current_input = final_after_rhs;
-                    }
-                    Err(_) => break,
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    Ok((current_input, left))
-}
 
 /// Parses function calls with optional array indexing: func(args)[index]
 fn parse_function_call_with_index(input: &str) -> IResult<&str, Expression> {
@@ -5264,53 +5259,229 @@ fn parse_cypher_expression(input: &str) -> IResult<&str, Expression> {
     parse_logical_expression(input)
 }
 
+/// Entry point for expression parsing.
+/// This maintains the precedence: OR < AND < NOT < Comparisons < Atoms.
+pub fn parse_expression(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_expression START, input length: {}", input.len());
+    parse_logical_expression(input)
+}
+
 /// Level 1: OR (Lowest Precedence)
 pub fn parse_logical_expression(input: &str) -> IResult<&str, Expression> {
-    println!("===> parse_logical_expression START");
+    let (input, left) = parse_and_term(input)?;
     
-    // OR has the lowest precedence, so we start by splitting by OR
-    // Each term between ORs is an 'AND' term
-    let (input, mut terms) = separated_list1(
-        delimited(multispace0, tag_no_case("OR"), multispace0),
-        parse_and_term, 
+    let (input, fold) = many0(
+        tuple((
+            multispace0,
+            tag_no_case("OR"),
+            multispace0,
+            parse_and_term,
+        ))
     ).parse(input)?;
 
-    let condition = if terms.len() == 1 {
-        terms.remove(0)
-    } else {
-        let mut iter = terms.into_iter();
-        let mut root = iter.next().unwrap();
-        for next in iter {
-            root = Expression::Or {
-                left: Box::new(root),
-                right: Box::new(next),
-            };
+    let res = fold.into_iter().fold(left, |acc, (_, _, _, next)| {
+        Expression::Or {
+            left: Box::new(acc),
+            right: Box::new(next),
         }
-        root
-    };
-    
-    Ok((input, condition))
+    });
+    Ok((input, res))
 }
 
 /// Level 2: AND
-fn parse_and_expression(input: &str) -> IResult<&str, CypherExpression> {
-    println!("===> parse_and_expression START");
-    let (input, left) = parse_comparison_expression(input)?;
+pub fn parse_and_term(input: &str) -> IResult<&str, Expression> {
+    let (input, left) = parse_not_expression(input)?;
     
-    let (input, remainder) = many0(pair(
-        delimited(multispace1, tag_no_case("AND"), multispace1),
-        parse_comparison_expression
+    let (input, fold) = many0(
+        tuple((
+            multispace0,
+            tag_no_case("AND"),
+            multispace0,
+            parse_not_expression,
+        ))
+    ).parse(input)?;
+
+    let res = fold.into_iter().fold(left, |acc, (_, _, _, next)| {
+        Expression::And {
+            left: Box::new(acc),
+            right: Box::new(next),
+        }
+    });
+    Ok((input, res))
+}
+
+/// Level 3: NOT (Unary Logical Negation)
+pub fn parse_not_expression(input: &str) -> IResult<&str, Expression> {
+    let (input, op_not) = opt(tuple((tag_no_case("NOT"), multispace0))).parse(input)?;
+    
+    let (input, expr) = parse_comparison_expression(input)?;
+    
+    if op_not.is_some() {
+        Ok((input, Expression::Not(Box::new(expr))))
+    } else {
+        Ok((input, expr))
+    }
+}
+
+/// Level 4: Comparisons and Label Predicates
+/// Handles: =, <>, CONTAINS, STARTS WITH, ENDS WITH, and e:Label
+pub fn parse_comparison_expression(input: &str) -> IResult<&str, Expression> {
+    let (input, left) = parse_atom(input)?;
+    let (input, _) = multispace0.parse(input)?;
+
+    // 1. High Precedence Check: Label Predicate (e.g., e:IdentityEvent)
+    // This must be checked immediately after an atom before binary operators.
+    if let Ok((remaining, (_, label))) = tuple((char(':'), parse_identifier)).parse(input) {
+        if let Expression::Variable(v) = &left {
+            return Ok((remaining, Expression::LabelPredicate { 
+                variable: v.clone(), 
+                label: label.to_string() 
+            }));
+        }
+    }
+
+    // 2. Try to parse a Binary Operator
+    let op_parse: IResult<&str, &str> = alt((
+        tag_no_case("CONTAINS"),
+        tag_no_case("STARTS WITH"),
+        tag_no_case("ENDS WITH"),
+        tag_no_case("IN"),
+        tag("=~"),
+        tag("="),
+        tag("<>"),
+        tag("!="),
+        tag(">="),
+        tag("<="),
+        tag(">"),
+        tag("<"),
+    )).parse(input);
+
+    if let Ok((input, op_str)) = op_parse {
+        let (input, _) = multispace0.parse(input)?;
+        let (input, right) = parse_atom(input)?;
+        
+        let op_upper = op_str.to_uppercase();
+        
+        let expr = match op_upper.as_str() {
+            "=~" => {
+                if let Expression::Property(PropertyAccess::Vertex(v, p)) = left {
+                    if let Expression::Literal(CypherValue::String(pat)) = right {
+                        Expression::Regex { variable: v, property: p, pattern: pat }
+                    } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+                } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+            },
+            "CONTAINS" => {
+                if let Expression::Property(PropertyAccess::Vertex(v, p)) = left {
+                    if let Expression::Literal(CypherValue::String(s)) = right {
+                        Expression::Contains { variable: v, property: p, substring: s }
+                    } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+                } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+            },
+            "STARTS WITH" => {
+                if let Expression::Property(PropertyAccess::Vertex(v, p)) = left {
+                    if let Expression::Literal(CypherValue::String(s)) = right {
+                        Expression::StartsWith { variable: v, property: p, prefix: s }
+                    } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+                } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+            },
+            "ENDS WITH" => {
+                if let Expression::Property(PropertyAccess::Vertex(v, p)) = left {
+                    if let Expression::Literal(CypherValue::String(s)) = right {
+                        Expression::EndsWith { variable: v, property: p, suffix: s }
+                    } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+                } else { return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))); }
+            },
+            _ => {
+                let op = match op_upper.as_str() {
+                    "=" => BinaryOp::Eq,
+                    "IN" => BinaryOp::In,
+                    "<>" | "!=" => BinaryOp::Neq,
+                    ">" => BinaryOp::Gt,
+                    "<" => BinaryOp::Lt,
+                    ">=" => BinaryOp::Gte,
+                    "<=" => BinaryOp::Lte,
+                    _ => BinaryOp::Eq,
+                };
+                Expression::Binary { op, left: Box::new(left), right: Box::new(right) }
+            }
+        };
+        Ok((input, expr))
+    } else {
+        // Fallback: return the atom or the label predicate
+        Ok((input, left))
+    }
+}
+
+/// Level 5: Atoms (Base elements)
+/// Handles identifiers, literals, function calls, and grouping.
+fn parse_atom(input: &str) -> IResult<&str, Expression> {
+    let (mut current_input, mut left) = alt((
+        // Parenthesized expressions (Recursion)
+        delimited(
+            char('('),
+            delimited(multispace0, parse_expression, multispace0),
+            char(')')
+        ),
+        
+        // Complex Predicates (any, all, exists)
+        parse_predicate_expression,
+        
+        // Function Calls with optional index access: labels(e)[0]
+        parse_function_call_with_index,
+        parse_function_call_full,
+        
+        // Dynamic Access: n["property_name"]
+        parse_dynamic_property_access,
+        
+        // List Literals: [1, 2, 3]
+        parse_list_literal,
+        
+        // Property Access: e.id
+        map(
+            tuple((parse_identifier, char('.'), parse_identifier)),
+            |(var, _, prop)| Expression::Property(
+                PropertyAccess::Vertex(var.to_string(), prop.to_string())
+            )
+        ),
+        
+        // Literals: "string", 10, true, null
+        map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
+        
+        // Plain Variables: e
+        map(parse_identifier, |v| Expression::Variable(v.to_string())),
     )).parse(input)?;
 
-    let mut res = left;
-    for (_op, right) in remainder {
-        res = CypherExpression::BinaryOp {
-            left: Box::new(res),
-            op: "AND".to_string(),
-            right: Box::new(right),
-        };
+    // Postfix: Handle array indexing (e.g., list[0])
+    loop {
+        let index_result = delimited(
+            multispace0,
+            tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
+            multispace0
+        ).parse(current_input);
+        
+        match index_result {
+            Ok((after_index, (_, index_expr, _))) => {
+                left = Expression::ArrayIndex {
+                    expr: Box::new(left),
+                    index: Box::new(index_expr),
+                };
+                current_input = after_index;
+            }
+            Err(_) => break,
+        }
     }
-    Ok((input, res))
+
+    // Postfix: Handle IS NULL / IS NOT NULL
+    if let Ok((after_null, op)) = parse_null_operator(current_input) {
+        left = match op {
+            UnaryOp::IsNull => Expression::IsNull(Box::new(left)),
+            UnaryOp::IsNotNull => Expression::IsNotNull(Box::new(left)),
+            _ => Expression::Unary { op, expr: Box::new(left) },
+        };
+        current_input = after_null;
+    }
+
+    Ok((current_input, left))
 }
 
 pub fn parse_with(input: &str) -> IResult<&str, WithClause> {
@@ -5488,65 +5659,6 @@ pub fn parse_with_full(input: &str) -> IResult<&str, ParsedWithClause> {
         skip: skip_val,
         limit: limit_val,
     }))
-}
-
-fn parse_atom(input: &str) -> IResult<&str, Expression> {
-    alt((
-        delimited(
-            char('('),
-            delimited(multispace0, parse_expression, multispace0),
-            char(')')
-        ),
-        map(
-            tuple((
-                parse_identifier,
-                delimited(multispace0, char('('), multispace0),
-                separated_list0(
-                    delimited(multispace0, char(','), multispace0),
-                    parse_expression
-                ),
-                delimited(multispace0, char(')'), multispace0),
-            )),
-            |(name, _, args, _)| Expression::FunctionCall {
-                name: name.to_string(),
-                args,
-            }
-        ),
-        map(
-            tuple((parse_identifier, char('.'), parse_identifier)),
-            |(var, _, prop)| Expression::Property(
-                PropertyAccess::Vertex(var.to_string(), prop.to_string())
-            )
-        ),
-        map(
-            parse_value, 
-            |v| Expression::Literal(CypherValue::from_json(v))
-        ),
-        map(
-            parse_identifier, 
-            |v| Expression::Variable(v.to_string())
-        ),
-    )).parse(input)
-}
-
-fn parse_and_term(input: &str) -> IResult<&str, Expression> {
-    println!("===> parse_and_term START");
-    let (input, mut expressions) = separated_list1(
-        delimited(multispace0, tag_no_case("AND"), multispace0),
-        parse_where_expression
-    ).parse(input)?;
-
-    let res = if expressions.len() == 1 {
-        expressions.remove(0)
-    } else {
-        let mut iter = expressions.into_iter();
-        let first = iter.next().unwrap();
-        iter.fold(first, |acc, next| Expression::And {
-            left: Box::new(acc),
-            right: Box::new(next),
-        })
-    };
-    Ok((input, res))
 }
 
 /// Find keyword position ensuring word boundaries
@@ -5802,46 +5914,41 @@ fn extract_identifier_before_keyword<'a>(text: &'a str, keywords: &[&str]) -> &'
     }
 }
 
-/// Level 3: Comparisons (=, <>, etc.)
-fn parse_comparison_expression(input: &str) -> IResult<&str, CypherExpression> {
-    println!("===> parse_comparison_expression START");
-    let (input, left) = parse_property_or_terminal(input)?;
-    
-    let (input, op_match) = opt(pair(
-        delimited(
-            multispace0, 
-            alt((
-                tag_no_case("IN"), // <--- Add IN here
-                tag("=~"), // <--- ADD THIS
-                tag("="), tag("!="), tag("<>"), 
-                tag("<="), tag(">="), tag("<"), tag(">")
-            )), 
-            multispace0
-        ),
-        // Allow the right side to be a list literal OR a terminal
-        alt((parse_list_literal, parse_property_or_terminal))
-    )).parse(input)?;
-
-    if let Some((op, right)) = op_match {
-        Ok((input, CypherExpression::BinaryOp {
-            left: Box::new(convert_expression_to_cypher(left)),
-            op: op.to_string(),
-            right: Box::new(convert_expression_to_cypher(right)),
-        }))
-    } else {
-        Ok((input, convert_expression_to_cypher(left)))
-    }
-}
-
 // Helper function to convert Expression to CypherExpression
 fn convert_expression_to_cypher(expr: Expression) -> CypherExpression {
-    println!("===> convert_expression_to_cypher START");
     match expr {
         Expression::Property(PropertyAccess::Vertex(var, prop)) => {
             CypherExpression::PropertyLookup { var, prop }
         },
         Expression::Literal(v) => CypherExpression::Literal(cypher_value_to_value(v)),
         Expression::Variable(v) => CypherExpression::Variable(v),
+        
+        // --- FIXED: Use UnaryOp Enum instead of String ---
+        Expression::Not(inner_expr) => {
+            CypherExpression::UnaryOp {
+                op: UnaryOp::Not, 
+                expr: Box::new(convert_expression_to_cypher(*inner_expr)),
+            }
+        },
+        Expression::IsNull(inner_expr) => {
+            CypherExpression::UnaryOp {
+                op: UnaryOp::IsNull,
+                expr: Box::new(convert_expression_to_cypher(*inner_expr)),
+            }
+        },
+        Expression::IsNotNull(inner_expr) => {
+            CypherExpression::UnaryOp {
+                op: UnaryOp::IsNotNull,
+                expr: Box::new(convert_expression_to_cypher(*inner_expr)),
+            }
+        },
+        Expression::Unary { op, expr: inner_expr } => {
+            CypherExpression::UnaryOp {
+                op, // op is already a UnaryOp enum here
+                expr: Box::new(convert_expression_to_cypher(*inner_expr)),
+            }
+        },
+
         Expression::FunctionCall { name, args } => {
             CypherExpression::FunctionCall { 
                 name, 
@@ -5851,7 +5958,7 @@ fn convert_expression_to_cypher(expr: Expression) -> CypherExpression {
         Expression::And { left, right } => {
             CypherExpression::BinaryOp {
                 left: Box::new(convert_expression_to_cypher(*left)),
-                op: "AND".to_string(),
+                op: "AND".to_string(), // BinaryOp variant uses String in your definition
                 right: Box::new(convert_expression_to_cypher(*right)),
             }
         },
@@ -5862,9 +5969,13 @@ fn convert_expression_to_cypher(expr: Expression) -> CypherExpression {
                 right: Box::new(convert_expression_to_cypher(*right)),
             }
         },
-        _ => CypherExpression::Variable("unknown".to_string()),
+        _ => {
+            // Log the actual variant for debugging your MPI event graph
+            CypherExpression::Variable("unknown".to_string())
+        },
     }
 }
+
 
 // Helper function to convert CypherValue to Value
 fn cypher_value_to_value(cv: CypherValue) -> Value {
@@ -6196,7 +6307,8 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
         return Ok((remaining, expr));
     }
 
-    // 3. Label Predicate check: (e:IdentityEvent)
+    // 3. Label Predicate check: e:IdentityEvent (with optional parentheses)
+    // Try with parentheses first: (e:IdentityEvent)
     if let Ok((remaining, _)) = char::<&str, nom::error::Error<&str>>('(').parse(input) {
         if let Ok((remaining2, (var, _, label, _))) = tuple((
             parse_identifier,
@@ -6209,6 +6321,19 @@ pub fn parse_where_expression(input: &str) -> IResult<&str, Expression> {
                 label: label.to_string(),
             }));
         }
+    }
+    
+    // Try without parentheses: e:IdentityEvent
+    if let Ok((remaining, (var, _, label))) = tuple((
+        parse_identifier,
+        char(':'),
+        parse_identifier,
+    )).parse(input) {
+        println!("===> Found label predicate: {}:{}", var, label);
+        return Ok((remaining, Expression::LabelPredicate {
+            variable: var.to_string(),
+            label: label.to_string(),
+        }));
     }
 
     // 4. Function calls with array indexing like labels(e)[0] = 'Value'
@@ -6743,14 +6868,10 @@ fn parse_unwind_clause(input: &str) -> IResult<&str, CypherQuery> {
 }
 
 fn parse_where_clause(input: &str) -> IResult<&str, Expression> {
-    println!("===> parse_where_clause START"); 
     let (input, _) = tag_no_case("WHERE").parse(input)?;
     let (input, _) = multispace1.parse(input)?;
-    
-    // Instead of take_while1, use the expression parser
-    let (input, expression) = parse_expression(input)?;
-    
-    Ok((input, expression))
+    // Call the OR level (the bottom of the precedence chain)
+    parse_logical_expression(input) 
 }
 
 // Fix parse_return_clause_as_struct to handle empty/incomplete RETURN
@@ -7363,13 +7484,23 @@ fn extract_filters_from_expression(
     var_name: &str,
     filters: &mut HashMap<String, PropertyValue>,
 ) {
-    println!("===> extract_filters_from_expressio START");
+    println!("===> extract_filters_from_expression START");
     match expr {
+        // --- Added NOT Variant ---
+        Expression::Not(inner_expr) => {
+            // Usually, we recurse. Note: If this is for an index lookup, 
+            // you might need a separate 'excluded_filters' map, 
+            // as 'NOT property = value' cannot be a direct equality filter.
+            extract_filters_from_expression(inner_expr, var_name, filters);
+        }
+
         Expression::And { left, right } => {
             extract_filters_from_expression(left, var_name, filters);
             extract_filters_from_expression(right, var_name, filters);
         }
         Expression::Or { left, right } => {
+            // Caution: In many query optimizers, OR filters cannot be 
+            // merged into a single HashMap because they aren't intersection-based.
             extract_filters_from_expression(left, var_name, filters);
             extract_filters_from_expression(right, var_name, filters);
         }
@@ -7415,7 +7546,6 @@ fn extract_filters_from_expression(
                 }
             }
         }
-        // ✅ Handle STARTS WITH
         Expression::StartsWith {
             variable,
             property,
@@ -7450,7 +7580,7 @@ fn extract_filters_for_var(
     where_clause: &Option<WhereClause>,
     var_name: &str,
 ) -> HashMap<String, PropertyValue> {
-    println!("===> extract_filters_for_var START");
+    println!("===> extract_filters_for_var START for variable: {}", var_name);
     let mut filters = HashMap::new();
 
     if let Some(WhereClause { condition }) = where_clause {
@@ -7458,26 +7588,62 @@ fn extract_filters_for_var(
         
         while let Some(expr) = queue.pop() {
             match expr {
-                // Traverse AND trees to find all equalities
+                // 1. Traverse Logical Trees
                 Expression::And { left, right } => {
                     queue.push(left);
                     queue.push(right);
                 }
-                // Match n.id = 'value' using Eq and Property variants
+                Expression::Or { left, right } => {
+                    queue.push(left);
+                    queue.push(right);
+                }
+                Expression::Not(inner) => {
+                    queue.push(inner);
+                }
+
+                // 2. Specialized Label Predicates (e:IdentityEvent)
+                Expression::LabelPredicate { variable, label } => {
+                    if variable == var_name {
+                        filters.insert("label".to_string(), PropertyValue::String(label.clone()));
+                    }
+                }
+
+                // 3. Optimized Property Comparisons (e.id = 'value')
+                Expression::PropertyComparison {
+                    variable,
+                    property,
+                    operator,
+                    value,
+                } => {
+                    if variable == var_name && (operator == "=" || operator == "==") {
+                        if let Ok(prop_val) = to_property_value(value.clone()) {
+                            filters.insert(property.clone(), prop_val);
+                        }
+                    }
+                }
+
+                // 4. Fallback Binary Equality (n.id = 'value')
                 Expression::Binary {
                     left,
-                    op: BinaryOp::Eq, // Matches BinaryOp::Eq in query_types.rs
+                    op: BinaryOp::Eq,
                     right,
                 } => {
                     if let Expression::Property(PropertyAccess::Vertex(var, prop)) = left.as_ref() {
                         if var == var_name {
                             if let Expression::Literal(cypher_val) = right.as_ref() {
-                                // Uses PropertyValue::from(CypherValue) implementation
                                 filters.insert(prop.clone(), PropertyValue::from(cypher_val.clone()));
                             }
                         }
                     }
                 }
+                
+                // 5. STARTS WITH (Optional: include if you want prefix-based filtering)
+                Expression::StartsWith { variable, property, prefix } => {
+                    if variable == var_name {
+                        filters.insert(property.clone(), PropertyValue::String(prefix.clone()));
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -10000,40 +10166,87 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
 /// Helper to compare CypherValues with an operator
 fn compare_values(left: &CypherValue, op: &str, right: &CypherValue) -> bool {
     match (left, op, right) {
-        // Integer comparisons
+        // --- Regex Comparison ---
+        (l, "=~", r) => {
+            let val_str = format_val(l);
+            let pattern = format_val(r);
+            // Compile regex and check for match
+            match Regex::new(&pattern) {
+                Ok(re) => re.is_match(&val_str),
+                Err(e) => {
+                    println!("===> Invalid Regex Pattern '{}': {}", pattern, e);
+                    false
+                }
+            }
+        },
+
+        // --- String Search Operators ---
+        (l, "CONTAINS", r) => {
+            let ls = format_val(l);
+            let rs = format_val(r);
+            ls.contains(&rs)
+        },
+        (l, "STARTS WITH", r) => {
+            format_val(l).starts_with(&format_val(r))
+        },
+        (l, "ENDS WITH", r) => {
+            format_val(l).ends_with(&format_val(r))
+        },
+
+        // --- Integer vs Integer ---
         (CypherValue::Integer(a), "<", CypherValue::Integer(b)) => a < b,
         (CypherValue::Integer(a), "<=", CypherValue::Integer(b)) => a <= b,
         (CypherValue::Integer(a), ">", CypherValue::Integer(b)) => a > b,
         (CypherValue::Integer(a), ">=", CypherValue::Integer(b)) => a >= b,
         (CypherValue::Integer(a), "=", CypherValue::Integer(b)) => a == b,
         (CypherValue::Integer(a), "!=", CypherValue::Integer(b)) => a != b,
-        
-        // Float comparisons
+
+        // --- Float vs Float ---
         (CypherValue::Float(a), "<", CypherValue::Float(b)) => a < b,
         (CypherValue::Float(a), "<=", CypherValue::Float(b)) => a <= b,
         (CypherValue::Float(a), ">", CypherValue::Float(b)) => a > b,
         (CypherValue::Float(a), ">=", CypherValue::Float(b)) => a >= b,
         (CypherValue::Float(a), "=", CypherValue::Float(b)) => (a - b).abs() < f64::EPSILON,
         (CypherValue::Float(a), "!=", CypherValue::Float(b)) => (a - b).abs() >= f64::EPSILON,
-        
-        // Mixed numeric comparisons
+
+        // --- Mixed Numeric: Integer vs Float ---
         (CypherValue::Integer(a), "<", CypherValue::Float(b)) => (*a as f64) < *b,
-        (CypherValue::Float(a), "<", CypherValue::Integer(b)) => *a < (*b as f64),
         (CypherValue::Integer(a), "<=", CypherValue::Float(b)) => (*a as f64) <= *b,
-        (CypherValue::Float(a), "<=", CypherValue::Integer(b)) => *a <= (*b as f64),
         (CypherValue::Integer(a), ">", CypherValue::Float(b)) => (*a as f64) > *b,
-        (CypherValue::Float(a), ">", CypherValue::Integer(b)) => *a > (*b as f64),
         (CypherValue::Integer(a), ">=", CypherValue::Float(b)) => (*a as f64) >= *b,
+        (CypherValue::Integer(a), "=", CypherValue::Float(b)) => (*a as f64 - *b).abs() < f64::EPSILON,
+        (CypherValue::Integer(a), "!=", CypherValue::Float(b)) => (*a as f64 - *b).abs() >= f64::EPSILON,
+
+        // --- Mixed Numeric: Float vs Integer ---
+        (CypherValue::Float(a), "<", CypherValue::Integer(b)) => *a < (*b as f64),
+        (CypherValue::Float(a), "<=", CypherValue::Integer(b)) => *a <= (*b as f64),
+        (CypherValue::Float(a), ">", CypherValue::Integer(b)) => *a > (*b as f64),
         (CypherValue::Float(a), ">=", CypherValue::Integer(b)) => *a >= (*b as f64),
-        
-        // String comparisons
-        (CypherValue::String(a), "=", CypherValue::String(b)) => a == b,
-        (CypherValue::String(a), "!=", CypherValue::String(b)) => a != b,
-        
+        (CypherValue::Float(a), "=", CypherValue::Integer(b)) => (*a - *b as f64).abs() < f64::EPSILON,
+        (CypherValue::Float(a), "!=", CypherValue::Integer(b)) => (*a - *b as f64).abs() >= f64::EPSILON,
+
+        // --- Equality/Inequality Catch-all ---
+        (l, "=", r) => format_val(l) == format_val(r),
+        (l, "!=", r) => format_val(l) != format_val(r),
+
+        // --- Failure Log ---
         _ => {
             println!("===> Unsupported comparison: {:?} {} {:?}", left, op, right);
             false
         }
+    }
+}
+
+/// Helper to extract string representation for coercion
+fn format_val(val: &CypherValue) -> String {
+    match val {
+        CypherValue::String(s) => s.clone(),
+        CypherValue::Uuid(u) => u.to_string(),
+        CypherValue::Integer(i) => i.to_string(),
+        CypherValue::Float(f) => f.to_string(),
+        CypherValue::Bool(b) => b.to_string(),
+        CypherValue::Null => "".to_string(),
+        _ => format!("{:?}", val), 
     }
 }
 
