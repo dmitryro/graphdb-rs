@@ -2,6 +2,7 @@
 
 pub mod clinical_encounters;
 pub mod clinical_notes;
+pub mod diagnostics;
 pub mod drug_interaction_knowledge;
 pub mod fhir;
 pub mod hl7;
@@ -13,6 +14,7 @@ pub mod from_vertex;
 
 pub use clinical_encounters::*;
 pub use clinical_notes::*;
+pub use diagnostics::*;
 pub use drug_interaction_knowledge::*;
 pub use fhir::*;
 pub use hl7::*;
