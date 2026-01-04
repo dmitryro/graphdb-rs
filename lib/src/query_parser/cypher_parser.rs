@@ -1023,6 +1023,60 @@ fn parse_property_pattern(input: &str) -> IResult<&str, Vec<String>> {
     Ok((input, props))
 }
 
+// Parse Complex Mutation
+pub fn parse_complex_mutation(input: &str) -> IResult<&str, CypherQuery> {
+    // 1. Parse all MATCH clauses
+    // If parse_match_clause returns the patterns directly, match_clauses is Vec<Vec<Pattern>>
+    let (input, match_clauses) = many1(parse_match_clause).parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+
+    let mut all_match_patterns = Vec::new();
+    
+    for m in match_clauses {
+        // 'm' is already the Vec of patterns according to the error message.
+        // We just extend our flat list with it.
+        all_match_patterns.extend(m); 
+    }
+
+    // 2. Decide final action
+    let trimmed = input.trim_start().to_uppercase();
+    
+    if trimmed.starts_with("MERGE") {
+        let (input, merge_query) = parse_merge_statement(input)?;
+        
+        if let CypherQuery::Merge { 
+            patterns: action_patterns, 
+            where_clause, 
+            with_clause, 
+            on_create_set, 
+            on_match_set, 
+            .. 
+        } = merge_query {
+            let mut combined = all_match_patterns;
+            combined.extend(action_patterns);
+            
+            Ok((input, CypherQuery::Merge {
+                patterns: combined,
+                where_clause,
+                with_clause,
+                on_create_set,
+                on_match_set,
+                return_clause: None, 
+            }))
+        } else {
+            Ok((input, merge_query))
+        }
+    } else {
+        let (input, create_patterns) = parse_create_clause(input)?;
+        
+        Ok((input, CypherQuery::MatchCreate {
+            match_patterns: all_match_patterns,
+            where_clause: None,
+            with_clause: None,
+            create_patterns,
+        }))
+    }
+}
 
 // ============================================================================
 // WHERE CLAUSE PARSING - Enhanced
@@ -3950,10 +4004,14 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
             .map_err(|e| format!("MATCH-DETACH-DELETE parse error: {:?}", e));
     }
 
-    // --- CRITICAL LOOKAHEAD: Identify RETURN statements early ---
+    // --- CRITICAL LOOKAHEAD: Identify Keywords ---
     let has_return = upper.contains("RETURN");
     let has_create = upper.contains("CREATE");
     let has_merge = upper.contains("MERGE");
+    
+    // Define MATCH counts (Fixes E0425)
+    let match_count = upper.matches("MATCH").count();
+    let has_multiple_match = match_count > 1;
 
     // 2. Sequential/Chained statements (MPI Logic)
     let has_union = upper.contains("UNION");
@@ -3970,8 +4028,18 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
     }
 
+    // Fixed: has_multiple_match is now defined
+    if (has_multiple_match || upper.starts_with("MATCH")) && has_create {
+        // Try the full_statement_parser first - it's designed to aggregate 
+        // multiple MATCHes and a CREATE into a single MatchCreate struct
+        if let Ok((remainder, query)) = full_statement_parser(trimmed) {
+            if remainder.trim().is_empty() {
+                return Ok(query);
+            }
+        }
+    }
+
     // 3. EXPLICIT LOOKAHEAD FIX: If query has RETURN, prioritize full_statement_parser
-    // This prevents MATCH...RETURN from being swallowed by parse_match_create_relationship
     if (upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH")) && has_return {
         if let Ok((remainder, query)) = full_statement_parser(trimmed) {
             if remainder.trim().is_empty() {
@@ -4000,22 +4068,24 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
             .map(|(remainder, query)| {
                 let remainder_trimmed = remainder.trim();
                 if !remainder_trimmed.is_empty() {
+                    // Fix: Return internal Result within the map
                     Err(format!("MERGE statement parsed partially. Remainder: '{}'", remainder_trimmed))
                 } else {
                     Ok(query)
                 }
             })
-            .map_err(|e| format!("MERGE parse error: {:?}", e))?;
+            .map_err(|e| format!("MERGE parse error: {:?}", e))
+            .and_then(|res| res); // Flatten the Result<Result<...>>
     }
 
     // 7. Single CREATE (no relationships)
     if upper.starts_with("CREATE") && !upper.contains("-[") {
         let create_parsers: Vec<Box<dyn Fn(&str) -> IResult<&str, CypherQuery>>> = vec![
-            Box::new(|i| parse_create_node(i)),
-            Box::new(|i| parse_create_nodes(i)),
-            Box::new(|i| parse_create_edge(i)),
-            Box::new(|i| parse_create_edge_between_existing(i)),
-            Box::new(|i| parse_create_complex_pattern(i)),
+            Box::new(parse_create_node),
+            Box::new(parse_create_nodes),
+            Box::new(parse_create_edge),
+            Box::new(parse_create_edge_between_existing),
+            Box::new(parse_create_complex_pattern),
         ];
         for parser in create_parsers {
             if let Ok((remainder, query)) = parser(trimmed) {
@@ -4044,16 +4114,16 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
     
     // 10. Final Fallback list
     let parsers: Vec<Box<dyn Fn(&str) -> IResult<&str, CypherQuery>>> = vec![
-        Box::new(|i| parse_create_statement(i)),
-        Box::new(|i| parse_delete_edges_simple(i)),
-        Box::new(|i| parse_match_create_relationship(i)),
-        Box::new(|i| parse_detach_delete(i)),
-        Box::new(|i| parse_create_index(i)),
-        Box::new(|i| parse_set_node(i)),
-        Box::new(|i| parse_delete_node(i)),
-        Box::new(|i| parse_set_kv(i)),
-        Box::new(|i| parse_get_kv(i)),
-        Box::new(|i| parse_delete_kv(i)),
+        Box::new(parse_create_statement),
+        Box::new(parse_delete_edges_simple),
+        Box::new(parse_match_create_relationship),
+        Box::new(parse_detach_delete),
+        Box::new(parse_create_index),
+        Box::new(parse_set_node),
+        Box::new(parse_delete_node),
+        Box::new(parse_set_kv),
+        Box::new(parse_get_kv),
+        Box::new(parse_delete_kv),
     ];
     
     for parser in parsers {
@@ -8076,19 +8146,24 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     })
                 });
 
+                // FIX: Clone match_patterns because resolve_match_patterns takes ownership (Vec<Pattern>)
+                // This allows the original match_patterns to be used for the is_empty() check below.
                 let matched_bindings = resolve_match_patterns(
                     &*graph_service,
-                    match_patterns,
+                    match_patterns.clone(),
                     &where_clause,
                     &compat_with_clause,
                 ).await?;
 
-                let mut should_proceed = true;
+                // Logic: Proceed if we found matches OR if there were no match patterns to begin with (pure CREATE)
+                let mut should_proceed = !matched_bindings.is_empty() || match_patterns.is_empty();
                 let ctx = EvaluationContext::from_uuid_bindings(&matched_bindings);
 
-                if let Some(wc) = &where_clause {
-                    if !wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false) {
-                        should_proceed = false;
+                if should_proceed {
+                    if let Some(wc) = &where_clause {
+                        if !wc.condition.evaluate(&ctx).map(|v| v.as_bool()).unwrap_or(false) {
+                            should_proceed = false;
+                        }
                     }
                 }
 
@@ -8145,6 +8220,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             let to_id = *var_to_id.get(&to_var)
                                 .ok_or_else(|| GraphError::ValidationError(to_var))?;
 
+                            // FIX: Underscored unused variables (_rel_var, _len_range) to silence compiler warnings
                             let (_rel_var, rel_label_opt, _len_range, rel_properties, direction_opt) = rel_tuple;
                             let (outbound_id, inbound_id) = match direction_opt {
                                 Some(false) => (to_id, from_id),
@@ -8916,27 +8992,40 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             }));
                         }
 
-
-                        // ================================================================
-                        // MATCH CREATE in Chain
-                        // ================================================================
-                        CypherQuery::MatchCreate { match_patterns, create_patterns, where_clause, .. } => {
+                        // ============================================================================
+                        // MATCH CREATE in Chain - Leverage Global Context for MPI Traceability
+                        // ============================================================================
+                        CypherQuery::MatchCreate { 
+                            match_patterns, 
+                            create_patterns, 
+                            where_clause, 
+                            .. 
+                        } => {
                             println!("===> Executing MATCH CREATE in Chain (clause {})", idx + 1);
                             
-                            let transformed_match_patterns: Vec<_> = match_patterns.iter().map(|(id, nodes, edges)| {
-                                let transformed_nodes: Vec<_> = nodes.iter().map(|(var, labels, props)| {
+                            // 1. Get existing bindings from global context to maintain MPI context
+                            let current_bindings = {
+                                let ctx = global_context.read().await;
+                                ctx.vertex_bindings.clone()
+                            };
+
+                            // 2. Prepare Match Patterns
+                            let transformed_match: Vec<_> = match_patterns.iter().map(|(_id, nodes, edges)| {
+                                let nodes: Vec<_> = nodes.iter().map(|(var, labels, props)| {
                                     (var.clone(), labels.first().cloned(), props.clone())
                                 }).collect();
-                                (id.clone(), transformed_nodes, edges.clone())
+                                (None, nodes, edges.clone()) // path_var is None for internal matching
                             }).collect();
 
+                            // 3. Execute MATCH part
                             let (v_match, e_match) = exec_cypher_pattern(
-                                transformed_match_patterns, 
+                                transformed_match, 
                                 &graph_service
                             ).await?;
 
                             let mut filtered_vertices = v_match;
 
+                            // 4. Apply WHERE filtering
                             if let Some(wc) = where_clause {
                                 filtered_vertices.retain(|v| {
                                     let var_ref = match_patterns.get(0)
@@ -8950,69 +9039,54 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                 });
                             }
 
+                            // 5. Update Global Context with Match results before CREATE
                             {
                                 let mut ctx = global_context.write().await;
-                                ctx.current_vertices.extend(filtered_vertices.clone());
-                                ctx.current_edges.extend(e_match);
-
-                                let mut match_node_idx = 0;
+                                ctx.current_vertices = filtered_vertices.clone();
+                                ctx.current_edges = e_match.clone();
+                                
                                 for pattern in match_patterns.iter() {
+                                    for (n_idx, node) in pattern.1.iter().enumerate() {
+                                        if let (Some(var), Some(vertex)) = (&node.0, filtered_vertices.get(n_idx)) {
+                                            ctx.vertex_bindings.entry(var.clone()).or_default().insert(vertex.id.0);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 6. Execute CREATE part using the context-aware service method
+                            // Matches the method name: execute_create_query_with_context
+                            let create_result = graph_service.execute_create_query_with_context(
+                                create_patterns.clone(),
+                                Some(current_bindings) 
+                            ).await?;
+
+                            final_execution_result.extend(create_result.clone());
+
+                            // 7. Final Context Refresh: Bind newly created nodes
+                            {
+                                let mut ctx_write = global_context.write().await;
+                                
+                                // Convert HashSet to Vec to allow indexed access matching the create_patterns loop
+                                let created_ids_vec: Vec<Uuid> = create_result.created_nodes.iter().cloned().collect();
+                                let mut create_node_idx = 0;
+
+                                for pattern in create_patterns.iter() {
                                     for node in &pattern.1 {
-                                        if let Some(var) = node.0.clone() {
-                                            if let Some(vertex) = filtered_vertices.get(match_node_idx) {
-                                                ctx.vertex_bindings
-                                                    .entry(var)
-                                                    .or_default()
-                                                    .insert(vertex.id.0);
+                                        if let Some(var) = &node.0 {
+                                            if let Some(new_id) = created_ids_vec.get(create_node_idx) {
+                                                // Correctly update the HashSet for this variable
+                                                ctx_write.vertex_bindings
+                                                    .entry(var.clone())
+                                                    .or_insert_with(std::collections::HashSet::new)
+                                                    .insert(*new_id);
                                             }
                                         }
-                                        match_node_idx += 1;
+                                        create_node_idx += 1;
                                     }
                                 }
-                            } 
-
-                            if !filtered_vertices.is_empty() {
-                                let mut initial_bindings = HashMap::new();
-                                {
-                                    let ctx = global_context.read().await;
-                                    for (var, ids) in &ctx.vertex_bindings {
-                                        if let Some(id) = ids.iter().next() {
-                                            initial_bindings.insert(var.clone(), json!(id.to_string()));
-                                        }
-                                    }
-                                }
-                                
-                                let create_result = graph_service.execute_create_patterns(
-                                    initial_bindings,
-                                    create_patterns.clone(),
-                                ).await?;
-                                
-                                final_execution_result.extend(create_result.clone());
-
-                                let all_vertices = graph_service.get_all_vertices().await
-                                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
-                                let new_vertices: Vec<Vertex> = all_vertices.into_iter()
-                                    .filter(|v| create_result.created_nodes.contains(&v.id.0))
-                                    .collect();
-
-                                let new_edges: Vec<Edge> = if !create_result.created_edges.is_empty() {
-                                    let all_edges = graph_service.get_all_edges().await
-                                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
-                                    all_edges.into_iter()
-                                        .filter(|e| create_result.created_edges.contains(&e.id.0))
-                                        .collect()
-                                } else {
-                                    Vec::new()
-                                };
-
-                                {
-                                    let mut ctx = global_context.write().await;
-                                    ctx.current_vertices.extend(new_vertices);
-                                    ctx.current_edges.extend(new_edges);
-                                } 
                             }
                         }
-
                         // ================================================================
                         // FIXED UNWIND in Chain
                         // ================================================================
@@ -9021,34 +9095,43 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             
                             let mut new_rows = Vec::new();
                             let ctx_snapshot = global_context.read().await;
-                            
-                            // We must iterate over the existing vertices to maintain "row" state
-                            for vertex in &ctx_snapshot.current_vertices {
-                                // Build eval context for the expression (e.g., keys(e))
-                                let mut eval_bindings = HashMap::new();
-                                // NOTE: You should ideally loop through ctx_snapshot.vertex_bindings 
-                                // to find which variable name maps to this vertex. 
-                                // For now, assuming "e" as per your snippet:
-                                eval_bindings.insert("e".to_string(), CypherValue::Vertex(vertex.clone()));
-                                
+
+                            // Use scalar_rows if they exist (from a previous UNWIND/MATCH), 
+                            // otherwise fallback to current_vertices (initial MATCH).
+                            let rows_to_process = if !ctx_snapshot.scalar_rows.is_empty() {
+                                ctx_snapshot.scalar_rows.clone()
+                            } else {
+                                // Convert vertices to a row-like format for consistency
+                                ctx_snapshot.current_vertices.iter().map(|v| {
+                                    let mut map = HashMap::new();
+                                    // We need to know the name assigned to these vertices (e.g., "p" or "e")
+                                    // This would ideally come from ctx_snapshot.vertex_bindings
+                                    map.insert("e".to_string(), CypherValue::Vertex(v.clone()));
+                                    map
+                                }).collect()
+                            };
+
+                            for row_bindings in rows_to_process {
                                 let eval_ctx = EvaluationContext {
-                                    variables: eval_bindings.clone(),
-                                    parameters: HashMap::new(),
+                                    variables: row_bindings.clone(),
+                                    parameters: HashMap::new(), // Pass global params here if available
                                 };
                                 
+                                // Evaluate the expression (e.g., keys(row.e) or a list parameter)
                                 if let Ok(CypherValue::List(items)) = expression.evaluate(&eval_ctx) {
                                     for item in items {
-                                        // IMPORTANT: Carry over the existing bindings and add the new variable
-                                        let mut row_with_new_var = eval_bindings.clone();
-                                        row_with_new_var.insert(variable.clone(), item);
-                                        new_rows.push(row_with_new_var);
+                                        let mut new_row = row_bindings.clone();
+                                        new_row.insert(variable.clone(), item);
+                                        
+                                        // Ensure we carry forward metadata for the "Graph of Events"
+                                        // e.g., if row_bindings has 'patient_id', it persists here.
+                                        new_rows.push(new_row);
                                     }
                                 }
                             }
                             
                             drop(ctx_snapshot);
                             let mut ctx_write = global_context.write().await;
-                            // Store as Vec<HashMap<String, CypherValue>> to match RETURN's expectations
                             ctx_write.scalar_rows = new_rows; 
                         }
 
