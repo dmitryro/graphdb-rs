@@ -4,7 +4,7 @@ use anyhow::Context; // Fixes E0599: no method named `context`
 use log::{debug, error, info, warn, trace};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while1, take_until, take_till, take_while,},
+    bytes::complete::{tag, tag_no_case, take_while1, take_until, take_till, take_while, take },
     character::complete::{char, alpha1, multispace0, multispace1, alphanumeric1, i64 as parse_i64, one_of, digit1},
     combinator::{map, cut, opt, recognize, value, map_res, verify, not,peek,}, 
     multi::{separated_list0, separated_list1, many0,}, 
@@ -163,8 +163,8 @@ fn is_at_keyword_boundary(input: &str) -> bool {
     }
     
     let upper = trimmed.to_uppercase();
-
-    // Existing checks
+    
+    // Check all keywords
     if upper.starts_with("WHERE")
         || upper.starts_with("RETURN")
         || upper.starts_with("CREATE")
@@ -180,6 +180,9 @@ fn is_at_keyword_boundary(input: &str) -> bool {
         || upper.starts_with("MERGE")
         || upper.starts_with("WITH")
         || upper.starts_with("AND")
+        || upper.starts_with("OR")
+        || upper.starts_with("AS")
+        || upper.starts_with("BY")
         || upper.starts_with("ON CREATE")
         || upper.starts_with("ON MATCH")
         || upper.starts_with("UNION ALL")
@@ -190,8 +193,8 @@ fn is_at_keyword_boundary(input: &str) -> bool {
     {
         return true;
     }
-
-    // NEW: stop if we see a closing ) followed by a keyword
+    
+    // Stop if we see a closing ) followed by a keyword
     if trimmed.starts_with(')') {
         let after_paren = trimmed[1..].trim_start().to_uppercase();
         if after_paren.starts_with("CREATE")
@@ -206,10 +209,9 @@ fn is_at_keyword_boundary(input: &str) -> bool {
             return true;
         }
     }
-
+    
     false
 }
-
 
 // FIXED: Consistent handling of delimiters and types for MPI transaction logging
 fn parse_property_map(input: &str) -> IResult<&str, Vec<(String, Literal)>> {
@@ -532,6 +534,24 @@ fn parse_single_pattern(input: &str) -> IResult<&str, Pattern> {
     let result_pattern = build_pattern_from_elements(all_nodes, all_relationships);
     
     Ok((current_input, result_pattern))
+}
+
+fn parse_return_item_expression(input: &str) -> IResult<&str, Expression> {
+    println!("===> parse_return_item_expression START, input length: {}", input.len());
+    
+    // First, try to parse an expression
+    let (remaining, expr) = parse_expression(input)?;
+    
+    // After parsing the expression, check if the next token is a RETURN clause keyword
+    let (remaining_trimmed, _) = multispace0.parse(remaining)?;
+    
+    // Check if we're at a keyword boundary that should terminate the return item
+    if is_at_keyword_boundary(remaining_trimmed) {
+        println!("===> parse_return_item_expression: stopped at keyword boundary");
+        return Ok((remaining, expr));
+    }
+    
+    Ok((remaining, expr))
 }
 
 fn parse_return_items(input: &str) -> IResult<&str, Vec<String>> {
@@ -5416,62 +5436,39 @@ pub fn parse_comparison_expression(input: &str) -> IResult<&str, Expression> {
 /// Handles identifiers, literals, function calls, and grouping.
 fn parse_atom(input: &str) -> IResult<&str, Expression> {
     let (mut current_input, mut left) = alt((
-        // Parenthesized expressions (Recursion)
-        delimited(
-            char('('),
-            delimited(multispace0, parse_expression, multispace0),
-            char(')')
-        ),
-        
-        // Complex Predicates (any, all, exists)
+        delimited(char('('), delimited(multispace0, parse_expression, multispace0), char(')')),
         parse_predicate_expression,
-        
-        // Function Calls with optional index access: labels(e)[0]
         parse_function_call_with_index,
         parse_function_call_full,
-        
-        // Dynamic Access: n["property_name"]
         parse_dynamic_property_access,
-        
-        // List Literals: [1, 2, 3]
         parse_list_literal,
-        
-        // Property Access: e.id
         map(
             tuple((parse_identifier, char('.'), parse_identifier)),
-            |(var, _, prop)| Expression::Property(
-                PropertyAccess::Vertex(var.to_string(), prop.to_string())
-            )
+            |(var, _, prop)| Expression::Property(PropertyAccess::Vertex(var.to_string(), prop.to_string()))
         ),
-        
-        // Literals: "string", 10, true, null
         map(parse_value, |v| Expression::Literal(CypherValue::from_json(v))),
-        
-        // Plain Variables: e
-        map(parse_identifier, |v| Expression::Variable(v.to_string())),
+        // FIX: Use verify to keep your boundary logic while satisfying lifetimes
+        map(
+            verify(parse_identifier, |id| !is_at_keyword_boundary(id)),
+            |v| Expression::Variable(v.to_string())
+        ),
     )).parse(input)?;
 
-    // Postfix: Handle array indexing (e.g., list[0])
+    // Keep your exact postfix logic below
     loop {
         let index_result = delimited(
             multispace0,
             tuple((char('['), delimited(multispace0, parse_expression, multispace0), char(']'))),
             multispace0
         ).parse(current_input);
-        
         match index_result {
             Ok((after_index, (_, index_expr, _))) => {
-                left = Expression::ArrayIndex {
-                    expr: Box::new(left),
-                    index: Box::new(index_expr),
-                };
+                left = Expression::ArrayIndex { expr: Box::new(left), index: Box::new(index_expr) };
                 current_input = after_index;
             }
             Err(_) => break,
         }
     }
-
-    // Postfix: Handle IS NULL / IS NOT NULL
     if let Ok((after_null, op)) = parse_null_operator(current_input) {
         left = match op {
             UnaryOp::IsNull => Expression::IsNull(Box::new(left)),
@@ -5480,7 +5477,6 @@ fn parse_atom(input: &str) -> IResult<&str, Expression> {
         };
         current_input = after_null;
     }
-
     Ok((current_input, left))
 }
 
@@ -6965,16 +6961,44 @@ pub fn parse_return_clause_as_struct(input: &str) -> IResult<&str, ReturnClause>
 }
 
 fn parse_single_return_item(input: &str) -> IResult<&str, ReturnItem> {
-    // Captures "expression AS alias" or just "expression"
-    let (input, expression) = take_while1(|c: char| c != ',' && !c.is_whitespace()).parse(input)?;
-    let (input, alias_opt) = opt(preceded(
-        tuple((multispace1, tag_no_case("AS"), multispace1)),
-        take_while1(|c: char| c != ',' && !c.is_whitespace())
-    )).parse(input)?;
+    println!("===> parse_single_return_item START, input: '{}'", &input[..input.len().min(50)]);
+    
+    // 1. Calculate the slice that actually belongs to this expression
+    let mut end_pos = 0;
+    let bytes = input.as_bytes();
+    while end_pos < bytes.len() {
+        let current_slice = &input[end_pos..];
+        
+        // Break on comma (next item)
+        if bytes[end_pos] == b',' { break; }
+        
+        // Break if we hit a keyword boundary (ORDER BY, LIMIT, etc.)
+        if bytes[end_pos].is_ascii_whitespace() && is_at_keyword_boundary(current_slice.trim_start()) {
+            break;
+        }
+        end_pos += 1;
+    }
 
-    Ok((input, ReturnItem {
-        expression: expression.trim().to_string(),
-        alias: alias_opt.map(|s| s.trim().to_string()),
+    let (remaining_after_expr, expr_raw) = take(end_pos)(input)?;
+    
+    // 2. Parse the expression from that specific slice only
+    // This prevents greedy consumption of keywords
+    let (_, expr_struct) = parse_expression(expr_raw.trim_end())?;
+    
+    // 3. Handle optional AS alias from the REMAINING input
+    let (remaining, _) = multispace0.parse(remaining_after_expr)?;
+    let (remaining, alias_opt) = opt(preceded(
+        tuple((tag_no_case("AS"), multispace1)),
+        parse_identifier
+    )).parse(remaining)?;
+    
+    let (remaining, _) = multispace0.parse(remaining)?;
+    
+    println!("===> parse_single_return_item parsed: expr='{}', alias={:?}", expr_raw.trim(), alias_opt);
+    
+    Ok((remaining, ReturnItem {
+        expression: expr_raw.trim().to_string(),
+        alias: alias_opt.map(|s| s.to_string()),
     }))
 }
 
@@ -10250,36 +10274,40 @@ fn format_val(val: &CypherValue) -> String {
     }
 }
 
-fn parse_order_by_items(input: &str) -> IResult<&str, Vec<OrderByItem>> {
-    use nom::{
-        combinator::map,
-        multi::separated_list1,
-        sequence::{preceded, tuple},
-        character::complete::{multispace0, multispace1},
-        Parser,
-    };
-
-    fn parse_order_direction(input: &str) -> IResult<&str, bool> {
-        alt((
-            map(tag_no_case("ASC"), |_| true),
-            map(tag_no_case("DESC"), |_| false),
-        )).parse(input)
-    }
-
-    let order_item = map(
-        pair(
-            parse_expression_string, // or parse_identifier for simple cases
-            opt(preceded(multispace1, parse_order_direction)),
-        ),
-        |(expr_str, direction)| OrderByItem {
-            expression: expr_str,
-            ascending: direction.unwrap_or(true),
-        }
-    );
-
+pub fn parse_order_by_items(input: &str) -> IResult<&str, Vec<OrderByItem>> {
     separated_list1(
-        preceded(multispace0, char(',')),
-        preceded(multispace0, order_item),
+        delimited(multispace0, char(','), multispace0),
+        |input| {
+            let (input, _) = multispace0.parse(input)?;
+            
+            let start = input;
+            
+            // Parse expression and track consumed input
+            let (input, _) = alt((
+                parse_function_call_full,
+                map(
+                    tuple((parse_identifier, char('.'), parse_identifier)),
+                    |_| Expression::Literal(CypherValue::Null)
+                ),
+                map(parse_identifier, |id| Expression::Variable(id.to_string())),
+            )).parse(input)?;
+            
+            let consumed = start.len() - input.len();
+            let expr_str = &start[..consumed];
+            
+            let (input, _) = multispace0.parse(input)?;
+            
+            // Parse ASC/DESC - make it optional since whitespace might not be present
+            let (input, direction) = opt(alt((
+                map(tag_no_case("ASC"), |_| true),
+                map(tag_no_case("DESC"), |_| false),
+            ))).parse(input)?;
+            
+            Ok((input, OrderByItem {
+                expression: expr_str.trim().to_string(),
+                ascending: direction.unwrap_or(true),
+            }))
+        }
     ).parse(input)
 }
 
