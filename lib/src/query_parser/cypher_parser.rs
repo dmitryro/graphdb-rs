@@ -3997,68 +3997,164 @@ fn parse_clause_with_symbol_table<'a>(
     input: &'a str, 
     symbol_table: &SymbolTable
 ) -> IResult<&'a str, (CypherQuery, SymbolTable)> {
-    // Parse the clause normally
-    let (remaining, clause) = parse_clause_non_recursive(input)?;
+    println!("===> parse_clause_with_symbol_table START, input: '{}'", &input[..input.len().min(50)]);
     
-    // Create updated symbol table based on clause type
-    let mut updated_symbols = symbol_table.clone();
+    let trimmed = input.trim();
+    let upper = trimmed.to_uppercase();
     
-    match &clause {
-        CypherQuery::Merge { patterns, .. } => {
-            // Extract variable names and assume they'll be bound to new UUIDs
-            for pattern in patterns {
-                // Handle node variables
-                for (var_name, _, _) in &pattern.1 {
-                    if let Some(var) = var_name {
-                        // If variable already exists in symbol table, keep existing binding
-                        // Otherwise, add placeholder for new variable
-                        if !updated_symbols.variables.contains_key(var) {
-                            updated_symbols.bind_variable(
-                                var.clone(), 
-                                SerializableUuid::default()
-                            );
-                        }
-                    }
-                }
-                // Handle relationship variables
-                for rel in &pattern.2 {
-                    if let Some(var_name) = &rel.0 {
-                        if !updated_symbols.relationships.contains_key(var_name) {
-                            updated_symbols.bind_relationship(
-                                var_name.clone(),
-                                SerializableUuid::default()
-                            );
-                        }
-                    }
-                }
+    // 1. Handle UNWIND (MUST be first to catch it before other parsers)
+    if upper.starts_with("UNWIND") {
+        println!("===> parse_clause_with_symbol_table: Trying UNWIND");
+        if let Ok((remainder, query)) = parse_unwind_clause(trimmed) {
+            let mut updated_symbols = symbol_table.clone();
+            if let CypherQuery::Unwind { ref variable, .. } = query {
+                updated_symbols.bind_variable(variable.clone(), SerializableUuid::default());
             }
+            return Ok((remainder, (query, updated_symbols)));
         }
-        CypherQuery::MatchPattern { patterns, with_clause, .. } => {
-            // Same logic for MATCH patterns
-            for pattern in patterns {
-                for (var_name, _, _) in &pattern.1 {
-                    if let Some(var) = var_name {
-                        if !updated_symbols.variables.contains_key(var) {
-                            updated_symbols.bind_variable(var.clone(), SerializableUuid::default());
-                        }
-                    }
-                }
-            }
-            // Handle WITH clause bindings
-            if let Some(with_data) = with_clause {
-                for item in &with_data.items {
-                    if let Some(alias) = &item.alias {
-                        if !updated_symbols.variables.contains_key(alias) {
-                            updated_symbols.bind_variable(alias.clone(), SerializableUuid::default());
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
     }
     
-    Ok((remaining, (clause, updated_symbols)))
+    // 2. Handle MERGE
+    if upper.starts_with("MERGE") {
+        println!("===> parse_clause_with_symbol_table: Trying MERGE");
+        if let Ok((remainder, clause)) = parse_merge(trimmed) {
+            let mut updated_symbols = symbol_table.clone();
+            
+            if let CypherQuery::Merge { patterns, .. } = &clause {
+                for pattern in patterns {
+                    for (var_name, _, _) in &pattern.1 {
+                        if let Some(var) = var_name {
+                            if !updated_symbols.variables.contains_key(var) {
+                                updated_symbols.bind_variable(var.clone(), SerializableUuid::default());
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return Ok((remainder, (clause, updated_symbols)));
+        }
+    }
+    
+    // 3. Handle MATCH / OPTIONAL MATCH
+    if upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH") {
+        println!("===> parse_clause_with_symbol_table: Trying MATCH");
+        
+        // Try full_statement_parser first for complete MATCH clauses
+        if let Ok((remainder, clause)) = full_statement_parser(trimmed) {
+            let mut updated_symbols = symbol_table.clone();
+            
+            match &clause {
+                CypherQuery::MatchPattern { patterns, with_clause, .. } 
+                | CypherQuery::MatchCreate { match_patterns: patterns, with_clause, .. }
+                | CypherQuery::MatchSet { match_patterns: patterns, with_clause, .. } => {
+                    for pattern in patterns {
+                        for (var_name, _, _) in &pattern.1 {
+                            if let Some(var) = var_name {
+                                if !updated_symbols.variables.contains_key(var) {
+                                    updated_symbols.bind_variable(var.clone(), SerializableUuid::default());
+                                }
+                            }
+                        }
+                        for rel in &pattern.2 {
+                            if let Some(var_name) = &rel.0 {
+                                if !updated_symbols.relationships.contains_key(var_name) {
+                                    updated_symbols.bind_relationship(var_name.clone(), SerializableUuid::default());
+                                }
+                            }
+                        }
+                    }
+                    
+                    if let Some(with_data) = with_clause {
+                        for item in &with_data.items {
+                            if let Some(alias) = &item.alias {
+                                if !updated_symbols.variables.contains_key(alias) {
+                                    updated_symbols.bind_variable(alias.clone(), SerializableUuid::default());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            
+            return Ok((remainder, (clause, updated_symbols)));
+        }
+    }
+    
+    // 4. Handle CREATE
+    if upper.starts_with("CREATE") {
+        println!("===> parse_clause_with_symbol_table: Trying CREATE");
+        if let Ok((remainder, query)) = parse_create_statement(trimmed) {
+            return Ok((remainder, (query, symbol_table.clone())));
+        }
+    }
+    
+    // 5. Handle SET
+    if upper.starts_with("SET") {
+        println!("===> parse_clause_with_symbol_table: Trying SET");
+        let (after_set, _) = tag_no_case::<_, _, nom::error::Error<&str>>("SET")(trimmed)?;
+        let (after_set, _) = multispace1(after_set)?;
+        
+        let (remainder, assignments) = separated_list1(
+            delimited(multispace0, char(','), multispace0),
+            parse_single_set_assignment
+        ).parse(after_set)?;
+        
+        let query = CypherQuery::SetStatement { assignments };
+        return Ok((remainder, (query, symbol_table.clone())));
+    }
+    
+    // 6. Handle REMOVE
+    if upper.starts_with("REMOVE") {
+        println!("===> parse_clause_with_symbol_table: Trying REMOVE");
+        let (after_remove, _) = tag_no_case::<_, _, nom::error::Error<&str>>("REMOVE")(trimmed)?;
+        let (after_remove, _) = multispace1(after_remove)?;
+        
+        let (remainder, removals) = separated_list1(
+            delimited(multispace0, char(','), multispace0),
+            parse_remove_clause
+        ).parse(after_remove)?;
+        
+        let query = CypherQuery::RemoveStatement { removals };
+        return Ok((remainder, (query, symbol_table.clone())));
+    }
+    
+    // 7. Handle RETURN
+    if upper.starts_with("RETURN") {
+        println!("===> parse_clause_with_symbol_table: Trying RETURN");
+        if let Ok((remainder, return_clause)) = parse_return_clause_as_struct(trimmed) {
+            let query = CypherQuery::ReturnStatement {
+                projection_string: format!("RETURN {}", 
+                    return_clause.items.iter().map(|item| item.expression.to_string()).collect::<Vec<_>>().join(", ")
+                ),
+                order_by: return_clause.order_by.unwrap_or_default()
+                    .into_iter()
+                    .map(|(expr, asc)| OrderByItem { expression: expr, ascending: asc })
+                    .collect(),
+                skip: return_clause.skip.map(|s| s as i64),
+                limit: return_clause.limit.map(|l| l as i64),
+            };
+            return Ok((remainder, (query, symbol_table.clone())));
+        }
+    }
+    
+    // 8. Handle WITH
+    if upper.starts_with("WITH") {
+        println!("===> parse_clause_with_symbol_table: Trying WITH");
+        if let Ok((remainder, with_clause)) = parse_with_full(trimmed) {
+            let query = CypherQuery::MatchPattern {
+                patterns: vec![],
+                where_clause: None,
+                with_clause: Some(with_clause),
+                return_clause: None,
+            };
+            return Ok((remainder, (query, symbol_table.clone())));
+        }
+    }
+    
+    println!("===> parse_clause_with_symbol_table: No match found");
+    Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
 }
 
 /// your **old** top-level logic, just moved into a helper
@@ -6982,20 +7078,23 @@ fn parse_union_clause(input: &str) -> IResult<&str, (bool, Box<CypherQuery>)> {
 
 /// Parses an UNWIND clause: UNWIND expression AS variable
 fn parse_unwind_clause(input: &str) -> IResult<&str, CypherQuery> {
-    println!("===> parse_unwind_clause START");
+    println!("===> parse_unwind_clause START, input: '{}'", &input[..input.len().min(50)]);
     
-    let (input, _) = tag_no_case("UNWIND").parse(input)?;
-    let (input, _) = multispace1.parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("UNWIND")(input)?;
+    let (input, _) = multispace1(input)?;
     
-    // Parse the expression to unwind (e.g., [1,2,3] or p.names)
+    // Parse the expression to unwind (e.g., [1,2,3] or keys(e))
     let (input, expression) = parse_expression(input)?;
     
-    let (input, _) = multispace1.parse(input)?;
-    let (input, _) = tag_no_case("AS").parse(input)?;
-    let (input, _) = multispace1.parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("AS")(input)?;
+    let (input, _) = multispace1(input)?;
     
     // Parse the variable name to bind each element to
     let (input, variable) = parse_identifier(input)?;
+    
+    println!("===> parse_unwind_clause END: variable='{}'", variable);
     
     Ok((input, CypherQuery::Unwind {
         expression,
