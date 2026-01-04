@@ -791,37 +791,57 @@ fn parse_multiple_nodes(input: &str) -> IResult<&str, Vec<NodePattern>> {
 }
 
 fn parse_relationship(input: &str) -> IResult<&str, RelPattern> {
-    println!("===> parse_relationsh START");
+    println!("===> parse_relationship START, input: '{}'", &input[..input.len().min(50)]);
+    
     type E<'a> = nom::error::Error<&'a str>;
     use nom::{branch::alt, combinator::map, Parser};
+    
+    let (input, _) = multispace0::<&str, E>.parse(input)?;
+    
+    // Try full relationship pattern first (with brackets): -[...]-> or <-[...]-
+    // Then try shorthand patterns: --> or -- or <--
+    alt((
+        parse_relationship_full,
+        parse_relationship_shorthand,
+    )).parse(input)
+}
 
-    // 1. Parse opening direction prefix
+fn parse_relationship_full(input: &str) -> IResult<&str, RelPattern> {
+    println!("===> parse_relationship_full START");
+    
+    type E<'a> = nom::error::Error<&'a str>;
+    use nom::Parser;
+    
+    // 1. Parse opening direction prefix: <-[ or -[
     let (input, has_left_arrow) = opt(tag::<_, _, E>("<")).parse(input)?;
     let (input, _) = tag::<_, _, E>("-[").parse(input)?;
     let (input, _) = multispace0::<&str, E>.parse(input)?;
-
+    
     // 2. Optional variable name
     let (input, var_opt) = opt(
         take_while1::<_, &str, E>(|c: char| c.is_alphanumeric() || c == '_')
     ).parse(input)?;
-
+    
+    let (input, _) = multispace0::<&str, E>.parse(input)?;
+    
     // 3. Optional Type (e.g., :TYPE)
     let (input, type_opt) = opt(preceded(
         char::<&str, E>(':'),
         take_while1::<_, &str, E>(|c: char| c.is_alphanumeric() || c == '_')
     )).parse(input)?;
-
+    
     // 4. Optional Variable Length (e.g., *1..3)
     let (input, range_opt) = opt(parse_range).parse(input)?;
-
+    
     // 5. Optional Properties {...}
-    let (input, _) = multispace0::<&str, E>.parse(input)?;  // ADD THIS LINE - consume whitespace before checking
-    let (input, props_vec) = if input.starts_with('{') {    // NOW check without trim_start()
+    let (input, _) = multispace0::<&str, E>.parse(input)?;
+    let (input, props_vec) = if input.starts_with('{') {
         let (next_input, raw_props) = parse_property_map(input)?;
         (next_input, raw_props)
     } else {
         (input, Vec::new())
     };
+    
     // 6. Convert Literal to serde_json::Value
     let props: HashMap<String, Value> = props_vec
         .into_iter()
@@ -841,11 +861,12 @@ fn parse_relationship(input: &str) -> IResult<&str, RelPattern> {
             (k, val)
         })
         .collect();
-
+    
     // 7. Parse closing ']'
+    let (input, _) = multispace0::<&str, E>.parse(input)?;
     let (input, _) = char::<&str, E>(']').parse(input)?;
     let (input, _) = multispace0::<&str, E>.parse(input)?;
-
+    
     // 8. Parse direction suffix (MUST come after ']')
     let (input, direction) = if has_left_arrow.is_some() {
         // Must be inbound: <-[...]-
@@ -858,12 +879,41 @@ fn parse_relationship(input: &str) -> IResult<&str, RelPattern> {
             map(tag("-"), |_| None),         // undirected
         )).parse(input)?
     };
-
+    
+    println!("===> parse_relationship_full END: var={:?}, type={:?}, direction={:?}", var_opt, type_opt, direction);
+    
     Ok((input, (
         var_opt.map(|s| s.to_string()),
         type_opt.map(|s| s.to_string()),
         range_opt,
         props,
+        direction,
+    )))
+}
+
+fn parse_relationship_shorthand(input: &str) -> IResult<&str, RelPattern> {
+    println!("===> parse_relationship_shorthand START");
+    
+    type E<'a> = nom::error::Error<&'a str>;
+    use nom::{branch::alt, combinator::map, Parser};
+    
+    let (input, _) = multispace0::<&str, E>.parse(input)?;
+    
+    // Parse shorthand patterns: --> or <-- or --
+    let (input, direction) = alt((
+        map(tag::<_, _, E>("-->"), |_| Some(true)),   // outbound
+        map(tag::<_, _, E>("<--"), |_| Some(false)),  // inbound
+        map(tag::<_, _, E>("--"), |_| None),          // undirected
+    )).parse(input)?;
+    
+    println!("===> parse_relationship_shorthand END: direction={:?}", direction);
+    
+    // Return empty relationship with just direction
+    Ok((input, (
+        None,                      // no variable
+        None,                      // no type
+        None,                      // no range
+        HashMap::new(),            // no properties
         direction,
     )))
 }
@@ -3272,6 +3322,32 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
     captured_with = with_clause_raw;
     input_current = input_after_with;
 
+    // === FIX START: Detect MERGE after WITH ===
+    // If we are currently in a MATCH but see a MERGE after a WITH, pivot the query type.
+    let (input_after_pivot, follow_up_merge) = opt(preceded(
+        multispace0,
+        tag_no_case("MERGE")
+    )).parse(input_current)?;
+
+    let mut is_merge = is_merge; // Make mutable
+    if follow_up_merge.is_some() {
+        is_merge = true; 
+        input_current = input_after_pivot;
+        
+        // We must parse the patterns belonging to the MERGE specifically
+        match parse_content_after_match_keyword(input_current) {
+            Ok((input_after_m_patterns, parsed_patterns)) => {
+                let converted = convert_parsed_patterns_to_execution_format(parsed_patterns);
+                // Append these to all_patterns so execute_merge_query_with_context 
+                // has the relationship patterns (e)-[r]->(p)
+                all_patterns.extend(converted);
+                input_current = input_after_m_patterns;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // === FIX END ===
+
     // --- 5. PARSE ON CLAUSES (MERGE only) ---
     if is_merge {
         loop {
@@ -4008,18 +4084,24 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
     let has_return = upper.contains("RETURN");
     let has_create = upper.contains("CREATE");
     let has_merge = upper.contains("MERGE");
-    
-    // Define MATCH counts (Fixes E0425)
-    let match_count = upper.matches("MATCH").count();
-    let has_multiple_match = match_count > 1;
-
-    // 2. Sequential/Chained statements (MPI Logic)
+    let has_with = upper.contains("WITH");
     let has_union = upper.contains("UNION");
-    let has_with = upper.contains("WITH"); 
+    
+    // Count occurrences
+    let match_count = upper.matches("MATCH").count();
     let merge_count = upper.matches("MERGE").count();
+    let has_multiple_match = match_count > 1;
     let has_multiple_merge = merge_count > 1;
 
-    if has_union || has_with || has_multiple_merge || (upper.starts_with("MATCH") && has_merge) { 
+    // 2. Sequential/Chained statements (MPI Logic)
+    // CRITICAL: Must handle MATCH...MATCH...WITH...MERGE...RETURN patterns
+    if has_union 
+        || has_with 
+        || has_multiple_merge 
+        || has_multiple_match
+        || (upper.starts_with("MATCH") && has_merge && has_with)
+        || (upper.starts_with("MATCH") && upper.contains("WITH") && upper.contains("ORDER BY"))
+    {
         let initial_symbols = SymbolTable::new();
         if let Ok((remainder, (query, _))) = parse_sequential_statements_with_context(trimmed, initial_symbols) {
             if remainder.trim().is_empty() {
@@ -4028,10 +4110,14 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
     }
 
-    // Fixed: has_multiple_match is now defined
-    if (has_multiple_match || upper.starts_with("MATCH")) && has_create {
-        // Try the full_statement_parser first - it's designed to aggregate 
-        // multiple MATCHes and a CREATE into a single MatchCreate struct
+    // 3. EXPLICIT LOOKAHEAD FIX: If query has RETURN but no complex patterns, prioritize full_statement_parser
+    // Only for simple MATCH...RETURN (no WITH, no MERGE, no multiple MATCH)
+    if (upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH")) 
+        && has_return 
+        && !has_with 
+        && !has_merge 
+        && !has_multiple_match 
+    {
         if let Ok((remainder, query)) = full_statement_parser(trimmed) {
             if remainder.trim().is_empty() {
                 return Ok(query);
@@ -4039,43 +4125,46 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
         }
     }
 
-    // 3. EXPLICIT LOOKAHEAD FIX: If query has RETURN, prioritize full_statement_parser
-    if (upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH")) && has_return {
-        if let Ok((remainder, query)) = full_statement_parser(trimmed) {
-            if remainder.trim().is_empty() {
-                return Ok(query);
-            }
-        }
-    }
-
-    // 4. MATCH ... CREATE ... SET (Only for simple single-pattern MATCH+CREATE)
-    if upper.starts_with("MATCH") && has_create && upper.contains("SET") {
+    // 4. MATCH ... CREATE ... SET (Only for simple single-pattern MATCH+CREATE without WITH)
+    if upper.starts_with("MATCH") 
+        && has_create 
+        && upper.contains("SET") 
+        && !has_with 
+        && !has_multiple_match 
+    {
         return parse_match_create_relationship(trimmed) 
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-CREATE-SET parse error: {:?}", e));
     }
     
-    // 5. MATCH ... CREATE (specific pattern)
-    if upper.starts_with("MATCH") && has_create {
+    // 5. MATCH ... CREATE (specific pattern, only simple cases without WITH)
+    if upper.starts_with("MATCH") 
+        && has_create 
+        && !has_with 
+        && !has_multiple_match 
+    {
         return parse_match_create_relationship(trimmed)
             .map(|(_, q)| q)
             .map_err(|e| format!("MATCH-CREATE parse error: {:?}", e));
     }
     
-    // 6. Single MERGE statement
-    if upper.starts_with("MERGE") && !has_multiple_merge {
+    // 6. Single MERGE statement (without WITH or multiple clauses)
+    if upper.starts_with("MERGE") 
+        && !has_multiple_merge 
+        && !has_with 
+        && !has_multiple_match 
+    {
         return parse_merge(trimmed)
             .map(|(remainder, query)| {
                 let remainder_trimmed = remainder.trim();
                 if !remainder_trimmed.is_empty() {
-                    // Fix: Return internal Result within the map
                     Err(format!("MERGE statement parsed partially. Remainder: '{}'", remainder_trimmed))
                 } else {
                     Ok(query)
                 }
             })
             .map_err(|e| format!("MERGE parse error: {:?}", e))
-            .and_then(|res| res); // Flatten the Result<Result<...>>
+            .and_then(|res| res);
     }
 
     // 7. Single CREATE (no relationships)
@@ -4103,8 +4192,11 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
             .map_err(|e| format!("Simple-statement parse error: {:?}", e));
     }
     
-    // 9. Fallback MATCH
-    if upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH") {
+    // 9. Fallback MATCH (only for simple cases without WITH/MERGE)
+    if (upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH")) 
+        && !has_with 
+        && !has_merge 
+    {
         if let Ok((remainder, query)) = full_statement_parser(trimmed) {
             if remainder.trim().is_empty() {
                 return Ok(query);
@@ -4116,7 +4208,6 @@ pub fn parse_single_statement(input: &str) -> Result<CypherQuery, String> {
     let parsers: Vec<Box<dyn Fn(&str) -> IResult<&str, CypherQuery>>> = vec![
         Box::new(parse_create_statement),
         Box::new(parse_delete_edges_simple),
-        Box::new(parse_match_create_relationship),
         Box::new(parse_detach_delete),
         Box::new(parse_create_index),
         Box::new(parse_set_node),
@@ -5148,27 +5239,6 @@ fn parse_optional_match_clause(input: &str) -> IResult<&str, Vec<Pattern>> {
         parse_pattern
     ).parse(input)?;
     Ok((input, patterns))
-}
-
-fn parse_relationship_full(input: &str) -> IResult<&str, RelPattern> {
-    println!("===> parse_relationship_full START, input length: {}, preview: '{}'", 
-             input.len(), &input[..input.len().min(100)]);
-    let (input, _) = multispace0.parse(input)?;
-    let (input, left_arrow) = opt(tag("<-")).parse(input)?;
-    let (input, _) = char('-').parse(input)?;
-    let (input, _) = multispace0.parse(input)?;
-    let (input, _) = char('[').parse(input)?;
-    let (input, detail) = parse_rel_detail(input)?;
-    let (input, _) = char(']').parse(input)?;
-    let (input, _) = multispace0.parse(input)?;
-    let (input, right_arrow) = opt(tag("->")).parse(input)?;
-    let direction = match (left_arrow, right_arrow) {
-        (Some(_), None) => Some(true),
-        (None, Some(_)) => Some(false),
-        (None, None) => None,
-        _ => return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Alt))),
-    };
-    Ok((input, (detail.0, detail.1, detail.2, detail.3, direction)))
 }
 
 // Parse patterns within a single MATCH clause, stopping at keyword boundaries
@@ -8443,7 +8513,8 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
             } => {
                 println!("===> Executing top-level MERGE");
                 
-                // Execute merge
+                // Execute merge with context to ensure MPI transactions are logged 
+                // and related to specific patient golden records.
                 let merge_result = graph_service.execute_merge_query_with_context(
                     patterns.clone(),
                     where_clause.clone(),
@@ -8496,11 +8567,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         }
                     }
 
-                    // Map variables to edges
+                    // Map variables to edges (crucial for relationship tracing)
                     for pattern in patterns.iter() {
                         for rel in &pattern.2 {
                             if let Some(rel_var) = &rel.0 {
-                                // Logic assumes the relationship matches the created edge
                                 if let Some(edge) = fetched_edges.first() {
                                     eval_bindings.insert(rel_var.clone(), CypherValue::Edge(edge.clone()));
                                 }
@@ -8508,6 +8578,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         }
                     }
 
+                    // Initialize result_row within the correct scope
                     let mut result_row = serde_json::Map::new();
                     for item in &ret.items {
                         let expr_str = &item.expression;
@@ -8535,7 +8606,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         }
                     }
 
-                    // RETURN STANDARD STRUCTURE - NO "results" wrapper
                     Ok(json!({
                         "vertices": vec![result_row],
                         "edges": fetched_edges,
