@@ -7505,41 +7505,37 @@ pub fn parse_with_clause(input: &str) -> IResult<&str, CypherQuery> {
 
 /// Resolves a node variable's ID by checking the storage engine for a matching 
 /// vertex based on its label and properties.
-
 async fn resolve_var(
     graph_service: &GraphService, 
     var: &str,
     label: &Option<String>,
-    properties: &HashMap<String, Value>,
+    properties: &HashMap<String, serde_json::Value>,
     where_clause: &Option<WhereClause>,
-    with_clause: &Option<WithClause>, // ← ADD THIS PARAMETER
-) -> GraphResult<SerializableUuid> {
+    with_clause: &Option<WithClause>,
+) -> GraphResult<Option<SerializableUuid>> {
     println!("===>        resolve_var: Looking for var='{}', label={:?}", var, label);
     
     let mut query_props: HashMap<String, PropertyValue> = HashMap::new();
     
-    // 1. Process inline properties from the MATCH pattern (e.g., {id: '123'})
+    // 1. Process inline properties from the MATCH pattern
     for (k, v) in properties.iter() {
         query_props.insert(k.clone(), to_property_value(v.clone())?);
     }
-
+    
     // 2. Extract filters from WHERE clause
     let where_filters = extract_filters_for_var(where_clause, var);
     for (k, v) in where_filters {
-        println!("===>        Merging WHERE filter for resolution: {} = {:?}", k, v);
         query_props.insert(k, v);
     }
-
-    // 3. ✅ CRITICAL: Extract filters from WITH clause (MPI identity logic)
+    
+    // 3. Extract filters from WITH clause (Critical for MPI context)
     let with_filters = extract_filters_for_var_from_with(with_clause, var);
     for (k, v) in with_filters {
-        println!("===>        Merging WITH filter for resolution: {} = {:?}", k, v);
         query_props.insert(k, v);
     }
     
-    println!("===>        Searching vertices with merged MPI constraints: {:?}", query_props);
+    println!("===>        Searching vertices with merged constraints: {:?}", query_props);
     
-    // Use direct DB access for full scan (as in your logs)
     println!("========================== USING DIRECT DB ACCESS TO GET ALL VERTICES ========================");
     let all_vertices = graph_service.get_all_vertices().await?;
     
@@ -7549,29 +7545,54 @@ async fn resolve_var(
             v.label.as_ref() == query_label.as_str()
         });
         
-        if !matches_label { 
-            return false; 
-        }
-
-        // Match merged Properties (Inline + WHERE + WITH)
+        if !matches_label { return false; }
+        
+        // Match merged Properties with Coercive Equality
         query_props.iter().all(|(k, expected_val)| {
-            v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
+            v.properties.get(k).map_or(false, |actual_val| {
+                // Try direct match (fast path)
+                if actual_val == expected_val {
+                    return true;
+                }
+                
+                // MPI Coercion: Handle cases where query is Integer but storage is String
+                match (expected_val, actual_val) {
+                    (PropertyValue::Integer(ev), PropertyValue::String(av)) => {
+                        av == &ev.to_string()
+                    },
+                    (PropertyValue::String(ev), PropertyValue::Integer(av)) => {
+                        ev == &av.to_string()
+                    },
+                    (PropertyValue::Uuid(ev), PropertyValue::String(av)) => {
+                        av == &ev.to_string()
+                    },
+                    (PropertyValue::String(ev), PropertyValue::Uuid(av)) => {
+                        ev == &av.to_string()
+                    },
+                    (PropertyValue::Integer(ev), PropertyValue::Float(av)) => {
+                        (*ev as f64 - av.0).abs() < f64::EPSILON
+                    },
+                    (PropertyValue::Float(ev), PropertyValue::Integer(av)) => {
+                        (ev.0 - *av as f64).abs() < f64::EPSILON
+                    },
+                    _ => false,
+                }
+            })
         })
     });
     
     match matched_vertex {
         Some(v) => {
             println!("===>        resolve_var: SUCCESS - Returning {}", v.id.0);
-            Ok(v.id)
+            Ok(Some(v.id))
         },
         None => {
-            Err(GraphError::ValidationError(format!(
-                "No node found for variable '{}' matching constraints: {:?}",
-                var, query_props
-            )))
+            println!("===>        resolve_var: No match found for '{}' - returning None (empty result)", var);
+            Ok(None)
         }
     }
 }
+
 
 fn extract_filters_from_expression(
     expr: &Expression,
@@ -7663,8 +7684,12 @@ fn extract_filters_for_var_from_with(
     let mut filters = HashMap::new();
     
     if let Some(wc) = with_clause {
-        // Use the same logic as for WHERE, but on wc.condition
-        extract_filters_from_expression(&wc.condition, var_name, &mut filters);
+        // Reuse extract_filters_for_var logic by wrapping WITH condition in a dummy WhereClause
+        let condition_filters = extract_filters_for_var(&Some(WhereClause { 
+            condition: wc.condition.clone() 
+        }), var_name);
+        
+        filters.extend(condition_filters);
     }
     
     filters
@@ -7676,13 +7701,12 @@ fn extract_filters_for_var(
 ) -> HashMap<String, PropertyValue> {
     println!("===> extract_filters_for_var START for variable: {}", var_name);
     let mut filters = HashMap::new();
-
+    
     if let Some(WhereClause { condition }) = where_clause {
         let mut queue = vec![condition];
         
         while let Some(expr) = queue.pop() {
             match expr {
-                // 1. Traverse Logical Trees
                 Expression::And { left, right } => {
                     queue.push(left);
                     queue.push(right);
@@ -7691,18 +7715,11 @@ fn extract_filters_for_var(
                     queue.push(left);
                     queue.push(right);
                 }
-                Expression::Not(inner) => {
-                    queue.push(inner);
-                }
-
-                // 2. Specialized Label Predicates (e:IdentityEvent)
                 Expression::LabelPredicate { variable, label } => {
                     if variable == var_name {
                         filters.insert("label".to_string(), PropertyValue::String(label.clone()));
                     }
                 }
-
-                // 3. Optimized Property Comparisons (e.id = 'value')
                 Expression::PropertyComparison {
                     variable,
                     property,
@@ -7715,8 +7732,6 @@ fn extract_filters_for_var(
                         }
                     }
                 }
-
-                // 4. Fallback Binary Equality (n.id = 'value')
                 Expression::Binary {
                     left,
                     op: BinaryOp::Eq,
@@ -7730,20 +7745,14 @@ fn extract_filters_for_var(
                         }
                     }
                 }
-                
-                // 5. STARTS WITH (Optional: include if you want prefix-based filtering)
-                Expression::StartsWith { variable, property, prefix } => {
-                    if variable == var_name {
-                        filters.insert(property.clone(), PropertyValue::String(prefix.clone()));
-                    }
-                }
-
                 _ => {}
             }
         }
     }
+    
     filters
 }
+
 
 // A higher-level function to resolve all node patterns in a MATCH clause.
 // It iterates over all node patterns and uses `resolve_var` to find their IDs,
@@ -7759,7 +7768,7 @@ async fn resolve_match_patterns(
     graph_service: &GraphService, 
     match_patterns: Vec<Pattern>,
     where_clause: &Option<WhereClause>,
-    with_clause: &Option<WithClause>, // ← ADD THIS
+    with_clause: &Option<WithClause>,
 ) -> GraphResult<HashMap<String, SerializableUuid>> {
     let mut var_to_id: HashMap<String, SerializableUuid> = HashMap::new();
     
@@ -7770,14 +7779,14 @@ async fn resolve_match_patterns(
             "===> Processing pattern {}: path_var={:?}, {} nodes, {} rels", 
             pattern_idx, pat.0, pat.1.len(), pat.2.len()
         );
-
+        
         if !pat.2.is_empty() {
             return Err(GraphError::NotImplemented(format!(
                 "Full graph pattern matching with relationships (Pattern {}) is not yet implemented.", 
                 pattern_idx
             )));
         }
-
+        
         for (node_idx, (var_opt, labels_vec, properties)) in pat.1.iter().enumerate() {
             if let Some(v_ref) = var_opt.as_ref() {
                 let var_name = v_ref.to_string();
@@ -7787,17 +7796,27 @@ async fn resolve_match_patterns(
                     
                     let first_label_opt = labels_vec.first().cloned();
                     
-                    let id = resolve_var(
+                    let id_opt = resolve_var(
                         graph_service, 
                         v_ref, 
                         &first_label_opt, 
                         properties,
                         where_clause,
-                        with_clause, // ← PASS IT HERE
+                        with_clause,
                     ).await?;
                     
-                    println!("===>    SUCCESS: '{}' resolved to {}", var_name, id.0);
-                    var_to_id.insert(var_name, id);
+                    // Handle Option - if node not found, return empty result
+                    match id_opt {
+                        Some(id) => {
+                            println!("===>    SUCCESS: '{}' resolved to {}", var_name, id.0);
+                            var_to_id.insert(var_name, id);
+                        }
+                        None => {
+                            println!("===>    Node '{}' not found - MATCH returns empty result", var_name);
+                            // Return empty HashMap to signal no matches found
+                            return Ok(HashMap::new());
+                        }
+                    }
                 }
             }
         }
