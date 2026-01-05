@@ -4002,9 +4002,8 @@ fn parse_clause_with_symbol_table<'a>(
     let trimmed = input.trim();
     let upper = trimmed.to_uppercase();
     
-    // 1. Handle UNWIND (MUST be first to catch it before other parsers)
+    // 1. Handle UNWIND (Highest priority)
     if upper.starts_with("UNWIND") {
-        println!("===> parse_clause_with_symbol_table: Trying UNWIND");
         if let Ok((remainder, query)) = parse_unwind_clause(trimmed) {
             let mut updated_symbols = symbol_table.clone();
             if let CypherQuery::Unwind { ref variable, .. } = query {
@@ -4016,10 +4015,8 @@ fn parse_clause_with_symbol_table<'a>(
     
     // 2. Handle MERGE
     if upper.starts_with("MERGE") {
-        println!("===> parse_clause_with_symbol_table: Trying MERGE");
         if let Ok((remainder, clause)) = parse_merge(trimmed) {
             let mut updated_symbols = symbol_table.clone();
-            
             if let CypherQuery::Merge { patterns, .. } = &clause {
                 for pattern in patterns {
                     for (var_name, _, _) in &pattern.1 {
@@ -4031,16 +4028,12 @@ fn parse_clause_with_symbol_table<'a>(
                     }
                 }
             }
-            
             return Ok((remainder, (clause, updated_symbols)));
         }
     }
     
     // 3. Handle MATCH / OPTIONAL MATCH
     if upper.starts_with("MATCH") || upper.starts_with("OPTIONAL MATCH") {
-        println!("===> parse_clause_with_symbol_table: Trying MATCH");
-        
-        // Try full_statement_parser first for complete MATCH clauses
         if let Ok((remainder, clause)) = full_statement_parser(trimmed) {
             let mut updated_symbols = symbol_table.clone();
             
@@ -4064,7 +4057,6 @@ fn parse_clause_with_symbol_table<'a>(
                             }
                         }
                     }
-                    
                     if let Some(with_data) = with_clause {
                         for item in &with_data.items {
                             if let Some(alias) = &item.alias {
@@ -4077,14 +4069,12 @@ fn parse_clause_with_symbol_table<'a>(
                 }
                 _ => {}
             }
-            
             return Ok((remainder, (clause, updated_symbols)));
         }
     }
     
     // 4. Handle CREATE
     if upper.starts_with("CREATE") {
-        println!("===> parse_clause_with_symbol_table: Trying CREATE");
         if let Ok((remainder, query)) = parse_create_statement(trimmed) {
             return Ok((remainder, (query, symbol_table.clone())));
         }
@@ -4092,45 +4082,60 @@ fn parse_clause_with_symbol_table<'a>(
     
     // 5. Handle SET
     if upper.starts_with("SET") {
-        println!("===> parse_clause_with_symbol_table: Trying SET");
         let (after_set, _) = tag_no_case::<_, _, nom::error::Error<&str>>("SET")(trimmed)?;
         let (after_set, _) = multispace1(after_set)?;
-        
         let (remainder, assignments) = separated_list1(
             delimited(multispace0, char(','), multispace0),
             parse_single_set_assignment
         ).parse(after_set)?;
-        
-        let query = CypherQuery::SetStatement { assignments };
-        return Ok((remainder, (query, symbol_table.clone())));
+        return Ok((remainder, (CypherQuery::SetStatement { assignments }, symbol_table.clone())));
     }
     
     // 6. Handle REMOVE
     if upper.starts_with("REMOVE") {
-        println!("===> parse_clause_with_symbol_table: Trying REMOVE");
         let (after_remove, _) = tag_no_case::<_, _, nom::error::Error<&str>>("REMOVE")(trimmed)?;
         let (after_remove, _) = multispace1(after_remove)?;
-        
         let (remainder, removals) = separated_list1(
             delimited(multispace0, char(','), multispace0),
             parse_remove_clause
         ).parse(after_remove)?;
-        
-        let query = CypherQuery::RemoveStatement { removals };
-        return Ok((remainder, (query, symbol_table.clone())));
+        return Ok((remainder, (CypherQuery::RemoveStatement { removals }, symbol_table.clone())));
     }
-    
+
     // 7. Handle RETURN
     if upper.starts_with("RETURN") {
         println!("===> parse_clause_with_symbol_table: Trying RETURN");
         if let Ok((remainder, return_clause)) = parse_return_clause_as_struct(trimmed) {
+            
+            // --- FIX: Ensure cleaned values are owned Strings to satisfy the borrow checker ---
+            let clean_projection: String = return_clause.items.iter()
+                .map(|item| {
+                    let clean_expr = item.expression
+                        .replace('\\', "")
+                        .trim_matches('"')
+                        .to_string(); // Own it
+
+                    if let Some(alias) = &item.alias {
+                        let clean_alias = alias
+                            .replace('\\', "")
+                            .trim_matches('"')
+                            .to_string(); // Own it
+                        format!("{} AS {}", clean_expr, clean_alias)
+                    } else {
+                        clean_expr
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(", ");
+
             let query = CypherQuery::ReturnStatement {
-                projection_string: format!("RETURN {}", 
-                    return_clause.items.iter().map(|item| item.expression.to_string()).collect::<Vec<_>>().join(", ")
-                ),
+                projection_string: format!("RETURN {}", clean_projection),
                 order_by: return_clause.order_by.unwrap_or_default()
                     .into_iter()
-                    .map(|(expr, asc)| OrderByItem { expression: expr, ascending: asc })
+                    .map(|(expr, asc)| OrderByItem { 
+                        expression: expr.replace('\\', "").trim_matches('"').to_string(), 
+                        ascending: asc 
+                    })
                     .collect(),
                 skip: return_clause.skip.map(|s| s as i64),
                 limit: return_clause.limit.map(|l| l as i64),
@@ -4138,10 +4143,9 @@ fn parse_clause_with_symbol_table<'a>(
             return Ok((remainder, (query, symbol_table.clone())));
         }
     }
-    
+        
     // 8. Handle WITH
     if upper.starts_with("WITH") {
-        println!("===> parse_clause_with_symbol_table: Trying WITH");
         if let Ok((remainder, with_clause)) = parse_with_full(trimmed) {
             let query = CypherQuery::MatchPattern {
                 patterns: vec![],
@@ -4153,7 +4157,6 @@ fn parse_clause_with_symbol_table<'a>(
         }
     }
     
-    println!("===> parse_clause_with_symbol_table: No match found");
     Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
 }
 
@@ -9035,151 +9038,200 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                 return_clause_opt = return_clause.clone();
                             }
                         }
-
                         // ============================================================================
                         // INTERNAL RETURN HANDLER (Inside Chain match arm)
                         // ============================================================================
-                        CypherQuery::ReturnStatement { projection_string, .. } => {
+                        CypherQuery::ReturnStatement { projection_string, order_by, .. } => {
                             println!("===> Processing RETURN in Chain using global context");
                             
-                            let (current_vertices, current_edges, vertex_bindings, edge_bindings) = {
+                            // 1. Snapshot the context including the new scalar_rows
+                            let (current_vertices, current_edges, vertex_bindings, edge_bindings, scalar_rows) = {
                                 let ctx = global_context.read().await;
                                 (
                                     ctx.current_vertices.clone(),
                                     ctx.current_edges.clone(),
                                     ctx.vertex_bindings.clone(),
-                                    ctx.edge_bindings.clone()
+                                    ctx.edge_bindings.clone(),
+                                    ctx.scalar_rows.clone(),
                                 )
                             };
                             
-                            println!("===> Context: {} vertices, {} edges, {} vertex_bindings, {} edge_bindings",
-                                     current_vertices.len(), current_edges.len(), vertex_bindings.len(), edge_bindings.len());
-                            
-                            // Build evaluation bindings
-                            let mut eval_bindings = HashMap::new();
-                            for (var_name, vertex_id_set) in &vertex_bindings {
-                                if let Some(vertex) = current_vertices.iter().find(|v| vertex_id_set.contains(&v.id.0)) {
-                                    eval_bindings.insert(var_name.clone(), CypherValue::Vertex(vertex.clone()));
-                                    println!("===> Bound variable '{}' to vertex with {} properties", 
-                                             var_name, vertex.properties.len());
-                                }
-                            }
-                            
-                            for (var_name, edge_id_set) in &edge_bindings {
-                                if let Some(edge) = current_edges.iter().find(|e| edge_id_set.contains(&e.id.0)) {
-                                    eval_bindings.insert(var_name.clone(), CypherValue::Edge(edge.clone()));
-                                    println!("===> Bound variable '{}' to edge '{}'", var_name, edge.label);
-                                }
-                            }
-                            
-                            // Parse projection items from the string
-                            let items: Vec<&str> = projection_string
-                                .trim_start_matches("RETURN ")
-                                .split(',')
-                                .map(|s| s.trim())
-                                .collect();
-                            
-                            let mut result_row = serde_json::Map::new();
-                            
-                            for item in items {
-                                println!("===> Processing projection item: '{}'", item);
-                                
-                                // Parse alias if present (e.g., "expr AS alias")
-                                let (expr_raw, alias_opt) = if let Some(as_pos) = item.to_uppercase().find(" AS ") {
-                                    (item[..as_pos].trim(), Some(item[as_pos + 4..].trim()))
-                                } else {
-                                    (item.trim(), None)
-                                };
-                                
-                                // Determine the output key
-                                let key = if let Some(alias) = alias_opt {
-                                    alias.to_string()
-                                } else {
-                                    expr_raw.to_string()
-                                };
-                                
-                                println!("===> Expression: '{}', Key: '{}'", expr_raw, key);
-                                
-                                // 1. Handle type() function for edges
-                                if expr_raw.to_lowercase().starts_with("type(") && expr_raw.ends_with(')') {
-                                    let edge_var = expr_raw[5..expr_raw.len()-1].trim();
-                                    if let Some(CypherValue::Edge(edge)) = eval_bindings.get(edge_var) {
-                                        result_row.insert(key.clone(), json!(edge.label.as_str()));
-                                        println!("===> ✓ Inserted type({}) = '{}'", edge_var, edge.label.as_str());
-                                        continue;
-                                    } else {
-                                        println!("===> ✗ Edge variable '{}' not found", edge_var);
-                                        result_row.insert(key, json!(null));
-                                        continue;
+                            println!("===> Context: {} vertices, {} edges, {} scalar_rows",
+                                     current_vertices.len(), current_edges.len(), scalar_rows.len());
+
+                            // 2. Normalize projection items into a Vec<(Expression, Alias)>
+                            let mut final_items = Vec::new();
+                            let trimmed_proj = projection_string.trim();
+
+                            if trimmed_proj.starts_with('{') {
+                                if let Ok(parsed_json) = serde_json::from_str::<serde_json::Value>(trimmed_proj) {
+                                    if let Some(items_array) = parsed_json.get("items").and_then(|i| i.as_array()) {
+                                        for item in items_array {
+                                            let expr = item.get("expression")
+                                                .and_then(|e| e.as_str())
+                                                .unwrap_or("")
+                                                .replace('\\', "")
+                                                .trim_matches('"')
+                                                .to_string();
+                                            let alias = item.get("alias")
+                                                .and_then(|a| a.as_str())
+                                                .map(|s| s.replace('\\', "").trim_matches('"').to_string());
+                                            final_items.push((expr, alias));
+                                        }
                                     }
                                 }
-                                
-                                // 2. Handle property access (e.g., "target_patient.mrn", "e.id")
-                                if let Some(dot_pos) = expr_raw.find('.') {
-                                    let var_name = expr_raw[..dot_pos].trim();
-                                    let prop_name = expr_raw[dot_pos + 1..].trim();
-                                    
-                                    println!("===> Looking up variable '{}', property '{}'", var_name, prop_name);
-                                    
-                                    if let Some(cypher_val) = eval_bindings.get(var_name) {
-                                        match cypher_val {
-                                            CypherValue::Vertex(vertex) => {
-                                                println!("===> Found vertex, checking properties map...");
-                                                if let Some(property_value) = vertex.properties.get(prop_name) {
-                                                    let json_val = serde_json::to_value(property_value)
-                                                        .unwrap_or(json!(null));
-                                                    println!("===> ✓ Inserted {} = {:?}", key, json_val);
-                                                    result_row.insert(key, json_val);
-                                                } else {
-                                                    println!("===> ✗ Property '{}' not found in vertex", prop_name);
-                                                    result_row.insert(key, json!(null));
-                                                }
-                                            }
-                                            CypherValue::Edge(edge) => {
-                                                if let Some(property_value) = edge.properties.get(prop_name) {
-                                                    let json_val = serde_json::to_value(property_value)
-                                                        .unwrap_or(json!(null));
-                                                    println!("===> ✓ Inserted {} = {:?}", key, json_val);
-                                                    result_row.insert(key, json_val);
-                                                } else {
-                                                    result_row.insert(key, json!(null));
-                                                }
-                                            }
-                                            _ => {
-                                                println!("===> ✗ Variable '{}' is not a Vertex or Edge", var_name);
-                                                result_row.insert(key, json!(null));
+                            } else {
+                                let raw_items: Vec<&str> = trimmed_proj
+                                    .trim_start_matches("RETURN ")
+                                    .split(',')
+                                    .map(|s| s.trim())
+                                    .collect();
+
+                                for item in raw_items {
+                                    if let Some(as_pos) = item.to_uppercase().find(" AS ") {
+                                        let expr = item[..as_pos].trim().replace('\\', "").trim_matches('"').to_string();
+                                        let alias = item[as_pos + 4..].trim().replace('\\', "").trim_matches('"').to_string();
+                                        final_items.push((expr, Some(alias)));
+                                    } else {
+                                        let expr = item.replace('\\', "").trim_matches('"').to_string();
+                                        final_items.push((expr, None));
+                                    }
+                                }
+                            }
+                            
+                            // 3. Determine if we need to perform aggregation (Grouping)
+                            let has_aggregation = final_items.iter().any(|(expr, _)| expr.contains("count("));
+                            let mut result_rows = Vec::new();
+
+                            let rows_to_process = if !scalar_rows.is_empty() {
+                                scalar_rows
+                            } else {
+                                let mut fallback_map = HashMap::new();
+                                for (var, ids) in &vertex_bindings {
+                                    if let Some(v) = current_vertices.iter().find(|v| ids.contains(&v.id.0)) {
+                                        fallback_map.insert(var.clone(), CypherValue::Vertex(v.clone()));
+                                    }
+                                }
+                                for (var, ids) in &edge_bindings {
+                                    if let Some(e) = current_edges.iter().find(|e| ids.contains(&e.id.0)) {
+                                        fallback_map.insert(var.clone(), CypherValue::Edge(e.clone()));
+                                    }
+                                }
+                                vec![fallback_map]
+                            };
+
+                            if has_aggregation {
+                                let mut groups: HashMap<Vec<serde_json::Value>, i64> = HashMap::new();
+
+                                for row_bindings in &rows_to_process {
+                                    let mut group_key = Vec::new();
+                                    for (expr_raw, _) in &final_items {
+                                        if !expr_raw.contains("count(") {
+                                            let val = if let Some(v) = row_bindings.get(expr_raw) {
+                                                v.to_json()
+                                            } else if let Some(dot_pos) = expr_raw.find('.') {
+                                                let var_name = &expr_raw[..dot_pos];
+                                                let prop_name = &expr_raw[dot_pos + 1..];
+                                                row_bindings.get(var_name).and_then(|cv| match cv {
+                                                    CypherValue::Vertex(v) => v.properties.get(prop_name).map(|pv| serde_json::to_value(pv).unwrap_or(serde_json::json!(null))),
+                                                    CypherValue::Edge(e) => e.properties.get(prop_name).map(|pv| serde_json::to_value(pv).unwrap_or(serde_json::json!(null))),
+                                                    _ => None,
+                                                }).unwrap_or(serde_json::json!(null))
+                                            } else {
+                                                serde_json::json!(null)
+                                            };
+                                            group_key.push(val);
+                                        }
+                                    }
+                                    *groups.entry(group_key).or_insert(0) += 1;
+                                }
+
+                                for (group_values, count) in groups {
+                                    let mut result_row = serde_json::Map::new();
+                                    let mut val_idx = 0;
+                                    for (expr_raw, alias_opt) in &final_items {
+                                        let key = alias_opt.clone().unwrap_or_else(|| expr_raw.clone());
+                                        if expr_raw.contains("count(") {
+                                            result_row.insert(key, serde_json::json!(count));
+                                        } else {
+                                            result_row.insert(key, group_values[val_idx].clone());
+                                            val_idx += 1;
+                                        }
+                                    }
+                                    result_rows.push(serde_json::Value::Object(result_row));
+                                }
+                            } else {
+                                for row_bindings in rows_to_process {
+                                    let mut result_row = serde_json::Map::new();
+                                    for (expr_raw, alias_opt) in &final_items {
+                                        let key = alias_opt.clone().unwrap_or_else(|| expr_raw.clone());
+                                        
+                                        if let Some(val) = row_bindings.get(expr_raw) {
+                                            result_row.insert(key.clone(), val.to_json());
+                                        } 
+                                        else if let Some(dot_pos) = expr_raw.find('.') {
+                                            let var_name = &expr_raw[..dot_pos];
+                                            let prop_name = &expr_raw[dot_pos + 1..];
+                                            if let Some(val) = row_bindings.get(var_name) {
+                                                let json_val = match val {
+                                                    CypherValue::Vertex(v) => v.properties.get(prop_name).map(|pv| serde_json::to_value(pv).unwrap_or(serde_json::json!(null))).unwrap_or(serde_json::json!(null)),
+                                                    CypherValue::Edge(e) => e.properties.get(prop_name).map(|pv| serde_json::to_value(pv).unwrap_or(serde_json::json!(null))).unwrap_or(serde_json::json!(null)),
+                                                    _ => serde_json::json!(null),
+                                                };
+                                                result_row.insert(key.clone(), json_val);
                                             }
                                         }
-                                    } else {
-                                        println!("===> ✗ Variable '{}' not found in eval_bindings", var_name);
-                                        result_row.insert(key, json!(null));
+                                        else if let Some(ids) = vertex_bindings.get(expr_raw) {
+                                            if let Some(v) = current_vertices.iter().find(|v| ids.contains(&v.id.0)) {
+                                                result_row.insert(key.clone(), CypherValue::Vertex(v.clone()).to_json());
+                                            }
+                                        }
+                                        else {
+                                            result_row.insert(key.clone(), serde_json::json!(null));
+                                        }
                                     }
-                                    continue;
-                                }
-                                
-                                // 3. Handle simple variable reference (entire vertex/edge)
-                                if let Some(val) = eval_bindings.get(expr_raw) {
-                                    result_row.insert(key.clone(), val.to_json());
-                                    println!("===> ✓ Inserted entire object for '{}'", expr_raw);
-                                } else {
-                                    println!("===> ✗ Variable '{}' not found", expr_raw);
-                                    result_row.insert(key, json!(null));
+                                    result_rows.push(serde_json::Value::Object(result_row));
                                 }
                             }
+
+                            // 4. Handle ORDER BY
+                            if !order_by.is_empty() {
+                                result_rows.sort_by(|a, b| {
+                                    for item in order_by {
+                                        let field = &item.expression; 
+                                        let val_a = a.get(field).unwrap_or(&serde_json::Value::Null);
+                                        let val_b = b.get(field).unwrap_or(&serde_json::Value::Null);
+                                        
+                                        let cmp = match (val_a, val_b) {
+                                            (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) => {
+                                                let f1 = n1.as_f64().unwrap_or(0.0);
+                                                let f2 = n2.as_f64().unwrap_or(0.0);
+                                                f1.partial_cmp(&f2).unwrap_or(std::cmp::Ordering::Equal)
+                                            }
+                                            (serde_json::Value::String(s1), serde_json::Value::String(s2)) => s1.cmp(s2),
+                                            _ => std::cmp::Ordering::Equal,
+                                        };
+
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return if item.ascending { cmp } else { cmp.reverse() };
+                                        }
+                                    }
+                                    std::cmp::Ordering::Equal
+                                });
+                            }
+
+                            println!("===> Final results: Generated {} aggregated rows", result_rows.len());
                             
-                            println!("===> Final result_row: {:?}", result_row);
-                            
-                            return Ok(json!({
-                                "vertices": vec![result_row],
+                            return Ok(serde_json::json!({
+                                "vertices": result_rows,
                                 "edges": current_edges,
                                 "stats": {
                                     "vertices_matched": current_vertices.len(),
                                     "edges_matched": current_edges.len(),
-                                    "contains_updates": final_execution_result.has_mutations()
+                                    "contains_updates": false
                                 }
                             }));
                         }
-
                         // ============================================================================
                         // MATCH CREATE in Chain - Leverage Global Context for MPI Traceability
                         // ============================================================================
@@ -9284,36 +9336,42 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             let mut new_rows = Vec::new();
                             let ctx_snapshot = global_context.read().await;
 
-                            // Use scalar_rows if they exist (from a previous UNWIND/MATCH), 
-                            // otherwise fallback to current_vertices (initial MATCH).
+                            // Use existing scalar_rows if they exist, otherwise use current_vertices
                             let rows_to_process = if !ctx_snapshot.scalar_rows.is_empty() {
                                 ctx_snapshot.scalar_rows.clone()
                             } else {
-                                // Convert vertices to a row-like format for consistency
+                                // Fallback: Convert matched vertices into the row format
                                 ctx_snapshot.current_vertices.iter().map(|v| {
                                     let mut map = HashMap::new();
-                                    // We need to know the name assigned to these vertices (e.g., "p" or "e")
-                                    // This would ideally come from ctx_snapshot.vertex_bindings
-                                    map.insert("e".to_string(), CypherValue::Vertex(v.clone()));
+                                    // We bind 'n' (or whatever the node var was) so labels(n) works
+                                    // In your log, the variable was 'n'
+                                    map.insert("n".to_string(), CypherValue::Vertex(v.clone()));
                                     map
-                                }).collect()
+                                }).collect::<Vec<_>>()
                             };
 
                             for row_bindings in rows_to_process {
                                 let eval_ctx = EvaluationContext {
                                     variables: row_bindings.clone(),
-                                    parameters: HashMap::new(), // Pass global params here if available
+                                    parameters: HashMap::new(), 
                                 };
                                 
-                                // Evaluate the expression (e.g., keys(row.e) or a list parameter)
-                                if let Ok(CypherValue::List(items)) = expression.evaluate(&eval_ctx) {
-                                    for item in items {
-                                        let mut new_row = row_bindings.clone();
-                                        new_row.insert(variable.clone(), item);
-                                        
-                                        // Ensure we carry forward metadata for the "Graph of Events"
-                                        // e.g., if row_bindings has 'patient_id', it persists here.
-                                        new_rows.push(new_row);
+                                // Evaluate expression (e.g., labels(n))
+                                if let Ok(val) = expression.evaluate(&eval_ctx) {
+                                    match val {
+                                        CypherValue::List(items) => {
+                                            for item in items {
+                                                let mut new_row = row_bindings.clone();
+                                                new_row.insert(variable.clone(), item);
+                                                new_rows.push(new_row);
+                                            }
+                                        },
+                                        scalar => {
+                                            // If it's a single value, it's still an unwind of 1 item
+                                            let mut new_row = row_bindings.clone();
+                                            new_row.insert(variable.clone(), scalar);
+                                            new_rows.push(new_row);
+                                        }
                                     }
                                 }
                             }
@@ -9321,6 +9379,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             drop(ctx_snapshot);
                             let mut ctx_write = global_context.write().await;
                             ctx_write.scalar_rows = new_rows; 
+                            println!("===> UNWIND complete: Produced {} rows", ctx_write.scalar_rows.len());
                         }
 
                         // ================================================================
