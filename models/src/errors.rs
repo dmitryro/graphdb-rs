@@ -101,6 +101,8 @@ pub enum GraphError {
     VertexError(String),
     #[error("Edge error: {0}")]
     EdgeError(String),
+    #[error("Pattern not found error: {0}")]
+    PatternNotFound(String),
 }
 
 // Implement the From trait for &str
